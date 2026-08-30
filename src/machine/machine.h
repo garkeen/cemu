@@ -14,5 +14,6 @@ typedef struct MachineOpts {
 Machine *MachineCreate(const char *name, const MachineOpts *opts);
 
 Machine *SpikeMachineCreate(const MachineOpts *opts);
+Machine *X86MachineCreate(const MachineOpts *opts);
 
 #endif

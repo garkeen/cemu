@@ -10,6 +10,7 @@ enum { kCpuRunning = 0, kCpuExited = 1 };
 typedef struct CpuState {
   uint64_t pc;
   Bus *bus;  // where the ISA reads and writes memory
+  Bus *io;   // port I/O space for ISAs that have one (x86 IN/OUT); NULL = none
   void *priv;
   int halted;
   int exit_code;

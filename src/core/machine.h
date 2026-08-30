@@ -12,6 +12,7 @@
 typedef struct Machine {
   const char *name;
   Bus bus;
+  Bus io;             // port I/O space; used only by machines whose ISA has one
   CpuState cpu;
   const IsaOps *isa;
   HtifDevice htif;    // attached only when the loaded image speaks HTIF
