@@ -17,6 +17,7 @@ typedef struct IsaOps {
 } IsaOps;
 
 extern const IsaOps kIsaRiscv64;
+extern const IsaOps kIsaX86;
 
 // Every ISA linked into the emulator registers itself here (NULL-terminated).
 // Image loading picks an ISA by matching e_machine against ops->elf_machine.
