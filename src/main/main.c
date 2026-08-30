@@ -3,6 +3,7 @@
 #include <string.h>
 #include "core/loader.h"
 #include "core/machine.h"
+#include "machine/machine.h"
 #include "host/host.h"
 #include "util/log.h"
 
@@ -25,9 +26,9 @@ static void Usage(void) {
       "  --isa NAME        isa for raw bins (default riscv64); ELF files\n"
       "                    self-identify and --isa must agree if given\n"
       "  --machine NAME    machine model (default spike)\n"
-      "  --mem MB          ram size in MB (default 256)\n"
-      "  --base ADDR       ram base (default 0x80000000)\n"
-      "  --bin-base ADDR   load address for raw bins (default ram base)\n"
+      "  --mem MB          ram size in MB (default: machine's)\n"
+      "  --base ADDR       ram base (default: machine's)\n"
+      "  --bin-base ADDR   load address for raw bins (default: machine's)\n"
       "  --htif ADDR       tohost address for raw bins (default base+0x1000)\n"
       "  --max-inst N      stop after N instructions (default unlimited)\n"
       "  --log FILE        also write logs to FILE\n"
@@ -41,15 +42,11 @@ static int ParseU64(const char *s, uint64_t *out) {
   return 0;
 }
 
+// Memory layout knobs are 0 when unset; the machine applies its own defaults.
 static int ParseArgs(Args *a, int argc, char **argv) {
   memset(a, 0, sizeof(*a));
-  // NULL means "ELF self-identifies; raw bins fall back to riscv64"
   a->isa_name = NULL;
   a->machine_name = "spike";
-  a->mem_size = kSpikeDramSizeDefault;
-  a->mem_base = kSpikeDramBase;
-  a->bin_base = kSpikeDramBase;
-  a->bin_tohost = 0;  // after parsing: bin_base + kRawBinTohostOffset
   for (int i = 1; i < argc; i++) {
     const char *arg = argv[i];
     if (strcmp(arg, "--isa") == 0) a->isa_name = argv[++i];
@@ -60,7 +57,6 @@ static int ParseArgs(Args *a, int argc, char **argv) {
       a->mem_size <<= 20;
     } else if (strcmp(arg, "--base") == 0) {
       if (ParseU64(argv[++i], &a->mem_base)) return -1;
-      a->bin_base = a->mem_base;
     } else if (strcmp(arg, "--bin-base") == 0) {
       if (ParseU64(argv[++i], &a->bin_base)) return -1;
     } else if (strcmp(arg, "--htif") == 0) {
@@ -72,7 +68,6 @@ static int ParseArgs(Args *a, int argc, char **argv) {
     else a->image = arg;
   }
   if (!a->image) return -1;
-  if (!a->bin_tohost) a->bin_tohost = a->bin_base + kRawBinTohostOffset;
   return 0;
 }
 
@@ -84,23 +79,20 @@ int main(int argc, char **argv) {
   }
   if (a.log_file) LogInitFile(a.log_file);
 
-  Machine *m = NULL;
-  if (strcmp(a.machine_name, "spike") == 0) {
-    m = MachineCreateSpike(a.mem_size, a.mem_base);
-  } else {
-    LogError("unknown machine '%s'", a.machine_name);
-    return 1;
-  }
-  if (!m) {
-    LogError("machine creation failed");
-    return 1;
-  }
+  MachineOpts opts = {a.mem_base, a.mem_size};
+  Machine *m = MachineCreate(a.machine_name, &opts);
+  if (!m) return 1;
 
+  uint64_t bin_base = a.bin_base ? a.bin_base : m->bin_base;
   LoadResult lr;
-  if (LoaderLoadImage(m, a.image, a.isa_name, a.bin_base, a.bin_tohost,
+  if (LoaderLoadImage(&m->bus, a.image, a.isa_name, bin_base, a.bin_tohost,
                       &lr) != 0) {
     MachineDestroy(m);
     return 1;
+  }
+  if (lr.has_htif) {
+    HtifBind(&m->htif, &m->cpu);
+    HtifRegister(&m->bus, &m->htif, lr.tohost, lr.fromhost);
   }
   m->isa = lr.isa;
   m->cpu.pc = lr.entry;

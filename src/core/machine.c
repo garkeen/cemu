@@ -2,21 +2,6 @@
 #include "core/machine.h"
 #include "util/log.h"
 
-Machine *MachineCreateSpike(uint64_t ram_size, uint64_t ram_base) {
-  Machine *m = (Machine *)calloc(1, sizeof(Machine));
-  if (!m) return NULL;
-  m->name = "spike";
-  m->ram = RamCreate(ram_base, ram_size);
-  if (!m->ram) {
-    free(m);
-    return NULL;
-  }
-  BusAddRamRegion(&m->bus, ram_base, ram_size, &kRamOps, m->ram, m->ram->mem);
-  m->cpu.halted = kCpuRunning;
-  m->cpu.bus = &m->bus;
-  return m;
-}
-
 void MachineRun(Machine *m, uint64_t max_inst) {
   while (!m->cpu.halted) {
     m->isa->Step(&m->cpu);

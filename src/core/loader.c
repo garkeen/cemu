@@ -37,9 +37,11 @@ static int ReadWholeFile(const char *path, uint8_t **out, size_t *out_size) {
 // Raw bins have no e_machine to self-identify, so they fall back to this ISA.
 static const char kDefaultIsaName[] = "riscv64";
 
-// Raw-bin HTIF placement, from riscv-test-env p/riscv_test.h: tohost and
+// Raw-bin HTIF placement, matching riscv-test-env p/riscv_test.h: tohost and
 // fromhost are stored 64-byte-aligned, so fromhost lands 0x40 after tohost.
-enum { kBinFromhostOffset = 0x40 };
+// tohost itself sits 0x1000 above the load address; test/probe/probe_bin.ld
+// mirrors this layout.
+enum { kBinTohostOffset = 0x1000, kBinFromhostOffset = 0x40 };
 
 static const IsaOps *FindIsaByMachine(uint32_t elf_machine) {
   for (const IsaOps *const *p = kIsaTable; *p; p++) {
@@ -79,7 +81,7 @@ static const IsaOps *PickIsa(const char *isa_name, int is_elf,
   return isa;
 }
 
-int LoaderLoadImage(Machine *m, const char *path, const char *isa_name,
+int LoaderLoadImage(Bus *bus, const char *path, const char *isa_name,
                     uint64_t bin_base, uint64_t bin_tohost, LoadResult *out) {
   memset(out, 0, sizeof(*out));
   uint8_t *data = NULL;
@@ -89,7 +91,7 @@ int LoaderLoadImage(Machine *m, const char *path, const char *isa_name,
   const IsaOps *isa = NULL;
   if (size >= 4 && memcmp(data, "\x7f" "ELF", 4) == 0) {
     ElfInfo info;
-    if (ElfLoad(&m->bus, data, size, &info) != 0) {
+    if (ElfLoad(bus, data, size, &info) != 0) {
       free(data);
       return -1;
     }
@@ -111,7 +113,7 @@ int LoaderLoadImage(Machine *m, const char *path, const char *isa_name,
       return -1;
     }
     uint8_t *host = NULL;
-    if (BusRamRange(&m->bus, bin_base, size, &host) != 0) {
+    if (BusRamRange(bus, bin_base, size, &host) != 0) {
       LogError("bin image of %llu bytes does not fit at %llx",
                (unsigned long long)size, (unsigned long long)bin_base);
       free(data);
@@ -119,16 +121,13 @@ int LoaderLoadImage(Machine *m, const char *path, const char *isa_name,
     }
     memcpy(host, data, size);
     out->entry = bin_base;
-    out->has_htif = 1;
-    out->tohost = bin_tohost;
-    out->fromhost = bin_tohost + kBinFromhostOffset;
+    if (isa->bin_uses_htif) {
+      out->has_htif = 1;
+      out->tohost = bin_tohost ? bin_tohost : bin_base + kBinTohostOffset;
+      out->fromhost = out->tohost + kBinFromhostOffset;
+    }
   }
   free(data);
   out->isa = isa;
-
-  if (out->has_htif) {
-    HtifBind(&m->htif, &m->cpu);
-    HtifRegister(&m->bus, &m->htif, out->tohost, out->fromhost);
-  }
   return 0;
 }

@@ -56,6 +56,7 @@ void RiscvDumpRegs(const CpuState *cpu) {
 const IsaOps kIsaRiscv64 = {
     "riscv64",
     243,  // EM_RISCV
+    1,    // raw bins follow the riscv-tests HTIF convention
     RiscvInit,
     RiscvStep,
     RiscvDumpRegs,
