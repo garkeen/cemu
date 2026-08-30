@@ -8,8 +8,10 @@ static uint64_t DebugExitRead(void *dev, uint64_t addr, int size) {
 static void DebugExitWrite(void *dev, uint64_t addr, int size, uint64_t val) {
   (void)addr; (void)size;
   DebugExitDevice *d = (DebugExitDevice *)dev;
+  // QEMU hw/misc/debugexit.c: status = (value << 1) | 1, calibrated against
+  // qemu-system-i386 -device isa-debug-exit (payloads 0/2/5 -> 1/5/11).
   d->cpu->halted = kCpuExited;
-  d->cpu->exit_code = (int)(val & 0xff) + 1;
+  d->cpu->exit_code = (int)(((val & 0xff) << 1) | 1);
 }
 
 const DeviceOps kDebugExitOps = {"debug-exit", DebugExitRead, DebugExitWrite};

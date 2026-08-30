@@ -18,7 +18,6 @@ enum {
 
 // Flow of an executed instruction: either eip advances by the instruction
 // length, or the instruction redirected it itself (control flow, trap).
-enum { kFlowNext = 0, kFlowRedirect = 1 };
 
 enum { kVecDe = 0, kVecUd = 6 };
 
@@ -305,8 +304,9 @@ static uint32_t Pop(CpuState *cpu, X86State *s, int size) {
 // ---- traps and real-mode interrupt dispatch ----
 
 // Delivers a vector through the real-mode IVT (IDTR base). Faults push the
-// address of the faulting instruction, which is still in s->eip here.
-static void DoInt(CpuState *cpu, X86State *s, int vec) {
+// address of the faulting instruction, which is still in s->eip here, and
+// return the new instruction pointer.
+static uint32_t DoInt(CpuState *cpu, X86State *s, int vec) {
   if (s->cr0 & kCr0Pe)
     Fatal("x86: exception in protected mode (outside stage-1.5 scope)");
   uint64_t tbl = s->idtr + (uint64_t)vec * 4;
@@ -317,7 +317,7 @@ static void DoInt(CpuState *cpu, X86State *s, int vec) {
   Push(cpu, s, 2, s->eip & 0xffff);
   s->eflags &= ~(kFlagIf | kFlagTf);
   LoadSegment(cpu, s, kSegCs, (uint16_t)seg);
-  s->eip = off;
+  return off;
 }
 
 // ---- ALU ----
@@ -546,8 +546,7 @@ static void ExecAas(X86State *s) {
 // ---- multiply and divide (GRP3 /4-/7) ----
 
 // Returns 0 normally, -1 when a #DE (divide error) was raised.
-static int ExecMulDiv(CpuState *cpu, X86State *s, int op, int size,
-                      uint32_t src) {
+static int ExecMulDiv(X86State *s, int op, int size, uint32_t src) {
   enum { kMul = 4, kImul = 5, kDiv = 6, kIdiv = 7 };
   int bits = size * 8;
   if (size == 1) {
@@ -585,8 +584,7 @@ static int ExecMulDiv(CpuState *cpu, X86State *s, int op, int size,
         return 0;
       }
     }
-    DoInt(cpu, s, kVecDe);  // #DE: quotient out of range or division by zero
-    return -1;
+    return -1;  // #DE: quotient out of range or division by zero
   }
   // 16/32-bit: dividend is the register pair (DX:AX or EDX:EAX).
   uint64_t upair = ((uint64_t)(s->gpr[kEdx] & ValueMask(size)) << bits) |
@@ -615,23 +613,22 @@ static int ExecMulDiv(CpuState *cpu, X86State *s, int op, int size,
       s->gpr[kEdx] = (uint32_t)(upair % usrc);
       return 0;
     }
-    default: {  // kIdiv
-      if (usrc == 0) break;
-      int64_t dividend =
-          size == 2 ? Sext64(upair, 32) : (int64_t)upair;
-      int64_t divisor = Sext64(src, bits);
-      int64_t quot = dividend / divisor;
-      if (quot < -(int64_t)(1LL << (bits - 1)) ||
-          quot >= (int64_t)(1LL << (bits - 1)))
-        break;
-      s->gpr[kEax] = (uint32_t)quot;
-      s->gpr[kEdx] = (uint32_t)(dividend % divisor);
-      return 0;
+      default: {  // kIdiv
+        if (usrc == 0) break;
+        int64_t dividend =
+            size == 2 ? Sext64(upair, 32) : (int64_t)upair;
+        int64_t divisor = Sext64(src, bits);
+        int64_t quot = dividend / divisor;
+        if (quot < -(int64_t)(1LL << (bits - 1)) ||
+            quot >= (int64_t)(1LL << (bits - 1)))
+          break;
+        s->gpr[kEax] = (uint32_t)quot;
+        s->gpr[kEdx] = (uint32_t)(dividend % divisor);
+        return 0;
+      }
     }
+    return -1;  // caller raises #DE: bad quotient or division by zero
   }
-  DoInt(cpu, s, kVecDe);
-  return -1;
-}
 
 // ---- debug output ----
 
@@ -720,11 +717,71 @@ static void LoadFar(CpuState *cpu, X86State *s, const Modrm *m, int size,
   LoadSegment(cpu, s, seg, sel);
 }
 
+// ---- string operations (MOVS/CMPS/STOS/LODS/SCAS, with REP/REPNE) ----
+
+// Executes one iteration. Returns 1 when a REP prefix wants another one,
+// which leaves eip on the string instruction itself (interruptible, like
+// hardware). SI uses DS (overridable), DI always ES; CX counts with the
+// operand size, SI/DI advance with the address size.
+static int ExecString(CpuState *cpu, X86State *s, uint8_t opcode,
+                      const Prefixes *p, int opsz, int addrsz) {
+  static const uint8_t kWordForms[] = {0xa5, 0xa7, 0xab, 0xad, 0xaf};
+  int size = 1;
+  for (unsigned i = 0; i < sizeof(kWordForms); i++)
+    if (opcode == kWordForms[i]) size = opsz;
+  int delta = (s->eflags & kFlagDf) ? -size : size;
+  uint32_t sioff = RegRead(s, kEsi, addrsz);
+  uint32_t dioff = RegRead(s, kEdi, addrsz);
+  uint64_t slin = SegLinear(s, p->seg >= 0 ? p->seg : kSegDs) + sioff;
+  uint64_t dlin = SegLinear(s, kSegEs) + dioff;
+  // SI belongs to MOVS/CMPS/LODS, DI to MOVS/CMPS/STOS/SCAS.
+  int uses_si = opcode == 0xa4 || opcode == 0xa5 || opcode == 0xa6 ||
+                opcode == 0xa7 || opcode == 0xac || opcode == 0xad;
+  int uses_di = opcode == 0xa4 || opcode == 0xa5 || opcode == 0xa6 ||
+                opcode == 0xa7 || opcode == 0xaa || opcode == 0xab ||
+                opcode == 0xae || opcode == 0xaf;
+  switch (opcode) {
+    case 0xa4: case 0xa5:  // MOVS: [ES:DI] = [DS:SI]
+      BusWrite(cpu->bus, dlin, size,
+               BusRead(cpu->bus, slin, size) & ValueMask(size));
+      break;
+    case 0xa6: case 0xa7: {  // CMPS: [DS:SI] - [ES:DI]
+      uint32_t a = (uint32_t)(BusRead(cpu->bus, slin, size) & ValueMask(size));
+      uint32_t b = (uint32_t)(BusRead(cpu->bus, dlin, size) & ValueMask(size));
+      SetSubFlags(s, a, b, (a - b) & ValueMask(size), size, 0);
+      break;
+    }
+    case 0xaa: case 0xab:  // STOS: [ES:DI] = AL/eAX
+      BusWrite(cpu->bus, dlin, size, RegRead(s, kEax, size));
+      break;
+    case 0xac: case 0xad:  // LODS: AL/eAX = [DS:SI]
+      RegWrite(s, kEax, size,
+               (uint32_t)(BusRead(cpu->bus, slin, size) & ValueMask(size)));
+      break;
+    default: {  // 0xae/0xaf SCAS: AL/eAX - [ES:DI]
+      uint32_t a = RegRead(s, kEax, size);
+      uint32_t b =
+          (uint32_t)(BusRead(cpu->bus, dlin, size) & ValueMask(size));
+      SetSubFlags(s, a, b, (a - b) & ValueMask(size), size, 0);
+      break;
+    }
+  }
+  if (uses_si) RegWrite(s, kEsi, addrsz, sioff + delta);
+  if (uses_di) RegWrite(s, kEdi, addrsz, dioff + delta);
+  if (!p->rep) return 0;
+  uint32_t cx = RegRead(s, kEcx, opsz) - 1;
+  RegWrite(s, kEcx, opsz, cx);
+  if (cx == 0) return 0;
+  // REPE/REPNE keep iterating on CMPS/SCAS while the comparison holds.
+  if (opcode == 0xa6 || opcode == 0xa7 || opcode == 0xae || opcode == 0xaf)
+    return !!(s->eflags & kFlagZf) == (p->rep == 1);
+  return 1;
+}
+
 void X86Step(CpuState *cpu) {
   X86State *s = (X86State *)cpu->priv;
   if (!cpu->io) Fatal("x86 requires a machine with port I/O");
 
-  int flow = kFlowNext;
   Fetch f = {cpu, SegLinear(s, kSegCs), s->eip};
   Prefixes p = {0, 0, -1, 0};
   uint8_t opcode;
@@ -824,7 +881,6 @@ void X86Step(CpuState *cpu) {
         int64_t rel = opsz == 2 ? FetchS16(&f) : FetchS32(&f);
         if (Cond(s, op2 & 0xf)) {
           f.ip = RelTarget(f.ip, rel, opsz);
-          flow = kFlowRedirect;
         }
         break;
       }
@@ -1095,7 +1151,6 @@ void X86Step(CpuState *cpu) {
         int8_t rel = FetchS8(&f);
         if (Cond(s, opcode & 0xf)) {
           f.ip = RelTarget(f.ip, rel, opsz);
-          flow = kFlowRedirect;
         }
         break;
       }
@@ -1212,6 +1267,12 @@ void X86Step(CpuState *cpu) {
         }
         break;
       }
+      case 0xa4: case 0xa5: case 0xa6: case 0xa7:
+      case 0xaa: case 0xab: case 0xac: case 0xad:
+      case 0xae: case 0xaf:  // string operations, REP-aware
+        if (ExecString(cpu, s, opcode, &p, opsz, addrsz))
+          f.ip = s->eip;  // REP continues: retry this instruction
+        break;
       case 0xa8: case 0xa9: {  // TEST acc, imm
         int size = opcode == 0xa9 ? opsz : 1;
         SetLogicFlags(s,
@@ -1238,12 +1299,10 @@ void X86Step(CpuState *cpu) {
         uint32_t n = Fetch16(&f);
         f.ip = Pop(cpu, s, opsz);
         StackAdjust(s, opsz, (int)n);
-        flow = kFlowRedirect;
         break;
       }
       case 0xc3:  // RET
         f.ip = Pop(cpu, s, opsz);
-        flow = kFlowRedirect;
         break;
       case 0xc4: case 0xc5:  // LES / LDS r, m16:32
         DecodeModrm(&f, s, &p, addrsz, &m);
@@ -1283,26 +1342,21 @@ void X86Step(CpuState *cpu) {
         f.ip = Pop(cpu, s, opsz);
         LoadSegment(cpu, s, kSegCs, (uint16_t)Pop(cpu, s, opsz));
         StackAdjust(s, opsz, (int)n);
-        flow = kFlowRedirect;
         break;
       }
       case 0xcb:  // RETF
         f.ip = Pop(cpu, s, opsz);
         LoadSegment(cpu, s, kSegCs, (uint16_t)Pop(cpu, s, opsz));
-        flow = kFlowRedirect;
         break;
       case 0xcc:  // INT3
-        DoInt(cpu, s, 3);
-        flow = kFlowRedirect;
+        f.ip = DoInt(cpu, s, 3);
         break;
       case 0xcd:  // INT imm8
-        DoInt(cpu, s, Fetch8(&f));
-        flow = kFlowRedirect;
+        f.ip = DoInt(cpu, s, Fetch8(&f));
         break;
       case 0xce:  // INTO
         if (s->eflags & kFlagOf) {
-          DoInt(cpu, s, 4);
-          flow = kFlowRedirect;
+          f.ip = DoInt(cpu, s, 4);
         }
         break;
       case 0xcf: {  // IRET
@@ -1311,7 +1365,6 @@ void X86Step(CpuState *cpu) {
         uint32_t fl = Pop(cpu, s, opsz);
         LoadSegment(cpu, s, kSegCs, (uint16_t)cs);
         s->eflags = opsz == 2 ? (s->eflags & 0xffff0000) | (fl | 2) : fl | 2;
-        flow = kFlowRedirect;
         break;
       }
       case 0xd0: case 0xd1: case 0xd2: case 0xd3: {  // GRP2 r/m, 1/CL
@@ -1325,8 +1378,7 @@ void X86Step(CpuState *cpu) {
       case 0xd4: {  // AAM imm8
         uint32_t base = Fetch8(&f);
         if (base == 0) {
-          DoInt(cpu, s, kVecDe);
-          flow = kFlowRedirect;
+          f.ip = DoInt(cpu, s, kVecDe);
           break;
         }
         uint32_t al = RegRead(s, kEax, 1);
@@ -1369,7 +1421,6 @@ void X86Step(CpuState *cpu) {
                     (opcode == 0xe2 || Cond(s, opcode == 0xe0 ? 5 : 4));
         if (taken) {
           f.ip = RelTarget(f.ip, rel, opsz);
-          flow = kFlowRedirect;
         }
         break;
       }
@@ -1377,7 +1428,6 @@ void X86Step(CpuState *cpu) {
         int8_t rel = FetchS8(&f);
         if (RegRead(s, kEcx, addrsz) == 0) {
           f.ip = RelTarget(f.ip, rel, opsz);
-          flow = kFlowRedirect;
         }
         break;
       }
@@ -1401,13 +1451,11 @@ void X86Step(CpuState *cpu) {
         int64_t rel = opsz == 2 ? FetchS16(&f) : FetchS32(&f);
         Push(cpu, s, opsz, opsz == 2 ? f.ip & 0xffff : f.ip);
         f.ip = RelTarget(f.ip, rel, opsz);
-        flow = kFlowRedirect;
         break;
       }
       case 0xe9: {  // JMP rel
         int64_t rel = opsz == 2 ? FetchS16(&f) : FetchS32(&f);
         f.ip = RelTarget(f.ip, rel, opsz);
-        flow = kFlowRedirect;
         break;
       }
       case 0xea: {  // JMP ptr16:16 / ptr16:32
@@ -1415,13 +1463,11 @@ void X86Step(CpuState *cpu) {
         uint16_t seg = Fetch16(&f);
         LoadSegment(cpu, s, kSegCs, seg);
         f.ip = off;
-        flow = kFlowRedirect;
         break;
       }
       case 0xeb: {  // JMP rel8
         int8_t rel = FetchS8(&f);
         f.ip = RelTarget(f.ip, rel, opsz);
-        flow = kFlowRedirect;
         break;
       }
       case 0xec:  // IN AL, DX
@@ -1440,7 +1486,6 @@ void X86Step(CpuState *cpu) {
         LogInfo("hlt with no interrupt sources, stopping emulation");
         cpu->halted = kCpuExited;
         cpu->exit_code = 0;
-        flow = kFlowRedirect;
         break;
       case 0xf5:  // CMC
         s->eflags ^= kFlagCf;
@@ -1465,8 +1510,9 @@ void X86Step(CpuState *cpu) {
             break;
           }
           default:  // 4-7: MUL/IMUL/DIV/IDIV
-            if (ExecMulDiv(cpu, s, m.reg, size, RmRead(cpu, s, &m, size)))
-              flow = kFlowRedirect;
+            if (ExecMulDiv(s, m.reg, size, RmRead(cpu, s, &m, size))) {
+              f.ip = DoInt(cpu, s, kVecDe);
+            }
             break;
         }
         break;
@@ -1499,7 +1545,6 @@ void X86Step(CpuState *cpu) {
             uint32_t target = RmRead(cpu, s, &m, opsz);
             Push(cpu, s, opsz, opsz == 2 ? f.ip & 0xffff : f.ip);
             f.ip = target;
-            flow = kFlowRedirect;
             break;
           }
           case 3: {  // CALL far m16:32
@@ -1511,12 +1556,10 @@ void X86Step(CpuState *cpu) {
             Push(cpu, s, opsz, opsz == 2 ? f.ip & 0xffff : f.ip);
             LoadSegment(cpu, s, kSegCs, seg);
             f.ip = target;
-            flow = kFlowRedirect;
             break;
           }
           case 4: {  // JMP near r/m
             f.ip = RmRead(cpu, s, &m, opsz);
-            flow = kFlowRedirect;
             break;
           }
           case 5: {  // JMP far m16:32
@@ -1526,7 +1569,6 @@ void X86Step(CpuState *cpu) {
                 (uint16_t)BusRead(cpu->bus, MemLinear(s, &m) + opsz, 2);
             LoadSegment(cpu, s, kSegCs, seg);
             f.ip = target;
-            flow = kFlowRedirect;
             break;
           }
           case 6:  // PUSH r/m
@@ -1542,9 +1584,11 @@ void X86Step(CpuState *cpu) {
     }
   }
 
-  if (flow == kFlowNext) s->eip = f.ip;
+  s->eip = f.ip;
+  cpu->pc = s->eip;  // keep the observable PC in sync (run loop, dumps)
   return;
 
 illegal:
-  DoInt(cpu, s, kVecUd);  // s->eip still holds the faulting instruction
+  s->eip = DoInt(cpu, s, kVecUd);  // pushed: the faulting instruction
+  cpu->pc = s->eip;
 }

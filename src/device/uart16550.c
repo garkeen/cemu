@@ -69,12 +69,12 @@ void Uart16550Write(Uart16550 *u, uint64_t off, uint8_t val) {
 
 static uint64_t UartRead(void *dev, uint64_t addr, int size) {
   (void)size;  // 1-byte registers; wider reads take the low byte
-  return Uart16550Read((Uart16550 *)dev, addr);
+  return Uart16550Read((Uart16550 *)dev, addr & 7);  // 8-byte register window
 }
 
 static void UartWrite(void *dev, uint64_t addr, int size, uint64_t val) {
   (void)size;
-  Uart16550Write((Uart16550 *)dev, addr, (uint8_t)val);
+  Uart16550Write((Uart16550 *)dev, addr & 7, (uint8_t)val);
 }
 
 const DeviceOps kUart16550Ops = {"uart16550", UartRead, UartWrite};
