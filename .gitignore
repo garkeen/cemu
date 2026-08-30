@@ -1,0 +1,14 @@
+# Build output (Makefile BUILD dir)
+build/
+
+# Object files and binaries anywhere they might stray
+*.o
+*.obj
+*.exe
+
+# Editor / OS junk
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
