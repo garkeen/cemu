@@ -39,7 +39,7 @@ static const char kDefaultIsaName[] = "riscv64";
 
 // Raw-bin HTIF placement, matching riscv-test-env p/riscv_test.h: tohost and
 // fromhost are stored 64-byte-aligned, so fromhost lands 0x40 after tohost.
-// tohost itself sits 0x1000 above the load address; test/probe/probe_bin.ld
+// tohost itself sits 0x1000 above the load address; test/riscv64/probe/probe_bin.ld
 // mirrors this layout.
 enum { kBinTohostOffset = 0x1000, kBinFromhostOffset = 0x40 };
 
