@@ -8,6 +8,7 @@
 typedef struct LoadResult {
   const IsaOps *isa;
   uint64_t entry;
+  uint64_t image_base;  // where the image starts in memory
   int has_htif;
   uint64_t tohost;
   uint64_t fromhost;

@@ -119,6 +119,8 @@ int ElfLoad(Bus *bus, const uint8_t *data, size_t size, ElfInfo *out) {
       p_memsz = Rd32(ph + 20);
     }
     if (p_type != kPtLoad) continue;
+    if (!out->image_base || p_vaddr < out->image_base)
+      out->image_base = p_vaddr;
     uint8_t *host = NULL;
     if (BusRamRange(bus, p_vaddr, p_memsz, &host) != 0) {
       LogError("elf: segment [%llx, %llx) outside RAM",

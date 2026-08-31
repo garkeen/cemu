@@ -12,3 +12,11 @@ build/
 Thumbs.db
 Desktop.ini
 .DS_Store
+realmode_cut.c
+rc.*
+probe.*
+realmode.gen.s
+realmode.flat.s
+realmode.o
+realmode.exe
+*.txt

@@ -111,12 +111,12 @@ static void SetIncDecFlags(X86State *s, uint32_t res, int size, int is_inc) {
 
 // ---- segments ----
 
-// Real mode computes the segment base from the visible selector on every
-// access; protected mode uses the descriptor cache (base/dbit). A descriptor
-// cache loaded in protected mode therefore survives CR0.PE=0 (big real mode).
+// Translation always uses the descriptor cache. Protected-mode loads fill it
+// from the GDT; real-mode loads fill it with sel<<4. The cache SURVIVES
+// CR0.PE=0 — that is exactly the big-real-mode mechanism the kvm-unit-tests
+// harness relies on when it drops from protected mode back to real mode.
 static uint64_t SegLinear(X86State *s, int seg) {
-  if (s->cr0 & kCr0Pe) return s->base[seg];
-  return (uint64_t)s->sreg[seg] << 4;
+  return s->base[seg];
 }
 
 static void LoadSegment(CpuState *cpu, X86State *s, int seg, uint16_t sel) {
@@ -134,6 +134,22 @@ static void LoadSegment(CpuState *cpu, X86State *s, int seg, uint16_t sel) {
   s->dbit[seg] = (uint8_t)((desc >> 54) & 1);
 }
 
+// Real x86 has no fault for accesses to memory nobody decodes (open bus):
+// reads return all ones and writes are dropped. QEMU's unassigned-memory
+// behavior matches this, so unclaimed RAM regions never trap.
+static uint32_t XMemRead(CpuState *cpu, uint64_t lin, int size) {
+  BusRegion *r;
+  if (BusProbe(cpu->bus, lin, size, &r) != 0)
+    return (uint32_t)(size == 4 ? 0xffffffffu : (1u << (size * 8)) - 1);
+  return (uint32_t)(BusRead(cpu->bus, lin, size) & ValueMask(size));
+}
+
+static void XMemWrite(CpuState *cpu, uint64_t lin, int size, uint64_t val) {
+  BusRegion *r;
+  if (BusProbe(cpu->bus, lin, size, &r) != 0) return;
+  BusWrite(cpu->bus, lin, size, val);
+}
+
 // ---- instruction fetch ----
 
 typedef struct Fetch {
@@ -143,7 +159,7 @@ typedef struct Fetch {
 } Fetch;
 
 static uint8_t Fetch8(Fetch *f) {
-  uint8_t v = (uint8_t)BusRead(f->cpu->bus, f->linear + f->ip, 1);
+  uint8_t v = (uint8_t)XMemRead(f->cpu, f->linear + f->ip, 1);
   f->ip++;
   return v;
 }
@@ -252,7 +268,7 @@ static uint64_t MemLinear(X86State *s, const Modrm *m) {
 
 static uint32_t RmRead(CpuState *cpu, X86State *s, const Modrm *m, int size) {
   if (!m->is_mem) return RegRead(s, m->rm, size);
-  return (uint32_t)(BusRead(cpu->bus, MemLinear(s, m), size) & ValueMask(size));
+  return (uint32_t)(XMemRead(cpu, MemLinear(s, m), size) & ValueMask(size));
 }
 
 static void RmWrite(CpuState *cpu, X86State *s, const Modrm *m, int size,
@@ -261,7 +277,7 @@ static void RmWrite(CpuState *cpu, X86State *s, const Modrm *m, int size,
     RegWrite(s, m->rm, size, v);
     return;
   }
-  BusWrite(cpu->bus, MemLinear(s, m), size, v & ValueMask(size));
+  XMemWrite(cpu, MemLinear(s, m), size, v & ValueMask(size));
 }
 
 // ---- stack ----
@@ -291,12 +307,12 @@ static uint64_t StackLinear(X86State *s, int size) {
 
 static void Push(CpuState *cpu, X86State *s, int size, uint32_t val) {
   StackAdjust(s, size, -size);
-  BusWrite(cpu->bus, StackLinear(s, size), size, val & ValueMask(size));
+  XMemWrite(cpu, StackLinear(s, size), size, val & ValueMask(size));
 }
 
 static uint32_t Pop(CpuState *cpu, X86State *s, int size) {
   uint32_t v =
-      (uint32_t)(BusRead(cpu->bus, StackLinear(s, size), size) & ValueMask(size));
+      (uint32_t)(XMemRead(cpu, StackLinear(s, size), size) & ValueMask(size));
   StackAdjust(s, size, size);
   return v;
 }
@@ -310,8 +326,8 @@ static uint32_t DoInt(CpuState *cpu, X86State *s, int vec) {
   if (s->cr0 & kCr0Pe)
     Fatal("x86: exception in protected mode (outside stage-1.5 scope)");
   uint64_t tbl = s->idtr + (uint64_t)vec * 4;
-  uint32_t off = BusRead(cpu->bus, tbl, 2);
-  uint32_t seg = BusRead(cpu->bus, tbl + 2, 2);
+  uint32_t off = XMemRead(cpu, tbl, 2);
+  uint32_t seg = XMemRead(cpu, tbl + 2, 2);
   Push(cpu, s, 2, s->eflags | 2);
   Push(cpu, s, 2, s->sreg[kSegCs]);
   Push(cpu, s, 2, s->eip & 0xffff);
@@ -666,12 +682,12 @@ void X86Init(CpuState *cpu) {
   }
   s->eip = (uint32_t)cpu->pc;
   s->eflags = 0x202;  // IF set, bit 1 forced on
-  // Detect a multiboot image (header within the first 8 KiB of the load
-  // region, 4-byte aligned). QEMU enters such kernels in flat 32-bit
-  // protected mode; everything else is a BIOS boot sector.
-  uint64_t scan = cpu->pc & ~0xfffull;
+  // Detect a multiboot image: the header sits within the first 8 KiB of the
+  // loaded image (Multiboot 0.6.96 spec, section 3.1.1), 4-byte aligned.
+  // QEMU enters such kernels in flat 32-bit protected mode; everything else
+  // is a BIOS boot sector.
   int multiboot = 0;
-  for (uint64_t a = scan; a < scan + 0x2000; a += 4) {
+  for (uint64_t a = cpu->image_base; a < cpu->image_base + 0x2000; a += 4) {
     if (BusRead(cpu->bus, a, 4) == kMultibootHeaderMagic) {
       multiboot = 1;
       break;
@@ -708,11 +724,15 @@ static uint32_t RelTarget(uint32_t ip_after, int64_t rel, int size) {
   return ip_after + (uint32_t)(int32_t)rel;
 }
 
+static int TraceEnabled(void) {
+  return getenv("CEMU_TRACE") != NULL;
+}
+
 // Far-pointer loads (LDS/LSS/LES/LFS/LGS): offset then selector in memory.
 static void LoadFar(CpuState *cpu, X86State *s, const Modrm *m, int size,
                     int seg) {
   uint32_t off = RmRead(cpu, s, m, size);
-  uint16_t sel = (uint16_t)BusRead(cpu->bus, MemLinear(s, m) + size, 2);
+  uint16_t sel = (uint16_t)XMemRead(cpu, MemLinear(s, m) + size, 2);
   RegWrite(s, m->reg, size, off);
   LoadSegment(cpu, s, seg, sel);
 }
@@ -742,26 +762,26 @@ static int ExecString(CpuState *cpu, X86State *s, uint8_t opcode,
                 opcode == 0xae || opcode == 0xaf;
   switch (opcode) {
     case 0xa4: case 0xa5:  // MOVS: [ES:DI] = [DS:SI]
-      BusWrite(cpu->bus, dlin, size,
-               BusRead(cpu->bus, slin, size) & ValueMask(size));
+      XMemWrite(cpu, dlin, size,
+               XMemRead(cpu, slin, size) & ValueMask(size));
       break;
     case 0xa6: case 0xa7: {  // CMPS: [DS:SI] - [ES:DI]
-      uint32_t a = (uint32_t)(BusRead(cpu->bus, slin, size) & ValueMask(size));
-      uint32_t b = (uint32_t)(BusRead(cpu->bus, dlin, size) & ValueMask(size));
+      uint32_t a = (uint32_t)(XMemRead(cpu, slin, size) & ValueMask(size));
+      uint32_t b = (uint32_t)(XMemRead(cpu, dlin, size) & ValueMask(size));
       SetSubFlags(s, a, b, (a - b) & ValueMask(size), size, 0);
       break;
     }
     case 0xaa: case 0xab:  // STOS: [ES:DI] = AL/eAX
-      BusWrite(cpu->bus, dlin, size, RegRead(s, kEax, size));
+      XMemWrite(cpu, dlin, size, RegRead(s, kEax, size));
       break;
     case 0xac: case 0xad:  // LODS: AL/eAX = [DS:SI]
       RegWrite(s, kEax, size,
-               (uint32_t)(BusRead(cpu->bus, slin, size) & ValueMask(size)));
+               (uint32_t)(XMemRead(cpu, slin, size) & ValueMask(size)));
       break;
     default: {  // 0xae/0xaf SCAS: AL/eAX - [ES:DI]
       uint32_t a = RegRead(s, kEax, size);
       uint32_t b =
-          (uint32_t)(BusRead(cpu->bus, dlin, size) & ValueMask(size));
+          (uint32_t)(XMemRead(cpu, dlin, size) & ValueMask(size));
       SetSubFlags(s, a, b, (a - b) & ValueMask(size), size, 0);
       break;
     }
@@ -802,6 +822,15 @@ void X86Step(CpuState *cpu) {
   }
   int two_byte = opcode == 0x0f;
   uint8_t op2 = two_byte ? Fetch8(&f) : 0;
+  if (TraceEnabled()) {
+    char buf[120];
+    int n = snprintf(buf, sizeof(buf),
+                     "cs=%04x eip=%04x op=%02x%02x eax=%08x ebx=%08x "
+                     "esp=%08x fl=%08x\n",
+                     s->sreg[kSegCs], s->eip, opcode, op2, s->gpr[kEax],
+                     s->gpr[kEbx], s->gpr[kEsp], s->eflags);
+    HostWriteErr(buf, (size_t)n);
+  }
   int opsz = ((s->cr0 & kCr0Pe) && s->dbit[kSegCs]) ? 4 : 2;
   if (p.opsz_toggle) opsz = 6 - opsz;
   int addrsz = ((s->cr0 & kCr0Pe) && s->dbit[kSegCs]) ? 4 : 2;
@@ -817,14 +846,14 @@ void X86Step(CpuState *cpu) {
             uint64_t lin = MemLinear(s, &m);
             uint64_t base = m.reg == 0 ? s->gdtr : s->idtr;
             uint32_t limit = m.reg == 0 ? s->gdtr_limit : s->idtr_limit;
-            BusWrite(cpu->bus, lin, 2, limit);
-            BusWrite(cpu->bus, lin + 2, 4, base);
+            XMemWrite(cpu, lin, 2, limit);
+            XMemWrite(cpu, lin + 2, 4, base);
             break;
           }
           case 2: case 3: {  // LGDT/LIDT
             uint64_t lin = MemLinear(s, &m);
-            uint16_t limit = (uint16_t)BusRead(cpu->bus, lin, 2);
-            uint64_t base = BusRead(cpu->bus, lin + 2, 4);
+            uint16_t limit = (uint16_t)XMemRead(cpu, lin, 2);
+            uint64_t base = XMemRead(cpu, lin + 2, 4);
             if (m.reg == 2) {
               s->gdtr = base;
               s->gdtr_limit = limit;
@@ -966,6 +995,19 @@ void X86Step(CpuState *cpu) {
         s->eflags &= ~(kFlagCf | kFlagOf);
         if (prod != Sext64((uint64_t)prod, opsz * 8))
           s->eflags |= kFlagCf | kFlagOf;
+        break;
+      }
+      case 0xba: {  // GRP8: BT/BTS/BTR/BTC r/m, imm8
+        DecodeModrm(&f, s, &p, addrsz, &m);
+        uint32_t imm = Fetch8(&f);
+        uint32_t v = RmRead(cpu, s, &m, opsz);
+        uint32_t pos = imm & (opsz * 8 - 1);
+        s->eflags &= ~kFlagCf;
+        if ((v >> pos) & 1) s->eflags |= kFlagCf;
+        if (m.reg == 5) RmWrite(cpu, s, &m, opsz, v | (1u << pos));
+        else if (m.reg == 6) RmWrite(cpu, s, &m, opsz, v & ~(1u << pos));
+        else if (m.reg == 7) RmWrite(cpu, s, &m, opsz, v ^ (1u << pos));
+        else if (m.reg != 4) goto illegal;
         break;
       }
       case 0xb0: case 0xb1:  // CMPXCHG: 486+, not in scope
@@ -1180,7 +1222,15 @@ void X86Step(CpuState *cpu) {
         DecodeModrm(&f, s, &p, addrsz, &m);
         int size = opcode == 0x87 ? opsz : 1;
         uint32_t t = RmRead(cpu, s, &m, size);
-        RmWrite(cpu, s, &m, size, RegRead(s, m.reg, size));
+        uint32_t r = RegRead(s, m.reg, size);
+        if (TraceEnabled()) {
+          char buf[96];
+          int n = snprintf(buf, sizeof(buf),
+                           "[xchg] reg=%d mem=%d val=%08x memval=%08x\n",
+                           m.reg, m.is_mem, r, t);
+          HostWriteErr(buf, (size_t)n);
+        }
+        RmWrite(cpu, s, &m, size, r);
         RegWrite(s, m.reg, size, t);
         break;
       }
@@ -1257,13 +1307,13 @@ void X86Step(CpuState *cpu) {
         uint32_t off = addrsz == 2 ? Fetch16(&f) : Fetch32(&f);
         uint64_t lin = SegLinear(s, p.seg >= 0 ? p.seg : kSegDs) + off;
         if (opcode == 0xa0) {
-          RegWrite(s, kEax, 1, BusRead(cpu->bus, lin, 1));
+          RegWrite(s, kEax, 1, XMemRead(cpu, lin, 1));
         } else if (opcode == 0xa1) {
-          RegWrite(s, kEax, opsz, BusRead(cpu->bus, lin, opsz));
+          RegWrite(s, kEax, opsz, XMemRead(cpu, lin, opsz));
         } else if (opcode == 0xa2) {
-          BusWrite(cpu->bus, lin, 1, RegRead(s, kEax, 1));
+          XMemWrite(cpu, lin, 1, RegRead(s, kEax, 1));
         } else {
-          BusWrite(cpu->bus, lin, opsz, RegRead(s, kEax, opsz));
+          XMemWrite(cpu, lin, opsz, RegRead(s, kEax, opsz));
         }
         break;
       }
@@ -1403,7 +1453,7 @@ void X86Step(CpuState *cpu) {
         uint32_t off = addrsz == 2 ? RegRead(s, kEbx, 2) : RegRead(s, kEbx, 4);
         off += RegRead(s, kEax, 1);
         uint64_t lin = SegLinear(s, p.seg >= 0 ? p.seg : kSegDs) + off;
-        RegWrite(s, kEax, 1, BusRead(cpu->bus, lin, 1));
+        RegWrite(s, kEax, 1, XMemRead(cpu, lin, 1));
         break;
       }
       case 0xd8: case 0xd9: case 0xda: case 0xdb:
@@ -1551,7 +1601,7 @@ void X86Step(CpuState *cpu) {
             if (!m.is_mem) goto illegal;
             uint32_t target = RmRead(cpu, s, &m, opsz);
             uint16_t seg =
-                (uint16_t)BusRead(cpu->bus, MemLinear(s, &m) + opsz, 2);
+                (uint16_t)XMemRead(cpu, MemLinear(s, &m) + opsz, 2);
             Push(cpu, s, opsz, s->sreg[kSegCs]);
             Push(cpu, s, opsz, opsz == 2 ? f.ip & 0xffff : f.ip);
             LoadSegment(cpu, s, kSegCs, seg);
@@ -1566,7 +1616,7 @@ void X86Step(CpuState *cpu) {
             if (!m.is_mem) goto illegal;
             uint32_t target = RmRead(cpu, s, &m, opsz);
             uint16_t seg =
-                (uint16_t)BusRead(cpu->bus, MemLinear(s, &m) + opsz, 2);
+                (uint16_t)XMemRead(cpu, MemLinear(s, &m) + opsz, 2);
             LoadSegment(cpu, s, kSegCs, seg);
             f.ip = target;
             break;

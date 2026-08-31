@@ -101,6 +101,7 @@ int LoaderLoadImage(Bus *bus, const char *path, const char *isa_name,
       return -1;
     }
     out->entry = info.entry;
+    out->image_base = info.image_base;
     if (info.has_tohost) {
       out->has_htif = 1;
       out->tohost = info.tohost;
@@ -121,6 +122,7 @@ int LoaderLoadImage(Bus *bus, const char *path, const char *isa_name,
     }
     memcpy(host, data, size);
     out->entry = bin_base;
+    out->image_base = bin_base;
     if (isa->bin_uses_htif) {
       out->has_htif = 1;
       out->tohost = bin_tohost ? bin_tohost : bin_base + kBinTohostOffset;

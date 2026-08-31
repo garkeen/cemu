@@ -96,6 +96,7 @@ int main(int argc, char **argv) {
   }
   m->isa = lr.isa;
   m->cpu.pc = lr.entry;
+  m->cpu.image_base = lr.image_base;
   lr.isa->Init(&m->cpu);
   LogInfo("loaded %s: entry=%llx isa=%s htif=%d", a.image,
           (unsigned long long)lr.entry, lr.isa->name, lr.has_htif);

@@ -7,6 +7,7 @@
 
 typedef struct ElfInfo {
   uint64_t entry;
+  uint64_t image_base;  // lowest PT_LOAD address
   uint32_t machine;  // e_machine, matched against IsaOps.elf_machine
   int is_64;
   int has_tohost;
