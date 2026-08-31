@@ -26,6 +26,8 @@ enum {
   kFlagIf = 1 << 9,
   kFlagDf = 1 << 10,
   kFlagOf = 1 << 11,
+  kFlagRf = 1 << 16,  // resume flag: transient, never survives to pushf
+  kFlagVm = 1 << 17,  // VM86 mode: not entered in this model
 };
 
 enum { kCr0Pe = 1 << 0 };  // protection enable

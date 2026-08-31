@@ -237,6 +237,9 @@ static void DecodeModrm(Fetch *f, X86State *s, const Prefixes *p, int addrsz,
         (m->rm == 2 || m->rm == 3 || (m->rm == 6 && m->mod != 0)))
       m->seg = kSegSs;
   } else if (m->rm == 4) {
+    // SIB byte: scale*index + base (+ disp). Index 4 means "no index"; a
+    // base of 5 with mod 0 means "no base" and the displacement supplies the
+    // address instead — but the index term applies in every form.
     uint8_t sib = Fetch8(f);
     int scale = 1 << (sib >> 6);
     int index = (sib >> 3) & 7;
@@ -245,9 +248,9 @@ static void DecodeModrm(Fetch *f, X86State *s, const Prefixes *p, int addrsz,
       off = Fetch32(f);  // no base register, disp32
     } else {
       off = s->gpr[base];
-      if (index != 4) off += (uint32_t)scale * s->gpr[index];  // 4 = none
       if (m->seg < 0 && base == 5) m->seg = kSegSs;  // EBP base
     }
+    if (index != 4) off += (uint32_t)scale * s->gpr[index];
     if (m->mod != 0) off += Disp(f, addrsz, m->mod);
   } else {
     if (m->rm == 5 && m->mod == 0) {
@@ -322,7 +325,11 @@ static uint32_t Pop(CpuState *cpu, X86State *s, int size) {
 // Delivers a vector through the real-mode IVT (IDTR base). Faults push the
 // address of the faulting instruction, which is still in s->eip here, and
 // return the new instruction pointer.
-static uint32_t DoInt(CpuState *cpu, X86State *s, int vec) {
+// Real-mode interrupt dispatch: read the IVT entry, push FLAGS/CS/IP, clear IF/TF,
+// and load CS:IP from the table. ret_eip is the value pushed as the return
+// address: traps (software INT) push the instruction after themselves, faults
+// (#DE/#UD) push the faulting instruction so a handler can re-run it.
+static uint32_t DoInt(CpuState *cpu, X86State *s, int vec, uint32_t ret_eip) {
   if (s->cr0 & kCr0Pe)
     Fatal("x86: exception in protected mode (outside stage-1.5 scope)");
   uint64_t tbl = s->idtr + (uint64_t)vec * 4;
@@ -330,7 +337,7 @@ static uint32_t DoInt(CpuState *cpu, X86State *s, int vec) {
   uint32_t seg = XMemRead(cpu, tbl + 2, 2);
   Push(cpu, s, 2, s->eflags | 2);
   Push(cpu, s, 2, s->sreg[kSegCs]);
-  Push(cpu, s, 2, s->eip & 0xffff);
+  Push(cpu, s, 2, ret_eip & 0xffff);
   s->eflags &= ~(kFlagIf | kFlagTf);
   LoadSegment(cpu, s, kSegCs, (uint16_t)seg);
   return off;
@@ -724,8 +731,11 @@ static uint32_t RelTarget(uint32_t ip_after, int64_t rel, int size) {
   return ip_after + (uint32_t)(int32_t)rel;
 }
 
-static int TraceEnabled(void) {
-  return getenv("CEMU_TRACE") != NULL;
+static int g_step_trace = -1;
+
+static int StepTrace(void) {
+  if (g_step_trace < 0) g_step_trace = getenv("CEMU_TRACE") != NULL;
+  return g_step_trace;
 }
 
 // Far-pointer loads (LDS/LSS/LES/LFS/LGS): offset then selector in memory.
@@ -822,13 +832,14 @@ void X86Step(CpuState *cpu) {
   }
   int two_byte = opcode == 0x0f;
   uint8_t op2 = two_byte ? Fetch8(&f) : 0;
-  if (TraceEnabled()) {
-    char buf[120];
+  if (StepTrace()) {
+    char buf[160];
     int n = snprintf(buf, sizeof(buf),
-                     "cs=%04x eip=%04x op=%02x%02x eax=%08x ebx=%08x "
-                     "esp=%08x fl=%08x\n",
+                     "cs=%04x eip=%04x op=%02x%02x ax=%08x bx=%08x cx=%08x "
+                     "dx=%08x si=%08x di=%08x sp=%08x bp=%08x fl=%08x\n",
                      s->sreg[kSegCs], s->eip, opcode, op2, s->gpr[kEax],
-                     s->gpr[kEbx], s->gpr[kEsp], s->eflags);
+                     s->gpr[kEbx], s->gpr[kEcx], s->gpr[kEdx], s->gpr[kEsi],
+                     s->gpr[kEdi], s->gpr[kEsp], s->gpr[kEbp], s->eflags);
     HostWriteErr(buf, (size_t)n);
   }
   int opsz = ((s->cr0 & kCr0Pe) && s->dbit[kSegCs]) ? 4 : 2;
@@ -1222,15 +1233,7 @@ void X86Step(CpuState *cpu) {
         DecodeModrm(&f, s, &p, addrsz, &m);
         int size = opcode == 0x87 ? opsz : 1;
         uint32_t t = RmRead(cpu, s, &m, size);
-        uint32_t r = RegRead(s, m.reg, size);
-        if (TraceEnabled()) {
-          char buf[96];
-          int n = snprintf(buf, sizeof(buf),
-                           "[xchg] reg=%d mem=%d val=%08x memval=%08x\n",
-                           m.reg, m.is_mem, r, t);
-          HostWriteErr(buf, (size_t)n);
-        }
-        RmWrite(cpu, s, &m, size, r);
+        RmWrite(cpu, s, &m, size, RegRead(s, m.reg, size));
         RegWrite(s, m.reg, size, t);
         break;
       }
@@ -1289,12 +1292,24 @@ void X86Step(CpuState *cpu) {
         RegWrite(s, kEdx, opsz, sign);
         break;
       }
+      case 0x9a: {  // CALL ptr16:16/32 — far call, immediate offset + selector
+        uint32_t off = opsz == 2 ? Fetch16(&f) : Fetch32(&f);
+        uint16_t sel = Fetch16(&f);
+        Push(cpu, s, opsz, s->sreg[kSegCs]);
+        Push(cpu, s, opsz, opsz == 2 ? f.ip & 0xffff : f.ip);
+        LoadSegment(cpu, s, kSegCs, sel);
+        f.ip = off;
+        break;
+      }
+      case 0x9b:  // FWAIT/WAIT: no x87 in this model, nothing to wait for
+        break;
       case 0x9c:  // PUSHF
         Push(cpu, s, opsz, s->eflags | 2);
         break;
       case 0x9d: {  // POPF
         uint32_t v = Pop(cpu, s, opsz);
-        s->eflags = opsz == 2 ? (s->eflags & 0xffff0000) | (v | 2) : v | 2;
+        s->eflags = opsz == 2 ? (s->eflags & 0xffff0000) | (v | 2)
+                               : (v & ~(kFlagRf | kFlagVm)) | 2;
         break;
       }
       case 0x9e:  // SAHF: SF ZF - AF - PF - CF from AH
@@ -1399,14 +1414,16 @@ void X86Step(CpuState *cpu) {
         LoadSegment(cpu, s, kSegCs, (uint16_t)Pop(cpu, s, opsz));
         break;
       case 0xcc:  // INT3
-        f.ip = DoInt(cpu, s, 3);
+        f.ip = DoInt(cpu, s, 3, f.ip);
         break;
-      case 0xcd:  // INT imm8
-        f.ip = DoInt(cpu, s, Fetch8(&f));
+      case 0xcd: {  // INT imm8
+        uint8_t vec = Fetch8(&f);
+        f.ip = DoInt(cpu, s, vec, f.ip);
         break;
+      }
       case 0xce:  // INTO
         if (s->eflags & kFlagOf) {
-          f.ip = DoInt(cpu, s, 4);
+          f.ip = DoInt(cpu, s, 4, f.ip);
         }
         break;
       case 0xcf: {  // IRET
@@ -1414,7 +1431,8 @@ void X86Step(CpuState *cpu) {
         uint32_t cs = Pop(cpu, s, opsz);
         uint32_t fl = Pop(cpu, s, opsz);
         LoadSegment(cpu, s, kSegCs, (uint16_t)cs);
-        s->eflags = opsz == 2 ? (s->eflags & 0xffff0000) | (fl | 2) : fl | 2;
+        s->eflags = opsz == 2 ? (s->eflags & 0xffff0000) | (fl | 2)
+                               : (fl & ~(kFlagRf | kFlagVm)) | 2;
         break;
       }
       case 0xd0: case 0xd1: case 0xd2: case 0xd3: {  // GRP2 r/m, 1/CL
@@ -1428,7 +1446,7 @@ void X86Step(CpuState *cpu) {
       case 0xd4: {  // AAM imm8
         uint32_t base = Fetch8(&f);
         if (base == 0) {
-          f.ip = DoInt(cpu, s, kVecDe);
+          f.ip = DoInt(cpu, s, kVecDe, s->eip);
           break;
         }
         uint32_t al = RegRead(s, kEax, 1);
@@ -1561,7 +1579,7 @@ void X86Step(CpuState *cpu) {
           }
           default:  // 4-7: MUL/IMUL/DIV/IDIV
             if (ExecMulDiv(s, m.reg, size, RmRead(cpu, s, &m, size))) {
-              f.ip = DoInt(cpu, s, kVecDe);
+              f.ip = DoInt(cpu, s, kVecDe, s->eip);
             }
             break;
         }
@@ -1639,6 +1657,6 @@ void X86Step(CpuState *cpu) {
   return;
 
 illegal:
-  s->eip = DoInt(cpu, s, kVecUd);  // pushed: the faulting instruction
+  s->eip = DoInt(cpu, s, kVecUd, s->eip);  // #UD is a fault: re-run the insn
   cpu->pc = s->eip;
 }
