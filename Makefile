@@ -6,10 +6,8 @@ BUILD := build
 TARGET := $(BUILD)/cemu.exe
 
 SRCS := $(foreach d,$(sort $(dir $(wildcard src/*/*/))),$(wildcard $(d)*.c))
-# Code not yet wired into any machine stays out of the build (开发准则 四):
-# sifive_test joins when machine/virt.c lands, time_win when a time consumer
-# (CLINT mtime) exists.
-SRCS := $(filter-out src/device/sifive_test.c src/host/time_win.c,$(SRCS))
+# Every module in the tree is wired: sifive_test/time_win landed with the
+# virt machine (CLINT mtime consumes the host clock).
 OBJS := $(patsubst src/%.c,$(BUILD)/%.obj,$(SRCS))
 DEPS := $(OBJS:.obj=.d)
 

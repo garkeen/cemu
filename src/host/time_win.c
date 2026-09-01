@@ -12,3 +12,5 @@ int64_t HostTimerNow(void) {
   QueryPerformanceCounter(&now);
   return (int64_t)(now.QuadPart * 1000000 / freq.QuadPart);
 }
+
+void HostSleepMs(int ms) { Sleep((DWORD)ms); }

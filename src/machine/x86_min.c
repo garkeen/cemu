@@ -19,6 +19,12 @@ static const uint64_t kPortSpaceSize = 0x10000;
 // enters it with CS:IP = 0000:7C00, DL = 0x80 (drive number).
 static const uint64_t kBootSectorLoad = 0x7C00;
 
+typedef struct X86Machine {
+  Machine base;
+  Uart16550 uart;
+  DebugExitDevice dexit;
+} X86Machine;
+
 static uint64_t UnclaimedRead(void *dev, uint64_t addr, int size) {
   (void)dev; (void)addr;
   return size >= 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
@@ -36,26 +42,19 @@ Machine *X86MachineCreate(const MachineOpts *opts) {
     LogError("x86 machine has a fixed 1MB real-mode layout");
     return NULL;
   }
-  Machine *m = (Machine *)calloc(1, sizeof(Machine));
-  if (!m) return NULL;
+  X86Machine *xm = (X86Machine *)calloc(1, sizeof(X86Machine));
+  if (!xm) return NULL;
+  Machine *m = &xm->base;
   m->name = "x86";
   m->ram = RamCreate(0, kRamSize);
   if (!m->ram) {
-    free(m);
+    free(xm);
     return NULL;
   }
   BusAddRamRegion(&m->bus, 0, kRamSize, &kRamOps, m->ram, m->ram->mem);
 
-  Uart16550 *uart = (Uart16550 *)calloc(1, sizeof(Uart16550));
-  DebugExitDevice *dexit =
-      (DebugExitDevice *)calloc(1, sizeof(DebugExitDevice));
-  if (!uart || !dexit) {
-    free(uart);
-    free(dexit);
-    RamDestroy(m->ram);
-    free(m);
-    return NULL;
-  }
+  Uart16550 *uart = &xm->uart;
+  DebugExitDevice *dexit = &xm->dexit;
   Uart16550Init(uart);
   DebugExitBind(dexit, &m->cpu);
   BusAddRegion(&m->io, 0, kPortSpaceSize, &kUnclaimedPortOps, NULL);

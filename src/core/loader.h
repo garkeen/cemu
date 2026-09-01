@@ -16,8 +16,11 @@ typedef struct LoadResult {
 
 // Loads .elf (segments + symbols) or .bin (raw image at bin_base).
 // isa_name picks the ISA for raw bins; ELF files self-identify.
+// bin_uses_htif is a machine property (spike yes, virt/PC no): it selects
+// the raw-binary HTIF convention; ELFs always decide by their symbols.
 // HTIF placement is reported, not wired; the caller attaches the device.
 int LoaderLoadImage(Bus *bus, const char *path, const char *isa_name,
-                    uint64_t bin_base, uint64_t bin_tohost, LoadResult *out);
+                    uint64_t bin_base, uint64_t bin_tohost, int bin_uses_htif,
+                    LoadResult *out);
 
 #endif

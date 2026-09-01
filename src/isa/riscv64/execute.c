@@ -13,8 +13,6 @@ static int StepTrace(void) {
   return g_step_trace;
 }
 
-enum { kPrivMachine = 3 };
-
 static RiscvState *Rs(CpuState *cpu) {
   return (RiscvState *)cpu->priv;
 }
@@ -28,29 +26,49 @@ static uint64_t Sext(uint64_t v, int bits) {
   return ((v & ((1ULL << bits) - 1)) ^ m) - m;
 }
 
-// ---- memory access with trap checks ----
+// ---- memory access with translation, PMP and trap checks ----
 
+// Loads and stores translate the effective address, check PMP on the
+// translated physical range, then decode on the bus. Access-fault causes:
+// load 5, store 7 (priv spec 3.5); mtval carries the faulting vaddr.
 static int MemRead(CpuState *cpu, RiscvState *s, uint64_t addr, int len,
                    uint64_t *out) {
-  Bus *bus = cpu->bus;
-  BusRegion *r;
-  if (BusProbe(bus, addr, len, &r) != 0) {
+  uint64_t paddr;
+  if (RiscvTranslate(cpu, s, addr, kAccRead, &paddr) != 0) return -1;
+  if (!RiscvPmpAllowed(s, paddr, (uint64_t)len, kAccRead, s->priv) ||
+      BusProbe(cpu->bus, paddr, len, NULL) != 0) {
     RiscvTrap(cpu, s, kExLoadFault, addr);
     return -1;
   }
-  *out = BusRead(bus, addr, len);
+  *out = BusRead(cpu->bus, paddr, len);
   return 0;
 }
 
 static int MemWrite(CpuState *cpu, RiscvState *s, uint64_t addr, int len,
                     uint64_t val) {
-  Bus *bus = cpu->bus;
-  BusRegion *r;
-  if (BusProbe(bus, addr, len, &r) != 0) {
+  uint64_t paddr;
+  if (RiscvTranslate(cpu, s, addr, kAccWrite, &paddr) != 0) return -1;
+  if (!RiscvPmpAllowed(s, paddr, (uint64_t)len, kAccWrite, s->priv) ||
+      BusProbe(cpu->bus, paddr, len, NULL) != 0) {
     RiscvTrap(cpu, s, kExStoreFault, addr);
     return -1;
   }
-  BusWrite(bus, addr, len, val);
+  BusWrite(cpu->bus, paddr, len, val);
+  return 0;
+}
+
+// Instruction fetch, one halfword at a time so an instruction straddling a
+// page boundary walks both pages. Fetch fault cause 1; tval = vaddr.
+static int FetchHalf(CpuState *cpu, RiscvState *s, uint64_t addr,
+                     uint16_t *out) {
+  uint64_t paddr;
+  if (RiscvTranslate(cpu, s, addr, kAccIfetch, &paddr) != 0) return -1;
+  if (!RiscvPmpAllowed(s, paddr, 2, kAccIfetch, s->priv) ||
+      BusProbe(cpu->bus, paddr, 2, NULL) != 0) {
+    RiscvTrap(cpu, s, kExFetchFault, addr);
+    return -1;
+  }
+  *out = (uint16_t)BusRead(cpu->bus, paddr, 2);
   return 0;
 }
 
@@ -410,12 +428,8 @@ static int ExecAtomic(CpuState *cpu, RiscvState *s, uint32_t inst,
     RiscvTrap(cpu, s, kExStoreMisaligned, addr);
     return -1;
   }
-  Bus *bus = cpu->bus;
-  BusRegion *r;
-  if (BusProbe(bus, addr, width, &r) != 0) {
-    RiscvTrap(cpu, s, kExLoadFault, addr);
-    return -1;
-  }
+  // Loads/stores below go through the translated, PMP-checked path; an AMO
+  // needs both R and W on the page/PMP entry, which the split covers.
   uint64_t old, val, stored;
   switch (f5) {
     case 0x02:  // lr
@@ -611,27 +625,60 @@ static int ExecOp32(CpuState *cpu, RiscvState *s, uint32_t inst) {
 }
 
 static int ExecSystem(CpuState *cpu, RiscvState *s, uint32_t inst,
-                      uint64_t *next_pc) {
+                      uint64_t pc, uint64_t *next_pc) {
   int f3 = (int)((inst >> 12) & 7);
   uint32_t imm12 = (inst >> 20) & 0xfff;
   if (f3 == 0) {
     int rd = (int)((inst >> 7) & 31);
     int rs1 = (int)((inst >> 15) & 31);
     switch (imm12) {
-      case 0x000:  // ecall
-        RiscvTrap(cpu, s, s->priv == kPrivMachine ? kExMachineEcall
-                                                  : kExUserEcall, 0);
+      case 0x000: {  // ecall: cause follows the active privilege (spec 1.4)
+        uint64_t cause = s->priv == kPrivMachine  ? kExMachineEcall
+                         : s->priv == kPrivSupervisor ? kExSupervisorEcall
+                                                      : kExUserEcall;
+        RiscvTrap(cpu, s, cause, 0);
         return -1;
-      case 0x001:  // ebreak
-        RiscvTrap(cpu, s, kExBreakpoint, 0);
+      }
+      case 0x001:  // ebreak: mtval is the breakpoint address (pc)
+        RiscvTrap(cpu, s, kExBreakpoint, pc);
         return -1;
       case 0x302:  // mret
-        if (rd != 0 || rs1 != 0) return Illegal(cpu, s, inst);
+        if (rd != 0 || rs1 != 0 || s->priv != kPrivMachine)
+          return Illegal(cpu, s, inst);
         *next_pc = RiscvMret(s);
         return 0;
-      case 0x105:  // wfi
+      case 0x102: {  // sret
+        if (rd != 0 || rs1 != 0) return Illegal(cpu, s, inst);
+        // TSR: S-mode sret traps (priv spec 3.1.6.8); M-mode executes it.
+        if (s->priv == kPrivSupervisor && (s->mstatus & kMstatusTsr))
+          return Illegal(cpu, s, inst);
+        if (s->priv < kPrivSupervisor) return Illegal(cpu, s, inst);
+        *next_pc = RiscvSret(s);
         return 0;
-      case 0x102:  // sret: S mode not implemented
+      }
+      case 0x105:  // wfi
+        if (rd != 0 || rs1 != 0) return Illegal(cpu, s, inst);
+        // TW: S-mode wfi traps (priv spec 3.1.6.8); U-mode always traps.
+        if (s->priv == kPrivUser ||
+            (s->priv == kPrivSupervisor && (s->mstatus & kMstatusTw)))
+          return Illegal(cpu, s, inst);
+        if (((s->mip | s->ext_irq) & s->mie) == 0) {
+          // Sleep with no fetch until an enabled interrupt arrives; the
+          // machine loop keeps the timer ticking (dearchap power_down
+          // semantics). With an enabled interrupt pending wfi is a nop.
+          s->wait = 1;
+        }
+        return 0;
+      case 0x120: {  // sfence.vma (encoding 0x12000073, imm[11:0] = 0x120)
+        if (rd != 0) return Illegal(cpu, s, inst);
+        // TVM: S-mode fences trap (priv spec 3.1.6.8); U-mode always traps.
+        if (s->priv == kPrivUser ||
+            (s->priv == kPrivSupervisor && (s->mstatus & kMstatusTvm)))
+          return Illegal(cpu, s, inst);
+        // No translation cache exists: every access walks the page tables,
+        // so the fence has nothing beyond its permission checks to do.
+        return 0;
+      }
       default:
         return Illegal(cpu, s, inst);
     }
@@ -643,7 +690,7 @@ static int ExecSystem(CpuState *cpu, RiscvState *s, uint32_t inst,
   int rs1 = (int)((inst >> 15) & 31);
   uint64_t csr = inst >> 20;
   uint64_t old;
-  if (RiscvCsrRead(s, csr, &old) != 0) return Illegal(cpu, s, inst);
+  if (RiscvCsrRead(cpu, s, csr, &old) != 0) return Illegal(cpu, s, inst);
   uint64_t src = (f3 >= 5) ? (uint64_t)(rs1 & 31) : s->gpr[rs1];
   int do_write = 1;
   uint64_t wval = old;
@@ -888,11 +935,48 @@ static int Exec32(CpuState *cpu, RiscvState *s, uint64_t pc, uint32_t inst,
       return ExecOp(cpu, s, inst);
     case 0x3B:
       return ExecOp32(cpu, s, inst);
-    case 0x0F:  // fence / fence.i
-      if (f3 == 0 || f3 == 1) return 0;
+    case 0x0F: {  // Zifencei + Zicboz/Zicbom cache-block operations
+      // Encoding (gem5 decoder.isa, ratified Zicbo*): funct3 0 = fence,
+      // 1 = fence.i / cbo.clean|inval|flush (funct5 [31:27] selects, and
+      // fence.i is the all-zero-operand form of clean), 2 = cbo.zero.
+      // M/S execute cbo ops unconditionally; U-mode needs the matching
+      // senvcfg enable bit (gem5 cbo_zero/cbo_flush guards).
+      int funct5 = (int)(inst >> 27);
+      int rs1 = (int)((inst >> 15) & 31);
+      int rd = (int)((inst >> 7) & 31);
+      if (f3 == 0) return 0;  // fence: full barrier is trivial here
+      if (f3 == 1) {
+        if (funct5 == 0 && rs1 == 0 && rd == 0) return 0;  // fence.i
+        if (funct5 <= 2) {  // cbo.clean(0) / cbo.inval(1) / cbo.flush(2)
+          // No cache exists, so clean/inval/flush are complete no-ops;
+          // only the U-mode enable and alignment checks remain.
+          if (s->priv == kPrivUser &&
+              !(s->senvcfg & (1ULL << (funct5 == 2 ? 6 : 4))))
+            return Illegal(cpu, s, inst);
+          if (s->gpr[rs1] % kCacheBlockSize)
+            return Illegal(cpu, s, inst);
+          return 0;
+        }
+        return Illegal(cpu, s, inst);
+      }
+      if (f3 == 2) {
+        if (funct5 != 0) return Illegal(cpu, s, inst);
+        if (s->priv == kPrivUser && !(s->senvcfg & (1ULL << 7)))
+          return Illegal(cpu, s, inst);
+        uint64_t addr = s->gpr[rs1];
+        if (addr % kCacheBlockSize) {
+          RiscvTrap(cpu, s, kExStoreMisaligned, addr);
+          return -1;
+        }
+        // cbo.zero stores zeros over the whole cache block (Zicboz).
+        for (int off = 0; off < kCacheBlockSize; off += 8)
+          if (MemWrite(cpu, s, addr + off, 8, 0) != 0) return -1;
+        return 0;
+      }
       return Illegal(cpu, s, inst);
+    }
     case 0x73:
-      return ExecSystem(cpu, s, inst, next_pc);
+      return ExecSystem(cpu, s, inst, pc, next_pc);
     case 0x2F:  // atomics
       if (f3 == 2) return ExecAtomic(cpu, s, inst, 0);
       if (f3 == 3) return ExecAtomic(cpu, s, inst, 1);
@@ -953,6 +1037,12 @@ static int Exec32(CpuState *cpu, RiscvState *s, uint64_t pc, uint32_t inst,
 
 void RiscvStep(CpuState *cpu) {
   RiscvState *s = Rs(cpu);
+  // wfi sleep: no fetch until an enabled interrupt is pending (dearchap
+  // power_down semantics; the machine loop keeps timers running).
+  if (s->wait) {
+    if (((s->mip | s->ext_irq) & s->mie) == 0) return;
+    s->wait = 0;
+  }
   RiscvDeliverPendingInterrupt(cpu, s);
   if (cpu->halted) return;
 
@@ -961,22 +1051,24 @@ void RiscvStep(CpuState *cpu) {
     RiscvTrap(cpu, s, kExFetchMisaligned, pc);
     return;
   }
-  Bus *bus = cpu->bus;
-  uint16_t half = (uint16_t)BusRead(bus, pc, 2);
+  int c_enabled = (int)((s->misa >> 2) & 1);
+  // With misa.C clear IALIGN is 32: a 4-byte instruction at a 2-aligned
+  // address is an instruction-address-misaligned exception.
+  if (!c_enabled && pc % 4) {
+    RiscvTrap(cpu, s, kExFetchMisaligned, pc);
+    return;
+  }
+  uint16_t half;
+  if (FetchHalf(cpu, s, pc, &half) != 0) return;
   uint32_t inst;
   int ilen;
-  int c_enabled = (int)((s->misa >> 2) & 1);
   if (c_enabled && (half & 3) != 3) {
     inst = half;
     ilen = 2;
   } else {
-    // With misa.C clear IALIGN is 32: a 4-byte instruction at a
-    // 2-aligned address is an instruction-address-misaligned exception.
-    if (!c_enabled && pc % 4) {
-      RiscvTrap(cpu, s, kExFetchMisaligned, pc);
-      return;
-    }
-    inst = (uint32_t)BusRead(bus, pc, 4);
+    uint16_t high;
+    if (FetchHalf(cpu, s, pc + 2, &high) != 0) return;
+    inst = (uint32_t)half | ((uint32_t)high << 16);
     ilen = 4;
   }
   RiscvTracePush(s, pc, inst, ilen);

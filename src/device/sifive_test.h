@@ -13,6 +13,7 @@ typedef struct SifiveTestDevice {
 extern const DeviceOps kSifiveTestOps;
 
 void SifiveTestBind(SifiveTestDevice *dev, CpuState *cpu);
-void SifiveTestRegister(Bus *bus, SifiveTestDevice *dev, uint64_t base);
+void SifiveTestRegister(Bus *bus, SifiveTestDevice *dev, uint64_t base,
+                        uint64_t size);
 
 #endif

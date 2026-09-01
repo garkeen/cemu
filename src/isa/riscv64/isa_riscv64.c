@@ -5,8 +5,6 @@
 #include "isa/isa.h"
 #include "host/host.h"
 
-enum { kPrivMachine = 3 };
-
 void RiscvInit(CpuState *cpu) {
   RiscvState *s = (RiscvState *)cpu->priv;
   if (!s) {
@@ -17,8 +15,9 @@ void RiscvInit(CpuState *cpu) {
   }
   s->priv = kPrivMachine;
   s->mstatus = 2ULL << 32;  // mstatus.UXL = 2 (U-mode is RV64)
-  s->misa = (2ULL << 62) | (1ULL << 0) | (1ULL << 2) | (1ULL << 3) |
-            (1ULL << 4) | (1ULL << 8) | (1ULL << 12);  // RV64IMAFDC
+  s->misa = kMisaSupported;  // RV64IMAFDC + S-mode
+  s->tdata[0] = kTrigTypeMcontrol6;  // both triggers are mcontrol6 (Sdtrig)
+  s->stimecmp = ~0ULL;  // Sstc: no S-level timer interrupt until programmed
 }
 
 void RiscvDumpRegs(const CpuState *cpu) {
@@ -56,7 +55,6 @@ void RiscvDumpRegs(const CpuState *cpu) {
 const IsaOps kIsaRiscv64 = {
     "riscv64",
     243,  // EM_RISCV
-    1,    // raw bins follow the riscv-tests HTIF convention
     RiscvInit,
     RiscvStep,
     RiscvDumpRegs,

@@ -8,9 +8,6 @@
 typedef struct IsaOps {
   const char *name;
   uint32_t elf_machine;   // EM_* value recognized in ELF headers
-  // Whether raw binary images of this ISA report results over HTIF (the
-  // riscv-tests convention). ELFs always declare HTIF via their symbols.
-  int bin_uses_htif;
   void (*Init)(CpuState *cpu);
   void (*Step)(CpuState *cpu);                        // 取指译码执行一条
   void (*DumpRegs)(const CpuState *cpu);

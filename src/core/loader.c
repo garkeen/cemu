@@ -82,7 +82,8 @@ static const IsaOps *PickIsa(const char *isa_name, int is_elf,
 }
 
 int LoaderLoadImage(Bus *bus, const char *path, const char *isa_name,
-                    uint64_t bin_base, uint64_t bin_tohost, LoadResult *out) {
+                    uint64_t bin_base, uint64_t bin_tohost, int bin_uses_htif,
+                    LoadResult *out) {
   memset(out, 0, sizeof(*out));
   uint8_t *data = NULL;
   size_t size = 0;
@@ -123,7 +124,7 @@ int LoaderLoadImage(Bus *bus, const char *path, const char *isa_name,
     memcpy(host, data, size);
     out->entry = bin_base;
     out->image_base = bin_base;
-    if (isa->bin_uses_htif) {
+    if (bin_uses_htif) {
       out->has_htif = 1;
       out->tohost = bin_tohost ? bin_tohost : bin_base + kBinTohostOffset;
       out->fromhost = out->tohost + kBinFromhostOffset;

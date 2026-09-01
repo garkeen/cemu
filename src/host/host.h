@@ -14,4 +14,9 @@ void HostFileClose(HostFile *f);
 void HostWriteOut(const char *buf, size_t n);
 void HostWriteErr(const char *buf, size_t n);
 
+// Monotonic host clock in microseconds since an arbitrary epoch (QPC).
+int64_t HostTimerNow(void);
+// Yields the CPU; used while a guest sleeps waiting for a timer interrupt.
+void HostSleepMs(int ms);
+
 #endif

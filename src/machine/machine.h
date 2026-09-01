@@ -10,10 +10,12 @@ typedef struct MachineOpts {
   uint64_t ram_size;
 } MachineOpts;
 
-// Creates a machine by name ("spike", ...). Returns NULL for unknown names.
+// Creates a machine by name ("spike", "x86", "virt"). Returns NULL for
+// unknown names.
 Machine *MachineCreate(const char *name, const MachineOpts *opts);
 
 Machine *SpikeMachineCreate(const MachineOpts *opts);
 Machine *X86MachineCreate(const MachineOpts *opts);
+Machine *VirtMachineCreate(const MachineOpts *opts);
 
 #endif

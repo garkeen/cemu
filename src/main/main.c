@@ -86,7 +86,7 @@ int main(int argc, char **argv) {
   uint64_t bin_base = a.bin_base ? a.bin_base : m->bin_base;
   LoadResult lr;
   if (LoaderLoadImage(&m->bus, a.image, a.isa_name, bin_base, a.bin_tohost,
-                      &lr) != 0) {
+                      m->bin_htif, &lr) != 0) {
     MachineDestroy(m);
     return 1;
   }
@@ -95,7 +95,7 @@ int main(int argc, char **argv) {
     HtifRegister(&m->bus, &m->htif, lr.tohost, lr.fromhost);
   }
   m->isa = lr.isa;
-  m->cpu.pc = lr.entry;
+  m->cpu.pc = m->reset_pc ? m->reset_pc : lr.entry;
   m->cpu.image_base = lr.image_base;
   lr.isa->Init(&m->cpu);
   LogInfo("loaded %s: entry=%llx isa=%s htif=%d", a.image,

@@ -14,8 +14,15 @@ typedef struct CpuState {
   Bus *io;   // port I/O space for ISAs that have one (x86 IN/OUT); NULL = none
   void *priv;
   int halted;
+  int wait;  // asleep waiting for an interrupt (wfi/hlt); the machine loop
+             // keeps polling devices and sleeping the host while this is set
   int exit_code;
   uint64_t inst_count;
+  // Machine time source for ISAs whose architecture reads wall-clock timers
+  // (riscv time CSR); NULL = none. The ISA defines the semantics of the
+  // value, the machine owns the clock.
+  uint64_t (*timer_read)(void *timer_dev);
+  void *timer_dev;
 } CpuState;
 
 #endif

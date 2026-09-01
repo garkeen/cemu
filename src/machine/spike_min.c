@@ -20,5 +20,6 @@ Machine *SpikeMachineCreate(const MachineOpts *opts) {
   m->cpu.halted = kCpuRunning;
   m->cpu.bus = &m->bus;
   m->bin_base = ram_base;  // images load at the DRAM base
+  m->bin_htif = 1;  // raw bins follow the riscv-tests HTIF convention
   return m;
 }

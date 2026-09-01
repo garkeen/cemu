@@ -42,6 +42,7 @@ void SifiveTestBind(SifiveTestDevice *dev, CpuState *cpu) {
   dev->cpu = cpu;
 }
 
-void SifiveTestRegister(Bus *bus, SifiveTestDevice *dev, uint64_t base) {
-  BusAddRegion(bus, base, 4, &kSifiveTestOps, dev);
+void SifiveTestRegister(Bus *bus, SifiveTestDevice *dev, uint64_t base,
+                        uint64_t size) {
+  BusAddRegion(bus, base, size, &kSifiveTestOps, dev);
 }

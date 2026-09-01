@@ -17,6 +17,10 @@ enum {
 static void UpdateIir(Uart16550 *u) {
   // With no receiver the only raiseable source is TX empty.
   u->iir = (u->ier & kIerThri) ? kIirThri : kIirNoInt;
+  // Level output: asserted while THRI is enabled and the transmitter is
+  // empty (dearchap serial_update_irq).
+  if (u->set_irq)
+    u->set_irq(u->irq_ctx, 0, (u->ier & kIerThri) && (u->lsr & kLsrThre));
 }
 
 void Uart16550Init(Uart16550 *u) {
@@ -78,3 +82,9 @@ static void UartWrite(void *dev, uint64_t addr, int size, uint64_t val) {
 }
 
 const DeviceOps kUart16550Ops = {"uart16550", UartRead, UartWrite};
+
+void Uart16550SetIrqSink(Uart16550 *u, void (*set_irq)(void *, int, int),
+                         void *ctx) {
+  u->set_irq = set_irq;
+  u->irq_ctx = ctx;
+}
