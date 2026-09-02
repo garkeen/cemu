@@ -23,6 +23,11 @@ typedef struct CpuState {
   // value, the machine owns the clock.
   uint64_t (*timer_read)(void *timer_dev);
   void *timer_dev;
+  // Interrupt-acknowledge cycle for ISAs with a hardware interrupt
+  // handshake (x86 INTA): returns the pending vector number. The machine
+  // wires this to its interrupt controller; NULL = no external irq source.
+  int (*int_ack)(void *ack_dev);
+  void *ack_dev;
 } CpuState;
 
 #endif

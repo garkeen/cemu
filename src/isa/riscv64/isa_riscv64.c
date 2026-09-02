@@ -58,4 +58,5 @@ const IsaOps kIsaRiscv64 = {
     RiscvInit,
     RiscvStep,
     RiscvDumpRegs,
+    NULL,  // riscv interrupts arrive via RiscvSetExtIrq from machine sinks
 };

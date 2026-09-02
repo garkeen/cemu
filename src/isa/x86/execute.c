@@ -331,7 +331,8 @@ static uint32_t Pop(CpuState *cpu, X86State *s, int size) {
 // (#DE/#UD) push the faulting instruction so a handler can re-run it.
 static uint32_t DoInt(CpuState *cpu, X86State *s, int vec, uint32_t ret_eip) {
   if (s->cr0 & kCr0Pe)
-    Fatal("x86: exception in protected mode (outside stage-1.5 scope)");
+    Fatal("x86: DoInt vec=%d eip=%x (protected mode outside stage-1.5)",
+          vec, s->eip);
   uint64_t tbl = s->idtr + (uint64_t)vec * 4;
   uint32_t off = XMemRead(cpu, tbl, 2);
   uint32_t seg = XMemRead(cpu, tbl + 2, 2);
@@ -524,23 +525,30 @@ static void ExecDaa(X86State *s) {
   if (cf) s->eflags |= kFlagCf;
 }
 
+// DAS per the actual 386+ behavior (v86/QEMU model, verified against the
+// kvm-unit-tests 1024-case truth table where the SDM pseudocode diverges):
+// the second condition tests the ORIGINAL AL, not the one after the -6.
+// PF/ZF/SF come from the final AL as a logic result; OF is unchanged.
 static void ExecDas(X86State *s) {
-  uint32_t al = RegRead(s, kEax, 1);
+  uint32_t old_al = RegRead(s, kEax, 1);
   int old_cf = !!(s->eflags & kFlagCf);
   int cf = 0;
+  int af = 0;
+  uint32_t al = old_al;
   if ((al & 0xf) > 9 || (s->eflags & kFlagAf)) {
-    cf = old_cf || al < 6;  // AL - 6 borrows
     al -= 6;
-    s->eflags |= kFlagAf;
-  } else {
-    s->eflags &= ~kFlagAf;
+    af = 1;
+    cf = old_cf || old_al < 6;  // borrow out of AL - 6
   }
-  if (al > 0x99 || old_cf) {
+  if (old_al > 0x99 || old_cf) {
     al -= 0x60;
     cf = 1;
   }
   RegWrite(s, kEax, 1, al);
+  // SetLogicFlags clears CF/OF/AF; restore AF and CF afterwards (the v86
+  // model computes both from the algorithm, PF/ZF/SF from the final AL).
   SetLogicFlags(s, al, 1);
+  if (af) s->eflags |= kFlagAf;
   if (cf) s->eflags |= kFlagCf;
 }
 
@@ -616,24 +624,24 @@ static int ExecMulDiv(X86State *s, int op, int size, uint32_t src) {
   switch (op) {
     case kMul: {
       uint64_t prod = (uint64_t)(s->gpr[kEax] & ValueMask(size)) * usrc;
-      s->gpr[kEax] = (uint32_t)prod;
-      s->gpr[kEdx] = (uint32_t)(prod >> bits);
+      RegWrite(s, kEax, size, (uint32_t)prod);
+      RegWrite(s, kEdx, size, (uint32_t)(prod >> bits));
       s->eflags &= ~(kFlagCf | kFlagOf);
       if (prod >> bits) s->eflags |= kFlagCf | kFlagOf;
       return 0;
     }
     case kImul: {
       int64_t prod = Sext64(s->gpr[kEax], bits) * Sext64(src, bits);
-      s->gpr[kEax] = (uint32_t)prod;
-      s->gpr[kEdx] = (uint32_t)((uint64_t)prod >> bits);
+      RegWrite(s, kEax, size, (uint32_t)prod);
+      RegWrite(s, kEdx, size, (uint32_t)((uint64_t)prod >> bits));
       s->eflags &= ~(kFlagCf | kFlagOf);
       if (prod != Sext64((uint64_t)prod, bits)) s->eflags |= kFlagCf | kFlagOf;
       return 0;
     }
     case kDiv: {
       if (usrc == 0 || upair / usrc > ValueMask(size)) break;
-      s->gpr[kEax] = (uint32_t)(upair / usrc);
-      s->gpr[kEdx] = (uint32_t)(upair % usrc);
+      RegWrite(s, kEax, size, (uint32_t)(upair / usrc));
+      RegWrite(s, kEdx, size, (uint32_t)(upair % usrc));
       return 0;
     }
       default: {  // kIdiv
@@ -645,8 +653,8 @@ static int ExecMulDiv(X86State *s, int op, int size, uint32_t src) {
         if (quot < -(int64_t)(1LL << (bits - 1)) ||
             quot >= (int64_t)(1LL << (bits - 1)))
           break;
-        s->gpr[kEax] = (uint32_t)quot;
-        s->gpr[kEdx] = (uint32_t)(dividend % divisor);
+        RegWrite(s, kEax, size, (uint32_t)quot);
+        RegWrite(s, kEdx, size, (uint32_t)(dividend % divisor));
         return 0;
       }
     }
@@ -738,6 +746,16 @@ static int StepTrace(void) {
   return g_step_trace;
 }
 
+// Machine irq sink: asserts/deasserts the external INTR line. Level 1 also
+// wakes a hlt-sleeping CPU (the run loop re-checks wait after each poll).
+void X86SetIntr(CpuState *cpu, int level) {
+  X86State *s = (X86State *)cpu->priv;
+  if (level) {
+    s->intr_pending = 1;
+    cpu->wait = 0;
+  }
+}
+
 // Far-pointer loads (LDS/LSS/LES/LFS/LGS): offset then selector in memory.
 static void LoadFar(CpuState *cpu, X86State *s, const Modrm *m, int size,
                     int seg) {
@@ -811,6 +829,21 @@ static int ExecString(CpuState *cpu, X86State *s, uint8_t opcode,
 void X86Step(CpuState *cpu) {
   X86State *s = (X86State *)cpu->priv;
   if (!cpu->io) Fatal("x86 requires a machine with port I/O");
+
+  // Hardware interrupt delivery: INTR is sampled between instructions when
+  // IF=1 and not inside the SDM inhibit window (the instruction after
+  // STI/POP SS/MOV SS does not take external interrupts). The INTA hook
+  // supplies the vector (the machine wires it to the PIC acknowledge). A
+  // hardware interrupt is a trap: the pushed return address is the next
+  // instruction, which is still s->eip at this point.
+  if (s->intr_pending && !s->intr_inhibit && (s->eflags & kFlagIf)
+      && cpu->int_ack) {
+    int vec = cpu->int_ack(cpu->ack_dev);
+    s->intr_pending = 0;
+    cpu->wait = 0;
+    DoInt(cpu, s, vec, s->eip);
+    return;
+  }
 
   Fetch f = {cpu, SegLinear(s, kSegCs), s->eip};
   Prefixes p = {0, 0, -1, 0};
@@ -1550,10 +1583,17 @@ void X86Step(CpuState *cpu) {
       case 0xef:  // OUT DX, eAX
         BusWrite(cpu->io, RegRead(s, kEdx, 2), opsz, RegRead(s, kEax, opsz));
         break;
-      case 0xf4:  // HLT: no wake sources in this machine, so emulation ends
-        LogInfo("hlt with no interrupt sources, stopping emulation");
-        cpu->halted = kCpuExited;
-        cpu->exit_code = 0;
+      case 0xf4:  // HLT: sleeps until an INTR wakes the CPU (SDM: a halted
+        // CPU resumes on any unmasked external interrupt). With IF=0 or no
+        // interrupt source there is no wake, so the machine never restarts
+        // it — treat as a normal exit like riscv wfi-with-no-irq.
+        if ((s->eflags & kFlagIf) && cpu->int_ack) {
+          cpu->wait = 1;
+        } else {
+          LogInfo("hlt with no wake sources, stopping emulation");
+          cpu->halted = kCpuExited;
+          cpu->exit_code = 0;
+        }
         break;
       case 0xf5:  // CMC
         s->eflags ^= kFlagCf;
@@ -1588,7 +1628,11 @@ void X86Step(CpuState *cpu) {
       case 0xf8: s->eflags &= ~kFlagCf; break;  // CLC
       case 0xf9: s->eflags |= kFlagCf; break;   // STC
       case 0xfa: s->eflags &= ~kFlagIf; break;  // CLI
-      case 0xfb: s->eflags |= kFlagIf; break;   // STI
+      case 0xfb:  // STI: the next instruction is not interruptible (SDM
+        // interrupt-inhibit window; realmode test_sti_inhibit tests this).
+        s->eflags |= kFlagIf;
+        s->intr_inhibit = 1;
+        break;
       case 0xfc: s->eflags &= ~kFlagDf; break;  // CLD
       case 0xfd: s->eflags |= kFlagDf; break;   // STD
       case 0xfe: {  // GRP4: INC/DEC rm8
@@ -1654,9 +1698,12 @@ void X86Step(CpuState *cpu) {
 
   s->eip = f.ip;
   cpu->pc = s->eip;  // keep the observable PC in sync (run loop, dumps)
+  // The inhibit window covers exactly one instruction: retire it now.
+  s->intr_inhibit = 0;
   return;
 
 illegal:
   s->eip = DoInt(cpu, s, kVecUd, s->eip);  // #UD is a fault: re-run the insn
   cpu->pc = s->eip;
+  s->intr_inhibit = 0;
 }

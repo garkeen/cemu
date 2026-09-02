@@ -45,10 +45,19 @@ typedef struct X86State {
   uint64_t idtr;
   uint16_t idtr_limit;
   uint32_t dr[8];
+  // External interrupt input. The machine's irq sink raises the INTR line
+  // here (X86SetIntr); X86Step acknowledges and dispatches it when IF=1.
+  // The vector comes from CpuState.int_ack (machine wires it to the PIC).
+  int intr_pending;
+  // SDM interrupt-inhibit window: the instruction after STI/POP SS/MOV SS
+  // does not sample INTR. Cleared when that instruction retires.
+  int intr_inhibit;
 } X86State;
 
 void X86Init(CpuState *cpu);
 void X86Step(CpuState *cpu);
 void X86DumpRegs(const CpuState *cpu);
+// Machine-side irq sink: asserts/deasserts the external INTR line.
+void X86SetIntr(CpuState *cpu, int level);
 
 #endif

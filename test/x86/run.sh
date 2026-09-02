@@ -2,7 +2,8 @@
 # suite, both calibrated against
 #   qemu-system-i386 -device isa-debug-exit,iobase=0xf4,iosize=0x4
 # (exit status = (value<<1)|1, not value+1; QEMU realmode reference output
-# was byte-identical to cemu's first 69 lines and reports 110 PASS total).
+# was byte-identical to cemu's first 110 lines and reports 110 PASS before
+# stalling on its own mid-suite).
 dir=$(cd "$(dirname "$0")" && pwd)
 CEMU=${CEMU:-$dir/../../build/cemu.exe}
 pass=0
@@ -19,11 +20,19 @@ else
   echo "FAIL (smoke: rc=$rc)"
 fi
 
-# Realmode: suite self-reports PASS/FAIL lines. Today it halts at
-# test_sti_inhibit's hlt (needs PIT+PIC interrupt wake, stage 2), so the
-# reachable count is 69; raise it when stage 2 lands (QEMU: 110).
-expected_pass=69
-out=$("$CEMU" --machine x86 --isa x86 "$dir/realmode/realmode.elf" 2>&1)
+# Realmode: suite self-reports PASS/FAIL lines. Stage 2 added the 8259 PIC
+# + 8254 PIT so hlt wakes on IRQ0, and the whole suite now runs: 122 PASS.
+# QEMU reference (qemu-system-i386 -kernel realmode.elf) prints the same
+# first 110 lines byte-identically and then stalls mid-suite (QEMU-side
+# behavior, reproduced on every run); cemu runs the full suite. The goldens
+# agree on every test QEMU actually reports.
+#
+# The process does NOT terminate on its own: the suite's test_fninit raises
+# #UD on the no-FPU interpreter (guideline review D13, stage-4 gap) and lands
+# on garbage IVT[6] content — an infinite loop, so the run.sh judge works on
+# output captured under a timeout.
+expected_pass=122
+out=$(timeout 60 "$CEMU" --machine x86 --isa x86 "$dir/realmode/realmode.elf" 2>&1)
 # Note: cemu's [info] loader line has no trailing newline, gluing the first
 # "PASS:" to it, so match PASS:/FAIL: anywhere in a line, not at line start.
 n_pass=$(echo "$out" | grep -c 'PASS:')
