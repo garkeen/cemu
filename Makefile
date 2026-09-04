@@ -5,13 +5,19 @@ CFLAGS += -MMD -MP
 BUILD := build
 TARGET := $(BUILD)/cemu.exe
 
-SRCS := $(foreach d,$(sort $(dir $(wildcard src/*/*/))),$(wildcard $(d)*.c))
-# Every module in the tree is wired: sifive_test/time_win landed with the
-# virt machine (CLINT mtime consumes the host clock).
+# Explicit per-depth wildcards. Portable GNU make (no shell, no find), and
+# unlike the old `src/*/*/` glob it does not rely on Windows' loose
+# trailing-slash matching — on POSIX make the old pattern matched directories
+# only and silently dropped every top-level module. Deepest modules are
+# src/cpu/isa/<name>/ and src/device/<class>/.
+SRCS := $(wildcard src/*.c) \
+        $(wildcard src/*/*.c) \
+        $(wildcard src/*/*/*.c) \
+        $(wildcard src/*/*/*/*.c)
 OBJS := $(patsubst src/%.c,$(BUILD)/%.obj,$(SRCS))
 DEPS := $(OBJS:.obj=.d)
 
-.PHONY: all clean
+.PHONY: all clean check dirs
 
 all: dirs $(TARGET)
 
@@ -21,13 +27,12 @@ dirs:
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS)
 
-$(BUILD)/%.obj: src/%.c
+$(BUILD)/%.obj: src/%.c | dirs
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-%.obj: | $(BUILD)
-
-$(BUILD):
-	mkdir -p $(BUILD)
+# Dependency-edge check: see tools/depcheck.sh (AGENTS.md 第七节).
+check:
+	@bash tools/depcheck.sh
 
 clean:
 	rm -rf $(BUILD)
