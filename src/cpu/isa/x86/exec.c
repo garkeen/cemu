@@ -673,15 +673,17 @@ static void div_w(uint32_t src) {
 }
 
 static void idiv_w(uint32_t src) {
-  int bits = d.w32 ? 64 : 32;
+  int qbits = d.w32 ? 32 : 16;  // the quotient's width (SDM IDIV r/m32: #DE when
+                                // the quotient is outside -2^31..2^31-1; r/m16 likewise)
   uint32_t lo = d.w32 ? eax : ax;
   int64_t dividend = (int64_t)((((uint64_t)(d.w32 ? edx : dx) << (d.w32 ? 32 : 16)) | lo) &
-                               (bits == 64 ? ~0ULL : 0xffffffffULL));
+                               (d.w32 ? ~0ULL : 0xffffffffULL));
   if (!d.w32) dividend = (int32_t)(uint32_t)dividend;
   int64_t divisor = d.w32 ? (int32_t)src : (int16_t)(uint16_t)src;
   if (divisor == 0) de();
   int64_t q = dividend / divisor;
-  if (q < -(int64_t)(1LL << (bits - 1)) || q >= (int64_t)(1LL << (bits - 1))) de();
+  int64_t hi = 1LL << (qbits - 1);  // 2^31 / 2^15, exact in int64 (no shift UB)
+  if (q < -hi || q >= hi) de();
   int64_t r = dividend % divisor;
   if (d.w32) {
     eax = (uint32_t)q;
@@ -856,38 +858,47 @@ static void daa(void) {
   int old_cf = fl->cf;
   int c = 0;
   if ((al & 0xf) > 9 || fl->af) {
-    c = old_cf || old_al > 0xf9;
-    al += 6;
+    al = (uint8_t)(old_al + 6);
     fl->af = 1;
+    c = old_cf || old_al > 0xf9;
   } else {
     fl->af = 0;
   }
-  if (old_al > 0x99 || old_cf) {
+  if (old_al > 0x99 || old_cf) {  // original AL and original CF (tiny386 model)
     al += 0x60;
     c = 1;
   }
+  // flags_logic clears AF; DAA/DAS keep the step-one AF (SDM "Flags Affected"
+  // and tiny386 __DAA/__DAS_helper: only SF/ZF/PF are recomputed from AL).
+  int keep_af = fl->af;
   flags_logic(al, 1);
+  fl->af = keep_af;
   if (c) fl->cf = 1;
 }
 
-// DAS per the actual 386+ behavior (QEMU/v86 model, verified against the
-// kvm-unit-tests 1024-case truth table where the SDM pseudocode diverges):
-// the second condition tests the ORIGINAL AL.
+// DAS per the actual 386+ behavior, verified 0 fails against the
+// kvm-unit-tests 1024-case truth table (dascheck offline harness): both
+// conditions test the ORIGINAL AL and ORIGINAL CF (tiny386 model; SDM's
+// step-two re-read of the decremented AL diverges on 26 cases). AF is the
+// step-one value, never cleared.
 static void das(void) {
   uint8_t old_al = al;
   int old_cf = fl->cf;
-  int c = 0, a = 0;
+  int c = 0;
   if ((al & 0xf) > 9 || fl->af) {
-    al -= 6;
-    a = 1;
+    al = (uint8_t)(old_al - 6);
+    fl->af = 1;
     c = old_cf || old_al < 6;
+  } else {
+    fl->af = 0;
   }
-  if (old_al > 0x99 || old_cf) {
+  if (old_al > 0x99 || old_cf) {  // original AL and original CF
     al -= 0x60;
     c = 1;
   }
+  int keep_af = fl->af;
   flags_logic(al, 1);
-  if (a) fl->af = 1;
+  fl->af = keep_af;
   if (c) fl->cf = 1;
 }
 
@@ -2322,11 +2333,16 @@ void run_op(uint8_t op) {
         return;
       }
       break;      // into
-    case 0xcf: {  // iret
+    case 0xcf: {  // iret: pop (E)IP, CS, (E)FLAGS. RF/VM never load from the
+                  // stored image (SDM IRET Operation: RF=0; VM stays 0 in
+                  // real mode). 16-bit form loads only the low half.
       eip = pop_w();
       load_seg(cs_i, (uint16_t)pop_w());
       uint32_t flv = pop_w();
-      fl->word = (fl->word & 0xffff0000u) | (flv | 2);
+      if (d.w32)
+        fl->word = (flv & ~(0x30000u)) | 2;
+      else
+        fl->word = (fl->word & 0xffff0000u) | ((flv & 0xffffu) | 2);
       break;
     }
     case 0xd0:
@@ -2538,7 +2554,8 @@ void run_op(uint8_t op) {
           uint32_t t = d.w32 ? rd32(d.mlin) : rd16(d.mlin);
           uint16_t sel = rd16(d.mlin + (d.w32 ? 4 : 2));
           push_w(s->sreg[cs_i]);
-          push_w(d.nxt);
+          push_w((uint32_t)(fr->rec.pc + d.nxt));  // return: next instruction,
+                                                   // same as 0x9a/0xe8 (SDM pushes EIP past the call)
           load_seg(cs_i, sel);
           eip = t;
           break;

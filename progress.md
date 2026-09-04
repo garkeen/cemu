@@ -59,8 +59,20 @@
 - mingw gcc（D:/mingw64/bin/gcc.exe，版本号以实际为准）：编 cemu 本体
   （CMake：`cmake --build build`）
 - qemu-system-i386：D:/qemu
+- **bash 指的是 Git Bash**（`C:\Program Files\Git\bin\bash.exe`；VSCode
+  `terminal.integrated.defaultProfile.windows` 已指向它，Cline 创建终端跟随此
+  profile）。不能在 WSL bash 里跑回归：WSL 会把 `/mnt/...` 路径原样传给
+  Windows 版 cemu.exe，loader 全部 cannot open，127/127 假 FAIL
+  （2026-09-04 实测）。Git Bash 命令行调用全路径：
+  `& 'C:\Program Files\Git\bin\bash.exe' -c '...'`
 - 回归：`bash test/run.sh`；单独 riscv `bash test/riscv64/run.sh`、
   x86 `bash test/x86/run.sh`
+- 回归基线（2026-09-04，V3 后实测）：riscv64 114 passed / 13 failed
+  （rv64uf 7 + rv64ud 5 + rv64uc-p-rvc 1，全部浮点/RVC，与简化登记 E1 相关；
+  progress 旧记录"fp 7 例钉死"与代码不符，V3 提交时未跑完回归）；x86
+  smoke PASS，realmode 50 PASS 后停滞在 call far 1（0x9A 远调用，旧解释器
+  时代修过、V3 重写复发；V3 后 x86 bug 群已知，2026-09-04 用户明确搁置；
+  run.sh 的 timeout 60 判据容纳）
 - debug：`CEMU_DEBUG=...`（见 AGENTS.md 第十节），例
   `CEMU_DEBUG="trace:table,state,mem,budget=200" build/cemu.exe --machine x86 --isa x86 test/x86/realmode/realmode.elf`
 
