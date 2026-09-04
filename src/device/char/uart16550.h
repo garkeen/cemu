@@ -2,6 +2,7 @@
 #define CEMU_DEVICE_CHAR_UART16550_H
 
 #include <stdint.h>
+
 #include "bus/bus.h"
 
 // 16550-style UART, transmit side only (console out). Registers are 1 byte
@@ -20,17 +21,16 @@ typedef struct Uart16550 {
   uint8_t msr;
   uint8_t scr;
   uint8_t fcr;
-  uint8_t lsr;     // read-only status, THRE/TEMT stay set (immediate transmit)
+  uint8_t lsr;       // read-only status, THRE/TEMT stay set (immediate transmit)
   uint16_t divider;  // divisor latch, visible at offsets 0/1 while DLAB=1
-  void (*set_irq)(void *ctx, int src, int level);
-  void *irq_ctx;
+  void (*set_irq)(void* ctx, int src, int level);
+  void* irq_ctx;
 } Uart16550;
 
-void Uart16550Init(Uart16550 *u);
-uint8_t Uart16550Read(Uart16550 *u, uint64_t off);
-void Uart16550Write(Uart16550 *u, uint64_t off, uint8_t val);
-void Uart16550SetIrqSink(Uart16550 *u, void (*set_irq)(void *, int, int),
-                         void *ctx);
+void Uart16550Init(Uart16550* u);
+uint8_t Uart16550Read(Uart16550* u, uint64_t off);
+void Uart16550Write(Uart16550* u, uint64_t off, uint8_t val);
+void Uart16550SetIrqSink(Uart16550* u, void (*set_irq)(void*, int, int), void* ctx);
 
 extern const DeviceOps kUart16550Ops;
 

@@ -12,8 +12,8 @@
 
 // The per-step CPU view. riscv_step installs these before any helper runs;
 // the manual-notation macros below read them.
-extern CpuState *cpu;
-extern RiscvState *rs;
+extern CpuState* cpu;
+extern RiscvState* rs;
 
 // The register banks, in the manual's own notation. x and f are aliases (no
 // token collides with them); the pc is never a macro — one named pc would eat
@@ -22,7 +22,7 @@ extern RiscvState *rs;
 #define f (cpu->fpr)
 
 // The switch itself: execute one instruction and return the next pc.
-uint64_t riscv_exec_inst(frame *fr, uint32_t inst);    // 4-byte instruction
-uint64_t riscv_exec_c(frame *fr, uint16_t inst);       // compressed (2-byte)
+uint64_t riscv_exec_inst(frame* fr, uint32_t inst);  // 4-byte instruction
+uint64_t riscv_exec_c(frame* fr, uint16_t inst);     // compressed (2-byte)
 
 #endif

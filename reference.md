@@ -43,7 +43,7 @@ QEMU 源码不在树中：QEMU 行为经 D:/qemu 的二进制实测校准
 | 工具 | 位置 | 用途 |
 |---|---|---|
 | clang / lld / llvm-objcopy / llvm-objdump | D:/LLVM/bin（LLVM 23.1） | seabios/x86 多目标交叉构建、ELF 检视（比 GNU objdump 格式友好） |
-| gcc / mingw32-make / objcopy / objdump | D:/mingw64/bin（注意：cemu 本体构建用 D:/mingw64/bin/gcc.exe，路径中无 8.1 版本号，与旧文档"mingw64 gcc 8.1"的描述以实际为准） | 编 cemu 本体（mingw32-make），平二进制 objcopy |
+| gcc / cmake / objcopy / objdump | D:/mingw64/bin（注意：cemu 本体构建用 D:/mingw64/bin/gcc.exe，路径中无 8.1 版本号，与旧文档"mingw64 gcc 8.1"的描述以实际为准） | 编 cemu 本体（cmake --build build），平二进制 objcopy |
 | ninja | D:/ninja/ninja.exe | seabios 等已带 build.ninja 的构建 |
 | qemu-system-i386 / riscv64 / riscv32 / arm | D:/qemu | 双跑对拍、机器契约实测（dumpdtb、pmemsave、-device help） |
 | nasm | D:/nasm/nasm.exe（2.16.03 亦在 D:/SSDOWN/tools/nasm-2.16.03/） | 16/32 位 x86 测试镜像（-f bin 引导扇区） |
@@ -69,6 +69,6 @@ QEMU 源码不在树中：QEMU 行为经 D:/qemu 的二进制实测校准
 | 8259 PIC / 8254 PIT | device/intc/i8259.c / device/timer/i8254.c | QEMU i8259/i8254 语义 |
 | spike 主板 | board/spike_min.c | spike 契约（tohost 从 ELF 符号表） |
 | 引导扇区契约 | board/x86_min.c（0x7C00、DL=0x80） | QEMU seabios 交接契约实测 |
-| 目录依赖检查 | tools/depcheck.sh（`mingw32-make check`） | 自订；规则见 AGENTS.md 第七节 |
+| 目录依赖检查 | tools/depcheck.sh（`cmake --build build --target check`） | 自订；规则见 AGENTS.md 第七节 |
 
 新设备/新机器动手前，先按"当初照谁写的"列找到参考原型读一遍。

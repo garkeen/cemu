@@ -21,19 +21,18 @@ enum { kPlicNumSrc = 95, kPlicNumCtx = 2, kPlicNumWords = 3 };
 
 typedef struct PlicDevice {
   uint64_t base;
-  uint32_t priority[kPlicNumSrc + 1];            // [0] reserved, reads 0
-  uint32_t pending[kPlicNumWords];               // bit i = source i
+  uint32_t priority[kPlicNumSrc + 1];  // [0] reserved, reads 0
+  uint32_t pending[kPlicNumWords];     // bit i = source i
   uint32_t enable[kPlicNumCtx][kPlicNumWords];
   uint32_t threshold[kPlicNumCtx];
-  void (*set_irq)(void *ctx, int line, int level);
-  void *irq_ctx;
+  void (*set_irq)(void* ctx, int line, int level);
+  void* irq_ctx;
 } PlicDevice;
 
-void PlicInit(PlicDevice *p);
-void PlicRegister(Bus *bus, PlicDevice *p, uint64_t base, uint64_t size);
-void PlicSetIrqSink(PlicDevice *p, void (*set_irq)(void *, int, int),
-                    void *ctx);
+void PlicInit(PlicDevice* p);
+void PlicRegister(Bus* bus, PlicDevice* p, uint64_t base, uint64_t size);
+void PlicSetIrqSink(PlicDevice* p, void (*set_irq)(void*, int, int), void* ctx);
 // Device-side input: asserts/drops external source src (level).
-void PlicDeviceIrq(PlicDevice *p, int src, int level);
+void PlicDeviceIrq(PlicDevice* p, int src, int level);
 
 #endif

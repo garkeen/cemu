@@ -1,0 +1,17 @@
+# clang-format 配置：基于 Google C 风格，仅约束排版
+# 用法：/d/LLVM/bin/clang-format.exe -i -style=file <file>
+# 注意：clang-format 只改空白/换行/对齐，不改命名与逻辑。
+BasedOnStyle: Google
+
+# 与本项目已有约定对齐的少量排版项（不改变语义）
+# 列宽：Google 默认为 80，本项目代码偏宽，放宽到 100 避免无谓折行
+ColumnLimit: 100
+
+# 关闭 include 排序：exec.h 定义单/双字母宏 x/f/eax，必须位于每个 .c 的
+# include 列表末尾（AGENTS.md 第八节坑点），否则会替换后续头文件里的形参名
+# frame *f。Google 风格默认 SortIncludes 会把它排到主头位从而违反该约束，
+# 故关闭；include 顺序由手工人肉维护。
+SortIncludes: false
+
+# 命名无关：保持 Google 默认的指针靠左 int* p（AGENTS.md 即此约定）
+# DerivePointerAlignment 留默认（false，即靠左）

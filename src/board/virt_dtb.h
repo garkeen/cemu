@@ -1,8 +1,8 @@
 #ifndef CEMU_BOARD_VIRT_DTB_H
 #define CEMU_BOARD_VIRT_DTB_H
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // Device tree blob captured from the real machine contract:
 // qemu-system-riscv64 -machine virt,dumpdtb=virt.dtb (QEMU 10.2, 128 MiB).

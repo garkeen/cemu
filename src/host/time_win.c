@@ -1,4 +1,5 @@
 #include <windows.h>
+
 #include "host/host.h"
 
 int64_t HostTimerNow(void) {

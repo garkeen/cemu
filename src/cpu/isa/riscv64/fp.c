@@ -4,21 +4,18 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include "riscv.h"
+
 #include "host/host.h"
+#include "riscv.h"
 #include "util/log.h"
 
 static const uint64_t kBoxMask = 0xffffffff00000000ULL;
 static const uint64_t kQnan64 = 0x7ff8000000000000ULL;
 static const uint32_t kQnan32 = 0x7fc00000u;
 
-static uint64_t Box32(uint32_t v) {
-  return kBoxMask | v;
-}
+static uint64_t Box32(uint32_t v) { return kBoxMask | v; }
 
-static int IsBoxed(uint64_t v) {
-  return (v >> 32) == 0xffffffffULL;
-}
+static int IsBoxed(uint64_t v) { return (v >> 32) == 0xffffffffULL; }
 
 static uint32_t Bits32(float f) {
   uint32_t v;
@@ -52,8 +49,7 @@ static int IsSnanF(float f) {
 
 static int IsSnanD(double d) {
   uint64_t v = Bits64(d);
-  return ((v >> 52) & 0x7ff) == 0x7ff && (v & 0xfffffffffffffULL) != 0 &&
-         !(v & (1ULL << 51));
+  return ((v >> 52) & 0x7ff) == 0x7ff && (v & 0xfffffffffffffULL) != 0 && !(v & (1ULL << 51));
 }
 
 static float MinNormalF(void) {
@@ -63,7 +59,7 @@ static float MinNormalF(void) {
   return f;
 }
 
-static void RoundSAdjust(RiscvState *s, float *r, long double e, int rm) {
+static void RoundSAdjust(RiscvState* s, float* r, long double e, int rm) {
   if ((long double)*r == e) return;
   s->fflags |= kFflagNX;
   switch (rm) {
@@ -91,7 +87,7 @@ static void RoundSAdjust(RiscvState *s, float *r, long double e, int rm) {
   }
 }
 
-static void RoundDAdjust(RiscvState *s, double *r, long double e, int rm) {
+static void RoundDAdjust(RiscvState* s, double* r, long double e, int rm) {
   if ((long double)*r == e) return;
   s->fflags |= kFflagNX;
   switch (rm) {
@@ -123,11 +119,17 @@ static uint32_t OverflowResult32(int negative, int rm) {
   uint32_t inf = negative ? 0xff800000u : 0x7f800000u;
   uint32_t max = negative ? 0xff7fffffu : 0x7f7fffffu;
   switch (rm) {
-    case kRmRne: case kRmRmm: return inf;
-    case kRmRtz: return max;
-    case kRmRup: return negative ? max : inf;
-    case kRmRdn: return negative ? inf : max;
-    default: return inf;
+    case kRmRne:
+    case kRmRmm:
+      return inf;
+    case kRmRtz:
+      return max;
+    case kRmRup:
+      return negative ? max : inf;
+    case kRmRdn:
+      return negative ? inf : max;
+    default:
+      return inf;
   }
 }
 
@@ -135,15 +137,21 @@ static uint64_t OverflowResult64(int negative, int rm) {
   uint64_t inf = negative ? 0xfff0000000000000ULL : 0x7ff0000000000000ULL;
   uint64_t max = negative ? 0xffefffffffffffffULL : 0x7fefffffffffffffULL;
   switch (rm) {
-    case kRmRne: case kRmRmm: return inf;
-    case kRmRtz: return max;
-    case kRmRup: return negative ? max : inf;
-    case kRmRdn: return negative ? inf : max;
-    default: return inf;
+    case kRmRne:
+    case kRmRmm:
+      return inf;
+    case kRmRtz:
+      return max;
+    case kRmRup:
+      return negative ? max : inf;
+    case kRmRdn:
+      return negative ? inf : max;
+    default:
+      return inf;
   }
 }
 
-static uint64_t FinishS(RiscvState *s, float r, long double e, int rm) {
+static uint64_t FinishS(RiscvState* s, float r, long double e, int rm) {
   if (isnan(r)) {
     s->fflags |= kFflagNV;
     return Box32(kQnan32);
@@ -159,7 +167,7 @@ static uint64_t FinishS(RiscvState *s, float r, long double e, int rm) {
   return Box32(Bits32(r));
 }
 
-static uint64_t FinishD(RiscvState *s, double r, long double e, int rm) {
+static uint64_t FinishD(RiscvState* s, double r, long double e, int rm) {
   if (isnan(r)) {
     s->fflags |= kFflagNV;
     return kQnan64;
@@ -175,8 +183,7 @@ static uint64_t FinishD(RiscvState *s, double r, long double e, int rm) {
   return Bits64(r);
 }
 
-uint64_t RiscvFpBinaryS(RiscvState *s, uint64_t ra, uint64_t rb, int kind,
-                        int rm) {
+uint64_t RiscvFpBinaryS(RiscvState* s, uint64_t ra, uint64_t rb, int kind, int rm) {
   if (!IsBoxed(ra) || !IsBoxed(rb)) {
     s->fflags |= kFflagNV;
     return Box32(kQnan32);
@@ -186,9 +193,18 @@ uint64_t RiscvFpBinaryS(RiscvState *s, uint64_t ra, uint64_t rb, int kind,
   float r;
   long double e;
   switch (kind) {
-    case kFpAdd: r = a + b; e = (long double)a + (long double)b; break;
-    case kFpSub: r = a - b; e = (long double)a - (long double)b; break;
-    case kFpMul: r = a * b; e = (long double)a * (long double)b; break;
+    case kFpAdd:
+      r = a + b;
+      e = (long double)a + (long double)b;
+      break;
+    case kFpSub:
+      r = a - b;
+      e = (long double)a - (long double)b;
+      break;
+    case kFpMul:
+      r = a * b;
+      e = (long double)a * (long double)b;
+      break;
     case kFpDiv:
       if (b == 0 && isfinite(a) && a != 0) {
         s->fflags |= kFflagDZ;
@@ -205,16 +221,24 @@ uint64_t RiscvFpBinaryS(RiscvState *s, uint64_t ra, uint64_t rb, int kind,
   return FinishS(s, r, e, rm);
 }
 
-uint64_t RiscvFpBinaryD(RiscvState *s, uint64_t ra, uint64_t rb, int kind,
-                        int rm) {
+uint64_t RiscvFpBinaryD(RiscvState* s, uint64_t ra, uint64_t rb, int kind, int rm) {
   double a = Float64(ra), b = Float64(rb);
   if (IsSnanD(a) || IsSnanD(b)) s->fflags |= kFflagNV;
   double r;
   long double e;
   switch (kind) {
-    case kFpAdd: r = a + b; e = (long double)a + (long double)b; break;
-    case kFpSub: r = a - b; e = (long double)a - (long double)b; break;
-    case kFpMul: r = a * b; e = (long double)a * (long double)b; break;
+    case kFpAdd:
+      r = a + b;
+      e = (long double)a + (long double)b;
+      break;
+    case kFpSub:
+      r = a - b;
+      e = (long double)a - (long double)b;
+      break;
+    case kFpMul:
+      r = a * b;
+      e = (long double)a * (long double)b;
+      break;
     case kFpDiv:
       if (b == 0 && isfinite(a) && a != 0) {
         s->fflags |= kFflagDZ;
@@ -231,7 +255,7 @@ uint64_t RiscvFpBinaryD(RiscvState *s, uint64_t ra, uint64_t rb, int kind,
   return FinishD(s, r, e, rm);
 }
 
-uint64_t RiscvFpSqrtS(RiscvState *s, uint64_t ra, int rm) {
+uint64_t RiscvFpSqrtS(RiscvState* s, uint64_t ra, int rm) {
   if (!IsBoxed(ra)) {
     s->fflags |= kFflagNV;
     return Box32(kQnan32);
@@ -247,7 +271,7 @@ uint64_t RiscvFpSqrtS(RiscvState *s, uint64_t ra, int rm) {
   return FinishS(s, r, e, rm);
 }
 
-uint64_t RiscvFpSqrtD(RiscvState *s, uint64_t ra, int rm) {
+uint64_t RiscvFpSqrtD(RiscvState* s, uint64_t ra, int rm) {
   double a = Float64(ra);
   if (IsSnanD(a)) s->fflags |= kFflagNV;
   if (a < 0 && !isnan(a)) {
@@ -259,8 +283,7 @@ uint64_t RiscvFpSqrtD(RiscvState *s, uint64_t ra, int rm) {
   return FinishD(s, r, e, rm);
 }
 
-uint64_t RiscvFpFmaS(RiscvState *s, uint64_t ra, uint64_t rb, uint64_t rc,
-                     int rm) {
+uint64_t RiscvFpFmaS(RiscvState* s, uint64_t ra, uint64_t rb, uint64_t rc, int rm) {
   if (!IsBoxed(ra) || !IsBoxed(rb) || !IsBoxed(rc)) {
     s->fflags |= kFflagNV;
     return Box32(kQnan32);
@@ -272,8 +295,7 @@ uint64_t RiscvFpFmaS(RiscvState *s, uint64_t ra, uint64_t rb, uint64_t rc,
   return FinishS(s, r, e, rm);
 }
 
-uint64_t RiscvFpFmaD(RiscvState *s, uint64_t ra, uint64_t rb, uint64_t rc,
-                     int rm) {
+uint64_t RiscvFpFmaD(RiscvState* s, uint64_t ra, uint64_t rb, uint64_t rc, int rm) {
   double a = Float64(ra), b = Float64(rb), c = Float64(rc);
   if (IsSnanD(a) || IsSnanD(b) || IsSnanD(c)) s->fflags |= kFflagNV;
   double r = fma(a, b, c);
@@ -283,7 +305,7 @@ uint64_t RiscvFpFmaD(RiscvState *s, uint64_t ra, uint64_t rb, uint64_t rc,
 
 // fmin/fmax: NaN inputs yield the other operand; sNaN raises NV. An unboxed
 // single-precision input is treated as a canonical NaN.
-static uint64_t MinMaxS(RiscvState *s, uint64_t ra, uint64_t rb, int is_max) {
+static uint64_t MinMaxS(RiscvState* s, uint64_t ra, uint64_t rb, int is_max) {
   float a = IsBoxed(ra) ? Float32(ra) : Float32(Box32(kQnan32));
   float b = IsBoxed(rb) ? Float32(rb) : Float32(Box32(kQnan32));
   if (IsSnanF(Float32(ra)) || IsSnanF(Float32(rb))) s->fflags |= kFflagNV;
@@ -295,7 +317,7 @@ static uint64_t MinMaxS(RiscvState *s, uint64_t ra, uint64_t rb, int is_max) {
   return Box32(Bits32(r));
 }
 
-static uint64_t MinMaxD(RiscvState *s, uint64_t ra, uint64_t rb, int is_max) {
+static uint64_t MinMaxD(RiscvState* s, uint64_t ra, uint64_t rb, int is_max) {
   double a = Float64(ra), b = Float64(rb);
   if (IsSnanD(a) || IsSnanD(b)) s->fflags |= kFflagNV;
   if (isnan(a) && !isnan(b)) return Bits64(b);
@@ -306,15 +328,15 @@ static uint64_t MinMaxD(RiscvState *s, uint64_t ra, uint64_t rb, int is_max) {
   return Bits64(r);
 }
 
-uint64_t RiscvFpMinMaxS(RiscvState *s, uint64_t ra, uint64_t rb, int is_max) {
+uint64_t RiscvFpMinMaxS(RiscvState* s, uint64_t ra, uint64_t rb, int is_max) {
   return MinMaxS(s, ra, rb, is_max);
 }
 
-uint64_t RiscvFpMinMaxD(RiscvState *s, uint64_t ra, uint64_t rb, int is_max) {
+uint64_t RiscvFpMinMaxD(RiscvState* s, uint64_t ra, uint64_t rb, int is_max) {
   return MinMaxD(s, ra, rb, is_max);
 }
 
-uint64_t RiscvFpCmpS(RiscvState *s, uint64_t ra, uint64_t rb, int kind) {
+uint64_t RiscvFpCmpS(RiscvState* s, uint64_t ra, uint64_t rb, int kind) {
   if (!IsBoxed(ra) || !IsBoxed(rb)) {
     s->fflags |= kFflagNV;
     return 0;
@@ -325,24 +347,34 @@ uint64_t RiscvFpCmpS(RiscvState *s, uint64_t ra, uint64_t rb, int kind) {
     return 0;
   }
   switch (kind) {
-    case kFpEq: return a == b;
-    case kFpLt: return a < b;
-    case kFpLe: return a <= b;
-    default: Fatal("fp: bad cmp kind %d", kind); return 0;
+    case kFpEq:
+      return a == b;
+    case kFpLt:
+      return a < b;
+    case kFpLe:
+      return a <= b;
+    default:
+      Fatal("fp: bad cmp kind %d", kind);
+      return 0;
   }
 }
 
-uint64_t RiscvFpCmpD(RiscvState *s, uint64_t ra, uint64_t rb, int kind) {
+uint64_t RiscvFpCmpD(RiscvState* s, uint64_t ra, uint64_t rb, int kind) {
   double a = Float64(ra), b = Float64(rb);
   if (isnan(a) || isnan(b)) {
     if (kind != kFpEq || IsSnanD(a) || IsSnanD(b)) s->fflags |= kFflagNV;
     return 0;
   }
   switch (kind) {
-    case kFpEq: return a == b;
-    case kFpLt: return a < b;
-    case kFpLe: return a <= b;
-    default: Fatal("fp: bad cmp kind %d", kind); return 0;
+    case kFpEq:
+      return a == b;
+    case kFpLt:
+      return a < b;
+    case kFpLe:
+      return a <= b;
+    default:
+      Fatal("fp: bad cmp kind %d", kind);
+      return 0;
   }
 }
 
@@ -351,19 +383,17 @@ static int Classify32(uint32_t v) {
   uint32_t frac = v & 0x7fffff;
   int sign = (int)(v >> 31);
   if (exp == 0xff) {
-    if (frac == 0) return sign ? 0 : 7;        // -inf / +inf
-    return (v & 0x400000) ? 9 : 8;             // qNaN / sNaN
+    if (frac == 0) return sign ? 0 : 7;  // -inf / +inf
+    return (v & 0x400000) ? 9 : 8;       // qNaN / sNaN
   }
   if (exp == 0) {
-    if (frac == 0) return sign ? 3 : 4;        // -zero / +zero
-    return sign ? 2 : 5;                       // subnormal
+    if (frac == 0) return sign ? 3 : 4;  // -zero / +zero
+    return sign ? 2 : 5;                 // subnormal
   }
-  return sign ? 1 : 6;                         // normal
+  return sign ? 1 : 6;  // normal
 }
 
-uint64_t RiscvFpClassS(uint64_t ra) {
-  return 1ULL << Classify32((uint32_t)ra);
-}
+uint64_t RiscvFpClassS(uint64_t ra) { return 1ULL << Classify32((uint32_t)ra); }
 
 static int Classify64(uint64_t v) {
   int exp = (int)((v >> 52) & 0x7ff);
@@ -380,17 +410,18 @@ static int Classify64(uint64_t v) {
   return sign ? 1 : 6;
 }
 
-uint64_t RiscvFpClassD(uint64_t ra) {
-  return 1ULL << Classify64(ra);
-}
+uint64_t RiscvFpClassD(uint64_t ra) { return 1ULL << Classify64(ra); }
 
 static uint64_t Sgnj64(uint64_t a, uint64_t b, int kind) {
   uint64_t sa = a & 0x8000000000000000ULL;
   uint64_t sb = b & 0x8000000000000000ULL;
   uint64_t rs;
-  if (kind == 0) rs = sb;
-  else if (kind == 1) rs = sb ^ 0x8000000000000000ULL;
-  else rs = sa ^ sb;
+  if (kind == 0)
+    rs = sb;
+  else if (kind == 1)
+    rs = sb ^ 0x8000000000000000ULL;
+  else
+    rs = sa ^ sb;
   return (a & ~0x8000000000000000ULL) | rs;
 }
 
@@ -401,29 +432,31 @@ uint64_t RiscvFpSgnjS(uint64_t ra, uint64_t rb, int kind) {
   uint32_t sb = (IsBoxed(rb) && ((uint32_t)rb >> 31)) ? 1u : 0u;
   uint32_t sa = a >> 31;
   uint32_t rs;
-  if (kind == 0) rs = sb ? 0x80000000u : 0;                    // fsgnj
-  else if (kind == 1) rs = sb ? 0 : 0x80000000u;               // fsgnjn
-  else rs = (sa ^ sb) ? 0x80000000u : 0;                       // fsgnjx
+  if (kind == 0)
+    rs = sb ? 0x80000000u : 0;  // fsgnj
+  else if (kind == 1)
+    rs = sb ? 0 : 0x80000000u;  // fsgnjn
+  else
+    rs = (sa ^ sb) ? 0x80000000u : 0;  // fsgnjx
   return Box32((a & ~0x80000000u) | rs);
 }
 
-uint64_t RiscvFpSgnjD(uint64_t ra, uint64_t rb, int kind) {
-  return Sgnj64(ra, rb, kind);
-}
+uint64_t RiscvFpSgnjD(uint64_t ra, uint64_t rb, int kind) { return Sgnj64(ra, rb, kind); }
 
-static long double F2IExact(long double e, int to_signed, int dbits, int *ok) {
-  long double max = to_signed
-                        ? (dbits == 32 ? 2147483647.0L : 9223372036854775807.0L)
-                        : (dbits == 32 ? 4294967295.0L
-                                       : 18446744073709551615.0L);
-  long double min = to_signed
-                        ? (dbits == 32 ? -2147483648.0L
-                                       : -9223372036854775808.0L)
-                        : 0.0L;
-  if (e > max) { *ok = 0; return max; }
+static long double F2IExact(long double e, int to_signed, int dbits, int* ok) {
+  long double max = to_signed ? (dbits == 32 ? 2147483647.0L : 9223372036854775807.0L)
+                              : (dbits == 32 ? 4294967295.0L : 18446744073709551615.0L);
+  long double min = to_signed ? (dbits == 32 ? -2147483648.0L : -9223372036854775808.0L) : 0.0L;
+  if (e > max) {
+    *ok = 0;
+    return max;
+  }
   if (e < min) {
     // values in (-1, 0) round to zero and are valid for unsigned targets
-    if (!to_signed && e > -1.0L) { *ok = 1; return 0; }
+    if (!to_signed && e > -1.0L) {
+      *ok = 1;
+      return 0;
+    }
     *ok = 0;
     return min;
   }
@@ -431,21 +464,29 @@ static long double F2IExact(long double e, int to_signed, int dbits, int *ok) {
   return e;
 }
 
-static uint64_t F2IResult(RiscvState *s, long double e, int to_signed,
-                          int dbits, int rm) {
+static uint64_t F2IResult(RiscvState* s, long double e, int to_signed, int dbits, int rm) {
   if (isnan(e)) {
     // NaN converts like positive overflow: the most positive value
     s->fflags |= kFflagNV;
-    return to_signed ? (dbits == 32 ? 0x7fffffffu : 0x7fffffffffffffffULL)
-                     : 0xffffffffffffffffULL;
+    return to_signed ? (dbits == 32 ? 0x7fffffffu : 0x7fffffffffffffffULL) : 0xffffffffffffffffULL;
   }
   long double cand;
   switch (rm) {
-    case kRmRtz: cand = truncl(e); break;
-    case kRmRdn: cand = floorl(e); break;
-    case kRmRup: cand = ceill(e); break;
-    case kRmRmm: cand = roundl(e); break;
-    default: cand = nearbyintl(e); break;  // RNE
+    case kRmRtz:
+      cand = truncl(e);
+      break;
+    case kRmRdn:
+      cand = floorl(e);
+      break;
+    case kRmRup:
+      cand = ceill(e);
+      break;
+    case kRmRmm:
+      cand = roundl(e);
+      break;
+    default:
+      cand = nearbyintl(e);
+      break;  // RNE
   }
   int neg = cand < 0;
   int ok;
@@ -453,22 +494,18 @@ static uint64_t F2IResult(RiscvState *s, long double e, int to_signed,
   if (!ok) {
     s->fflags |= kFflagNV;
     if (to_signed)
-      return neg ? (dbits == 32 ? 0xffffffff80000000ULL
-                                : 0x8000000000000000ULL)
+      return neg ? (dbits == 32 ? 0xffffffff80000000ULL : 0x8000000000000000ULL)
                  : (dbits == 32 ? 0x7fffffffu : 0x7fffffffffffffffULL);
     // unsigned negative overflow clamps to 0, positive to the max
     return neg ? 0 : 0xffffffffffffffffULL;
   }
   if (clamped != e) s->fflags |= kFflagNX;
   // RV64: both signed and unsigned 32-bit results are sign-extended into rd
-  if (to_signed)
-    return dbits == 32 ? (uint64_t)(int32_t)clamped : (uint64_t)(int64_t)clamped;
-  return dbits == 32 ? (uint64_t)(int64_t)(int32_t)(uint32_t)clamped
-                     : (uint64_t)clamped;
+  if (to_signed) return dbits == 32 ? (uint64_t)(int32_t)clamped : (uint64_t)(int64_t)clamped;
+  return dbits == 32 ? (uint64_t)(int64_t)(int32_t)(uint32_t)clamped : (uint64_t)clamped;
 }
 
-uint64_t RiscvFpF2IS(RiscvState *s, uint64_t ra, int to_signed, int dbits,
-                     int rm) {
+uint64_t RiscvFpF2IS(RiscvState* s, uint64_t ra, int to_signed, int dbits, int rm) {
   if (!IsBoxed(ra)) {
     s->fflags |= kFflagNV;
     return to_signed ? 0x8000000000000000ULL : 0xffffffffffffffffULL;
@@ -477,24 +514,22 @@ uint64_t RiscvFpF2IS(RiscvState *s, uint64_t ra, int to_signed, int dbits,
   return F2IResult(s, e, to_signed, dbits, rm);
 }
 
-uint64_t RiscvFpF2ID(RiscvState *s, uint64_t ra, int to_signed, int dbits,
-                     int rm) {
+uint64_t RiscvFpF2ID(RiscvState* s, uint64_t ra, int to_signed, int dbits, int rm) {
   long double e = (long double)Float64(ra);
   return F2IResult(s, e, to_signed, dbits, rm);
 }
 
-static uint64_t I2FCommonS(RiscvState *s, long double e, int rm) {
+static uint64_t I2FCommonS(RiscvState* s, long double e, int rm) {
   float r = (float)e;
   return FinishS(s, r, e, rm);
 }
 
-static uint64_t I2FCommonD(RiscvState *s, long double e, int rm) {
+static uint64_t I2FCommonD(RiscvState* s, long double e, int rm) {
   double r = (double)e;
   return FinishD(s, r, e, rm);
 }
 
-uint64_t RiscvFpI2FS(RiscvState *s, uint64_t val, int val_signed, int bits,
-                     int rm) {
+uint64_t RiscvFpI2FS(RiscvState* s, uint64_t val, int val_signed, int bits, int rm) {
   long double e;
   if (val_signed)
     e = (bits == 32) ? (long double)(int32_t)val : (long double)(int64_t)val;
@@ -503,8 +538,7 @@ uint64_t RiscvFpI2FS(RiscvState *s, uint64_t val, int val_signed, int bits,
   return I2FCommonS(s, e, rm);
 }
 
-uint64_t RiscvFpI2FD(RiscvState *s, uint64_t val, int val_signed, int bits,
-                     int rm) {
+uint64_t RiscvFpI2FD(RiscvState* s, uint64_t val, int val_signed, int bits, int rm) {
   long double e;
   if (val_signed)
     e = (bits == 32) ? (long double)(int32_t)val : (long double)(int64_t)val;
@@ -513,14 +547,14 @@ uint64_t RiscvFpI2FD(RiscvState *s, uint64_t val, int val_signed, int bits,
   return I2FCommonD(s, e, rm);
 }
 
-uint64_t RiscvFpCvtSD(RiscvState *s, uint64_t ra, int rm) {
+uint64_t RiscvFpCvtSD(RiscvState* s, uint64_t ra, int rm) {
   // the input is a double: NaN boxing does not apply to D values
   long double e = (long double)Float64(ra);
   float r = (float)e;
   return FinishS(s, r, e, rm);
 }
 
-uint64_t RiscvFpCvtDS(RiscvState *s, uint64_t ra, int rm) {
+uint64_t RiscvFpCvtDS(RiscvState* s, uint64_t ra, int rm) {
   if (!IsBoxed(ra)) {
     s->fflags |= kFflagNV;
     return kQnan64;
@@ -529,4 +563,3 @@ uint64_t RiscvFpCvtDS(RiscvState *s, uint64_t ra, int rm) {
   double r = (double)e;
   return FinishD(s, r, e, rm);
 }
-

@@ -16,20 +16,19 @@ typedef struct ClintDevice {
   uint64_t base;
   uint32_t msip;
   uint64_t mtimecmp;
-  uint64_t mtime0;   // mtime value anchored at host time host0
-  uint64_t host0;    // HostTimerNow() microseconds at anchor
+  uint64_t mtime0;  // mtime value anchored at host time host0
+  uint64_t host0;   // HostTimerNow() microseconds at anchor
   uint64_t timebase_hz;
-  void (*set_irq)(void *ctx, int line, int level);
-  void *irq_ctx;
+  void (*set_irq)(void* ctx, int line, int level);
+  void* irq_ctx;
 } ClintDevice;
 
-void ClintInit(ClintDevice *c, uint64_t timebase_hz);
-void ClintRegister(Bus *bus, ClintDevice *c, uint64_t base, uint64_t size);
-void ClintSetIrqSink(ClintDevice *c, void (*set_irq)(void *, int, int),
-                     void *ctx);
+void ClintInit(ClintDevice* c, uint64_t timebase_hz);
+void ClintRegister(Bus* bus, ClintDevice* c, uint64_t base, uint64_t size);
+void ClintSetIrqSink(ClintDevice* c, void (*set_irq)(void*, int, int), void* ctx);
 // Current mtime; called by the machine poll loop and by the time CSR.
-uint64_t ClintMtime(ClintDevice *c);
+uint64_t ClintMtime(ClintDevice* c);
 // Re-evaluates the MTIP line as host time advances past mtimecmp.
-void ClintPoll(ClintDevice *c);
+void ClintPoll(ClintDevice* c);
 
 #endif

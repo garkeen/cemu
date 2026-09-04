@@ -12,10 +12,10 @@
 
 // The per-step view. x86_step installs these before any helper runs; the
 // register, flag and eip spellings below read them.
-extern CpuState *cpu;
-extern x86_state *s;
-extern frame *fr;
-extern eflags *fl;
+extern CpuState* cpu;
+extern x86_state* s;
+extern frame* fr;
+extern eflags* fl;
 
 #define eip cpu->pc  // the offset within CS; fetch reads base[cs] + eip
 
@@ -52,19 +52,19 @@ extern eflags *fl;
 // manual's vocabulary. `w32`/`a32` are the operand/address size the prefixes
 // selected; `nxt` is the ip after the fully fetched instruction.
 typedef struct dec {
-  int w32, a32;      // operand / address size is 32-bit (else 16)
-  int code16;        // CS is a 16-bit segment: EIP wraps at 64K
-  int seg;           // segment override, -1 = default
-  int rep;           // 0 none, 1 = F3 (repe), 2 = F2 (repne)
-  int op2;           // the second byte for 0f opcodes, else 0
-  uint32_t nxt;      // eip after the whole instruction, both arms know it
+  int w32, a32;  // operand / address size is 32-bit (else 16)
+  int code16;    // CS is a 16-bit segment: EIP wraps at 64K
+  int seg;       // segment override, -1 = default
+  int rep;       // 0 none, 1 = F3 (repe), 2 = F2 (repne)
+  int op2;       // the second byte for 0f opcodes, else 0
+  uint32_t nxt;  // eip after the whole instruction, both arms know it
 
   // modrm decode (tables 2-1/2-3); valid after modrm().
   int mod, reg, rm;  // the three fields
   int is_mem;
-  int mseg;          // the effective segment (override or default)
-  uint64_t mlin;     // linear address of the memory operand
-  uint32_t moff;     // the segment-relative offset (LEA's answer)
+  int mseg;       // the effective segment (override or default)
+  uint64_t mlin;  // linear address of the memory operand
+  uint32_t moff;  // the segment-relative offset (LEA's answer)
 } dec;
 
 // One decode context for the instruction being executed; `d` is the short

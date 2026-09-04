@@ -13,13 +13,13 @@
 // board's business beyond the platform wiring — the ISA rides in isa_ops and
 // is picked at image load time.
 typedef struct Board {
-  const char *name;
+  const char* name;
   Bus bus;  // memory address space
   Bus io;   // port I/O space; only boards whose CPU has one fill it
   CpuState cpu;
-  const isa_ops *isa;
+  const isa_ops* isa;
   HtifDevice htif;    // attached only when the loaded image speaks HTIF
-  RamDevice *ram;     // main RAM, freed by BoardDestroy
+  RamDevice* ram;     // main RAM, freed by BoardDestroy
   uint64_t bin_base;  // where the board expects raw images to load
   // Reset state, applied after the image loads (QEMU-style boot flow):
   // 0 = enter at the loaded image entry.
@@ -29,10 +29,10 @@ typedef struct Board {
   int bin_htif;
   // Time-driven device refresh (CLINT MTIP, PIT counters); called by the run
   // loop every step and more often while the CPU sleeps.
-  void (*poll)(struct Board *b);
+  void (*poll)(struct Board* b);
   // Board-specific teardown of non-RAM devices; BoardDestroy calls it after
   // freeing the standard parts.
-  void (*destroy)(struct Board *b);
+  void (*destroy)(struct Board* b);
 } Board;
 
 // Command-line overridable knobs; 0 means "board default". A board may reject
@@ -44,12 +44,12 @@ typedef struct BoardOpts {
 
 // Creates a board by name ("spike", "x86", "virt"); returns NULL for unknown
 // names. The name is the user-facing --machine value.
-Board *BoardCreate(const char *name, const BoardOpts *opts);
-Board *SpikeBoardCreate(const BoardOpts *opts);
-Board *X86BoardCreate(const BoardOpts *opts);
-Board *VirtBoardCreate(const BoardOpts *opts);
+Board* BoardCreate(const char* name, const BoardOpts* opts);
+Board* SpikeBoardCreate(const BoardOpts* opts);
+Board* X86BoardCreate(const BoardOpts* opts);
+Board* VirtBoardCreate(const BoardOpts* opts);
 
-void BoardRun(Board *b, uint64_t max_inst);
-void BoardDestroy(Board *b);
+void BoardRun(Board* b, uint64_t max_inst);
+void BoardDestroy(Board* b);
 
 #endif

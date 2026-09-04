@@ -6,13 +6,13 @@
 
 typedef struct HostFile HostFile;
 
-HostFile *HostFileOpenRead(const char *path);
-int64_t HostFileSize(HostFile *f);
-size_t HostFileRead(HostFile *f, void *buf, size_t n);
-void HostFileClose(HostFile *f);
+HostFile* HostFileOpenRead(const char* path);
+int64_t HostFileSize(HostFile* f);
+size_t HostFileRead(HostFile* f, void* buf, size_t n);
+void HostFileClose(HostFile* f);
 
-void HostWriteOut(const char *buf, size_t n);
-void HostWriteErr(const char *buf, size_t n);
+void HostWriteOut(const char* buf, size_t n);
+void HostWriteErr(const char* buf, size_t n);
 
 // Monotonic host clock in microseconds since an arbitrary epoch (QPC).
 int64_t HostTimerNow(void);

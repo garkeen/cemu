@@ -1,14 +1,16 @@
+#include "util/table.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "util/table.h"
+
 #include "host/host.h"
 
 // One line buffer per table; a row is assembled here and flushed once,
 // keeping writes line-atomic on the console.
 struct Table {
-  const TableColumn *cols;
+  const TableColumn* cols;
   int ncols;
   int ascii;
   int header_every;
@@ -19,11 +21,11 @@ struct Table {
 };
 
 // Glyphs. UTF-8 box drawing by default, plain ASCII with `ascii`.
-static const char *Vertical(Table *t) { return t->ascii ? "|" : "\xe2\x94\x82"; }
-static const char *Cross(Table *t) { return t->ascii ? "+" : "\xe2\x94\xbc"; }
-static const char *Horz(Table *t) { return t->ascii ? "-" : "\xe2\x94\x80"; }
+static const char* Vertical(Table* t) { return t->ascii ? "|" : "\xe2\x94\x82"; }
+static const char* Cross(Table* t) { return t->ascii ? "+" : "\xe2\x94\xbc"; }
+static const char* Horz(Table* t) { return t->ascii ? "-" : "\xe2\x94\x80"; }
 
-static void Put(Table *t, const char *s) {
+static void Put(Table* t, const char* s) {
   int n = (int)strlen(s);
   if (t->len + n + 1 >= (int)sizeof(t->line)) return;
   memcpy(t->line + t->len, s, (size_t)n);
@@ -31,13 +33,12 @@ static void Put(Table *t, const char *s) {
 }
 
 // Append a run of n horizontal-rule glyphs.
-static void PutRule(Table *t, int n) {
+static void PutRule(Table* t, int n) {
   for (int i = 0; i < n; i++) Put(t, Horz(t));
 }
 
-Table *TableOpen(const TableColumn *cols, int ncols, int ascii,
-                 int header_every) {
-  Table *t = calloc(1, sizeof(Table));
+Table* TableOpen(const TableColumn* cols, int ncols, int ascii, int header_every) {
+  Table* t = calloc(1, sizeof(Table));
   t->cols = cols;
   t->ncols = ncols;
   t->ascii = ascii;
@@ -45,14 +46,14 @@ Table *TableOpen(const TableColumn *cols, int ncols, int ascii,
   return t;
 }
 
-void TableFree(Table *t) { free(t); }
+void TableFree(Table* t) { free(t); }
 
-static void Flush(Table *t) {
+static void Flush(Table* t) {
   if (t->len) HostWriteErr(t->line, (size_t)t->len);
   t->len = 0;
 }
 
-void TableHeader(Table *t) {
+void TableHeader(Table* t) {
   // separator rule, then the title row
   t->len = 0;
   Put(t, Vertical(t));
@@ -88,30 +89,27 @@ void TableHeader(Table *t) {
   Flush(t);
 }
 
-void TableRowBegin(Table *t) {
+void TableRowBegin(Table* t) {
   // Re-print the header periodically so long greppable dumps stay readable.
-  if (t->header_every && t->rows && t->rows % t->header_every == 0)
-    TableHeader(t);
+  if (t->header_every && t->rows && t->rows % t->header_every == 0) TableHeader(t);
   t->len = 0;
   Put(t, Vertical(t));
   t->cell = 0;
 }
 
-void TableRowCell(Table *t, const char *text) {
+void TableRowCell(Table* t, const char* text) {
   if (t->cell >= t->ncols) return;
-  const TableColumn *c = &t->cols[t->cell];
+  const TableColumn* c = &t->cols[t->cell];
   // Truncate over-wide cells: the fixed width is the diff-stability contract.
   char cell[256];
-  snprintf(cell, sizeof(cell), c->align == kTableRight ? " %*s"
-                                                       : " %-*s",
-           c->width, text);
+  snprintf(cell, sizeof(cell), c->align == kTableRight ? " %*s" : " %-*s", c->width, text);
   cell[c->width + 1] = 0;  // snprintf pads to width but never truncates
   Put(t, cell);
   Put(t, Vertical(t));
   t->cell++;
 }
 
-void TableRowEnd(Table *t) {
+void TableRowEnd(Table* t) {
   Put(t, "\n");
   Flush(t);
   t->rows++;

@@ -57,7 +57,7 @@
 - nasm：D:/nasm（2.16.03 也在 D:/SSDOWN/tools/nasm-2.16.03/）
 - LLVM 23.1：D:/LLVM（clang/lld/llvm-objcopy，seabios 与 x86 构建用）
 - mingw gcc（D:/mingw64/bin/gcc.exe，版本号以实际为准）：编 cemu 本体
-  （Makefile：`mingw32-make`）
+  （CMake：`cmake --build build`）
 - qemu-system-i386：D:/qemu
 - 回归：`bash test/run.sh`；单独 riscv `bash test/riscv64/run.sh`、
   x86 `bash test/x86/run.sh`

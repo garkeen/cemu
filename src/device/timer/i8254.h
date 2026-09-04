@@ -15,18 +15,17 @@
 // calls PitPoll() every step (and more often while the CPU sleeps) so that
 // the period elapses in wall time even during hlt.
 typedef struct PitDevice {
-  void (*set_irq)(void *ctx, int line, int level);
-  void *irq_ctx;
+  void (*set_irq)(void* ctx, int line, int level);
+  void* irq_ctx;
   // channels[0] is IRQ0 (the periodic timer the BIOS programs).
-  struct PitChannel *channels;
+  struct PitChannel* channels;
 } PitDevice;
 
-void PitInit(PitDevice *pit);
-void PitRegister(Bus *io, PitDevice *pit, uint16_t base);
-void PitSetIrqSink(PitDevice *pit, void (*set_irq)(void *, int, int),
-                   void *ctx);
+void PitInit(PitDevice* pit);
+void PitRegister(Bus* io, PitDevice* pit, uint16_t base);
+void PitSetIrqSink(PitDevice* pit, void (*set_irq)(void*, int, int), void* ctx);
 // Advances the counter state by the elapsed host time and emits any pending
 // IRQ edges. Called from the machine poll loop.
-void PitPoll(PitDevice *pit);
+void PitPoll(PitDevice* pit);
 
 #endif

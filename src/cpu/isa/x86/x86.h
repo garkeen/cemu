@@ -2,6 +2,7 @@
 #define CEMU_CPU_ISA_X86_X86_H
 
 #include <stdint.h>
+
 #include "cpu/cpu.h"
 
 // The 386 real-mode interpreter, written to read like the manual: each case
@@ -31,7 +32,9 @@ typedef union cell {
     uint32_t e;
     union {
       uint16_t x;
-      struct { uint8_t l, h; };
+      struct {
+        uint8_t l, h;
+      };
     };
   };
 } cell;
@@ -47,10 +50,10 @@ typedef union eflags {
 } eflags;
 
 typedef struct x86_state {
-  cell *r;             // the shared CpuState bank, seen as eight cells
-  uint16_t sreg[6];    // visible selector values
-  uint64_t base[6];    // descriptor-cache segment bases
-  uint8_t dbit[6];     // D/B flag: default operand size is 4 when set
+  cell* r;           // the shared CpuState bank, seen as eight cells
+  uint16_t sreg[6];  // visible selector values
+  uint64_t base[6];  // descriptor-cache segment bases
+  uint8_t dbit[6];   // D/B flag: default operand size is 4 when set
   eflags fl;
   uint32_t cr0;
   uint64_t gdtr;
@@ -58,13 +61,13 @@ typedef struct x86_state {
   uint64_t idtr;
   uint16_t idtr_limit;
   uint32_t dr[8];
-  int intr_pending;    // the machine's INTR line is asserted
-  int intr_inhibit;    // SDM window: instruction after STI takes no INTR
+  int intr_pending;  // the machine's INTR line is asserted
+  int intr_inhibit;  // SDM window: instruction after STI takes no INTR
 } x86_state;
 
-void x86_init(CpuState *cpu);
-void x86_step(CpuState *cpu);
-void x86_dump_regs(const CpuState *cpu);
-void x86_set_intr(CpuState *cpu, int level);
+void x86_init(CpuState* cpu);
+void x86_step(CpuState* cpu);
+void x86_dump_regs(const CpuState* cpu);
+void x86_set_intr(CpuState* cpu, int level);
 
 #endif

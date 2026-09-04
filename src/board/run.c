@@ -1,10 +1,11 @@
 #include <stdlib.h>
+
 #include "board/board.h"
 #include "debug/debug.h"
 #include "host/host.h"
 #include "util/log.h"
 
-void BoardRun(Board *m, uint64_t max_inst) {
+void BoardRun(Board* m, uint64_t max_inst) {
   DebugInit();
   while (!m->cpu.halted) {
     if (m->poll) m->poll(m);
@@ -18,8 +19,8 @@ void BoardRun(Board *m, uint64_t max_inst) {
     if (asleep && m->cpu.wait) continue;  // no instruction retired
     m->cpu.inst_count++;
     if (max_inst && m->cpu.inst_count >= max_inst) {
-      LogError("instruction limit %llu reached at pc=%llx",
-               (unsigned long long)max_inst, (unsigned long long)m->cpu.pc);
+      LogError("instruction limit %llu reached at pc=%llx", (unsigned long long)max_inst,
+               (unsigned long long)m->cpu.pc);
       break;
     }
   }
@@ -30,7 +31,7 @@ void BoardRun(Board *m, uint64_t max_inst) {
   DebugSessionEnd(&end, "halt");
 }
 
-void BoardDestroy(Board *m) {
+void BoardDestroy(Board* m) {
   if (!m) return;
   RamDestroy(m->ram);
   if (m->destroy) m->destroy(m);

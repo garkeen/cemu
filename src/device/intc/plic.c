@@ -9,7 +9,7 @@ enum {
   kPlicContextStride = 0x1000,
 };
 
-void PlicInit(PlicDevice *p) {
+void PlicInit(PlicDevice* p) {
   for (int i = 0; i <= kPlicNumSrc; i++) p->priority[i] = 0;
   for (int w = 0; w < kPlicNumWords; w++) p->pending[w] = 0;
   for (int c = 0; c < kPlicNumCtx; c++) {
@@ -18,7 +18,7 @@ void PlicInit(PlicDevice *p) {
   }
 }
 
-static void UpdateOutput(PlicDevice *p) {
+static void UpdateOutput(PlicDevice* p) {
   if (!p->set_irq) return;
   for (int ctx = 0; ctx < kPlicNumCtx; ctx++) {
     int claimable = 0;
@@ -32,23 +32,24 @@ static void UpdateOutput(PlicDevice *p) {
   }
 }
 
-void PlicDeviceIrq(PlicDevice *p, int src, int level) {
+void PlicDeviceIrq(PlicDevice* p, int src, int level) {
   if (src < 1 || src > kPlicNumSrc) return;
   uint32_t bit = 1u << (src % 32);
-  if (level) p->pending[src / 32] |= bit;
-  else p->pending[src / 32] &= ~bit;
+  if (level)
+    p->pending[src / 32] |= bit;
+  else
+    p->pending[src / 32] &= ~bit;
   UpdateOutput(p);
 }
 
 // Highest-priority claimable source for a context, or 0 (lowest source wins
 // ties, per the PLIC manual's strict priority then ID order).
-static int Claim(PlicDevice *p, int ctx) {
+static int Claim(PlicDevice* p, int ctx) {
   int best = 0;
   uint32_t best_prio = 0;
   for (int src = 1; src <= kPlicNumSrc; src++) {
     uint32_t bit = 1u << (src % 32);
-    if (!(p->pending[src / 32] & bit) || !(p->enable[ctx][src / 32] & bit))
-      continue;
+    if (!(p->pending[src / 32] & bit) || !(p->enable[ctx][src / 32] & bit)) continue;
     if (p->priority[src] <= p->threshold[ctx]) continue;
     if (best == 0 || p->priority[src] > best_prio) {
       best = src;
@@ -60,7 +61,7 @@ static int Claim(PlicDevice *p, int ctx) {
 
 // The register file is 4-byte granular (QEMU sifive_plic impl access size);
 // wider accesses see two adjacent words, narrower ones the one word.
-static uint32_t ReadWord(PlicDevice *p, uint64_t off) {
+static uint32_t ReadWord(PlicDevice* p, uint64_t off) {
   int src = (int)(off / 4);
   int word = (int)((off - kPlicOffPending) / 4);
   int ctx, widx;
@@ -97,7 +98,7 @@ static uint32_t ReadWord(PlicDevice *p, uint64_t off) {
   return 0;
 }
 
-static void WriteWord(PlicDevice *p, uint64_t off, uint32_t val) {
+static void WriteWord(PlicDevice* p, uint64_t off, uint32_t val) {
   int src = (int)(off / 4);
   int ctx, widx;
   if (off < kPlicOffPending) {  // priority block, base offset 0
@@ -128,31 +129,29 @@ static void WriteWord(PlicDevice *p, uint64_t off, uint32_t val) {
   // pending and undecoded offsets ignore writes
 }
 
-static uint64_t PlicRead(void *dev, uint64_t addr, int size) {
-  PlicDevice *p = (PlicDevice *)dev;
+static uint64_t PlicRead(void* dev, uint64_t addr, int size) {
+  PlicDevice* p = (PlicDevice*)dev;
   uint64_t off = addr - p->base;
   uint64_t v = ReadWord(p, off & ~3ULL);
   if (size > 4 && (off & 4)) v |= (uint64_t)ReadWord(p, (off & ~3ULL) + 4) << 32;
   return v;
 }
 
-static void PlicWrite(void *dev, uint64_t addr, int size, uint64_t val) {
-  PlicDevice *p = (PlicDevice *)dev;
+static void PlicWrite(void* dev, uint64_t addr, int size, uint64_t val) {
+  PlicDevice* p = (PlicDevice*)dev;
   uint64_t off = addr - p->base;
   WriteWord(p, off & ~3ULL, (uint32_t)val);
-  if (size > 4 && (off & 4))
-    WriteWord(p, (off & ~3ULL) + 4, (uint32_t)(val >> 32));
+  if (size > 4 && (off & 4)) WriteWord(p, (off & ~3ULL) + 4, (uint32_t)(val >> 32));
 }
 
 static const DeviceOps kPlicOps = {"plic", PlicRead, PlicWrite};
 
-void PlicRegister(Bus *bus, PlicDevice *p, uint64_t base, uint64_t size) {
+void PlicRegister(Bus* bus, PlicDevice* p, uint64_t base, uint64_t size) {
   p->base = base;
   BusAddRegion(bus, base, size, &kPlicOps, p);
 }
 
-void PlicSetIrqSink(PlicDevice *p, void (*set_irq)(void *, int, int),
-                    void *ctx) {
+void PlicSetIrqSink(PlicDevice* p, void (*set_irq)(void*, int, int), void* ctx) {
   p->set_irq = set_irq;
   p->irq_ctx = ctx;
 }

@@ -32,19 +32,19 @@ void DebugInit(void);
 // ---- emission points -------------------------------------------------------
 
 // After the PC commit in a step: insn row + state row + regs tick.
-void DebugInsn(struct frame *f);
+void DebugInsn(struct frame* f);
 
 // After the raise consumer installed the resume point: the trap row.
-void DebugTrap(struct frame *f);
+void DebugTrap(struct frame* f);
 
 // In the ISA memory funnels: ld/st + watch rows. addr is linear.
-void DebugMem(struct frame *f, uint64_t addr, int size, int acc,
-              uint64_t val_or_result, int is_load);
+void DebugMem(struct frame* f, uint64_t addr, int size, int acc, uint64_t val_or_result,
+              int is_load);
 
 // MMIO/device hit row: called by the funnels when the winning region has no
 // RAM backing. name comes from DeviceOps.
-void DebugBus(struct frame *f, const char *dev_name, uint64_t addr, int size,
-              int is_load, uint64_t val);
+void DebugBus(struct frame* f, const char* dev_name, uint64_t addr, int size, int is_load,
+              uint64_t val);
 
 // True when a watchpoint matches (funnels ask before doing the access so
 // the row prints even when the access itself faults).
@@ -52,7 +52,7 @@ int DebugWatchHit(uint64_t addr, int size, int is_load);
 
 // Halt/exit: the final regs table + session summary (always, once debug is
 // active at all).
-void DebugSessionEnd(const struct frame *f, const char *stop_reason);
+void DebugSessionEnd(const struct frame* f, const char* stop_reason);
 
 // CEMU_DEBUG grammar this hub implements (AGENTS.md §X):
 //   trace[:line|table][=N], state, mem[:ld|st], trap, bus, regs=N,

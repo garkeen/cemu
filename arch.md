@@ -29,7 +29,7 @@
 ## 三、目录结构
 
 目录按被模拟机器的部件划分；各目录之间允许/禁止的 include 边由
-`mingw32-make check` 机械检查，规则表见 AGENTS.md 第七节。
+`cmake --build build --target check` 机械检查，规则表见 AGENTS.md 第七节。
 
 ```
 cemu/

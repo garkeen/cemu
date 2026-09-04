@@ -2,6 +2,7 @@
 #define CEMU_DEVICE_MISC_DEBUG_EXIT_H
 
 #include <stdint.h>
+
 #include "bus/bus.h"
 #include "cpu/cpu.h"
 
@@ -10,10 +11,10 @@
 // distinguishable from "never exited". kvm-unit-tests runs it at I/O port
 // 0xF4.
 typedef struct DebugExitDevice {
-  CpuState *cpu;
+  CpuState* cpu;
 } DebugExitDevice;
 
-void DebugExitBind(DebugExitDevice *d, CpuState *cpu);
+void DebugExitBind(DebugExitDevice* d, CpuState* cpu);
 
 extern const DeviceOps kDebugExitOps;
 

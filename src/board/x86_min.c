@@ -1,8 +1,9 @@
 #include <stdlib.h>
+
 #include "board/board.h"
 #include "device/char/uart16550.h"
-#include "device/misc/debug_exit.h"
 #include "device/intc/i8259.h"
+#include "device/misc/debug_exit.h"
 #include "device/timer/i8254.h"
 #include "util/log.h"
 
@@ -34,52 +35,53 @@ typedef struct X86Board {
   PitDevice pit;
 } X86Board;
 
-static uint64_t UnclaimedRead(void *dev, uint64_t addr, int size) {
-  (void)dev; (void)addr;
+static uint64_t UnclaimedRead(void* dev, uint64_t addr, int size) {
+  (void)dev;
+  (void)addr;
   return size >= 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
 }
 
-static void UnclaimedWrite(void *dev, uint64_t addr, int size, uint64_t val) {
-  (void)dev; (void)addr; (void)size; (void)val;
+static void UnclaimedWrite(void* dev, uint64_t addr, int size, uint64_t val) {
+  (void)dev;
+  (void)addr;
+  (void)size;
+  (void)val;
 }
 
-static const DeviceOps kUnclaimedPortOps = {"unclaimed-ports", UnclaimedRead,
-                                            UnclaimedWrite};
+static const DeviceOps kUnclaimedPortOps = {"unclaimed-ports", UnclaimedRead, UnclaimedWrite};
 
 // PIC -> CPU: the master's highest-priority deliverable IRQ asserts INTR.
 // The board talks to the CpuState hook, not to a CPU-model function, so this
 // board carries no ISA header at all.
-static void OnPicIrq(void *ctx, int line, int level) {
-  CpuState *cpu = (CpuState *)ctx;
+static void OnPicIrq(void* ctx, int line, int level) {
+  CpuState* cpu = (CpuState*)ctx;
   (void)line;  // one INTR line; the vector is fetched on acknowledge
   cpu->set_irq(cpu, 0, level);
 }
 
 // INTA cycle: the CPU asks the PIC for the vector number of the pending IRQ.
-static int OnIntAck(void *ack_dev) {
-  return PicAcknowledge((PicDevice *)ack_dev);
-}
+static int OnIntAck(void* ack_dev) { return PicAcknowledge((PicDevice*)ack_dev); }
 
 // PIT -> PIC: channel edges set/clear IRQ lines (level edges from the PIT
 // become edge-triggered IRR bits in the PIC).
-static void OnPitIrq(void *ctx, int line, int level) {
-  PicDevice *pic = (PicDevice *)ctx;
+static void OnPitIrq(void* ctx, int line, int level) {
+  PicDevice* pic = (PicDevice*)ctx;
   PicSetIrq(pic, line, level);
 }
 
-static void X86Poll(Board *m) {
-  X86Board *xm = (X86Board *)m;
+static void X86Poll(Board* m) {
+  X86Board* xm = (X86Board*)m;
   PitPoll(&xm->pit);
 }
 
-Board *X86BoardCreate(const BoardOpts *opts) {
+Board* X86BoardCreate(const BoardOpts* opts) {
   if (opts->ram_base || opts->ram_size) {
     LogError("x86 machine has a fixed 1MB real-mode layout");
     return NULL;
   }
-  X86Board *xm = (X86Board *)calloc(1, sizeof(X86Board));
+  X86Board* xm = (X86Board*)calloc(1, sizeof(X86Board));
   if (!xm) return NULL;
-  Board *m = &xm->base;
+  Board* m = &xm->base;
   m->name = "x86";
   m->ram = RamCreate(0, kRamSize);
   if (!m->ram) {
@@ -88,10 +90,10 @@ Board *X86BoardCreate(const BoardOpts *opts) {
   }
   BusAddRamRegion(&m->bus, 0, kRamSize, &kRamOps, m->ram, m->ram->mem);
 
-  Uart16550 *uart = &xm->uart;
-  DebugExitDevice *dexit = &xm->dexit;
-  PicDevice *pic = &xm->pic;
-  PitDevice *pit = &xm->pit;
+  Uart16550* uart = &xm->uart;
+  DebugExitDevice* dexit = &xm->dexit;
+  PicDevice* pic = &xm->pic;
+  PitDevice* pit = &xm->pit;
   Uart16550Init(uart);
   DebugExitBind(dexit, &m->cpu);
   PicInit(pic);

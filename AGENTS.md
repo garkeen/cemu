@@ -74,7 +74,7 @@ src/ 按被模拟机器的部件分目录：
 
 ### 禁止的依赖边
 
-`mingw32-make check`（tools/depcheck.sh）机械检查，命中即失败：
+`cmake --build build --target check`（tools/depcheck.sh）机械检查，命中即失败：
 
 - `bus/`、`mem/`、`device/`、`debug/` 不得 include `cpu/isa/`：总线、内存、
   外设不认 CPU 型号，只见 `cpu/cpu.h`。
@@ -89,12 +89,15 @@ ISA 头，`virt.c` 仅引 `platform.h`。
 
 - 命名：Google C 风格。文件与变量 snake_case，类型与函数 PascalCase，
   常量与枚举值 k 前缀，宏全大写。include guard 按路径（`CEMU_BUS_BUS_H`）。
-- 构建：MinGW gcc，`-Wall -Wextra` 零告警（Makefile 已含 -MMD -MP 头依赖）。
-  Makefile 的 SRCS 用四级显式通配（`src/*.c`、`src/*/*.c`、`src/*/*/*.c`、
-  `src/*/*/*/*.c`），不依赖 glob 的尾部斜杠行为。
+- 构建：CMake（`CMakeLists.txt`）+ Ninja 生成器，MinGW gcc，`-Wall -Wextra`
+  零告警。源文件用 `file(GLOB_RECURSE src/*.c)`（`CONFIGURE_DEPENDS`，新增/
+  删除源文件自动重扫），是旧 Makefile 四级显式通配（`src/*.c` … `src/*/*/*/*.c`）
+  的超集，不依赖 glob 尾部斜杠行为。头文件依赖由 CMake/Ninja 自动追踪。
+  流程：`cmake -G Ninja -B build && cmake --build build`（ninja 不在 PATH 时
+  前置 `PATH=/d/ninja:$PATH`）。
 - 每轮改动结束前限时跑回归：`bash test/run.sh`（分层入口：riscv
   `bash test/riscv64/run.sh`，x86 `bash test/x86/run.sh`）；依赖边用
-  `mingw32-make check`。
+  `cmake --build build --target check`。
 - 测试超时：任何测试套件/单测都必须有 time limit（run.sh 用 `timeout`
   包裹 cemu 调用），防止被测程序死循环导致不退出的挂起。
 - 对比数据体积：凡需落地对比数据的测试（如导出万步状态流做对拍），其

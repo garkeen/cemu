@@ -11,11 +11,11 @@
 #include "debug/debug.h"
 #include "exec.h"  // last: it defines the short register macros x/f/eax/...
 
-void riscv_step(CpuState *c) {
+void riscv_step(CpuState* c) {
   cpu = c;
-  rs = (RiscvState *)cpu->priv;
+  rs = (RiscvState*)cpu->priv;
   static frame fbuf;
-  frame *fr = &fbuf;
+  frame* fr = &fbuf;
   fr->cpu = cpu;
   fr->priv = rs;
   fr->isa = &k_isa_riscv64;
@@ -67,19 +67,16 @@ void riscv_step(CpuState *c) {
 
     // The one commit: the interpreter returns the new pc; x0 stays zero.
     x[0] = 0;
-    cpu->pc = ilen == 2 ? riscv_exec_c(fr, (uint16_t)inst)
-                        : riscv_exec_inst(fr, inst);
+    cpu->pc = ilen == 2 ? riscv_exec_c(fr, (uint16_t)inst) : riscv_exec_inst(fr, inst);
     fr->rec.dnpc = cpu->pc;
     DebugInsn(fr);
   }
 
   // Counter increments gated by mcountinhibit; a write to a counter
   // suppresses its own increment for the writing instruction (Zicntr).
-  if (!(rs->mcountinhibit & kMcountinhibitIr) &&
-      rs->counter_written != kCounterMinstret)
+  if (!(rs->mcountinhibit & kMcountinhibitIr) && rs->counter_written != kCounterMinstret)
     rs->minstret++;
-  if (!(rs->mcountinhibit & kMcountinhibitCy) &&
-      rs->counter_written != kCounterMcycle)
+  if (!(rs->mcountinhibit & kMcountinhibitCy) && rs->counter_written != kCounterMcycle)
     rs->mcycle++;
   rs->counter_written = kCounterNone;
 }

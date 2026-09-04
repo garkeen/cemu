@@ -1,7 +1,8 @@
 #include <windows.h>
+
 #include "host/host.h"
 
-static void WriteTo(DWORD std_handle, const char *buf, size_t n) {
+static void WriteTo(DWORD std_handle, const char* buf, size_t n) {
   HANDLE h = GetStdHandle(std_handle);
   if (h == INVALID_HANDLE_VALUE) return;
   DWORD written = 0;
@@ -13,10 +14,6 @@ static void WriteTo(DWORD std_handle, const char *buf, size_t n) {
   }
 }
 
-void HostWriteOut(const char *buf, size_t n) {
-  WriteTo(STD_OUTPUT_HANDLE, buf, n);
-}
+void HostWriteOut(const char* buf, size_t n) { WriteTo(STD_OUTPUT_HANDLE, buf, n); }
 
-void HostWriteErr(const char *buf, size_t n) {
-  WriteTo(STD_ERROR_HANDLE, buf, n);
-}
+void HostWriteErr(const char* buf, size_t n) { WriteTo(STD_ERROR_HANDLE, buf, n); }

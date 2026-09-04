@@ -1,4 +1,4 @@
-# Build output (Makefile BUILD dir)
+# Build output (cmake build dir)
 build/
 
 # Object files and binaries anywhere they might stray
@@ -14,6 +14,8 @@ build/
 
 # Debug output captures
 *.txt
+# ...but the build definition is source, not capture output
+!CMakeLists.txt
 
 # Editor / OS junk
 .vscode/

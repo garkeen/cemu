@@ -27,7 +27,7 @@ static const uint64_t kPteReserved = ~((1ULL << 54) - 1);
 
 // ---- PMP (priv spec 3.7) ----
 
-static uint8_t PmpCfg(const RiscvState *s, int i) {
+static uint8_t PmpCfg(const RiscvState* s, int i) {
   return (uint8_t)(s->pmpcfg[i / 8] >> (8 * (i % 8)));
 }
 
@@ -35,8 +35,7 @@ static uint8_t PmpCfg(const RiscvState *s, int i) {
 // ranges. NA4/NAPOT follow the raw pmpaddr encoding (QEMU
 // target/riscv/pmp.c pmp_napot_get_range); TOR entries read pmpaddr[i-1]
 // as the lower bound and mask both to the 16-byte grain (G=2).
-static int PmpRegion(const RiscvState *s, int i, uint64_t *base,
-                     uint64_t *size) {
+static int PmpRegion(const RiscvState* s, int i, uint64_t* base, uint64_t* size) {
   uint8_t cfg = PmpCfg(s, i);
   uint64_t a = cfg & kPmpAMask;
   uint64_t addr = s->pmpaddr[i];
@@ -69,8 +68,7 @@ static int PmpRegion(const RiscvState *s, int i, uint64_t *base,
   return 0;  // A = OFF
 }
 
-int RiscvPmpAllowed(const RiscvState *s, uint64_t addr, uint64_t len, int acc,
-                    int mode) {
+int RiscvPmpAllowed(const RiscvState* s, uint64_t addr, uint64_t len, int acc, int mode) {
   int need_r = (acc == acc_read || acc == acc_amo);
   int need_w = (acc == acc_write || acc == acc_amo);
   int need_x = (acc == acc_ifetch);
@@ -84,8 +82,7 @@ int RiscvPmpAllowed(const RiscvState *s, uint64_t addr, uint64_t len, int acc,
     if (!(addr >= base && addr + len <= base + size)) return 0;
     uint8_t cfg = PmpCfg(s, i);
     if (mode == kPrivMachine && !(cfg & kPmpL)) return 1;  // M passes unlocked
-    if ((need_r && !(cfg & kPmpR)) || (need_w && !(cfg & kPmpW)) ||
-        (need_x && !(cfg & kPmpX)))
+    if ((need_r && !(cfg & kPmpR)) || (need_w && !(cfg & kPmpW)) || (need_x && !(cfg & kPmpX)))
       return 0;
     return 1;
   }
@@ -108,7 +105,7 @@ static int PageFaultCause(int acc) {
 
 // PTE fetch: a physical 8-byte read checked as S-mode (xiangshanNEMU mmu.c
 // walks page tables under MODE_S regardless of the trapped privilege).
-static uint64_t PteRead(frame *f, RiscvState *s, uint64_t pte_addr, int acc) {
+static uint64_t PteRead(frame* f, RiscvState* s, uint64_t pte_addr, int acc) {
   if (!RiscvPmpAllowed(s, pte_addr, 8, acc_read, kPrivSupervisor) ||
       BusProbe(f->cpu->bus, pte_addr, 8, NULL) != 0) {
     raise_(f, AccessFaultCause(acc), pte_addr);
@@ -116,8 +113,7 @@ static uint64_t PteRead(frame *f, RiscvState *s, uint64_t pte_addr, int acc) {
   return BusRead(f->cpu->bus, pte_addr, 8);
 }
 
-int RiscvTranslate(frame *f, RiscvState *s, uint64_t vaddr, int acc,
-                   uint64_t *paddr) {
+int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int acc, uint64_t* paddr) {
   // Effective privilege for data accesses under MPRV uses MPP (priv spec
   // 3.1.6.6); instruction fetch always uses the current mode.
   int eff = s->priv;
@@ -142,8 +138,7 @@ int RiscvTranslate(frame *f, RiscvState *s, uint64_t vaddr, int acc,
     uint64_t vpn = (vaddr >> (12 + 9 * level)) & 0x1ff;
     pte_addr = (ppn_base << 12) + vpn * 8;
     pte = PteRead(f, s, pte_addr, acc);
-    if (!(pte & kPteV) || (!(pte & kPteR) && (pte & kPteW)) ||
-        (pte & kPteReserved)) {
+    if (!(pte & kPteV) || (!(pte & kPteR) && (pte & kPteW)) || (pte & kPteReserved)) {
       raise_(f, PageFaultCause(acc), vaddr);
     }
     if (pte & (kPteR | kPteX)) break;  // leaf
@@ -159,15 +154,12 @@ int RiscvTranslate(frame *f, RiscvState *s, uint64_t vaddr, int acc,
   // readable.
   int ok = 1;
   if (eff == kPrivUser && !(pte & kPteU)) ok = 0;
-  if ((pte & kPteU) && eff == kPrivSupervisor &&
-      (!(s->mstatus & kMstatusSum) || acc == acc_ifetch))
+  if ((pte & kPteU) && eff == kPrivSupervisor && (!(s->mstatus & kMstatusSum) || acc == acc_ifetch))
     ok = 0;
   if (acc == acc_ifetch) {
     if (!ok || !(pte & kPteX)) goto page_fault;
   } else if (acc == acc_read) {
-    if (!ok || (!((pte & kPteR) ||
-                  ((s->mstatus & kMstatusMxr) && (pte & kPteX)))))
-      goto page_fault;
+    if (!ok || (!((pte & kPteR) || ((s->mstatus & kMstatusMxr) && (pte & kPteX))))) goto page_fault;
   } else {  // write and AMO need W (the AMO read side faults as a store,
             // xiangshanNEMU uses EX_SPF for cpu.amo)
     if (!ok || !(pte & kPteW)) goto page_fault;

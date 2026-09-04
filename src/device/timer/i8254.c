@@ -24,9 +24,9 @@
 enum { kRwLsb = 1, kRwMsb = 2, kRwWord0 = 3, kRwWord1 = 4 };
 
 typedef struct PitChannel {
-  uint32_t count;          // programmed reload value (0 == 65536)
+  uint32_t count;  // programmed reload value (0 == 65536)
   uint16_t latched_count;
-  uint8_t count_latched;   // 0 = none, else the rw_mode at latch time
+  uint8_t count_latched;  // 0 = none, else the rw_mode at latch time
   uint8_t status_latched;
   uint8_t status;
   uint8_t read_state;
@@ -34,12 +34,12 @@ typedef struct PitChannel {
   uint8_t write_latch;
   uint8_t rw_mode;
   uint8_t mode;
-  uint8_t bcd;              // not modeled
+  uint8_t bcd;  // not modeled
   uint8_t gate;
-  uint64_t count_load_time; // HostTimerNow() us at last (re)load; 0 = unarmed
-  uint64_t last_irq_count;  // tick count at last edge
-  int armed;                // set after the first load; later loads anchor now
-  int irq;                  // -1 if none (channels 1/2 in the PC)
+  uint64_t count_load_time;  // HostTimerNow() us at last (re)load; 0 = unarmed
+  uint64_t last_irq_count;   // tick count at last edge
+  int armed;                 // set after the first load; later loads anchor now
+  int irq;                   // -1 if none (channels 1/2 in the PC)
 } PitChannel;
 
 struct PitDevicePrivate {
@@ -51,7 +51,7 @@ struct PitDevicePrivate {
 // creation and image loading take wall time, and the counter must not run
 // before the CPU does (QEMU runs the PIT on the virtual clock, which only
 // advances while the guest executes).
-static uint64_t PitElapsed(PitChannel *s) {
+static uint64_t PitElapsed(PitChannel* s) {
   uint64_t now = HostTimerNow();
   if (s->count_load_time == 0) {
     s->count_load_time = now;
@@ -60,10 +60,13 @@ static uint64_t PitElapsed(PitChannel *s) {
   return (now - s->count_load_time) * PIT_FREQ / 1000000;
 }
 
-static int PitGetCount(PitChannel *s) {
+static int PitGetCount(PitChannel* s) {
   uint64_t d = PitElapsed(s);
   switch (s->mode) {
-    case 0: case 1: case 4: case 5:
+    case 0:
+    case 1:
+    case 4:
+    case 5:
       return (s->count - d) & 0xffff;
     case 3:
       // square wave: odd counts behave slightly differently (QEMU comment).
@@ -73,20 +76,26 @@ static int PitGetCount(PitChannel *s) {
   }
 }
 
-static int PitGetOut(PitChannel *s) {
+static int PitGetOut(PitChannel* s) {
   uint64_t d = PitElapsed(s);
   uint64_t count = s->count ? s->count : 0x10000;
   switch (s->mode) {
     default:
-    case 0: return d >= count;
-    case 1: return d < count;
-    case 2: return (d % count) == 0 && d != 0;
-    case 3: return (d % count) < ((count + 1) >> 1);
-    case 4: case 5: return d == count;
+    case 0:
+      return d >= count;
+    case 1:
+      return d < count;
+    case 2:
+      return (d % count) == 0 && d != 0;
+    case 3:
+      return (d % count) < ((count + 1) >> 1);
+    case 4:
+    case 5:
+      return d == count;
   }
 }
 
-static void PitLoadCount(PitChannel *s, int val) {
+static void PitLoadCount(PitChannel* s, int val) {
   if (val == 0) val = 0x10000;
   // 0 = unarmed: the anchor is armed on the first Poll after this load so
   // that machine construction / image loading wall time is not counted as
@@ -97,32 +106,31 @@ static void PitLoadCount(PitChannel *s, int val) {
   s->armed = 1;
 }
 
-static void PitLatchCount(PitChannel *s) {
+static void PitLatchCount(PitChannel* s) {
   if (!s->count_latched) {
     s->latched_count = (uint16_t)PitGetCount(s);
     s->count_latched = s->rw_mode;
   }
 }
 
-static void PitIoWrite(PitDevice *pit, uint16_t addr, uint8_t val) {
+static void PitIoWrite(PitDevice* pit, uint16_t addr, uint8_t val) {
   if (addr == 3) {
     // mode/control register
     int channel = val >> 6;
     if (channel == 3) {
       // read-back command
       for (channel = 0; channel < 3; channel++) {
-        PitChannel *s = &pit->channels[channel];
+        PitChannel* s = &pit->channels[channel];
         if (val & (2 << channel)) {
           if (!(val & 0x20)) PitLatchCount(s);
           if (!(val & 0x10) && !s->status_latched) {
-            s->status = (PitGetOut(s) << 7) | (s->rw_mode << 4)
-                        | (s->mode << 1) | s->bcd;
+            s->status = (PitGetOut(s) << 7) | (s->rw_mode << 4) | (s->mode << 1) | s->bcd;
             s->status_latched = 1;
           }
         }
       }
     } else {
-      PitChannel *s = &pit->channels[channel];
+      PitChannel* s = &pit->channels[channel];
       int access = (val >> 4) & 3;
       if (access == 0) {
         PitLatchCount(s);
@@ -136,7 +144,7 @@ static void PitIoWrite(PitDevice *pit, uint16_t addr, uint8_t val) {
     }
     return;
   }
-  PitChannel *s = &pit->channels[addr];
+  PitChannel* s = &pit->channels[addr];
   switch (s->write_state) {
     case kRwLsb:
       PitLoadCount(s, val);
@@ -155,8 +163,8 @@ static void PitIoWrite(PitDevice *pit, uint16_t addr, uint8_t val) {
   }
 }
 
-static uint8_t PitIoRead(PitDevice *pit, uint16_t addr) {
-  PitChannel *s = &pit->channels[addr];
+static uint8_t PitIoRead(PitDevice* pit, uint16_t addr) {
+  PitChannel* s = &pit->channels[addr];
   if (s->status_latched) {
     s->status_latched = 0;
     return s->status;
@@ -178,8 +186,10 @@ static uint8_t PitIoRead(PitDevice *pit, uint16_t addr) {
   }
   int count = PitGetCount(s);
   switch (s->read_state) {
-    case kRwLsb: return count & 0xff;
-    case kRwMsb: return (count >> 8) & 0xff;
+    case kRwLsb:
+      return count & 0xff;
+    case kRwMsb:
+      return (count >> 8) & 0xff;
     case kRwWord0:
       s->read_state = kRwWord1;
       return count & 0xff;
@@ -191,9 +201,9 @@ static uint8_t PitIoRead(PitDevice *pit, uint16_t addr) {
   }
 }
 
-static void PitReset(PitDevice *pit) {
+static void PitReset(PitDevice* pit) {
   for (int i = 0; i < 3; i++) {
-    PitChannel *s = &pit->channels[i];
+    PitChannel* s = &pit->channels[i];
     s->mode = 3;
     s->gate = (i != 2);
     s->irq = -1;
@@ -201,9 +211,9 @@ static void PitReset(PitDevice *pit) {
   }
 }
 
-void PitPoll(PitDevice *pit) {
+void PitPoll(PitDevice* pit) {
   // Only channel 0 carries an IRQ in the standard PC wiring.
-  PitChannel *s = &pit->channels[0];
+  PitChannel* s = &pit->channels[0];
   if (s->irq == -1) return;
   uint64_t d = PitElapsed(s);
   switch (s->mode) {
@@ -220,8 +230,7 @@ void PitPoll(PitDevice *pit) {
           pit->set_irq(pit->irq_ctx, s->irq, 0);
         }
         s->last_irq_count += s->count;
-        if (HostTimerNow() - s->count_load_time > (1ULL << 31))
-          PitLoadCount(s, s->count);
+        if (HostTimerNow() - s->count_load_time > (1ULL << 31)) PitLoadCount(s, s->count);
       }
       (void)delta;
       break;
@@ -231,32 +240,30 @@ void PitPoll(PitDevice *pit) {
   }
 }
 
-static uint64_t PitRead(void *dev, uint64_t addr, int size) {
+static uint64_t PitRead(void* dev, uint64_t addr, int size) {
   (void)size;
-  return PitIoRead((PitDevice *)dev, (uint16_t)(addr & 3));
+  return PitIoRead((PitDevice*)dev, (uint16_t)(addr & 3));
 }
-static void PitWrite(void *dev, uint64_t addr, int size, uint64_t val) {
+static void PitWrite(void* dev, uint64_t addr, int size, uint64_t val) {
   (void)size;
-  PitIoWrite((PitDevice *)dev, (uint16_t)(addr & 3), (uint8_t)val);
+  PitIoWrite((PitDevice*)dev, (uint16_t)(addr & 3), (uint8_t)val);
 }
 
 static const DeviceOps kPitOps = {"8254", PitRead, PitWrite};
 
-void PitInit(PitDevice *pit) {
-  pit->channels =
-      (PitChannel *)calloc(3, sizeof(PitChannel));
+void PitInit(PitDevice* pit) {
+  pit->channels = (PitChannel*)calloc(3, sizeof(PitChannel));
   PitReset(pit);
   pit->channels[0].irq = 0;  // IRQ0
   pit->set_irq = NULL;
   pit->irq_ctx = NULL;
 }
 
-void PitRegister(Bus *io, PitDevice *pit, uint16_t base) {
+void PitRegister(Bus* io, PitDevice* pit, uint16_t base) {
   BusAddRegion(io, base, 4, &kPitOps, pit);
 }
 
-void PitSetIrqSink(PitDevice *pit, void (*set_irq)(void *, int, int),
-                   void *ctx) {
+void PitSetIrqSink(PitDevice* pit, void (*set_irq)(void*, int, int), void* ctx) {
   pit->set_irq = set_irq;
   pit->irq_ctx = ctx;
 }

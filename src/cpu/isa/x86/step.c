@@ -20,17 +20,27 @@
 static void do_step(void) {
   for (;;) {
     uint8_t b = fetch8();
-    if (b == 0x66) d.w32 = !d.w32;
-    else if (b == 0x67) d.a32 = !d.a32;
-    else if (b == 0x26) d.seg = es_i;
-    else if (b == 0x2e) d.seg = cs_i;
-    else if (b == 0x36) d.seg = ss_i;
-    else if (b == 0x3e) d.seg = ds_i;
-    else if (b == 0x64) d.seg = fs_i;
-    else if (b == 0x65) d.seg = gs_i;
-    else if (b == 0xf0) {}
-    else if (b == 0xf2) d.rep = 2;
-    else if (b == 0xf3) d.rep = 1;
+    if (b == 0x66)
+      d.w32 = !d.w32;
+    else if (b == 0x67)
+      d.a32 = !d.a32;
+    else if (b == 0x26)
+      d.seg = es_i;
+    else if (b == 0x2e)
+      d.seg = cs_i;
+    else if (b == 0x36)
+      d.seg = ss_i;
+    else if (b == 0x3e)
+      d.seg = ds_i;
+    else if (b == 0x64)
+      d.seg = fs_i;
+    else if (b == 0x65)
+      d.seg = gs_i;
+    else if (b == 0xf0) {
+    } else if (b == 0xf2)
+      d.rep = 2;
+    else if (b == 0xf3)
+      d.rep = 1;
     else {
       run_op(b);  // b is the opcode; d.nxt already counts it
       return;
@@ -38,9 +48,9 @@ static void do_step(void) {
   }
 }
 
-void x86_step(CpuState *c) {
+void x86_step(CpuState* c) {
   cpu = c;
-  s = (x86_state *)cpu->priv;
+  s = (x86_state*)cpu->priv;
   fl = &s->fl;
   static frame f;
   fr = &f;

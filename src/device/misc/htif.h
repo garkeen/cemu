@@ -2,6 +2,7 @@
 #define CEMU_DEVICE_MISC_HTIF_H
 
 #include <stdint.h>
+
 #include "bus/bus.h"
 #include "cpu/cpu.h"
 
@@ -12,13 +13,12 @@ typedef struct HtifDevice {
   uint64_t fromhost_addr;
   uint64_t tohost;
   uint64_t fromhost;
-  CpuState *cpu;
+  CpuState* cpu;
 } HtifDevice;
 
 extern const DeviceOps kHtifOps;
 
-void HtifBind(HtifDevice *htif, CpuState *cpu);
-void HtifRegister(Bus *bus, HtifDevice *htif, uint64_t tohost_addr,
-                  uint64_t fromhost_addr);
+void HtifBind(HtifDevice* htif, CpuState* cpu);
+void HtifRegister(Bus* bus, HtifDevice* htif, uint64_t tohost_addr, uint64_t fromhost_addr);
 
 #endif
