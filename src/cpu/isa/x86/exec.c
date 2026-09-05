@@ -72,6 +72,7 @@ static void wr32(uint64_t lin, uint32_t v) { bus_store(lin, 4, v); }
 _Noreturn static void gp_fault(uint32_t code) { raise_(fr, vec_gp, code); }
 _Noreturn static void ss_fault(uint32_t code) { raise_(fr, vec_ss, code); }
 _Noreturn static void np_fault(uint32_t code) { raise_(fr, vec_np, code); }
+_Noreturn static void ts_fault(uint32_t code) { raise_(fr, vec_ts, code); }
 
 // The per-access segment checks, protected mode only (SDM vol.3 5.3): the
 // segment must be usable (a null selector loads into DS/ES/FS/GS fine and
@@ -468,24 +469,179 @@ static void load_cs(uint16_t sel) {
   seg_commit(cs_i, sel, &v);
 }
 
-// Delivers a vector through the IVT (IDTR base): read the entry, push
-// flags/CS/return-IP, clear IF/TF, load CS:IP. Traps (software INT) push the
-// next instruction, faults push the faulting one (SDM 6-3). Protected mode
-// routes the same delivery through IDT gates instead — not in yet, so this
-// stays the real-mode form and CS fills its cache unchecked.
-void do_int(int vec, uint32_t ret_eip) {
-  uint64_t tbl = s->idtr + (uint64_t)vec * 4;
-  uint32_t off = rd16(tbl);
-  uint32_t seg = rd16(tbl + 2);
-  push16(fl->word | 2);
-  push16(s->sreg[cs_i]);
-  push16((uint16_t)ret_eip);
-  fl->if_ = 0;
+// Vectors whose delivery pushes an error code (SDM vol.3 table 6-1, error
+// code column); real-mode delivery pushes none.
+static int vec_has_ec(int vec) {
+  return vec == vec_df || vec == vec_ts || vec == vec_np || vec == vec_ss ||
+         vec == vec_gp || vec == vec_pf || vec == vec_ac;
+}
+
+// Protected-mode IRET (SDM vol.2 IRET Operation): a same-privilege return
+// pops EIP/CS/EFLAGS; an outward return (CS RPL > CPL) additionally pops
+// ESP/SS, and only outward or CPL-0 returns may reload IOPL/NT. NT=1 is the
+// task-return form — task switching is stage 3 item 3.
+static void pm_iret(void) {
+  if (fl->nt) Fatal("x86: task return waits for task switching (stage 3 item 3)");
+  uint32_t new_eip = pop_w();
+  uint16_t sel = (uint16_t)pop_w();
+  uint32_t flv = pop_w();
+  if (!d.w32) flv &= 0xffff;
+  int newpl = sel & 3;
+  if (newpl < cpl()) gp_fault(sel & ~3u);  // returns inward don't exist
+  int outer = newpl > cpl();
+  uint32_t new_esp = 0;
+  uint16_t new_ss = 0;
+  if (outer) {
+    new_esp = pop_w();
+    new_ss = (uint16_t)pop_w();
+  }
+
+  // The return code segment: null → GP(0); table limits, code type,
+  // non-conforming DPL == RPL (conforming DPL <= RPL) → GP(sel); present →
+  // NP(sel). CPL becomes the return RPL.
+  if ((sel & 0xfffc) == 0) gp_fault(0);
+  if (sel & 4) Fatal("x86: LDT selectors not implemented");
+  if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(sel & ~3u);
+  seg_view cv;
+  desc_parse(sel, &cv);
+  if ((cv.ar & 0x18) != 0x18) gp_fault(sel & ~3u);  // executable
+  int conf = cv.ar & 4;
+  if (conf ? (((cv.ar >> 5) & 3) > newpl) : (((cv.ar >> 5) & 3) != newpl))
+    gp_fault(sel & ~3u);
+  if (!(cv.ar & 0x80)) np_fault(sel & ~3u);
+
+  // The outward return's fresh stack: SS RPL == CS RPL, writable data,
+  // DPL == CS RPL — all #GP, not-present #SS (SDM vol.2 IRET).
+  if (outer) {
+    if ((new_ss & 3) != newpl) gp_fault(new_ss & ~3u);
+    if ((new_ss & 0xfffc) == 0) gp_fault(0);
+    if (new_ss & 4) Fatal("x86: LDT selectors not implemented");
+    if ((uint32_t)(new_ss >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(new_ss & ~3u);
+    seg_view sv;
+    desc_parse(new_ss, &sv);
+    if ((sv.ar & 0x1a) != 0x12) gp_fault(new_ss & ~3u);  // writable data
+    if (((sv.ar >> 5) & 3) != newpl) gp_fault(new_ss & ~3u);
+    if (!(sv.ar & 0x80)) ss_fault(new_ss & ~3u);
+    esp = new_esp;
+    seg_commit(ss_i, new_ss, &sv);
+  }
+
+  // The flags image: CF..OF/TF/IF/DF always; IOPL and NT only on an outward
+  // or CPL-0 return (SDM vol.2 IRET). RF/VM never load (D14).
+  uint32_t mask = outer || cpl() == 0 ? 0x7fd7u : 0x0fd7u;
+  fl->word = (fl->word & ~(mask | 0x30000u)) | (flv & mask) | 2;
+
+  if (conf) cv.ar = (uint8_t)((cv.ar & ~0x60u) | (newpl << 5));
+  seg_commit(cs_i, sel, &cv);
+  eip = new_eip;
+}
+
+// Delivers a vector. Real mode: the IVT at IDTR (SDM vol.3 16.3). Protected
+// mode: the IDT gate — interrupt/trap gates push flags/CS/IP (plus the error
+// code when the vector carries one), switching to the TSS SS0:ESP0 stack on
+// a privilege change (SDM vol.2 INT Operation; behavior cross-checked
+// against v86 call_interrupt_vector; task gates and NT returns are task
+// switching, stage 3 item 3). `soft` marks INT n/INT3/INTO: only those check
+// the gate DPL, and external events stamp EXT into gate-fault error codes.
+void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
+  int ext = !soft;
+  if (!(s->cr0 & 1)) {
+    uint64_t tbl = s->idtr + (uint64_t)vec * 4;
+    uint32_t off = rd16(tbl);
+    uint32_t seg = rd16(tbl + 2);
+    push16(fl->word | 2);
+    push16(s->sreg[cs_i]);
+    push16((uint16_t)ret_eip);
+    fl->if_ = 0;
+    fl->tf = 0;
+    seg_view v;
+    desc_parse((uint16_t)seg, &v);
+    seg_commit(cs_i, (uint16_t)seg, &v);
+    eip = off;
+    return;
+  }
+
+  uint32_t gate_idx = (uint32_t)vec * 8;
+  if (gate_idx + 7 > s->idtr_limit) gp_fault(gate_idx | 2 | ext);
+  uint64_t gate = BusRead(cpu->bus, s->idtr + gate_idx, 8);
+  uint8_t gt = (uint8_t)((gate >> 40) & 0xf);
+  if (soft && ((gate >> 45) & 3) < (uint32_t)cpl()) gp_fault(gate_idx | 2);
+  if (gt != 6 && gt != 7 && gt != 0xe && gt != 0xf && gt != 5)
+    gp_fault(gate_idx | 2 | ext);
+  if (!((gate >> 47) & 1)) np_fault(gate_idx | 2 | ext);
+  if (gt == 5) Fatal("x86: task gates wait for task switching (stage 3 item 3)");
+  int gate16 = gt == 6 || gt == 7;
+
+  uint16_t code_sel = (uint16_t)gate;
+  uint32_t off = ((uint32_t)(gate >> 16) & 0xffff) |
+                 ((uint32_t)(gate >> 32) & 0xffff) << 16;
+
+  // The gate's code segment (SDM vol.2 INT: table limits, executable,
+  // DPL <= CPL, present — a faulting gate is never entered).
+  if ((code_sel & 0xfffc) == 0) gp_fault(0);
+  if (code_sel & 4) Fatal("x86: LDT selectors not implemented");
+  if ((uint32_t)(code_sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(code_sel & ~3u);
+  seg_view cv;
+  desc_parse(code_sel, &cv);
+  if ((cv.ar & 0x18) != 0x18) gp_fault(code_sel & ~3u);  // executable
+  int conf = cv.ar & 4;
+  int tdpl = (cv.ar >> 5) & 3;
+  if (tdpl > cpl()) gp_fault(code_sel & ~3u);
+  int newpl = !conf && tdpl < cpl() ? tdpl : cpl();
+  int switched = newpl < cpl();
+
+  uint32_t old_ss = s->sreg[ss_i], old_esp = esp, old_cs = s->sreg[cs_i];
+  if (switched) {
+    // TSS stack switch: every SS0:ESP0 defect faults #TS (SDM vol.2 INT);
+    // stack slots 4+8n/8+8n in a 32-bit TSS, 2+4n/4+4n in a 286 one.
+    uint8_t ty = s->tr_ar & 0xf;
+    if (!(s->tr_ar & 0x80) || (ty != 1 && ty != 3 && ty != 9 && ty != 0xb))
+      ts_fault(0);  // TR holds no TSS
+    int tss32 = ty & 8;
+    uint32_t esp0 = tss32 ? rd32(s->tr_base + 4 + 8 * newpl)
+                          : rd16(s->tr_base + 2 + 4 * newpl);
+    uint16_t ss0 = tss32 ? rd16(s->tr_base + 8 + 8 * newpl)
+                         : rd16(s->tr_base + 4 + 4 * newpl);
+    if ((ss0 & 0xfffc) == 0) ts_fault(0);
+    if (ss0 & 4) Fatal("x86: LDT selectors not implemented");
+    if ((uint32_t)(ss0 >> 3) * 8 + 7 > s->gdtr_limit) ts_fault(ss0 & ~3u);
+    seg_view sv;
+    desc_parse(ss0, &sv);
+    if ((sv.ar & 0x1a) != 0x12) ts_fault(ss0 & ~3u);  // writable data
+    if (((sv.ar >> 5) & 3) != newpl || (ss0 & 3) != newpl) ts_fault(ss0 & ~3u);
+    if (!(sv.ar & 0x80)) ts_fault(ss0 & ~3u);
+    esp = esp0;
+    seg_commit(ss_i, ss0, &sv);
+  }
+
+  // CS commits with its RPL forced to the new CPL (tiny386 call_isr); a
+  // conforming target keeps CPL, so its cached DPL follows the kept one.
+  if (conf) cv.ar = (uint8_t)((cv.ar & ~0x60u) | (newpl << 5));
+  seg_commit(cs_i, (uint16_t)((code_sel & ~3u) | newpl), &cv);
+
+  if (gate16) {
+    if (switched) {
+      push16((uint16_t)old_ss);
+      push16((uint16_t)old_esp);
+    }
+    push16(fl->word | 2);
+    push16((uint16_t)old_cs);
+    push16((uint16_t)ret_eip);
+    if (vec_has_ec(vec)) push16((uint16_t)ec);
+  } else {
+    if (switched) {
+      push32(old_ss);
+      push32(old_esp);
+    }
+    push32(fl->word | 2);
+    push32(old_cs);
+    push32(ret_eip);
+    if (vec_has_ec(vec)) push32(ec);
+  }
   fl->tf = 0;
-  seg_view v;
-  desc_parse((uint16_t)seg, &v);
-  seg_commit(cs_i, (uint16_t)seg, &v);
-  eip = off;
+  fl->nt = 0;
+  if (gt == 6 || gt == 0xe) fl->if_ = 0;  // interrupt gates clear IF
+  eip = gate16 ? (off & 0xffff) : off;
 }
 
 _Noreturn static void ud(void) { raise_(fr, vec_ud, (uint64_t)eip); }
@@ -1116,7 +1272,37 @@ static void aas(void) {
 // The 0f two-byte dispatch.
 static void run_op2(uint8_t op2) {
   switch (op2) {
-    case 0x01: {  // grp6: sgdt/sidt/lgdt/lidt/smsw (reg field)
+    case 0x00: {  // 0f 00 group: sldt/str/lldt/ltr/verr/verw (reg field)
+      modrm();
+      switch (d.reg) {
+        case 1:  // str: the visible TR selector
+          if (d.w32)
+            set_rm32(s->tr);
+          else
+            set_rm16(s->tr);
+          break;
+        case 3: {  // ltr: a system descriptor for an available TSS
+          uint16_t sel = rm16();
+          if ((sel & 0xfffc) == 0) gp_fault(0);
+          if (sel & 4) Fatal("x86: LDT selectors not implemented");
+          if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(sel & ~3u);
+          seg_view v;
+          desc_parse(sel, &v);
+          if ((v.ar & 0x10) || ((v.ar & 0xf) != 1 && (v.ar & 0xf) != 9))
+            gp_fault(sel & ~3u);  // system, available TSS (16- or 32-bit)
+          if (!(v.ar & 0x80)) np_fault(sel & ~3u);
+          s->tr = sel;
+          s->tr_base = v.base;
+          s->tr_limit = v.limit;
+          s->tr_ar = v.ar;
+          break;
+        }
+        default:
+          ud();  // sldt/lldt/verr/verw: stage-3 item 5 (LDT machinery)
+      }
+      break;
+    }
+    case 0x01: {  // 0f 01 group: sgdt/sidt/lgdt/lidt/smsw (reg field)
       modrm();
       switch (d.reg) {
         case 0:
@@ -2540,23 +2726,32 @@ void run_op(uint8_t op) {
       load_cs((uint16_t)pop_w());
       break;  // retf
     case 0xcc:
-      do_int(3, (uint32_t)(fr->rec.pc + d.nxt));
+      do_int(3, (uint32_t)(fr->rec.pc + d.nxt), 1, 0);
       return;  // int3
     case 0xcd:
-      do_int(imm8(), (uint32_t)(fr->rec.pc + d.nxt));
+      do_int(imm8(), (uint32_t)(fr->rec.pc + d.nxt), 1, 0);
       return;  // int imm8
     case 0xce:
       if (fl->of) {
-        do_int(4, (uint32_t)(fr->rec.pc + d.nxt));
+        do_int(4, (uint32_t)(fr->rec.pc + d.nxt), 1, 0);
         return;
       }
       break;      // into
-    case 0xcf: {  // iret: pop (E)IP, CS, (E)FLAGS. RF/VM never load from the
-                  // stored image (SDM IRET Operation: RF=0; VM stays 0 in
-                  // real mode). 16-bit form loads only the low half.
-      eip = pop_w();
-      load_cs((uint16_t)pop_w());
+    case 0xcf: {
+      if (s->cr0 & 1) {
+        pm_iret();  // SDM vol.2 IRET: the gate-return rules apply
+        break;
+      }
+      // Real mode: pop (E)IP, CS, (E)FLAGS. RF/VM never load from the
+      // stored image (SDM IRET Operation: RF=0; VM stays 0 in real mode).
+      // 16-bit form loads only the low half.
+      uint32_t new_eip = pop_w();
+      uint16_t sel = (uint16_t)pop_w();
       uint32_t flv = pop_w();
+      seg_view v;
+      desc_parse(sel, &v);
+      seg_commit(cs_i, sel, &v);
+      eip = new_eip;
       if (d.w32)
         fl->word = (flv & ~(0x30000u)) | 2;
       else

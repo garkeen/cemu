@@ -18,7 +18,10 @@ enum { eax_i, ecx_i, edx_i, ebx_i, esp_i, ebp_i, esi_i, edi_i };
 // Segment indices follow the sreg 3-bit encoding order.
 enum { es_i, cs_i, ss_i, ds_i, fs_i, gs_i };
 // Exception vectors (SDM vol.3 table 6-1).
-enum { vec_de = 0, vec_ud = 6, vec_np = 11, vec_ss = 12, vec_gp = 13 };
+enum {
+  vec_de = 0, vec_ud = 6, vec_df = 8, vec_ts = 10, vec_np = 11,
+  vec_ss = 12, vec_gp = 13, vec_pf = 14, vec_ac = 17
+};
 
 // One general-purpose bank cell, named exactly the way the architecture
 // names its parts: a 32-bit register, whose low half is the 16-bit one,
@@ -41,12 +44,13 @@ typedef union cell {
 } cell;
 
 // EFLAGS as the manual presents it: whole word for pushf/popf/iret, single
-// flags everywhere else. Bit 1 is reserved-one (never named).
+// flags everywhere else. Bit 1 is reserved-one (never named); the PM-relevant
+// upper bits (IOPL, NT) join the named set once gates load a flags image.
 typedef union eflags {
   uint32_t word;
   struct {
     unsigned cf : 1, : 1, pf : 1, : 1, af : 1, : 1, zf : 1, sf : 1;
-    unsigned tf : 1, if_ : 1, df : 1, of : 1, rest : 20;
+    unsigned tf : 1, if_ : 1, df : 1, of : 1, iopl : 2, nt : 1, : 1, rf : 1, vm : 1, rest : 14;
   };
 } eflags;
 
@@ -63,6 +67,10 @@ typedef struct x86_state {
   uint16_t gdtr_limit;
   uint64_t idtr;
   uint16_t idtr_limit;
+  uint16_t tr;        // visible TR selector (LTR/STR)
+  uint64_t tr_base;   // task register descriptor cache (SDM vol.3 7.2)
+  uint32_t tr_limit;
+  uint8_t tr_ar;      // access byte; type bit 3 distinguishes 32-bit TSS
   uint32_t dr[8];
   int intr_pending;  // the machine's INTR line is asserted
   int intr_inhibit;  // SDM window: instruction after STI takes no INTR

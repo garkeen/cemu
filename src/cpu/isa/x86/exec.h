@@ -73,9 +73,12 @@ extern dec g;
 #define d g
 
 // The opcode switches (exec.c) and the exception/interrupt dispatch they
-// share with the step protocol.
+// share with the step protocol. `soft` marks software-originated INTs (INT n,
+// INT3, INTO) — only those check the gate DPL (SDM vol.2 INT Operation);
+// `ec` is the raised exception's error code, pushed when the vector carries
+// one.
 void run_op(uint8_t op);
-void do_int(int vec, uint32_t ret_eip);
+void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec);
 // The instruction stream: the step consumes prefixes through this before the
 // opcode dispatch takes over. It also records raw bytes for the trace.
 uint8_t fetch8(void);

@@ -72,7 +72,7 @@ void x86_step(CpuState* c) {
     fr->rec.dnpc = cpu->pc;
     fr->rec.raw_len = 0;
     fr->rec.mnemonic = "intr";
-    do_int(vec, (uint32_t)cpu->pc);
+    do_int(vec, (uint32_t)cpu->pc, 0, 0);
     DebugInsn(fr);
     return;
   }
@@ -92,8 +92,9 @@ void x86_step(CpuState* c) {
 
   if (setjmp(fr->raise)) {
     // Faults re-deliver through the interrupt table at the raised vector and
-    // resume at the faulting instruction (SDM 6-3 fault semantics).
-    do_int((int)fr->trap.cause, (uint32_t)cpu->pc);
+    // resume at the faulting instruction (SDM 6-3 fault semantics); tval is
+    // the error code for vectors that push one.
+    do_int((int)fr->trap.cause, (uint32_t)cpu->pc, 0, (uint32_t)fr->trap.tval);
     DebugTrap(fr);
     return;
   }

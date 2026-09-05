@@ -3,6 +3,27 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 3 项 2：PM 异常与中断门（2026-09-05）
+
+do_int 按 CR0.PE 分臂。PM 臂：IDT 门派发全序（表限 → 软中断 DPL → 门型 →
+P，error code = vec*8|2|EXT）→ 目标 CS 检查（可执行/DPL<=CPL/P）→ 特权
+变更时 TSS SS0:ESP0 换栈（缺陷全部 #TS，支持 32/16 位 TSS 偏移）→ 压栈
+（门宽度决定 16/32 位，非操作数宽度）→ IF/TF/NT 处理（中断门清 IF）。配套：
+
+- PM IRET：同特权/外层两臂；外层返回弹 ESP/SS（SS 检查全 #GP、按新 CPL
+  校验 DPL/RPL）；IOPL/NT 仅外层或 CPL0 返回可载入；RF/VM 继续屏蔽（D14）。
+- LTR/STR（0f 00 组）+ TR 描述符缓存（tr_base/limit/ar）；sldt/lldt/
+  verr/verw 留项 5。任务门与 NT 任务返回显式 Fatal（等项 3，不装假语义）。
+- eflags 命名位补 iopl/nt/rf/vm；do_int 签名加 soft/ec（软中断才查门 DPL；
+  ec 按向量表 vec_has_ec 压栈，实模式不压）。
+- 参考格局：tiny386 call_isr/pmret（结构主 oracle）+ v86 call_interrupt_vector
+  （行为对照，kvm 驱动）+ gem5（其门派发在本版本下放微码 ROM，不可直读；
+  价值=行为裁决，复位 TR 态已记档）。自查抓到门 EIP 位段掩码 bug
+  （gate>>16 未截 16 位，会混入 type/limit 字节）。
+- 回归：riscv 127/127、x86 smoke+realmode 122/122、state 基线零漂移。
+  PM 门路径尚无验收件——下一步先搭 PM 冒烟探针（multiboot 平段 +
+  GDT/IDT/门 + 换栈往返），再进项 3（调用门/任务切换）。
+
 ## 阶段 3 开工：项 1 段机制核心（2026-09-05）
 
 保护模式语义第一片：描述符解析 + 特权/limit 检查（exec.c +218 行，回归
