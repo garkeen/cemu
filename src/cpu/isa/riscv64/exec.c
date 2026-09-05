@@ -343,17 +343,19 @@ static void fp_op(frame* fr, uint32_t i) {
       return;
     }
     case 0x60:
-    case 0x61: {  // fcvt.{w|wu|l|lu}.{s|d}: rs2 picks signed/width
+    case 0x61: {  // fcvt.{w|wu|l|lu}.{s|d}: rs2 = 0:w 1:wu 2:l 3:lu (even
+                  // = signed, odd = unsigned; bit 1 = 64-bit source). The
+                  // result is an INTEGER: write the GPR bank, not f[].
       if (rs2(i) > 3) illegal(fr, i);
-      int to_signed = rs2(i) < 2, w64 = rs2(i) & 2;
-      r = dbl ? RiscvFpF2ID(rs, a, to_signed, w64 ? 64 : 32, rm)
-              : RiscvFpF2IS(rs, a, to_signed, w64 ? 64 : 32, rm);
-      break;
+      int to_signed = (rs2(i) & 1) == 0, w64 = rs2(i) & 2;
+      x[rd(i)] = dbl ? RiscvFpF2ID(rs, a, to_signed, w64 ? 64 : 32, rm)
+                     : RiscvFpF2IS(rs, a, to_signed, w64 ? 64 : 32, rm);
+      return;
     }
     case 0x68:
-    case 0x69: {  // fcvt.{s|d}.{w|wu|l|lu}
+    case 0x69: {  // fcvt.{s|d}.{w|wu|l|lu}: same rs2 map as 0x60/0x61
       if (rs2(i) > 3) illegal(fr, i);
-      int to_signed = rs2(i) < 2, w64 = rs2(i) & 2;
+      int to_signed = (rs2(i) & 1) == 0, w64 = rs2(i) & 2;
       r = dbl ? RiscvFpI2FD(rs, x[rs1(i)], to_signed, w64 ? 64 : 32, rm)
               : RiscvFpI2FS(rs, x[rs1(i)], to_signed, w64 ? 64 : 32, rm);
       break;
@@ -368,7 +370,10 @@ static void fp_op(frame* fr, uint32_t i) {
       break;
     case 0x70: {  // fmv.x.w (f3=0) / fclass.s (f3=1)
       if (rs2(i) || f3v > 1) illegal(fr, i);
-      x[rd(i)] = f3v == 0 ? a : RiscvFpClassS(a);
+      // fmv.x.w sign-extends the low 32 bits into rd on RV64 (volume I
+      // FMV.X.S: "the upper 32 bits of the result are the sign extension of
+      // the lower 32 bits") — the NaN-boxed upper bits never escape verbatim
+      x[rd(i)] = f3v == 0 ? (uint64_t)(int64_t)(int32_t)a : RiscvFpClassS(a);
       return;
     }
     case 0x71: {  // fmv.x.d (f3=0) / fclass.d (f3=1)
@@ -968,13 +973,15 @@ uint64_t riscv_exec_c(frame* fr, uint16_t i16) {
         }
         break;
       }
-      case 5: {  // c.j
-        pc += (uint64_t)sext((((i16 >> 12) & 1) << 11) | (((i16 >> 11) & 1) << 4) |
-                                 (((i16 >> 9) & 3) << 8) | (((i16 >> 8) & 1) << 10) |
-                                 (((i16 >> 7) & 1) << 6) | (((i16 >> 6) & 1) << 7) |
-                                 (((i16 >> 3) & 7) << 1) | (((i16 >> 2) & 1) << 5),
-                             12);
-        break;
+      case 5: {  // c.j: target = pc of the instruction + offset (like the
+                 // branches below; the straight-line `pc + 2` exit must not
+                 // run — it would slide the target two bytes)
+        return pc + (uint64_t)sext(
+                          (((i16 >> 12) & 1) << 11) | (((i16 >> 11) & 1) << 4) |
+                              (((i16 >> 9) & 3) << 8) | (((i16 >> 8) & 1) << 10) |
+                              (((i16 >> 7) & 1) << 6) | (((i16 >> 6) & 1) << 7) |
+                              (((i16 >> 3) & 7) << 1) | (((i16 >> 2) & 1) << 5),
+                          12);
       }
       case 6:
       case 7: {  // c.beqz / c.bnez

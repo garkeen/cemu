@@ -3,6 +3,33 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## riscv64 浮点/RVC 修复（2026-09-05）
+
+回归基线从 114/13 → **127/127 全绿**。三个独立根因，全部在 exec.c 的译码/
+写回层，fp.c 的 IEEE 语义（E1 登记的宿主浮点）一个没碰：
+
+1. **fmv.x.w 把整个 NaN-box cell 拷进 rd**。规格（volume I FMV.X.S）：RV64
+   下结果 = 低 32 位**符号扩展**进 rd（上 32 位随位 31），测试用 `lw` 符号
+   扩展的期望值配对，正负结果都要对。第一版修复误用零扩展（负数用例反败），
+   反汇编 test_3 对照寄存器现场后纠正为符号扩展。
+2. **fcvt 符号性字段映射错**：`to_signed = rs2 < 2` 把 rs2=1 的 .wu 当有
+   符号（rs2=3 的 .lu 碰巧对）。编码语义 rs2 偶数=有符号、奇数=无符号
+   （0:w 1:wu 2:l 3:lu），修为 `(rs2 & 1) == 0`。fcvt.w.s/wu.s/l/lu 与
+   I2F 两侧同修。
+3. **fcvt→整数写回了浮点组**：case 0x60/0x61 算出整数后 `break`，掉进
+   fp_op 尾部公共写回 `f[rd] = r`——-1 写进了 f10，a0 纹丝不动。state 流
+   直接暴露（g10 不变、f10=0xffff_ffff_ffff_ffff）。修为显式 `x[rd] = ...;
+   return`，与比较类/fmv.x 类一致。E2 类教训：新增返回整数的 case 忘了
+   绕开公共浮点写回。
+4. **c.j 目标滑 2 字节**：Q1 case 5 写 `pc += imm; break`，掉进 RVC 公共
+   出口 `return pc + 2`——目标 = 指令地址 + imm + 2。三个 c.j 链（rvc.S
+   用例 30）被逐个滑进 `j fail`。修为直接 `return pc + imm`，与
+   c.beqz/c.bnez、c.jr/c.jalr 的显式 return 风格一致。
+
+方法论记录：失败用例号从 RVTEST_FAIL 的 `(gp<<1)|1` 反解（exit dump 的
+gp）；位段类 bug 用 llvm-objdump 对照 cemu trace 的 raw/dnpc 即可裁决，
+无需手解码。E1 登记项保持不变（宿主浮点的长尾风险独立于本次修复）。
+
 ## grp2 立即数移位修复（2026-09-05）
 
 - 症状：realmode 118/122，FAIL 为 DAS/lahf/movsx ah/movzx ah，疑似 AH 访问
@@ -86,12 +113,11 @@
   `& 'C:\Program Files\Git\bin\bash.exe' -c '...'`
 - 回归：`bash test/run.sh`；单独 riscv `bash test/riscv64/run.sh`、
   x86 `bash test/x86/run.sh`
-- 回归基线（2026-09-05，grp2 修复后实测）：riscv64 114 passed / 13 failed
-  （rv64uf 7 + rv64ud 5 + rv64uc-p-rvc 1，全部浮点/RVC，与简化登记 E1 相关；
-  progress 旧记录"fp 7 例钉死"与代码不符，V3 提交时未跑完回归）；x86
-  smoke PASS + realmode 122/122（grp2 C0/C1 立即数计数在 modrm 前求值的
-  bug 修复，见上文；套件尾部 fninit #UD 死循环由 D13 登记容纳，run.sh 的
-  timeout 60 判据容纳）
+- 回归基线（2026-09-05，浮点/RVC 修复后实测）：riscv64 **127 passed /
+  0 failed**（fmv.x.w 符号扩展、fcvt 符号性字段、F2I 写回组、c.j 目标基址
+  四处修复，见上文）；x86 smoke PASS + realmode 122/122（grp2 C0/C1 立即数
+  计数在 modrm 前求值的 bug 修复，见下文；套件尾部 fninit #UD 死循环由
+  D13 登记容纳，run.sh 的 timeout 60 判据容纳）
 - debug：`CEMU_DEBUG=...`（见 AGENTS.md 第十节），例
   `CEMU_DEBUG="trace:table,state,mem,budget=200" build/cemu.exe --machine x86 --isa x86 test/x86/realmode/realmode.elf`
 
