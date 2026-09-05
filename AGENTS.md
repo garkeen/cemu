@@ -223,9 +223,9 @@ CEMU_DEBUG="regs=100000" ./cemu.exe ... img 2> r.txt
 |---|---|---|---|---|---|
 | D6 | csr.c tdata1/2/3 WARL 存储无触发匹配 | debug trigger（gem5 tselect 写 val+1 报告存在 trigger） | xiangshanNEMU trigger.c | 阶段 3.5 gdb stub（仅硬件断点 hbreak/watch；软件断点不依赖） | 登记中 |
 | D7 | LR/SC 单核预留集 | 无多核冲突语义 | spike 单核同款；规格允许 SC 假失败 | 多核引入时 | 登记中 |
-| D11 | htif.c HTIF syscall（dev0/cmd0）报错退出 | 无 fesvr syscall 设备 | fesvr htif_t::handle_syscall | 阶段 3 cesdk | 登记中 |
-| D13 | x86 LMSW/INVLPG/RDTSC/CMPXCHG/CMPXCHG8B/x87 FPU 判非法 #UD | 386 子集外指令与 FPU 未实现 | intel SDM vol.2；QEMU translate.c | 阶段 4 全 x86 | 登记中。现实表现：realmode 尾 test_fninit #UD→垃圾 IVT[6]→死循环，run.sh 以 timeout+输出判据容纳 |
-| D14 | x86 iret/popf 载入屏蔽 RF(bit16)/VM(bit17) | RF 瞬态建模（真机不可观测为 1，等价）；VM86 不进入 | intel SDM EFLAGS | 阶段 4（VM86 时） | 登记中 |
+| D11 | htif.c HTIF syscall（dev0/cmd0）报错退出 | 无 fesvr syscall 设备 | fesvr htif_t::handle_syscall | 阶段 5 cesdk | 登记中 |
+| D13 | x86 LMSW/INVLPG/RDTSC/CMPXCHG/CMPXCHG8B/x87 FPU 判非法 #UD | 386 子集外指令与 FPU 未实现 | intel SDM vol.2；QEMU translate.c | 阶段 3 指令侧按需（保护模式/xv6）；x87 FPU 在 Linux 用户态（阶段 4+） | 登记中。现实表现：realmode 尾 test_fninit #UD→垃圾 IVT[6]→死循环，run.sh 以 timeout+输出判据容纳 |
+| D14 | x86 iret/popf 载入屏蔽 RF(bit16)/VM(bit17) | RF 瞬态建模（真机不可观测为 1，等价）；VM86 不进入 | intel SDM EFLAGS | DOS/BIOS 兼容路线需要 VM86 时评估（Linux 不需要） | 登记中 |
 | E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中（先加 softfloat 测试向量回归对照） |
 
 已销账（历史存档，无需再管）：D1-D5（S 态机制/sret/wfi/sfence/time 真实

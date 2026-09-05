@@ -10,9 +10,10 @@
    运行真实软件。
 2. **cesdk**：AM 式构建系统，C 源码 → 自含 .bin/.elf/.img，产物在真 QEMU 上
    可运行。
-3. 顺序：cemu 先行，cesdk 第三阶段。理由：cemu 的测试阶梯不依赖 cesdk；
-   cesdk 只能靠在 cemu 上跑输出来测；cesdk 的 API 要等真实软件跑过才有
-   设计依据。
+3. 顺序（2026-09-05 重排）：cemu 先行；x86 保护模式与分页是最后一大块
+   指令集语义，提前收掉，其后进入纯设备/IO 与真实 OS（xv6 → Linux）；
+   cesdk 放后——真实软件跑通之后其 API 才有设计依据，cemu 的测试阶梯
+   也不依赖 cesdk。
 
 ## 二、通用性靠结构
 
@@ -148,13 +149,19 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - x86 侧：PC 平台（i8259 + i8254，hlt 由 IRQ0 唤醒），realmode 全绿过。
 - M 态完整化：misa/medeleg/mideleg/PMP/Sv39（mmu.c）全落地。
 
-### 阶段 3：cesdk
-- 交付：crun 运行时（_start、putch→UART、halt→sifive_test）、klib、
-  链接脚本、构建前端（先批处理形态）。
-- 验收：hello 的 .bin 与 .elf 在 cemu 与真 QEMU 上行为一致。
-- 蓝本：AM 源码逐文件对照移植。D11（HTIF syscall）在此销账。
-- 工具链：构建前端统一 LLVM 系列（clang riscv64 交叉；riscv 客户机由
-  xpack gcc 切换，x86 侧已在用 D:/LLVM 23.1）。
+### 阶段 3：x86 保护模式与分页（2026-09-05 提前，原阶段 4 的语义核心）
+最后一大块指令集语义，收掉之后进入纯设备/IO 阶段。固件已备：x86 SeaBIOS
+（bios.bin 阶段 0 已构建）、riscv OpenSBI（fw_jump 阶段 2 已引导）。
+- 32 位保护模式：GDT/LDT/IDT 装载、描述符缓存、特权级检查
+  （CPL/RPL/DPL）、门（call/int/ret/iret、经 TSS SS0 的栈切换）、PM 异常
+  error code 语义。
+- 386 分页：两级页走（形状参照 riscv 侧 mmu.c）、CR0.PG/CR3、page fault
+  error code、A/D 位。
+- 指令增量（tiny386 主 oracle，按需销账 D13 指令侧）：LGDT/LIDT/SGDT/
+  SIDT、LLDT/LTR/STR、ARPL、LAR/LSL、VERR/VERW、MOV CR/DR、INVLPG、
+  LMSW/SMSW/CLTS、CMPXCHG/CMPXCHG8B 等。
+- 验收：kvm-unit-tests 32 位保护模式用例 + multiboot 平段内核开分页冒烟。
+- riscv 侧无新增语义（S 态/Sv39 阶段 2 已落地）。
 
 ### 阶段 3.5：调试器与 GUI（2026-09-05 立项）
 三片独立可交付，顺序可调；显示通道是阶段 4 图形 OS 的硬前置。
@@ -170,16 +177,25 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - 验收：真 gdb attach 设断点/单步/看现场；CGA 窗口点亮 realmode hello；
   图形 OS 显示前置就绪，衔接阶段 4。
 
-### 阶段 4：x86 全集
-- 32 位保护模式（GDT/描述符/特权级/门）、386 分页、PC 设备模型全集
-  （CGA、PS/2、PIC、PIT、UART、IDE、LAPIC、IOAPIC）。
+### 阶段 4：设备全集与真实 OS（此后为纯设备/IO 阶段）
+- PC 设备模型全集（CGA、PS/2、PIC、PIT、UART、IDE、LAPIC、IOAPIC）。
 - bin 路线：multiboot 等价的入口契约，xv6 去掉 bootasm.S/bootmain.c
   编为 .bin；SeaBIOS 路线：官方 bios.bin 映射内存顶端，复位 F000:FFF0
-  （bios.bin 已备料）。
-- 验收阶梯：xv6-x86 → Linux（参照 v86/tests/full 清单）。
-- D13（FPU/全集指令）、D14（VM86）在此销账。
+  （bios.bin 已备料；跑通 SeaBIOS 本体属本阶段设备集成，不前置）。
+- 验收阶梯：xv6-x86 → Linux（参照 v86/tests/full 清单）；riscv 侧
+  xv6-riscv（OpenSBI fw_jump 引导）并行验收。
+- D13 剩余（x87 FPU）在 Linux 用户态销账；D14（VM86）在 DOS/BIOS 兼容
+  路线需要时评估（Linux 不需要）。
 
-### 阶段 5：arm 与 mips
+### 阶段 5：cesdk（放后：真实 OS 跑通后再做 SDK）
+- 交付：crun 运行时（_start、putch→UART、halt→sifive_test）、klib、
+  链接脚本、构建前端（先批处理形态）。
+- 验收：hello 的 .bin 与 .elf 在 cemu 与真 QEMU 上行为一致。
+- 蓝本：AM 源码逐文件对照移植。D11（HTIF syscall）在此销账。
+- 工具链：构建前端统一 LLVM 系列（clang riscv64 交叉；riscv 客户机由
+  xpack gcc 切换，x86 侧已在用 D:/LLVM 23.1）。
+
+### 阶段 6：arm 与 mips
 先引 LLVM 做交叉（本地无解释型参考，语义来源为官方手册）。
 
 ## 七、复用映射
@@ -192,7 +208,7 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 | tiny386/i386.c + i386ins.def | x86 386 主语义 oracle | 纯 C，5250 行 |
 | v86/tests/kvm-unit-tests | x86 验收套件 | in-tree，386 级子集已入库 |
 | dearchap-tinyemu | 映射树结构、iomem is_ram、uart16550/clint/plic、htif 应答语义 | MIT 许可；x86_cpu.c 是 96 行残桩，勿用 |
-| abstract-machine | trm 模式、linker.ld、klib | 阶段 3 cesdk 的蓝本 |
+| abstract-machine | trm 模式、linker.ld、klib | 阶段 5 cesdk 的蓝本 |
 
 ## 八、测试阶梯
 
@@ -201,6 +217,8 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 1.5. x86_min：0x7C00 bin 双跑对拍（cemu vs qemu-system-i386）→
     kvm-unit-tests 386 级子集全绿。
 2. OpenSBI 起动出 banner。
-3. Linux 引导、cesdk hello。
+3. xv6 引导跑通（x86 bin 路线；riscv 侧 OpenSBI 引导并行）。
+4. Linux 引导。
+5. cesdk hello。
 
 每一级都是真实软件，无 cemu 定制成分。
