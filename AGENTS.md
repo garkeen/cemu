@@ -211,8 +211,9 @@ CEMU_DEBUG="trace:line,mem,budget=50000" ./cemu.exe ... img 2> t.txt
 CEMU_DEBUG="regs=100000" ./cemu.exe ... img 2> r.txt
 ```
 
-- 交互式调试器/REPL、反汇编器、GUI 输出明确排除（mnemonic 由译码表给出，
-  够用；单独立项再说）。
+- 交互式调试器/REPL、反汇编器、GUI 输出已立项为阶段 3.5（2026-09-05，见
+  arch.md 阶段计划：gdb RSP stub / Win32 显示通道 / LLVM 反汇编）。在
+  3.5 落地前 CEMU_DEBUG 仍是唯一调试入口（mnemonic 由译码表给出）。
 
 ## X、简化登记（原准则审查 D/E 表，2026-09-03 按代码逐条核实后仅存存活项）
 
@@ -220,7 +221,7 @@ CEMU_DEBUG="regs=100000" ./cemu.exe ... img 2> r.txt
 
 | 编号 | 位置 | 缺失 | 参考出处 | 恢复阶段 | 状态 |
 |---|---|---|---|---|---|
-| D6 | csr.c tdata1/2/3 WARL 存储无触发匹配 | debug trigger（gem5 tselect 写 val+1 报告存在 trigger） | xiangshanNEMU trigger.c | gdb stub 时 | 登记中 |
+| D6 | csr.c tdata1/2/3 WARL 存储无触发匹配 | debug trigger（gem5 tselect 写 val+1 报告存在 trigger） | xiangshanNEMU trigger.c | 阶段 3.5 gdb stub（仅硬件断点 hbreak/watch；软件断点不依赖） | 登记中 |
 | D7 | LR/SC 单核预留集 | 无多核冲突语义 | spike 单核同款；规格允许 SC 假失败 | 多核引入时 | 登记中 |
 | D11 | htif.c HTIF syscall（dev0/cmd0）报错退出 | 无 fesvr syscall 设备 | fesvr htif_t::handle_syscall | 阶段 3 cesdk | 登记中 |
 | D13 | x86 LMSW/INVLPG/RDTSC/CMPXCHG/CMPXCHG8B/x87 FPU 判非法 #UD | 386 子集外指令与 FPU 未实现 | intel SDM vol.2；QEMU translate.c | 阶段 4 全 x86 | 登记中。现实表现：realmode 尾 test_fninit #UD→垃圾 IVT[6]→死循环，run.sh 以 timeout+输出判据容纳 |

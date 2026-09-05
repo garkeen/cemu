@@ -153,6 +153,22 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   链接脚本、构建前端（先批处理形态）。
 - 验收：hello 的 .bin 与 .elf 在 cemu 与真 QEMU 上行为一致。
 - 蓝本：AM 源码逐文件对照移植。D11（HTIF syscall）在此销账。
+- 工具链：构建前端统一 LLVM 系列（clang riscv64 交叉；riscv 客户机由
+  xpack gcc 切换，x86 侧已在用 D:/LLVM 23.1）。
+
+### 阶段 3.5：调试器与 GUI（2026-09-05 立项）
+三片独立可交付，顺序可调；显示通道是阶段 4 图形 OS 的硬前置。
+- 显示通道：host/ 加 Win32 GDI 窗口与显示后端，device/ 加显示设备。
+  x86 CGA 文本模式先行（realmode 即可点亮验收），VGA 图形模式、
+  riscv ramfb 随后——阶段 4 设备清单中的 CGA 在此提前消化。
+- 调试器内核：gdb 远程串行协议（RSP）over TCP（host/ 加 winsock），
+  断点/单步/读写现场复用 raise 通道与 CEMU_DEBUG 基建。软件断点不依赖
+  D6；硬件断点（hbreak/watch → trigger 匹配语义）在此销账 D6。
+- 图形调试前端 + LLVM 反汇编：依赖前两片。反汇编走 llvm-objdump/llvm-mc
+  子进程起步，cemu 本体保持纯 C 零新依赖（LLVM C API 链接仅在确有需要
+  时评估）。
+- 验收：真 gdb attach 设断点/单步/看现场；CGA 窗口点亮 realmode hello；
+  图形 OS 显示前置就绪，衔接阶段 4。
 
 ### 阶段 4：x86 全集
 - 32 位保护模式（GDT/描述符/特权级/门）、386 分页、PC 设备模型全集
