@@ -3,6 +3,38 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 3 项 3：调用门（参数拷贝）+ 任务切换（2026-09-05）
+
+exec.c 新增 PM 门机制全链（对照 v86 far_jump/do_task_switch/call_interrupt_vector
+与 tiny386 pmcall/task_switch，SDM 裁决）：
+
+- `do_task_switch`（SDM vol.3 7.2.1 全序）：TSS 描述符检查（忙位三态——JMP 清旧
+  设新/CALL 只设新/IRET 清旧保新，P、限长 ≥0x67）；旧态保存（EIP/EFLAGS/GPR/
+  6 段选择器，段字段步距 4；IRET 保存时清 NT）；CALL 写 back-link、强制 NT；
+  TR 先于新态提交（tiny386/SDM 序）；CR3 携带、LDT 仅接受空（D16）、
+  FLAGS 全图载入、CS 以 #TS 检查提交（cpl=RPL）、GPR/数据段按普通向量载入、
+  CR0.TS 置位；异常经任务门投递时 ec 压新栈。
+- 调用门 `call_gate`（0xC/0x4）：门 DPL/P、内层 CS 检查、向内时 TSS 环栈
+  （`tss_stack`，do_int 复用）+ 门 count 字段参数拷贝（SDM CALL 伪代码序：
+  SS:ESP 最深、参数居中、CS:EIP 顶部）；JMP 过门不拷参数不换栈
+  （非 conforming 且 DPL≠CPL → #GP）。
+- `pm_far` 统一 0x9a/0xea/ff /2,3/ff /5 的 PM 分派；`pm_ret` 实现 PM
+  RETF/RETF imm——**外层返回 imm 用两次**（先在本栈跳过门参数再读
+  SS:ESP，提交后再清调用者栈参数；felixcloutier 转录的 SDM RET 伪代码
+  裁决，QEMU 行为印证）。
+- pm_iret 加 NT 嵌套任务返回（读 back-link，空 → #TS）；IRET/RETF 全部
+  peek-then-commit——`raise_` 不回滚寄存器，故障必须发生在任何提交之前。
+- 既有偏差修正：软件 `int n` 落在带 ec 向量上不再压 ec=0（SDM vol.2 INT，
+  v86 传 None）；ltr 置 TSS 忙位（SDM 7.2.3）；LDT Fatal 站点改为按站点
+  向量抛故障（D16）。
+
+探针扩到 13 项（t9 同权调用门/t10 内层门+参数拷贝+RETF 8/t11 lcall 任务
+往返/t12 ljmp 任务往返+忙 TSS #GP(0x38)/t13 int 任务门+#GP 经任务门 ec
+传递+EIP 修复）。QEMU 对拍 12/13（t7 仍是 dirty-QEMU 段限缺陷，已登记），
+x86 run.sh 3/3、riscv 127/127、depcheck ok；三套件新旧二进制 state 流
+逐字节一致。调试教训再+1：TSS 段字段步距与 RETF 双 imm 都是脑内推演失败、
+靠"QEMU 仲裁 + 内存 dump + 手册转录"定位的（九.2 再验证）。
+
 ## 阶段 3 项 1-2 验收：PM 冒烟探针 + 六处解释器修复（2026-09-05）
 
 PM 冒烟探针（test/x86/pm，multiboot ELF 入口，nasm+ld.lld 构建）在平坦

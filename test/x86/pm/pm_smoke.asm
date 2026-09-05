@@ -14,6 +14,20 @@
 ;   t7  ring-3 write beyond a small data segment -> #GP(0)
 ;   t8  ring-3 INT 0x23 whose handler rewrites the gate frame to resume in
 ;       ring 0 (same-privilege return at the rewritten CS RPL)
+;   t9  ring-0 CALL through a DPL0 call gate: return EIP/CS on the stack,
+;       ESP restored by RETF (runs 4th, right after t3)
+;   t10 ring-3 CALL through a DPL3 call gate with 2 stack params: params
+;       copied between the return address and the saved SS:ESP, handler on
+;       the TSS ring-0 stack, RETF imm drops the params (runs 8th, after t7)
+;   t11 CALL through a TSS descriptor: full state save/restore round trip,
+;       NT forced in the new task, IRET task-return through the back-link
+;   t12 JMP through a TSS descriptor (no NT, state round trip) and back;
+;       then a CALL to the busy current TSS -> #GP(TSS selector)
+;   t13 INT through an IDT task gate (NT forced), then a real #GP delivered
+;       through a task gate: the error code lands on the task's stack and
+;       the task resumes main past the faulting instruction
+; The tN numbers are report slots, not run order: t9 runs after t3 and t10
+; runs after t7 (both need the ring levels already established).
 ; Reports one "tN ok" line per test plus "pm-smoke done", then exits through
 ; the QEMU isa-debug-exit port 0xF4 with payload 5 (status = (5<<1)|1 = 11).
 ;
@@ -36,10 +50,14 @@
 %define SEL_DATA3S  0x30
 %define SEL_DATA3SR3 (SEL_DATA3S | 3)
 %define SEL_TSS     0x38
+%define SEL_GATE9   0x40    ; DPL0 call gate -> gate9_entry, 0 params
+%define SEL_GATE10  0x48    ; DPL3 call gate -> gate10_entry, 2 params
+%define SEL_TSS2    0x50    ; 32-bit TSS #2 at TSS2_LIN
 
-%define IDT_LIN    0x2100      ; gates built at runtime, 0x24 slots
+%define IDT_LIN    0x2100      ; gates built at runtime, 0x2a slots
 %define TSS_LIN    0x2400      ; TSS image: ESP0 at +4, SS0 at +8
-%define RES_LIN    0x2500      ; result bytes r1..r8 (1 = ok, RAM starts 0)
+%define TSS2_LIN   0x2600      ; second TSS image (filled at runtime)
+%define RES_LIN    0x2500      ; result bytes r1..r13 (1 = ok, RAM starts 0)
 %define OBS_LIN    0x2510      ; handler observation slots (dwords)
 %define RING0_TOP  0x4000
 %define TSS_ESP0   0x4800
@@ -99,27 +117,56 @@ _start:
   ; immediates here, and gate 13 must exist to make any #GP observable
   mov edi, IDT_LIN + 13 * 8
   mov eax, gp_handler
+  mov cx, SEL_CODE0
   mov bl, 0x8e
   call mk_gate
   mov edi, IDT_LIN + 0x20 * 8
   mov eax, int20_handler
+  mov cx, SEL_CODE0
   mov bl, 0x8e
   call mk_gate
   mov edi, IDT_LIN + 0x21 * 8
   mov eax, int21_handler
+  mov cx, SEL_CODE0
   mov bl, 0xee
   call mk_gate
   mov edi, IDT_LIN + 0x22 * 8
   mov eax, gp_handler
+  mov cx, SEL_CODE0
   mov bl, 0x8e
   call mk_gate
   mov edi, IDT_LIN + 0x23 * 8
   mov eax, int23_handler
+  mov cx, SEL_CODE0
   mov bl, 0xee
   call mk_gate
   lidt [idtdesc]
   mov ax, SEL_TSS
   ltr ax
+  ; GDT call gates (same 8-byte layout as IDT gates) and the second TSS
+  ; image, both filled at runtime.
+  mov edi, gdt + SEL_GATE9
+  mov eax, gate9_entry
+  mov cx, SEL_CODE0
+  mov bl, 0x8c                 ; present, DPL0, 32-bit call gate
+  call mk_gate
+  mov edi, gdt + SEL_GATE10
+  mov eax, gate10_entry
+  mov cx, SEL_CODE0
+  mov bl, 0xec                 ; present, DPL3, 32-bit call gate
+  mov dl, 2                    ; copy two stack parameters
+  call mk_gate
+  mov dword [TSS2_LIN + 4], TSS_ESP0
+  mov word [TSS2_LIN + 8], SEL_DATA0
+  ; the task-entry context (eip/eflags/eax are rewritten per test)
+  mov dword [TSS2_LIN + 0x38], 0x6000      ; ESP
+  mov word [TSS2_LIN + 0x48], SEL_DATA0    ; ES
+  mov word [TSS2_LIN + 0x4c], SEL_CODE0    ; CS
+  mov word [TSS2_LIN + 0x50], SEL_DATA0    ; SS
+  mov word [TSS2_LIN + 0x54], SEL_DATA0    ; DS
+  mov word [TSS2_LIN + 0x58], SEL_DATA0    ; FS
+  mov word [TSS2_LIN + 0x5c], SEL_DATA0    ; GS
+  mov word [TSS2_LIN + 0x64], 0x68         ; I/O map base (minimal TSS)
 
   ; ---- t1: write/readback through the rebuilt segment set -------------------
   mov dword [SCRATCH], 0xC0DE0001
@@ -160,6 +207,19 @@ _start:
   jne .t3_done
   mov byte [RES_LIN + 2], 1
 .t3_done:
+
+  ; ---- t9: same-privilege CALL through the DPL0 call gate 0x40 -------------
+  mov dword [OBS_LIN + 0x38], esp
+  call far [ptr_gate9]
+t9_ret:
+  cmp dword [OBS_LIN + 0x3c], t9_ret      ; the gate pushed the exact return EIP
+  jne .t9_done
+  cmp dword [OBS_LIN + 0x40], SEL_CODE0   ; and the inner CS
+  jne .t9_done
+  cmp esp, [OBS_LIN + 0x38]               ; RETF put ESP back
+  jne .t9_done
+  mov byte [RES_LIN + 8], 1
+.t9_done:
 
   ; ---- t4: IRET trampoline into ring 3 ---------------------------------------
   push dword SEL_DATA3R3        ; SS (RPL 3)
@@ -219,6 +279,30 @@ ring3_entry:
   mov byte [RES_LIN + 6], 1
 .t7_done:
 
+  ; ---- t10: ring-3 CALL through the DPL3 call gate 0x48 with 2 params ------
+  push dword 0x11110002
+  push dword 0x11110001
+  mov dword [OBS_LIN + 0x44], esp
+  call far [ptr_gate10]
+t10_ret:
+  cmp dword [OBS_LIN + 0x48], 0x11110001  ; param0 copied to the ring-0 stack
+  jne .t10_done
+  cmp dword [OBS_LIN + 0x4c], 0x11110002  ; param1 after it
+  jne .t10_done
+  mov eax, [OBS_LIN + 0x50]               ; saved old ESP == ESP at the call
+  cmp eax, [OBS_LIN + 0x44]
+  jne .t10_done
+  cmp dword [OBS_LIN + 0x54], 3           ; saved old SS RPL 3
+  jne .t10_done
+  cmp dword [OBS_LIN + 0x58], SEL_CODE0   ; handler CS committed at RPL 0
+  jne .t10_done
+  mov eax, [OBS_LIN + 0x44]               ; RETF 8: ESP loaded from the frame
+  add eax, 8                              ; then the imm dropped the params
+  cmp esp, eax
+  jne .t10_done
+  mov byte [RES_LIN + 9], 1
+.t10_done:
+
   ; ---- t8: the exit vector — its handler rewrites the gate frame to resume
   ; at ring 0, so this INT never returns here ----------------------------------
   int 0x23
@@ -256,10 +340,12 @@ print:                         ; ESI = NUL-terminated string
   pop eax
   ret
 
-mk_gate:                       ; EAX = handler, BL = attr, EDI = gate slot
+mk_gate:                       ; EAX = offset, BL = attr, DL = param count,
+                               ; CX = selector, EDI = gate slot
   mov [edi], ax                ; offset 15:0
-  mov word [edi + 2], SEL_CODE0
-  mov [edi + 5], bl            ; P DPL type (byte 4 stays zero: RAM is clear)
+  mov [edi + 2], cx            ; selector (code for int/trap/call gates)
+  mov [edi + 4], dl            ; call-gate parameter count
+  mov [edi + 5], bl            ; P DPL type
   shr eax, 16
   mov [edi + 6], ax            ; offset 31:16
   ret
@@ -322,6 +408,108 @@ int23_handler:                 ; exit: rewrite the gate frame into a ring-0
   mov dword [esp + 8], 0x2
   iretd
 
+gate9_entry:                   ; t9: record the return frame, RETF back
+  push eax
+  push ds
+  mov ax, SEL_DATA0
+  mov ds, ax
+  mov eax, [esp + 8]           ; [esp]=ds [esp+4]=saved eax [esp+8]=return EIP
+  mov dword [OBS_LIN + 0x3c], eax
+  mov eax, [esp + 12]          ; the inner CS
+  mov dword [OBS_LIN + 0x40], eax
+  pop ds
+  pop eax
+  retf
+
+gate10_entry:                  ; t10: inward gate entry — params copied, on
+  push eax                     ; the TSS ring-0 stack
+  push ds
+  mov ax, SEL_DATA0
+  mov ds, ax
+  mov eax, [esp + 16]          ; +8=ret EIP +12=CS +16=param0 +20=param1
+  mov dword [OBS_LIN + 0x48], eax
+  mov eax, [esp + 20]
+  mov dword [OBS_LIN + 0x4c], eax
+  mov eax, [esp + 24]          ; +24=saved old ESP, +28=saved old SS
+  mov dword [OBS_LIN + 0x50], eax
+  mov eax, [esp + 28]
+  and eax, 3
+  mov dword [OBS_LIN + 0x54], eax
+  mov ax, cs                   ; the handler's CS register: RPL forced 0
+  mov dword [OBS_LIN + 0x58], eax
+  pop ds
+  pop eax
+  retf 8                       ; outward: frame SS:ESP loaded, then ESP += 8
+
+task2_entry:                   ; t11: the TSS2 task body
+  push eax
+  push ds
+  mov ax, SEL_DATA0
+  mov ds, ax
+  mov edx, [esp + 4]           ; the saved EAX (the TSS2 image value)
+  mov dword [OBS_LIN + 0x5c], edx
+  pushfd
+  pop eax
+  and eax, 0x4000              ; NT forced by the CALL switch
+  mov dword [OBS_LIN + 0x60], eax
+  mov eax, cs
+  and eax, 3
+  mov dword [OBS_LIN + 0x64], eax
+  pop ds
+  pop eax
+  iretd                        ; NT=1: nested-task return to main
+
+task3_entry:                   ; t12: the JMP-switched task body
+  push eax
+  push ds
+  mov ax, SEL_DATA0
+  mov ds, ax
+  pushfd
+  pop eax
+  and eax, 0x4000
+  mov dword [OBS_LIN + 0x6c], eax
+  pop ds
+  pop eax
+  jmp far [ptr_maintss]        ; JMP back: main's TSS is available again
+
+task4_entry:                   ; t13a: arrived through the IDT task gate
+  push eax
+  push ds
+  mov ax, SEL_DATA0
+  mov ds, ax
+  pushfd
+  pop eax
+  and eax, 0x4000
+  mov dword [OBS_LIN + 0x74], eax
+  pop ds
+  pop eax
+  iretd                        ; NT=1: nested-task return
+
+task4_ec:                      ; t13b: a real #GP through the task gate: the
+  push eax                     ; error code sits on this task's stack; fix
+  push ds                      ; main's saved EIP past the faulting MOV and
+  mov ax, SEL_DATA0            ; return
+  mov ds, ax
+  mov eax, [esp + 8]           ; [esp]=ds, [esp+4]=eax, [esp+8]=error code
+  mov dword [OBS_LIN + 0x78], eax
+  add dword [TSS_LIN + 0x20], 2   ; skip the 2-byte faulting MOV es,ax
+  pop ds
+  pop eax
+  iretd
+
+busy_handler:                  ; t12b: #GP from the busy-TSS CALL — record
+  push eax                     ; the error code, skip the 6-byte far call
+  push ds
+  mov ax, SEL_DATA0
+  mov ds, ax
+  mov eax, [esp + 8]           ; [esp]=ds, [esp+4]=eax, [esp+8]=error code
+  mov dword [OBS_LIN + 0x70], eax
+  pop ds
+  pop eax
+  add esp, 4
+  add dword [esp], 6
+  iretd
+
 resume0:
   mov eax, cs
   and eax, 3
@@ -331,13 +519,98 @@ resume0:
   mov ax, SEL_DATA0
   mov ds, ax
 
+  ; ---- t11: CALL through the TSS2 descriptor -> task switch round trip -----
+  mov dword [TSS2_LIN + 0x20], task2_entry
+  mov dword [TSS2_LIN + 0x24], 0x2
+  mov dword [TSS2_LIN + 0x28], 0x22220001  ; the task's EAX comes from here
+  mov eax, 0xAAAA0001
+  mov ebx, 0xAAAA0002
+  mov dword [OBS_LIN + 0x68], esp
+  call far [ptr_tss2]
+t11_ret:
+  cmp eax, 0xAAAA0001              ; the task return restored main's GPRs
+  jne .t11_done
+  cmp ebx, 0xAAAA0002
+  jne .t11_done
+  cmp esp, [OBS_LIN + 0x68]        ; and its ESP
+  jne .t11_done
+  cmp dword [OBS_LIN + 0x5c], 0x22220001   ; task2 saw the TSS2 image EAX
+  jne .t11_done
+  cmp dword [OBS_LIN + 0x60], 0x4000       ; the CALL switch forced NT
+  jne .t11_done
+  cmp dword [OBS_LIN + 0x64], 0            ; task2 CS RPL 0
+  jne .t11_done
+  mov byte [RES_LIN + 10], 1
+.t11_done:
+
+  ; ---- t12: JMP through the TSS2 (no NT, state round trip) and back, then
+  ; a CALL to the busy current TSS -> #GP(TSS selector) through gate 0x26 ----
+  mov dword [TSS2_LIN + 0x20], task3_entry
+  mov dword [TSS2_LIN + 0x24], 0x2
+  jmp far [ptr_tss2]
+t12_ret:
+  cmp dword [OBS_LIN + 0x6c], 0    ; the JMP switch left NT clear
+  jne t12_done
+  ; the busy-TSS #GP comes in on vector 13 — repoint it at a handler that
+  ; skips the 6-byte far call, then touch the current task's own TSS
+  mov edi, IDT_LIN + 13 * 8
+  mov eax, busy_handler
+  mov cx, SEL_CODE0
+  mov bl, 0x8e
+  call mk_gate
+  call far [ptr_maintss]           ; the current task's TSS is busy
+t12b_ret:
+  cmp dword [OBS_LIN + 0x70], SEL_TSS
+  jne t12_done
+  mov byte [RES_LIN + 11], 1
+t12_done:
+
+  ; ---- t13: INT through the IDT task gate 0x25, then a real #GP delivered
+  ; through a task gate at vector 13 -----------------------------------------
+  mov dword [TSS2_LIN + 0x20], task4_entry
+  mov dword [TSS2_LIN + 0x24], 0x2
+  mov edi, IDT_LIN + 0x25 * 8
+  mov eax, 0                       ; task gates carry no offset
+  mov cx, SEL_TSS2
+  mov bl, 0x85                     ; present, DPL0, task gate
+  call mk_gate
+  int 0x25
+t13a_ret:
+  cmp dword [OBS_LIN + 0x74], 0x4000   ; the INT switch forced NT
+  jne t13_done
+  mov dword [TSS2_LIN + 0x20], task4_ec
+  mov edi, IDT_LIN + 13 * 8
+  mov eax, 0
+  mov cx, SEL_TSS2
+  mov bl, 0x85
+  call mk_gate
+  mov ax, 0x1234
+  mov es, ax                       ; #GP(0x1234) -> task gate -> task4_ec
+t13_ret:
+  cmp dword [OBS_LIN + 0x78], 0x1234   ; the error code reached the task stack
+  jne t13_done
+  mov byte [RES_LIN + 12], 1
+t13_done:
+
   ; ---- report ---------------------------------------------------------------------
   xor ebx, ebx
 .loop:
   mov al, 't'
   call putc
-  mov al, bl
-  add al, '1'
+  mov eax, ebx
+  inc eax                       ; 1-based test number, two digits for 10+
+  cmp eax, 10
+  jl .single
+  push eax
+  mov al, '1'
+  call putc
+  pop eax
+  sub al, 10
+  add al, '0'
+  jmp .digit
+.single:
+  add al, '0'
+.digit:
   call putc
   mov esi, RES_LIN
   add esi, ebx
@@ -351,7 +624,7 @@ resume0:
 .emit:
   call print
   inc ebx
-  cmp ebx, 8
+  cmp ebx, 13
   jl .loop
   mov esi, msg_done
   call print
@@ -375,6 +648,9 @@ gdt:
   dq 0x0040f200000001ff        ; 30: data, base 0, limit 0x1ff, DPL3
   dq 0x0000890024000067        ; 38: 32-bit TSS at TSS_LIN, limit 0x67
                                ; (bytes: 67 00 | 00 24 | 00 | 89 | 00 | 00)
+  dq 0                         ; 40: DPL0 call gate, built at runtime
+  dq 0                         ; 48: DPL3 call gate, count 2, built at runtime
+  dq 0x0000890026000067        ; 50: 32-bit TSS #2 at TSS2_LIN, limit 0x67
 gdt_end:
 
 gdtdesc:
@@ -382,9 +658,19 @@ gdtdesc:
   dd gdt
 
 idtdesc:
-  dw 0x11f                     ; 0x24 gate slots
+  dw 0x14f                     ; 0x2a gate slots (through the 0x25 task gate)
   dd IDT_LIN
 
 msg_ok:   db " ok", 10, 0
 msg_bad:  db " BAD", 10, 0
 msg_done: db "pm-smoke done", 10, 0
+
+; far-call/far-jmp memory operands (offset then selector, m16:32)
+ptr_gate9:   dd gate9_entry
+             dw SEL_GATE9
+ptr_gate10:  dd 0
+             dw SEL_GATE10
+ptr_tss2:    dd 0
+             dw SEL_TSS2
+ptr_maintss: dd 0
+             dw SEL_TSS

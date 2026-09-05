@@ -11,7 +11,7 @@ fail=0
 
 # Smoke: boot sector prints "cemu-x86-smoke" on COM1 (the QEMU dual-run golden
 # output) and exits via debug-exit with value 5 -> status 11.
-out=$("$CEMU" --machine x86 --isa x86 "$dir/smoke/x86_smoke.bin" 2>&1)
+out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$dir/smoke/x86_smoke.bin" 2>&1)
 rc=$?
 if [ "$rc" -eq 11 ] && echo "$out" | grep -q cemu-x86-smoke; then
   pass=$((pass + 1))
@@ -23,16 +23,20 @@ fi
 # PM: the protected-mode smoke probe (test/x86/pm). Multiboot ELF enters flat
 # PM, rebuilds GDT/IDT/TSS, and walks the stage-3 gate semantics: descriptor
 # loads, limit #GP, same-priv and cross-ring gate delivery with TSS stack
-# switch, gate-DPL violation #GP(ec=vec*8|2), IRET privilege round-trips.
-# Self-reports 8 "tN ok" lines then "pm-smoke done", exits status 11.
+# switch, gate-DPL violation #GP(ec=vec*8|2), IRET privilege round-trips,
+# call gates (same-priv, inward with stack-parameter copy), far RETF with the
+# SDM double-imm outer return, task switching (lcall/ljmp through a TSS,
+# state save/restore round trip, busy-bit #GP, IRET nested-task return,
+# IDT task gates incl. error-code delivery).
+# Self-reports 13 "tN ok" lines then "pm-smoke done", exits status 11.
 #
-# Calibration: byte-identical to qemu-system-i386 -kernel on 7 of 8 tests.
+# Calibration: byte-identical to qemu-system-i386 -kernel on 12 of 13 tests.
 # The one divergence, t7 (ring-3 store beyond a data-segment limit), is a
 # deficiency of the local arbiter build: this qemu (10.2.92,
 # v11.0.0-rc2-12119-gaa7f0eb8d8-dirty) loads the descriptor (LSL confirms
 # limit 0x1ff) yet lets the store land without #GP. SDM vol.3 5.2.1 mandates
 # the check, so cemu faults and the judge below counts on cemu's output.
-expected_pm=8
+expected_pm=13
 out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$dir/pm/pm_smoke.elf" 2>&1)
 rc=$?
 n_ok=$(echo "$out" | grep -c ' ok$')

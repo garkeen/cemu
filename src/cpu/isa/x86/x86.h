@@ -9,9 +9,9 @@
 // instruction, operand names are the manual's names (r/m8, reg8, imm8...),
 // and the width lives in the function-name suffix. Scope: real mode plus
 // protected mode through segment protection (SDM vol.3 5.3: descriptor
-// parse, CPL/RPL/DPL and limit checks); interrupt gates, task switching and
-// paging are not in yet. The descriptor cache surviving CR0.PE=0 IS big
-// real mode.
+// parse, CPL/RPL/DPL and limit checks), the gate machinery (interrupt/trap/
+// call/task gates, SDM vol.3 6-7) and task switching; paging is not in yet.
+// The descriptor cache surviving CR0.PE=0 IS big real mode.
 
 // Register cells follow the modrm reg/rm encoding order (SDM table 3-1).
 enum { eax_i, ecx_i, edx_i, ebx_i, esp_i, ebp_i, esi_i, edi_i };
@@ -63,6 +63,8 @@ typedef struct x86_state {
   uint8_t dbit[6];   // D/B flag: default operand size is 4 when set
   eflags fl;
   uint32_t cr0;
+  uint32_t cr3;       // page-table base: carried by task switches (TSS +1c);
+                      // paging itself is stage-3 item 4
   uint64_t gdtr;
   uint16_t gdtr_limit;
   uint64_t idtr;
