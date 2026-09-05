@@ -508,8 +508,11 @@ static void grp1(int size, int imm_form) {
 
 // ---- GRP2 shifts/rotates (SDM c0/c1/d0..d3): reg field picks the op ---------
 
+// The modrm byte is decoded by the caller before this runs — the C0/C1 count
+// immediate follows the modrm byte in the encoding, so the caller must fetch
+// it after modrm() (tiny386 loads the count through an accessor resolved the
+// same way).
 static void grp2(int size, uint32_t cnt) {
-  modrm();  // the r/m operand: reg field selects the shift (table 2-2)
   cnt &= 31;
   uint32_t v, r;
   if (size == 1) {
@@ -2230,10 +2233,12 @@ void run_op(uint8_t op) {
       else
         s->r[op & 7].x = imm16();
       break;
-    case 0xc0:
+    case 0xc0:  // grp2 EbIb: modrm byte, then the count immediate
+      modrm();
       grp2(1, imm8());
       break;
     case 0xc1:
+      modrm();
       grp2(d.w32 ? 4 : 2, imm8());
       break;
     case 0xc2: {  // ret imm16
@@ -2352,15 +2357,19 @@ void run_op(uint8_t op) {
       break;
     }
     case 0xd0:
+      modrm();
       grp2(1, 1);
       break;
     case 0xd1:
+      modrm();
       grp2(d.w32 ? 4 : 2, 1);
       break;
     case 0xd2:
+      modrm();
       grp2(1, cl);
       break;
     case 0xd3:
+      modrm();
       grp2(d.w32 ? 4 : 2, cl);
       break;
     case 0xd4: {  // aam imm8: AH = AL/base, AL = AL%base (base 0 -> #DE)
