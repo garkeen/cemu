@@ -5,19 +5,20 @@
 
 #include "cpu/cpu.h"
 
-// The 386 real-mode interpreter, written to read like the manual: each case
-// is one instruction, operand names are the manual's names (r/m8, reg8,
-// imm8...), and the width lives in the function-name suffix. Scope: real
-// mode plus the protected-mode entry the multiboot contract needs (flat
-// segments, CR0.PE, no paging, no privilege checks). Segment limits are not
-// enforced — the descriptor cache surviving CR0.PE=0 IS big real mode.
+// The x86 interpreter, written to read like the manual: each case is one
+// instruction, operand names are the manual's names (r/m8, reg8, imm8...),
+// and the width lives in the function-name suffix. Scope: real mode plus
+// protected mode through segment protection (SDM vol.3 5.3: descriptor
+// parse, CPL/RPL/DPL and limit checks); interrupt gates, task switching and
+// paging are not in yet. The descriptor cache surviving CR0.PE=0 IS big
+// real mode.
 
 // Register cells follow the modrm reg/rm encoding order (SDM table 3-1).
 enum { eax_i, ecx_i, edx_i, ebx_i, esp_i, ebp_i, esi_i, edi_i };
 // Segment indices follow the sreg 3-bit encoding order.
 enum { es_i, cs_i, ss_i, ds_i, fs_i, gs_i };
-// Exception vectors (SDM real-address-mode exceptions).
-enum { vec_de = 0, vec_ud = 6 };
+// Exception vectors (SDM vol.3 table 6-1).
+enum { vec_de = 0, vec_ud = 6, vec_np = 11, vec_ss = 12, vec_gp = 13 };
 
 // One general-purpose bank cell, named exactly the way the architecture
 // names its parts: a 32-bit register, whose low half is the 16-bit one,
@@ -53,6 +54,8 @@ typedef struct x86_state {
   cell* r;           // the shared CpuState bank, seen as eight cells
   uint16_t sreg[6];  // visible selector values
   uint64_t base[6];  // descriptor-cache segment bases
+  uint32_t limit[6]; // descriptor-cache effective limits (G already expanded)
+  uint8_t ar[6];     // descriptor-cache access rights: P DPL S Type
   uint8_t dbit[6];   // D/B flag: default operand size is 4 when set
   eflags fl;
   uint32_t cr0;

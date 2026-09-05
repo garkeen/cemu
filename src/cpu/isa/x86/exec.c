@@ -4,9 +4,10 @@
 // the flags, rm8/reg8/imm8 for the operands; the width lives in the name
 // (rd8, rm16, push32) — never in a parameter. C operators do the arithmetic;
 // helpers exist only for what C has no operator for (flags, stack, segments,
-// interrupt dispatch). Scope: the 386 real-mode set plus the flat protected
-// mode the multiboot contract enters (SDM); segment limits are not enforced
-// — the descriptor cache surviving CR0.PE=0 IS big real mode.
+// interrupt dispatch). Scope: the 386 real-mode set plus protected mode
+// through segment protection (SDM vol.3 5.3) — gates, task switching and
+// paging are not in yet; the descriptor cache surviving CR0.PE=0 IS big real
+// mode.
 //
 // The step protocol around these switches (INTR sampling, prefix consumption,
 // the single commit) lives in step.c.
@@ -62,6 +63,35 @@ static uint32_t rd32(uint64_t lin) { return (uint32_t)bus_load(lin, 4); }
 static void wr8(uint64_t lin, uint8_t v) { bus_store(lin, 1, v); }
 static void wr16(uint64_t lin, uint16_t v) { bus_store(lin, 2, v); }
 static void wr32(uint64_t lin, uint32_t v) { bus_store(lin, 4, v); }
+
+// ---- protection faults (SDM vol.3 5.3 / vol.2 exception pages) ---------------
+
+// Segment-protection faults carry an error code: the selector (index+TI,
+// RPL cleared) when a descriptor is the problem, 0 for a null selector or a
+// limit break on a usable segment (SDM vol.3 5.3).
+_Noreturn static void gp_fault(uint32_t code) { raise_(fr, vec_gp, code); }
+_Noreturn static void ss_fault(uint32_t code) { raise_(fr, vec_ss, code); }
+_Noreturn static void np_fault(uint32_t code) { raise_(fr, vec_np, code); }
+
+// The per-access segment checks, protected mode only (SDM vol.3 5.3): the
+// segment must be usable (a null selector loads into DS/ES/FS/GS fine and
+// faults on use), the access type must fit (writes go through writable data
+// segments only; execute-only code is unreadable), and the offset must lie
+// inside the limit — expand-up below the limit, expand-down data above it.
+// A B=0 segment bounds offsets at 64K however big the expanded limit is.
+static void seg_use(int seg, uint32_t off, int size, int write) {
+  if (!(s->cr0 & 1)) return;
+  uint8_t ar = s->ar[seg];
+  if (ar == 0) gp_fault(0);
+  if (write ? (ar & 0x1a) != 0x12 : (ar & 0x1a) == 0x18) gp_fault(0);
+  if ((ar & 0x1c) == 0x04) {  // expand-down data: S=1, E=0, DC=1
+    uint32_t upper = s->dbit[seg] ? 0xffffffffu : 0xffffu;
+    if (off <= s->limit[seg] || (uint64_t)off + size - 1 > upper) gp_fault(0);
+  } else {
+    if (off > s->limit[seg] || (uint64_t)off + size - 1 > s->limit[seg]) gp_fault(0);
+    if (!s->dbit[seg] && off > 0xffff) gp_fault(0);
+  }
+}
 
 // ---- flag rules (SDM "Flags Affected": one helper per family) ----------------
 
@@ -125,6 +155,9 @@ dec g;
 
 // The instruction stream. fetch8 also records raw bytes for the trace.
 uint8_t fetch8(void) {
+  uint32_t off = (uint32_t)(eip + d.nxt);
+  // CS limit (SDM vol.3 5.3): every fetched byte lies inside the segment.
+  if ((s->cr0 & 1) && off > s->limit[cs_i]) gp_fault(0);
   uint8_t v = rd8(s->base[cs_i] + eip + d.nxt);
   if (fr->rec.raw_len < sizeof(fr->rec.raw)) fr->rec.raw[fr->rec.raw_len++] = v;
   d.nxt++;
@@ -221,29 +254,51 @@ static uint32_t reg32(void) { return s->r[d.reg].e; }
 static void set_reg32(uint32_t v) { s->r[d.reg].e = v; }
 
 static uint8_t rm8(void) {
-  return d.is_mem ? rd8(d.mlin) : (d.rm < 4 ? s->r[d.rm].l : s->r[d.rm - 4].h);
+  if (d.is_mem) {
+    seg_use(d.mseg, d.moff, 1, 0);
+    return rd8(d.mlin);
+  }
+  return d.rm < 4 ? s->r[d.rm].l : s->r[d.rm - 4].h;
 }
 static void set_rm8(uint8_t v) {
-  if (d.is_mem)
+  if (d.is_mem) {
+    seg_use(d.mseg, d.moff, 1, 1);
     wr8(d.mlin, v);
-  else if (d.rm < 4)
+  } else if (d.rm < 4) {
     s->r[d.rm].l = v;
-  else
+  } else {
     s->r[d.rm - 4].h = v;
+  }
 }
-static uint16_t rm16(void) { return d.is_mem ? rd16(d.mlin) : s->r[d.rm].x; }
+static uint16_t rm16(void) {
+  if (d.is_mem) {
+    seg_use(d.mseg, d.moff, 2, 0);
+    return rd16(d.mlin);
+  }
+  return s->r[d.rm].x;
+}
 static void set_rm16(uint16_t v) {
-  if (d.is_mem)
+  if (d.is_mem) {
+    seg_use(d.mseg, d.moff, 2, 1);
     wr16(d.mlin, v);
-  else
+  } else {
     s->r[d.rm].x = v;
+  }
 }
-static uint32_t rm32(void) { return d.is_mem ? rd32(d.mlin) : s->r[d.rm].e; }
+static uint32_t rm32(void) {
+  if (d.is_mem) {
+    seg_use(d.mseg, d.moff, 4, 0);
+    return rd32(d.mlin);
+  }
+  return s->r[d.rm].e;
+}
 static void set_rm32(uint32_t v) {
-  if (d.is_mem)
+  if (d.is_mem) {
+    seg_use(d.mseg, d.moff, 4, 1);
     wr32(d.mlin, v);
-  else
+  } else {
     s->r[d.rm].e = v;
+  }
 }
 
 // The 8/16/32 rm access at the size the case wants, in one name each arm.
@@ -256,54 +311,168 @@ static void set_rm32(uint32_t v) {
 
 // ---- the stack (SDM PUSH/POP; SP wraps at 64K in 16-bit stacks) -------------
 
-static void push16(uint16_t v) {
-  sp -= 2;
-  wr16(s->base[ss_i] + sp, v);
-}
-static uint16_t pop16(void) {
-  uint16_t v = rd16(s->base[ss_i] + sp);
-  sp += 2;
-  return v;
-}
-static void push32(uint32_t v) {
-  esp -= 4;
-  wr32(s->base[ss_i] + esp, v);
-}
-static uint32_t pop32(void) {
-  uint32_t v = rd32(s->base[ss_i] + esp);
-  esp += 4;
-  return v;
-}
-// The operand-size polymorphic pair: `w32` picks the arm.
-static void push_w(uint32_t v) {
-  if (d.w32)
-    push32(v);
+// ---- the stack (SDM PUSH/POP) -------------------------------------------------
+// The stack's address size follows SS.B (SDM vol.3 3.4.5), not the operand
+// prefix: a B=0 stack wraps SP at 64K and keeps ESP's high bits; d.w32 only
+// picks the pushed width.
+
+static void stack_push(int size, uint32_t v) {
+  // A B=0 stack decrements and addresses through SP only: the memory offset
+  // stays under 64K while ESP's high bits ride along untouched (SDM vol.3
+  // 3.4.5; pinned by kvm realmode's push_pop_high_esp_bits).
+  uint32_t sp16 = (uint16_t)(esp - size);
+  uint32_t off = s->dbit[ss_i] ? esp - (uint32_t)size : sp16;
+  seg_use(ss_i, off, size, 1);
+  if (size == 4)
+    wr32(s->base[ss_i] + off, v);
   else
-    push16((uint16_t)v);
+    wr16(s->base[ss_i] + off, (uint16_t)v);
+  esp = s->dbit[ss_i] ? off : (esp & 0xffff0000u) | sp16;
 }
-static uint32_t pop_w(void) { return d.w32 ? pop32() : pop16(); }
+static uint32_t stack_pop(int size) {
+  uint32_t off = s->dbit[ss_i] ? esp : (uint16_t)esp;
+  seg_use(ss_i, off, size, 0);
+  uint32_t v = size == 4 ? rd32(s->base[ss_i] + off) : rd16(s->base[ss_i] + off);
+  esp = s->dbit[ss_i] ? esp + (uint32_t)size
+                      : (esp & 0xffff0000u) | (uint16_t)(esp + size);
+  return v;
+}
+static void push16(uint16_t v) { stack_push(2, v); }
+static void push32(uint32_t v) { stack_push(4, v); }
+static uint16_t pop16(void) { return (uint16_t)stack_pop(2); }
+static uint32_t pop32(void) { return stack_pop(4); }
+// The operand-size polymorphic pair: `w32` picks the width.
+static void push_w(uint32_t v) { stack_push(d.w32 ? 4 : 2, v); }
+static uint32_t pop_w(void) { return stack_pop(d.w32 ? 4 : 2); }
 
 // ---- segments and interrupts --------------------------------------------------
 
-// Translation always uses the descriptor cache: protected-mode loads walk
-// the GDT, real-mode loads set sel<<4. The cache SURVIVES CR0.PE=0 — that
+// The descriptor cache view (SDM vol.3 3.4.5): what a segment-register load
+// commits — base, effective limit (G already expanded), the access-rights
+// byte (P DPL S Type) and the D/B flag. The cache SURVIVES CR0.PE=0 — that
 // survival is big real mode (the kvm-unit-tests harness relies on it).
-static void load_seg(int seg, uint16_t sel) {
-  s->sreg[seg] = sel;
+typedef struct seg_view {
+  uint64_t base;
+  uint32_t limit;
+  uint8_t ar;
+  uint8_t dbit;
+} seg_view;
+
+// Real mode synthesizes sel<<4 with a 64K limit (SDM vol.3 3.4.4); protected
+// mode parses the table entry. No checks here — the loaders validate before
+// committing, in the SDM vol.3 5.3 pseudocode order (the checks live in the
+// SDM, not in tiny386, whose limit/type checks are partial).
+static void desc_parse(uint16_t sel, seg_view* v) {
   if (!(s->cr0 & 1)) {
-    s->base[seg] = (uint64_t)sel << 4;
-    s->dbit[seg] = 0;
+    v->base = (uint64_t)sel << 4;
+    v->limit = 0xffff;
+    v->ar = 0x93;  // present, DPL0, data, read-write
+    v->dbit = 0;
     return;
   }
   if (sel & 4) Fatal("x86: LDT selectors not implemented");
-  uint64_t desc = BusRead(cpu->bus, s->gdtr + ((sel >> 3) & 0x1fff) * 8, 8);
-  s->base[seg] = ((desc >> 16) & 0xffffff) | (((desc >> 56) & 0xff) << 24);
-  s->dbit[seg] = (uint8_t)((desc >> 54) & 1);
+  uint64_t desc = BusRead(cpu->bus, s->gdtr + (uint64_t)(sel >> 3) * 8, 8);
+  v->base = ((desc >> 16) & 0xffffff) | (((desc >> 56) & 0xff) << 24);
+  uint32_t lim = (uint32_t)(desc & 0xffff) | (uint32_t)((desc >> 32) & 0xf0000);
+  v->limit = (desc >> 55) & 1 ? (lim << 12) | 0xfff : lim;
+  v->ar = (uint8_t)(desc >> 40);  // type/DPL/S/P: descriptor bytes 5:4 hi
+  v->dbit = (uint8_t)((desc >> 54) & 1);
+}
+
+// Commits a validated load: fills the cache and marks the descriptor
+// accessed (SDM vol.3 5.3: the CPU sets the A bit when a segment register
+// is loaded from it).
+static void seg_commit(int seg, uint16_t sel, const seg_view* v) {
+  s->sreg[seg] = sel;
+  s->base[seg] = v->base;
+  s->limit[seg] = v->limit;
+  s->ar[seg] = v->ar;
+  s->dbit[seg] = v->dbit;
+  if ((s->cr0 & 1) && (sel & 0xfffc) && !(v->ar & 1))
+    BusWrite(cpu->bus, s->gdtr + (uint64_t)(sel >> 3) * 8 + 5, 1, (uint8_t)((v->ar & 0x0f) | 1));
+}
+
+// CPL is the CS descriptor's DPL (SDM vol.1 3.4.5); the cache is the source.
+static int cpl(void) { return (s->ar[cs_i] >> 5) & 3; }
+
+// DS/ES/FS/GS (SDM vol.2 MOV to Sreg Operation): a null selector loads and
+// marks the segment unusable; otherwise the descriptor must be data or
+// readable code, DPL >= CPL and DPL >= RPL, and present — faults in that
+// order.
+static void load_data(int seg, uint16_t sel) {
+  seg_view v;
+  if (!(s->cr0 & 1)) {
+    desc_parse(sel, &v);
+    seg_commit(seg, sel, &v);
+    return;
+  }
+  if ((sel & 0xfffc) == 0) {  // null: legal for data, unusable until reloaded
+    seg_view z = {0, 0, 0, 0};
+    seg_commit(seg, sel, &z);
+    return;
+  }
+  if (sel & 4) Fatal("x86: LDT selectors not implemented");
+  if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(sel & ~3u);
+  desc_parse(sel, &v);
+  if (!(v.ar & 0x10) || ((v.ar & 0x08) && !(v.ar & 2)))
+    gp_fault(sel & ~3u);  // system and execute-only descriptors don't load
+  if (((v.ar >> 5) & 3) < cpl() || ((v.ar >> 5) & 3) < (sel & 3))
+    gp_fault(sel & ~3u);
+  if (!(v.ar & 0x80)) np_fault(sel & ~3u);
+  seg_commit(seg, sel, &v);
+}
+
+// SS (SDM vol.2 MOV to Sreg / POP SS): writable data only, exactly at CPL
+// (DPL == CPL and RPL == CPL). Table-limit, type and present faults are
+// #SS; the privilege faults are #GP.
+static void load_ss(uint16_t sel) {
+  seg_view v;
+  if (!(s->cr0 & 1)) {
+    desc_parse(sel, &v);
+    seg_commit(ss_i, sel, &v);
+    return;
+  }
+  if ((sel & 0xfffc) == 0) gp_fault(0);
+  if (sel & 4) Fatal("x86: LDT selectors not implemented");
+  if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) ss_fault(sel & ~3u);
+  desc_parse(sel, &v);
+  if ((v.ar & 0x1a) != 0x12) ss_fault(sel & ~3u);  // writable data: S=1 E=0 W=1
+  if (((v.ar >> 5) & 3) != cpl() || (sel & 3) != cpl()) gp_fault(sel & ~3u);
+  if (!(v.ar & 0x80)) ss_fault(sel & ~3u);
+  seg_commit(ss_i, sel, &v);
+}
+
+// CS on a direct far JMP/CALL/RET/IRET (SDM vol.2 LJMP Operation): a code
+// segment, conforming (DPL <= CPL) or not (DPL == CPL, RPL <= CPL). CPL
+// follows a non-conforming load and is kept by a conforming one. Gate
+// descriptors route through the interrupt machinery, which is not in yet —
+// they raise #GP until then.
+static void load_cs(uint16_t sel) {
+  seg_view v;
+  if (!(s->cr0 & 1)) {
+    desc_parse(sel, &v);
+    seg_commit(cs_i, sel, &v);
+    return;
+  }
+  if ((sel & 0xfffc) == 0) gp_fault(0);
+  if (sel & 4) Fatal("x86: LDT selectors not implemented");
+  if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(sel & ~3u);
+  desc_parse(sel, &v);
+  if ((v.ar & 0x18) != 0x18) gp_fault(sel & ~3u);  // code: S=1, E=1
+  int conf = v.ar & 4;
+  if (conf ? ((v.ar >> 5) & 3) > cpl()
+           : ((v.ar >> 5) & 3) != cpl() || (sel & 3) > cpl())
+    gp_fault(sel & ~3u);
+  if (!(v.ar & 0x80)) np_fault(sel & ~3u);
+  if (conf) v.ar = (uint8_t)((v.ar & ~0x60u) | (cpl() << 5));
+  seg_commit(cs_i, sel, &v);
 }
 
 // Delivers a vector through the IVT (IDTR base): read the entry, push
 // flags/CS/return-IP, clear IF/TF, load CS:IP. Traps (software INT) push the
-// next instruction, faults (#DE/#UD) push the faulting one (SDM 6-3).
+// next instruction, faults push the faulting one (SDM 6-3). Protected mode
+// routes the same delivery through IDT gates instead — not in yet, so this
+// stays the real-mode form and CS fills its cache unchecked.
 void do_int(int vec, uint32_t ret_eip) {
   uint64_t tbl = s->idtr + (uint64_t)vec * 4;
   uint32_t off = rd16(tbl);
@@ -313,7 +482,9 @@ void do_int(int vec, uint32_t ret_eip) {
   push16((uint16_t)ret_eip);
   fl->if_ = 0;
   fl->tf = 0;
-  load_seg(cs_i, (uint16_t)seg);
+  seg_view v;
+  desc_parse((uint16_t)seg, &v);
+  seg_commit(cs_i, (uint16_t)seg, &v);
   eip = off;
 }
 
@@ -783,7 +954,13 @@ static void string_op(uint8_t op) {
   int step = fl->df ? -size : size;
   uint32_t sio = d.a32 ? esi : (uint32_t)si;
   uint32_t dio = d.a32 ? edi : (uint32_t)di;
-  uint64_t slin = s->base[d.seg >= 0 ? d.seg : ds_i] + sio;
+  int sseg = d.seg >= 0 ? d.seg : ds_i;
+  // One check per direction, once per iteration (SDM vol.3 5.3): MOVS/CMPS/
+  // LODS read DS:SI; MOVS/STOS write ES:DI; CMPS/SCAS read ES:DI.
+  if (str_uses_si(op)) seg_use(sseg, sio, size, 0);
+  if (str_uses_di(op))
+    seg_use(es_i, dio, size, op == 0xa4 || op == 0xa5 || op == 0xaa || op == 0xab);
+  uint64_t slin = s->base[sseg] + sio;
   uint64_t dlin = s->base[es_i] + dio;
   switch (op) {
     case 0xa4:
@@ -977,7 +1154,7 @@ static void run_op2(uint8_t op2) {
           }
           break;
         default:
-          ud();  // lmsw/invlpg: stage-4 scope
+          ud();  // lmsw/invlpg: stage-3 scope
       }
       break;
     }
@@ -1050,13 +1227,13 @@ static void run_op2(uint8_t op2) {
       push_w(s->sreg[fs_i]);
       break;  // push fs
     case 0xa1:
-      load_seg(fs_i, (uint16_t)pop_w());
+      load_data(fs_i, (uint16_t)pop_w());
       break;      // pop fs
     case 0xa8:
       push_w(s->sreg[gs_i]);
       break;  // push gs
     case 0xa9:
-      load_seg(gs_i, (uint16_t)pop_w());
+      load_data(gs_i, (uint16_t)pop_w());
       break;      // pop gs
     case 0xa2: {  // cpuid
       uint32_t leaf = eax;
@@ -1176,10 +1353,18 @@ static void run_op2(uint8_t op2) {
       int seg = op2 == 0xb2 ? ss_i : op2 == 0xb4 ? fs_i : gs_i;
       if (d.w32) {
         set_reg32(RM32());
-        load_seg(seg, rd16(d.mlin + 4));
+        seg_use(d.mseg, d.moff + 4, 2, 0);
+        if (seg == ss_i)
+          load_ss(rd16(d.mlin + 4));  // LSS: SS gets the full SS checks (SDM)
+        else
+          load_data(seg, rd16(d.mlin + 4));
       } else {
         set_reg16(RM16());
-        load_seg(seg, rd16(d.mlin + 2));
+        seg_use(d.mseg, d.moff + 2, 2, 0);
+        if (seg == ss_i)
+          load_ss(rd16(d.mlin + 2));
+        else
+          load_data(seg, rd16(d.mlin + 2));
       }
       break;
     }
@@ -1351,7 +1536,7 @@ void run_op(uint8_t op) {
       push_w(s->sreg[es_i]);
       break;  // push es
     case 0x07:
-      load_seg(es_i, (uint16_t)pop_w());
+      load_data(es_i, (uint16_t)pop_w());
       break;  // pop es
     case 0x08: {
       modrm();
@@ -1494,7 +1679,8 @@ void run_op(uint8_t op) {
       push_w(s->sreg[ss_i]);
       break;  // push ss
     case 0x17:
-      load_seg(ss_i, (uint16_t)pop_w());
+      load_ss((uint16_t)pop_w());
+      s->intr_inhibit = 1;  // POP SS: one-instruction interrupt shadow (SDM)
       break;  // pop ss
     case 0x18: {
       modrm();
@@ -1570,7 +1756,7 @@ void run_op(uint8_t op) {
       push_w(s->sreg[ds_i]);
       break;  // push ds
     case 0x1f:
-      load_seg(ds_i, (uint16_t)pop_w());
+      load_data(ds_i, (uint16_t)pop_w());
       break;  // pop ds
     case 0x20: {
       modrm();
@@ -2080,7 +2266,15 @@ void run_op(uint8_t op) {
     case 0x8e: {
       modrm();
       if (d.reg > gs_i) ud();
-      load_seg(d.reg, rm16());
+      uint16_t sel = rm16();
+      if (d.reg == ss_i) {
+        load_ss(sel);
+        s->intr_inhibit = 1;  // MOV SS: one-instruction interrupt shadow (SDM)
+      } else if (d.reg == cs_i) {
+        ud();  // MOV to CS does not exist (SDM vol.2 MOV)
+      } else {
+        load_data(d.reg, sel);
+      }
       break;
     }  // mov sreg, rm16
     case 0x8f: {
@@ -2124,12 +2318,13 @@ void run_op(uint8_t op) {
       else
         dx = (int16_t)ax < 0 ? 0xffffu : 0;
       break;
-    case 0x9a: {  // call ptr16:16/32 — push CS, push return IP, load CS, jump
+    case 0x9a: {  // call ptr16:16/32 — check CS, push CS/return IP, jump
       uint32_t off = d.w32 ? imm32() : imm16();
       uint16_t sel = imm16();
-      push_w(s->sreg[cs_i]);
+      uint16_t ret_cs = s->sreg[cs_i];
+      load_cs(sel);  // descriptor checks first: a faulting call pushes nothing
+      push_w(ret_cs);
       push_w((uint32_t)(fr->rec.pc + d.nxt));  // return: next instruction
-      load_seg(cs_i, sel);
       eip = off;
       break;
     }
@@ -2155,29 +2350,37 @@ void run_op(uint8_t op) {
       ah = (uint8_t)(fl->word & 0xd5u) | 2;
       break;  // lahf
     case 0xa0: {
-      uint64_t lin = s->base[d.seg >= 0 ? d.seg : ds_i] + (d.a32 ? imm32() : imm16());
-      al = rd8(lin);
+      int sseg = d.seg >= 0 ? d.seg : ds_i;
+      uint32_t off = d.a32 ? imm32() : imm16();
+      seg_use(sseg, off, 1, 0);
+      al = rd8(s->base[sseg] + off);
       break;
     }  // mov al, moffs8
     case 0xa1: {
-      uint64_t lin = s->base[d.seg >= 0 ? d.seg : ds_i] + (d.a32 ? imm32() : imm16());
+      int sseg = d.seg >= 0 ? d.seg : ds_i;
+      uint32_t off = d.a32 ? imm32() : imm16();
+      seg_use(sseg, off, d.w32 ? 4 : 2, 0);
       if (d.w32)
-        eax = rd32(lin);
+        eax = rd32(s->base[sseg] + off);
       else
-        ax = rd16(lin);
+        ax = rd16(s->base[sseg] + off);
       break;
     }  // mov eAX, moffs
     case 0xa2: {
-      uint64_t lin = s->base[d.seg >= 0 ? d.seg : ds_i] + (d.a32 ? imm32() : imm16());
-      wr8(lin, al);
+      int sseg = d.seg >= 0 ? d.seg : ds_i;
+      uint32_t off = d.a32 ? imm32() : imm16();
+      seg_use(sseg, off, 1, 1);
+      wr8(s->base[sseg] + off, al);
       break;
     }  // mov moffs8, al
     case 0xa3: {
-      uint64_t lin = s->base[d.seg >= 0 ? d.seg : ds_i] + (d.a32 ? imm32() : imm16());
+      int sseg = d.seg >= 0 ? d.seg : ds_i;
+      uint32_t off = d.a32 ? imm32() : imm16();
+      seg_use(sseg, off, d.w32 ? 4 : 2, 1);
       if (d.w32)
-        wr32(lin, eax);
+        wr32(s->base[sseg] + off, eax);
       else
-        wr16(lin, ax);
+        wr16(s->base[sseg] + off, ax);
       break;
     }  // mov moffs, eAX
     case 0xa4:
@@ -2260,10 +2463,12 @@ void run_op(uint8_t op) {
       int seg = op == 0xc4 ? es_i : ds_i;
       if (d.w32) {
         set_reg32(RM32());
-        load_seg(seg, rd16(d.mlin + 4));
+        seg_use(d.mseg, d.moff + 4, 2, 0);
+        load_data(seg, rd16(d.mlin + 4));
       } else {
         set_reg16(RM16());
-        load_seg(seg, rd16(d.mlin + 2));
+        seg_use(d.mseg, d.moff + 2, 2, 0);
+        load_data(seg, rd16(d.mlin + 2));
       }
       break;
     }
@@ -2290,11 +2495,13 @@ void run_op(uint8_t op) {
           if (d.w32) {
             ebp -= 4;
             esp = ebp;
-            push32(rd32(s->base[ss_i] + esp + 4 - 4));
+            seg_use(ss_i, esp, 4, 0);
+            push32(rd32(s->base[ss_i] + esp));
           } else {
             bp -= 2;
             sp = bp;
-            push16(rd16(s->base[ss_i] + sp + 2 - 2));
+            seg_use(ss_i, sp, 2, 0);
+            push16(rd16(s->base[ss_i] + sp));
           }
         }
         push_w(frame);
@@ -2321,7 +2528,7 @@ void run_op(uint8_t op) {
     case 0xca: {  // retf imm16
       uint32_t n = imm16();
       eip = pop_w();
-      load_seg(cs_i, (uint16_t)pop_w());
+      load_cs((uint16_t)pop_w());
       if (d.w32)
         esp += n;
       else
@@ -2330,7 +2537,7 @@ void run_op(uint8_t op) {
     }
     case 0xcb:
       eip = pop_w();
-      load_seg(cs_i, (uint16_t)pop_w());
+      load_cs((uint16_t)pop_w());
       break;  // retf
     case 0xcc:
       do_int(3, (uint32_t)(fr->rec.pc + d.nxt));
@@ -2348,7 +2555,7 @@ void run_op(uint8_t op) {
                   // stored image (SDM IRET Operation: RF=0; VM stays 0 in
                   // real mode). 16-bit form loads only the low half.
       eip = pop_w();
-      load_seg(cs_i, (uint16_t)pop_w());
+      load_cs((uint16_t)pop_w());
       uint32_t flv = pop_w();
       if (d.w32)
         fl->word = (flv & ~(0x30000u)) | 2;
@@ -2392,9 +2599,11 @@ void run_op(uint8_t op) {
     case 0xd6:
       al = fl->cf ? 0xff : 0x00;
       break;      // salc (undocumented)
-    case 0xd7: {  // xlat: AL = [seg:BX + AL]
-      uint64_t lin = s->base[d.seg >= 0 ? d.seg : ds_i] + (d.a32 ? ebx : (uint32_t)bx) + al;
-      al = rd8(lin);
+    case 0xd7: {  // xlat: AL = [seg:(BX + AL) mod 2^addr_size] (SDM XLAT)
+      int sseg = d.seg >= 0 ? d.seg : ds_i;
+      uint32_t off = d.a32 ? ebx + al : (uint16_t)(bx + al);
+      seg_use(sseg, off, 1, 0);
+      al = rd8(s->base[sseg] + off);
       break;
     }
     case 0xd8:
@@ -2460,7 +2669,7 @@ void run_op(uint8_t op) {
     }
     case 0xea: {  // jmp ptr16:16/32
       uint32_t off = d.w32 ? imm32() : imm16();
-      load_seg(cs_i, imm16());
+      load_cs(imm16());
       eip = off;
       break;
     }
@@ -2567,11 +2776,13 @@ void run_op(uint8_t op) {
         case 3: {  // call far m16:16/32
           if (!d.is_mem) ud();
           uint32_t t = d.w32 ? rd32(d.mlin) : rd16(d.mlin);
+          seg_use(d.mseg, d.moff + (d.w32 ? 4 : 2), 2, 0);
           uint16_t sel = rd16(d.mlin + (d.w32 ? 4 : 2));
-          push_w(s->sreg[cs_i]);
+          uint16_t ret_cs = s->sreg[cs_i];
+          load_cs(sel);  // descriptor checks first: a faulting call pushes nothing
+          push_w(ret_cs);
           push_w((uint32_t)(fr->rec.pc + d.nxt));  // return: next instruction,
                                                    // same as 0x9a/0xe8 (SDM pushes EIP past the call)
-          load_seg(cs_i, sel);
           eip = t;
           break;
         }
@@ -2581,8 +2792,9 @@ void run_op(uint8_t op) {
         case 5: {  // jmp far m16:16/32
           if (!d.is_mem) ud();
           uint32_t t = d.w32 ? rd32(d.mlin) : rd16(d.mlin);
+          seg_use(d.mseg, d.moff + (d.w32 ? 4 : 2), 2, 0);
           uint16_t sel = rd16(d.mlin + (d.w32 ? 4 : 2));
-          load_seg(cs_i, sel);
+          load_cs(sel);
           eip = t;
           break;
         }
@@ -2647,13 +2859,19 @@ void x86_init(CpuState* c) {
     }
   if (multiboot) {
     st->cr0 = 1;  // PE
+    // Flat CS=0x08 / data=0x10 descriptors (QEMU multiboot GDT: 00cf9b00...,
+    // 00cf93...): 4 GiB limit, DPL0, D/B set.
     st->sreg[cs_i] = 0x08;
     st->base[cs_i] = 0;
+    st->limit[cs_i] = 0xffffffff;
+    st->ar[cs_i] = 0x9b;  // present, DPL0, code, readable, accessed
     st->dbit[cs_i] = 1;
     for (int i = 0; i < 6; i++) {
       if (i == cs_i) continue;
       st->sreg[i] = 0x10;
       st->base[i] = 0;
+      st->limit[i] = 0xffffffff;
+      st->ar[i] = 0x93;  // present, DPL0, data, read-write, accessed
       st->dbit[i] = 1;
     }
     st->r[eax_i].e = k_mb_load_magic;

@@ -3,6 +3,28 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 3 开工：项 1 段机制核心（2026-09-05）
+
+保护模式语义第一片：描述符解析 + 特权/limit 检查（exec.c +218 行，回归
+全绿、state 基线零漂移）。要点：
+
+- **检查语义主 oracle 是 SDM 卷 3 §5.3**，不是 tiny386——实读发现 tiny386
+  的 limit 检查整个 `#if 0`、特权检查只有半套（自认 TODO）。tiny386 只作
+  描述符解析/缓存形状参照。
+- 结构：`desc_parse`（实模式 sel<<4 / PM 解析表项）→ 各目标类检查
+  （`load_data`/`load_ss`/`load_cs`，按 SDM 伪代码顺序）→ `seg_commit`
+  （写缓存 + 置 A 位）；访问侧 `seg_use` 钩进 rm*/栈/串/moffs/xlat/fetch。
+  CPL 从 CS 缓存的 DPL 派生，不设独立状态。
+- 栈模型修正：B=0 栈只经由 SP——访存地址 16 位、ESP 高 32 位保留
+  （SDM vol.3 3.4.5）。kvm realmode 的 push_pop_high_esp_bits 测试钉死
+  该行为，第一版把寄存器更新和访存地址混用导致 1 FAIL，分开后过。
+- 连带修复：STI 的 INTR inhibit 窗口原来是死的（步尾清零早于下一步采样），
+  改为采样后消费；POP SS/MOV SS 补上同一 shadow（SDM vol.2）。
+- 其他：MOV to CS 判 #UD；far call 先查描述符后压栈（故障不压栈）；
+  xlat 补 2^addr_size 取模；GDT 表越界 #GP(sel)；LSS 走 SS 全套检查。
+- 门/任务切换/分页/0F 00 组增量仍未动（项 2-5）；LGDT/LIDT/SMSW/MOV CR0
+  原已有。D13 恢复阶段已按重排改挂阶段 3。
+
 ## 路线图重排（2026-09-05，用户指令）
 
 x86 保护模式提前、cesdk 放后：**阶段 3 = x86 保护模式与分页**（原阶段 4

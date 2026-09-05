@@ -59,9 +59,12 @@ void x86_step(CpuState* c) {
   fr->isa = &k_isa_x86;
 
   // Hardware interrupts are sampled between instructions, when IF=1 and
-  // outside the SDM inhibit window (the instruction after STI). A hardware
-  // interrupt is a trap: the pushed return address is the next instruction.
-  if (s->intr_pending && !s->intr_inhibit && fl->if_ && cpu->int_ack) {
+  // outside the SDM inhibit window (the instruction after STI/MOV SS/POP
+  // SS). A hardware interrupt is a trap: the pushed return address is the
+  // next instruction. The shadow blocks one sample and expires here.
+  int intr_shadow = s->intr_inhibit;
+  s->intr_inhibit = 0;
+  if (s->intr_pending && !intr_shadow && fl->if_ && cpu->int_ack) {
     int vec = cpu->int_ack(cpu->ack_dev);
     s->intr_pending = 0;
     cpu->wait = 0;
@@ -88,11 +91,10 @@ void x86_step(CpuState* c) {
   fr->rec.mnemonic = NULL;
 
   if (setjmp(fr->raise)) {
-    // #DE/#UD are faults: re-deliver through the IVT, resume at the handler.
-    int vec = fr->trap.cause == vec_ud ? vec_ud : vec_de;
-    do_int(vec, (uint32_t)fr->trap.tval);
+    // Faults re-deliver through the interrupt table at the raised vector and
+    // resume at the faulting instruction (SDM 6-3 fault semantics).
+    do_int((int)fr->trap.cause, (uint32_t)cpu->pc);
     DebugTrap(fr);
-    s->intr_inhibit = 0;
     return;
   }
 
@@ -104,5 +106,4 @@ void x86_step(CpuState* c) {
   if (d.code16) cpu->pc &= 0xffff;
   fr->rec.dnpc = cpu->pc;
   DebugInsn(fr);
-  s->intr_inhibit = 0;
 }
