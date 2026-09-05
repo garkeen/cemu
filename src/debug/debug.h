@@ -59,4 +59,11 @@ void DebugSessionEnd(const struct frame* f, const char* stop_reason);
 //   watch=ADDR:SIZE[:r|w|rw] (repeatable), budget=N (per-category cap),
 //   skip=N (per-category silent window before printing), utf8.
 
+// Session output cap (bytes). All debug writes (table rows, state stream,
+// line trace, session summary) are accounted here; once the cap is hit,
+// further writes are dropped so a misconfigured CEMU_DEBUG can't fill the
+// disk. Returns 1 if n bytes may still be written (and accounts for them),
+// 0 once the cap is hit.
+int DebugAccountOut(size_t n);
+
 #endif

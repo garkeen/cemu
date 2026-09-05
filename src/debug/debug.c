@@ -24,6 +24,15 @@ static int g_regs_period;      // 0 = off
 static int g_budget = 100000;  // per-category event cap
 static uint64_t g_skip = 0;    // per-category events suppressed BEFORE printing
 
+// Hard session output cap (bytes). Every debug write is accounted here; once
+// the cap is hit, further writes are dropped so a misconfigured CEMU_DEBUG
+// can't fill the disk (the `state` category alone can otherwise emit gigabytes
+// since it bypasses the per-category budget). ~5MB is plenty for any real
+// diagnosis; raise it with a code change if you genuinely need more.
+static const uint64_t kOutLimit = 5ULL * 1024 * 1024;
+static uint64_t g_out_bytes;
+static int g_limit_hit;
+
 // The one event table every category shares (AGENTS.md §X).
 static const TableColumn kEventCols[] = {
     {"KIND", 4, kTableLeft},      {"PC", 16, kTableRight},    {"RAW", 12, kTableLeft},
@@ -162,6 +171,28 @@ static int Allow(uint32_t cat) {
   return 0;
 }
 
+// Session output cap. Returns 1 if n bytes may still be written (and accounts
+// for them); 0 once the cap is hit. table.c's Flush routes through here.
+int DebugAccountOut(size_t n) {
+  if (g_limit_hit) return 0;
+  if (g_out_bytes >= kOutLimit) {
+    g_limit_hit = 1;
+    static const char msg[] =
+        "\n[CEMU_DEBUG: output limit 5MB reached — further output dropped]\n";
+    HostWriteErr(msg, sizeof(msg) - 1);
+    return 0;
+  }
+  if (g_out_bytes + (uint64_t)n > kOutLimit) {
+    g_limit_hit = 1;
+    static const char msg[] =
+        "\n[CEMU_DEBUG: output limit 5MB reached — further output dropped]\n";
+    HostWriteErr(msg, sizeof(msg) - 1);
+    return 0;
+  }
+  g_out_bytes += (uint64_t)n;
+  return 1;
+}
+
 static void CellRaw(Table* t, const frame* f) {
   char c[32];
   int n = 0;
@@ -215,21 +246,26 @@ static void RowBegin(Table* t, char kind, frame* f) {
 // diff baseline for golden runs (AGENTS.md §X).
 static void StateRow(frame* f) {
   char line[1024];
-  int n = snprintf(line, sizeof(line), "S @pc=%016llx dnpc=%016llx | ",
+  size_t cap = sizeof(line);
+  int n = snprintf(line, (size_t)cap, "S @pc=%016llx dnpc=%016llx | ",
                    (unsigned long long)f->rec.pc, (unsigned long long)f->rec.dnpc);
   for (int bank = 0; bank < 2; bank++) {
     if (bank == 1 && !(f->isa->has_fpr && f->isa->has_fpr(f)))
       break;  // x86 has no FP bank in the stream
-    for (int c = 0; c < 32 && n < (int)sizeof(line) - 24; c++) {
+    for (int c = 0; c < 32 && n < (int)cap - 24; c++) {
       uint64_t v = bank == 0 ? f->cpu->gpr[c] : f->cpu->fpr[c];
-      n += snprintf(line + n, sizeof(line) - (size_t)n, "%c%d=%016llx ", bank == 0 ? 'g' : 'f', c,
+      n += snprintf(line + n, cap - (size_t)n, "%c%d=%016llx ", bank == 0 ? 'g' : 'f', c,
                     (unsigned long long)v);
     }
-    n += snprintf(line + n, sizeof(line) - (size_t)n, "| ");
+    n += snprintf(line + n, cap - (size_t)n, "| ");
   }
-  if (f->isa->debug_state_line) f->isa->debug_state_line(line + n, (int)sizeof(line) - n, f);
-  HostWriteErr(line, (size_t)strlen(line));
-  HostWriteErr("\n", 1);
+  if (f->isa->debug_state_line)
+    f->isa->debug_state_line(line + n, (int)(cap - (size_t)n), f);
+  size_t len = strlen(line);
+  if (DebugAccountOut(len + 1)) {
+    HostWriteErr(line, len);
+    HostWriteErr("\n", 1);
+  }
 }
 
 // ---- emission points --------------------------------------------------------
@@ -246,7 +282,7 @@ void DebugInsn(frame* f) {
         n += snprintf(line + n, sizeof(line) - (size_t)n, " %02x", f->rec.raw[i]);
       n += snprintf(line + n, sizeof(line) - (size_t)n, " %s -> %016llx\n",
                     f->rec.mnemonic ? f->rec.mnemonic : "?", (unsigned long long)f->rec.dnpc);
-      HostWriteErr(line, (size_t)n);
+      if (DebugAccountOut((size_t)n)) HostWriteErr(line, (size_t)n);
     }
   }
   if (g_mask & kDbgTraceTable) {
@@ -340,5 +376,5 @@ void DebugSessionEnd(const frame* f, const char* stop_reason) {
       n += snprintf(line + n, sizeof(line) - (size_t)n, " supp[%d]=%llu", i,
                     (unsigned long long)g_suppressed[i]);
   snprintf(line + n, sizeof(line) - (size_t)n, " stop=%s\n", stop_reason);
-  HostWriteErr(line, (size_t)strlen(line));
+  if (DebugAccountOut(strlen(line))) HostWriteErr(line, strlen(line));
 }

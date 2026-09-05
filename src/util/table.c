@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "debug/debug.h"
 #include "host/host.h"
 
 // One line buffer per table; a row is assembled here and flushed once,
@@ -49,7 +50,10 @@ Table* TableOpen(const TableColumn* cols, int ncols, int ascii, int header_every
 void TableFree(Table* t) { free(t); }
 
 static void Flush(Table* t) {
-  if (t->len) HostWriteErr(t->line, (size_t)t->len);
+  // Gate the write through the session output cap: once the cap is hit, drop
+  // further rows so a misconfigured CEMU_DEBUG can't fill the disk.
+  if (t->len && DebugAccountOut((size_t)t->len))
+    HostWriteErr(t->line, (size_t)t->len);
   t->len = 0;
 }
 
