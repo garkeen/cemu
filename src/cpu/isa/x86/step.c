@@ -13,6 +13,7 @@
 #include "cpu/isa/isa.h"
 #include "debug/debug.h"
 #include "exec.h"  // last: it defines the short register macros x/f/eax/...
+#include "util/log.h"
 
 // Consumes the prefix stream then dispatches the opcode. Prefixes flip
 // w32/a32, pick a segment override and a rep mode; LOCK is a single-hart
@@ -57,6 +58,11 @@ void x86_step(CpuState* c) {
   fr->cpu = cpu;
   fr->priv = s;
   fr->isa = &k_isa_x86;
+  // The vector currently being delivered, or -1. A fault inside that window
+  // escalates to #DF, and a fault during #DF delivery is a triple fault —
+  // shutdown (SDM vol.3 6.9). Without this the landing pad would ping-pong
+  // between the two forever.
+  static int delivering_vec = -1;
 
   // Hardware interrupts are sampled between instructions, when IF=1 and
   // outside the SDM inhibit window (the instruction after STI/MOV SS/POP
@@ -72,7 +78,9 @@ void x86_step(CpuState* c) {
     fr->rec.dnpc = cpu->pc;
     fr->rec.raw_len = 0;
     fr->rec.mnemonic = "intr";
+    delivering_vec = vec;
     do_int(vec, (uint32_t)cpu->pc, 0, 0);
+    delivering_vec = -1;
     DebugInsn(fr);
     return;
   }
@@ -93,8 +101,21 @@ void x86_step(CpuState* c) {
   if (setjmp(fr->raise)) {
     // Faults re-deliver through the interrupt table at the raised vector and
     // resume at the faulting instruction (SDM 6-3 fault semantics); tval is
-    // the error code for vectors that push one.
-    do_int((int)fr->trap.cause, (uint32_t)cpu->pc, 0, (uint32_t)fr->trap.tval);
+    // the error code for vectors that push one. A fault while a vector is
+    // being delivered escalates to #DF; #DF failing its own delivery is a
+    // triple fault — shutdown (SDM vol.3 6.9).
+    int cause = (int)fr->trap.cause;
+    uint32_t tval = (uint32_t)fr->trap.tval;
+    int was = delivering_vec;
+    delivering_vec = -1;
+    if (was >= 0) {
+      if (was == vec_df) Fatal("x86: triple fault");
+      cause = vec_df;
+      tval = 0;  // #DF pushes error code 0 (SDM vol.3 table 6-1)
+    }
+    delivering_vec = cause;
+    do_int(cause, (uint32_t)cpu->pc, 0, tval);
+    delivering_vec = -1;
     DebugTrap(fr);
     return;
   }
@@ -102,8 +123,9 @@ void x86_step(CpuState* c) {
   do_step();
   // The one commit. d.nxt counts consumed bytes from the instruction start;
   // relative jumps rewrote it relatively, absolute cases set eip themselves.
-  // 16-bit code wraps the instruction pointer at 64K (SDM rel16 semantics).
-  if (eip == fr->rec.pc) cpu->pc = fr->rec.pc + d.nxt;
+  // EIP is 32 bits — the sum wraps at 2^32 (a negative rel32 rides on the
+  // wrap); 16-bit code then wraps the instruction pointer at 64K.
+  if (eip == fr->rec.pc) cpu->pc = (uint32_t)(fr->rec.pc + d.nxt);
   if (d.code16) cpu->pc &= 0xffff;
   fr->rec.dnpc = cpu->pc;
   DebugInsn(fr);

@@ -20,6 +20,31 @@ else
   echo "FAIL (smoke: rc=$rc)"
 fi
 
+# PM: the protected-mode smoke probe (test/x86/pm). Multiboot ELF enters flat
+# PM, rebuilds GDT/IDT/TSS, and walks the stage-3 gate semantics: descriptor
+# loads, limit #GP, same-priv and cross-ring gate delivery with TSS stack
+# switch, gate-DPL violation #GP(ec=vec*8|2), IRET privilege round-trips.
+# Self-reports 8 "tN ok" lines then "pm-smoke done", exits status 11.
+#
+# Calibration: byte-identical to qemu-system-i386 -kernel on 7 of 8 tests.
+# The one divergence, t7 (ring-3 store beyond a data-segment limit), is a
+# deficiency of the local arbiter build: this qemu (10.2.92,
+# v11.0.0-rc2-12119-gaa7f0eb8d8-dirty) loads the descriptor (LSL confirms
+# limit 0x1ff) yet lets the store land without #GP. SDM vol.3 5.2.1 mandates
+# the check, so cemu faults and the judge below counts on cemu's output.
+expected_pm=8
+out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$dir/pm/pm_smoke.elf" 2>&1)
+rc=$?
+n_ok=$(echo "$out" | grep -c ' ok$')
+n_bad=$(echo "$out" | grep -c 'BAD')
+if [ "$rc" -eq 11 ] && [ "$n_ok" -eq "$expected_pm" ] && [ "$n_bad" -eq 0 ] &&
+   echo "$out" | grep -q 'pm-smoke done'; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL (pm: rc=$rc, $n_ok ok, $n_bad bad)"
+fi
+
 # Realmode: suite self-reports PASS/FAIL lines. Stage 2 added the 8259 PIC
 # + 8254 PIT so hlt wakes on IRQ0, and the whole suite now runs: 122 PASS.
 # QEMU reference (qemu-system-i386 -kernel realmode.elf) prints the same

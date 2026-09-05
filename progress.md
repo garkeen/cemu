@@ -3,6 +3,45 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 3 项 1-2 验收：PM 冒烟探针 + 六处解释器修复（2026-09-05）
+
+PM 冒烟探针（test/x86/pm，multiboot ELF 入口，nasm+ld.lld 构建）在平坦
+保护模式下自建 GDT/IDT/TSS，走完项 1-2 的门语义八项：段装载+读写回、
+ring0 越限 #GP(0)、同特权门（不换栈/清 IF/压栈 flags 位1）、IRET 入
+ring3、ring3 过门 TSS 换栈（老 SS/ESP 帧）、门 DPL 违例 #GP(vec*8|2)、
+ring3 越限 #GP(0)、门帧改写回 ring0。探针把解释器里六个从未被验收件
+踩过的 bug 全部炸出并修复：
+
+1. **门字段布局颠倒**（exec.c do_int）：SDM 卷3 图3-8 门布局是
+   [off15:0][selector][保留][P DPL type][off31:16]，原实现把 bits0-15 当
+   selector。PM 门从未被走过，一踩即 LDT Fatal。
+2. **SIB 基址 ESP 缺 SS 默认段**（exec.c modrm）：只给了 EBP，漏了 ESP
+   （SDM 卷1 2.1.2）；`add [esp],2` 走了 DS。实模式 seg_use 早退掩蔽。
+3. **int imm8 返回地址差 1**（exec.c case 0xcd）：`do_int(imm8(),
+   rec.pc+d.nxt, ...)` 踩 C 实参求值顺序未定义——imm8 先提出去。
+4. **提交点缺 32 位截断**（step.c）：EIP 是 32 位，负 rel32 靠回绕；
+   原来在 64 位 pc 上相加不回绕。实模式被 code16 掩蔽。
+5. **A 位写破坏描述符**（exec.c seg_commit）：`(ar&0xf)|1` 把 P/DPL/S
+   抹掉；应为 `ar|1`。
+6. **故障投递中故障无限乒乓**（step.c）：新增 delivering_vec——投递中
+   故障升级 #DF（SDM 卷3 6.9），#DF 自身投递再失败 = 三重故障 → 停机。
+   之前 GP↔DF 无限 longjmp 循环。
+
+QEMU 对拍（qemu-system-i386 -kernel，multiboot 同镜像）：**7/8 逐字节
+一致**。唯一分歧 t7（ring3 数据段越限写）：本机 QEMU 是 dirty 开发版
+（10.2.92, v11.0.0-rc2-12119-gaa7f0eb8d8-**dirty**）——LSL 证实其缓存的
+limit=0x1ff，但越界写照样落地（monitor xp 证值落在 0x40000）——TCG 不
+执行数据段限检查，与 SDM 卷3 5.2.1 相悖。按裁决序 SDM 为最终裁决
+（DAS 先例只允许"实机真值表"推翻 SDM，dirty 构建仿真器不算实机），
+cemu 保持 fault，run.sh 注释登记该分歧。待办：换干净 QEMU 构建重新
+校准 t7。
+
+回归：riscv 127/127、x86 smoke+pm+realmode 全绿（run.sh 新增 pm 判据，
+timeout 30）、smoke state 基线与改动前逐字节一致（git stash 采基线）、
+depcheck ok。教训两次亲证 AGENTS.md 第九节：TSS 描述符常量字节序手写
+错了（0x89 应在 byte5）、门槽位 0x13 是十六进制 19——纸面推演全部
+错过，靠 CEMU_DEBUG + gdb（-O0 临时构建）+ QEMU monitor/gdbstub 定位。
+
 ## 阶段 3 项 2：PM 异常与中断门（2026-09-05）
 
 do_int 按 CR0.PE 分臂。PM 臂：IDT 门派发全序（表限 → 软中断 DPL → 门型 →

@@ -215,7 +215,9 @@ static void modrm(void) {
       off = fetch32();
     } else {
       off = s->r[base].e;
-      if (d.mseg < 0 && base == 5) d.mseg = ss_i;
+      // ESP and EBP bases default to SS (SDM vol.1 2.1.2); every other base
+      // stays on the override-or-DS default.
+      if (d.mseg < 0 && (base == 4 || base == 5)) d.mseg = ss_i;
     }
     if (idx != 4) off += (uint32_t)scale * s->r[idx].e;
     if (d.mod == 1)
@@ -390,7 +392,7 @@ static void seg_commit(int seg, uint16_t sel, const seg_view* v) {
   s->ar[seg] = v->ar;
   s->dbit[seg] = v->dbit;
   if ((s->cr0 & 1) && (sel & 0xfffc) && !(v->ar & 1))
-    BusWrite(cpu->bus, s->gdtr + (uint64_t)(sel >> 3) * 8 + 5, 1, (uint8_t)((v->ar & 0x0f) | 1));
+    BusWrite(cpu->bus, s->gdtr + (uint64_t)(sel >> 3) * 8 + 5, 1, (uint8_t)(v->ar | 1));
 }
 
 // CPL is the CS descriptor's DPL (SDM vol.1 3.4.5); the cache is the source.
@@ -572,9 +574,11 @@ void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
   if (gt == 5) Fatal("x86: task gates wait for task switching (stage 3 item 3)");
   int gate16 = gt == 6 || gt == 7;
 
-  uint16_t code_sel = (uint16_t)gate;
-  uint32_t off = ((uint32_t)(gate >> 16) & 0xffff) |
-                 ((uint32_t)(gate >> 32) & 0xffff) << 16;
+  // Gate layout (SDM vol.3 fig 3-8): [off15:0][selector][reserved][P DPL
+  // type][off31:16] — offset is split around the middle, selector in bits
+  // 16-31. Type/DPL/P decode from byte 5 (bits 40-47).
+  uint16_t code_sel = (uint16_t)(gate >> 16);
+  uint32_t off = (uint32_t)(gate & 0xffff) | (uint32_t)((gate >> 48) & 0xffff) << 16;
 
   // The gate's code segment (SDM vol.2 INT: table limits, executable,
   // DPL <= CPL, present — a faulting gate is never entered).
@@ -2728,9 +2732,13 @@ void run_op(uint8_t op) {
     case 0xcc:
       do_int(3, (uint32_t)(fr->rec.pc + d.nxt), 1, 0);
       return;  // int3
-    case 0xcd:
-      do_int(imm8(), (uint32_t)(fr->rec.pc + d.nxt), 1, 0);
-      return;  // int imm8
+    case 0xcd: {
+      int v = imm8();  // evaluate the immediate first: d.nxt must count it
+                       // before the return address is formed (arg order in C
+                       // is unspecified)
+      do_int(v, (uint32_t)(fr->rec.pc + d.nxt), 1, 0);
+      return;
+    }  // int imm8
     case 0xce:
       if (fl->of) {
         do_int(4, (uint32_t)(fr->rec.pc + d.nxt), 1, 0);
