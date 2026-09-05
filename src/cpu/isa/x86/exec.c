@@ -1049,6 +1049,12 @@ static void run_op2(uint8_t op2) {
     case 0xa1:
       load_seg(fs_i, (uint16_t)pop_w());
       break;      // pop fs
+    case 0xa8:
+      push_w(s->sreg[gs_i]);
+      break;  // push gs
+    case 0xa9:
+      load_seg(gs_i, (uint16_t)pop_w());
+      break;      // pop gs
     case 0xa2: {  // cpuid
       uint32_t leaf = eax;
       if (leaf == 0) {
