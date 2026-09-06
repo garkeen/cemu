@@ -37,9 +37,24 @@
 ;       caches translations, a real 386 caches them too)
 ;   t18 ring 3 paged: U/RW user page write succeeds; write to a
 ;       supervisor-only page -> #PF(ec=7, P|W|U), exit through gate 0x24
+;   t19 build an LDT (GDT slot 0x58 + six entries), LLDT it, SLDT round
+;       trip, then load DS through a TI=1 selector and use it
+;   t20 store beyond the LDT entry's limit -> #GP(0) (segment limits bind
+;       LDT segments the way they bind GDT ones); LLDT 0 clears the LDTR
+;       (SLDT reads 0) and the next TI=1 load lookup-fails #GP(ec=sel&~3)
+;   t21 VERR/VERW matrix: writable data / read-only data / readable code /
+;       null selector / out-of-table selector (SDM: only ZF answers)
+;   t22 LAR/LSL values and failures: rights byte 0x00cf9b00 for code,
+;       effective limits with and without G, DPL3 data from CPL 0, and an
+;       out-of-table selector leaves the destination untouched with ZF=0
+;   t23 ARPL raises a selector's RPL (ZF=1 on change, ZF=0 when already
+;       there) and leaves the index alone
+;   t24 a task switch loads the incoming TSS's LDT (+0x60): the task body
+;       SLDTs it, reads through an LDT segment and VERRs an LDT code entry
 ; The tN numbers are report slots, not run order: t9 runs after t3 and t10
 ; runs after t7 (both need the ring levels already established); t14-t18 run
-; at the end, inside the ring-0 resume flow after t13.
+; at the end, inside the ring-0 resume flow after t13, and t19-t24 (the LDT
+; set) run right before them.
 ; Reports one "tN ok" line per test plus "pm-smoke done", then exits through
 ; the QEMU isa-debug-exit port 0xF4 with payload 5 (status = (5<<1)|1 = 11).
 ;
@@ -65,12 +80,19 @@
 %define SEL_GATE9   0x40    ; DPL0 call gate -> gate9_entry, 0 params
 %define SEL_GATE10  0x48    ; DPL3 call gate -> gate10_entry, 2 params
 %define SEL_TSS2    0x50    ; 32-bit TSS #2 at TSS2_LIN
+%define SEL_LDT     0x58    ; the LDT descriptor itself (GDT-only, SDM 3.5)
+%define SEL_LDT0    0x0c    ; LDT entry 1: data DPL0 writable, limit 0x1ff
+%define SEL_LDTBIG  0x14    ; LDT entry 2: data DPL0 writable, 4 GiB
+%define SEL_LDTCODE 0x1c    ; LDT entry 3: code DPL0 readable, 4 GiB
+%define SEL_LDTRO   0x24    ; LDT entry 4: data DPL0 read-only
+%define SEL_LDT3    0x2c    ; LDT entry 5: data DPL3 writable, 4 GiB
 
 %define IDT_LIN    0x2100      ; gates built at runtime, 0x2a slots
 %define TSS_LIN    0x2400      ; TSS image: ESP0 at +4, SS0 at +8
 %define TSS2_LIN   0x2600      ; second TSS image (filled at runtime)
-%define RES_LIN    0x2500      ; result bytes r1..r18 (1 = ok, RAM starts 0)
+%define RES_LIN    0x2500      ; result bytes r1..r24 (1 = ok, RAM starts 0)
 %define OBS_LIN    0x2700      ; handler observation slots (dwords)
+%define LDT_LIN    0x2a00      ; six LDT entries, filled at runtime
 %define PD_LIN     0x60000     ; page directory (4 KiB aligned)
 %define PT0_LIN    0x61000     ; page table covering 0-4 MiB, identity
 %define RING0_TOP  0x4000
@@ -560,6 +582,30 @@ task4_entry:                   ; t13a: arrived through the IDT task gate
   pop eax
   iretd                        ; NT=1: nested-task return
 
+task5_entry:                   ; t24: the switch loaded this TSS's LDT — the
+  push eax                     ; body runs with it and reports through OBS
+  push ds
+  mov ax, SEL_DATA0
+  mov ds, ax
+  sldt eax                     ; zero-extended (cemu and QEMU both)
+  mov dword [OBS_LIN + 0x88], eax
+  mov ax, SEL_LDT0
+  mov ds, ax                   ; the task's own LDT serves TI=1 loads
+  mov eax, [0x100]             ; t19's value through the LDT segment
+  mov edx, eax                 ; the DS reload clobbers ax — park the value
+  mov ax, SEL_DATA0            ; back to flat: OBS lives past the 0x1ff limit
+  mov ds, ax
+  mov dword [OBS_LIN + 0x8c], edx
+  mov ax, SEL_LDTCODE
+  verr ax
+  pushfd
+  pop eax
+  and eax, 0x40                ; ZF: the LDT code entry verifies readable
+  mov dword [OBS_LIN + 0x90], eax
+  pop ds
+  pop eax
+  iretd                        ; nested-task return to main
+
 task4_ec:                      ; t13b: a real #GP through the task gate: the
   push eax                     ; error code sits on this task's stack; fix
   push ds                      ; main's saved EIP past the faulting MOV and
@@ -659,13 +705,198 @@ t13a_ret:
   mov cx, SEL_TSS2
   mov bl, 0x85
   call mk_gate
-  mov ax, 0x1234
-  mov es, ax                       ; #GP(0x1234) -> task gate -> task4_ec
+  mov ax, 0x1230                      ; TI=0: a TI=1 selector with no LDT is
+  mov es, ax                          ; #TS now (t20); this one is #GP(0x1230)
 t13_ret:
-  cmp dword [OBS_LIN + 0x78], 0x1234   ; the error code reached the task stack
+  cmp dword [OBS_LIN + 0x78], 0x1230  ; the error code reached the task stack
   jne t13_done
   mov byte [RES_LIN + 12], 1
 t13_done:
+
+  ; t12 repointed gate 13 at busy_handler (6-byte skipper); the LDT tests
+  ; fault on 2-byte MOVs, so restore the plain #GP handler first.
+  mov edi, IDT_LIN + 13 * 8
+  mov eax, gp_handler
+  mov cx, SEL_CODE0
+  mov bl, 0x8e
+  call mk_gate
+
+  ; ---- t19: build an LDT, load it, resolve a TI=1 selector ------------------
+  ; The LDT descriptor lives in GDT slot 0x58 (system, type 2, present);
+  ; six data/code entries follow at LDT_LIN, filled inline.
+  mov dword [LDT_LIN + 0x08], 0x000001ff   ; e1: data DPL0 W, limit 0x1ff
+  mov dword [LDT_LIN + 0x0c], 0x00009200
+  mov dword [LDT_LIN + 0x10], 0x0000ffff   ; e2: data DPL0 W, 4 GiB (G=1)
+  mov dword [LDT_LIN + 0x14], 0x00cf9200
+  mov dword [LDT_LIN + 0x18], 0x0000ffff   ; e3: code DPL0 readable, 4 GiB
+  mov dword [LDT_LIN + 0x1c], 0x00cf9b00
+  mov dword [LDT_LIN + 0x20], 0x0000ffff   ; e4: data DPL0 read-only
+  mov dword [LDT_LIN + 0x24], 0x00009100
+  mov dword [LDT_LIN + 0x28], 0x0000ffff   ; e5: data DPL3 W, 4 GiB
+  mov dword [LDT_LIN + 0x2c], 0x00cff200
+  mov dword [gdt + 0x58], 0x2a00002f       ; limit 0x2f, base LDT_LIN
+  mov dword [gdt + 0x5c], 0x00008200       ; system, type 2, present
+  mov ax, SEL_LDT
+  lldt ax
+  sldt ax
+  cmp ax, SEL_LDT
+  jne .t19_done
+  mov ax, SEL_LDT0
+  mov ds, ax                               ; a TI=1 selector names the LDT
+  mov dword [0x100], 0xC0DE0019
+  mov eax, [0x100]
+  mov edx, eax                ; the DS reload clobbers ax — park the value
+  mov ax, SEL_DATA0           ; back to flat before any RES write:
+  mov ds, ax                  ; the LDT segment's limit is 0x1ff
+  cmp edx, 0xC0DE0019
+  jne .t19_done
+  mov byte [RES_LIN + 18], 1
+.t19_done:
+  mov ax, SEL_DATA0
+  mov ds, ax
+
+  ; ---- t20: LDT limit violation, then a cleared LDTR -------------------------
+  ; Two distinct defect classes: a store past the LDT segment's own limit is
+  ; a plain #GP(0) (t2 semantics), while a selector lookup with no LDT is a
+  ; table-limit failure carrying the selector (#GP(sel&~3)).
+  mov dword [OBS_LIN + 0], 0x55
+  mov ax, SEL_LDT0
+  mov ds, ax
+  mov ecx, 0x200
+  mov [ecx], ecx                           ; beyond limit 0x1ff -> #GP(0)
+  mov ax, SEL_DATA0
+  mov ds, ax
+  cmp dword [OBS_LIN + 0], 0
+  jne .t20_restore
+  xor ax, ax
+  lldt ax                                  ; null: the LDTR cache empties
+  sldt ax
+  test ax, ax
+  jnz .t20_restore
+  mov ax, SEL_LDT0
+  mov ds, ax                               ; no LDT: the lookup is #GP(0x0c)
+  mov ax, SEL_DATA0
+  mov ds, ax
+  cmp dword [OBS_LIN + 0], 0x0c
+  jne .t20_restore
+  mov byte [RES_LIN + 19], 1
+.t20_restore:
+  mov ax, SEL_LDT
+  lldt ax
+
+  ; ---- t21: VERR/VERW across the descriptor matrix ---------------------------
+  mov ax, SEL_LDT0                         ; writable data
+  verr ax
+  pushfd
+  pop edx
+  test edx, 0x40
+  jz .t21_done
+  verw ax
+  pushfd
+  pop edx
+  test edx, 0x40
+  jz .t21_done
+  mov ax, SEL_LDTRO                        ; read-only data: readable, not writable
+  verw ax
+  pushfd
+  pop edx
+  test edx, 0x40
+  jnz .t21_done
+  verr ax
+  pushfd
+  pop edx
+  test edx, 0x40
+  jz .t21_done
+  mov ax, SEL_LDTCODE                      ; readable code: verr yes, verw no
+  verr ax
+  pushfd
+  pop edx
+  test edx, 0x40
+  jz .t21_done
+  verw ax
+  pushfd
+  pop edx
+  test edx, 0x40
+  jnz .t21_done
+  xor ax, ax                               ; null selector clears ZF
+  verr ax
+  pushfd
+  pop edx
+  test edx, 0x40
+  jnz .t21_done
+  mov ax, 0x34                             ; beyond the LDT limit: ZF=0
+  verr ax
+  pushfd
+  pop edx
+  test edx, 0x40
+  jnz .t21_done
+  mov byte [RES_LIN + 20], 1
+.t21_done:
+
+  ; ---- t22: LAR/LSL values and failures --------------------------------------
+  mov eax, 0xDEADBEEF
+  mov ax, SEL_LDTCODE
+  lar eax, ax                              ; rights byte of the 4 GiB code seg:
+  cmp eax, 0x00c09b00                      ; mask 00FxFF00 zeroes the limit nibble
+  jne .t22_done
+  mov ax, SEL_LDT0
+  lsl eax, ax                              ; the raw 0x1ff limit (no G)
+  cmp eax, 0x1ff
+  jne .t22_done
+  mov ax, SEL_LDTBIG
+  lsl eax, ax                              ; G-expanded 4 GiB
+  cmp eax, 0xffffffff
+  jne .t22_done
+  mov ax, SEL_LDT3                         ; DPL3 data from CPL 0: dpl >= cpl
+  lar eax, ax
+  cmp eax, 0x00c0f200
+  jne .t22_done
+  mov eax, 0xDEADBEEF
+  mov ecx, 0x34                            ; out of table: ZF=0, dest kept
+  lar eax, cx                              ; (cx: eax's low half is the marker)
+  pushfd
+  pop edx
+  test edx, 0x40
+  jnz .t22_done
+  cmp eax, 0xDEADBEEF
+  jne .t22_done
+  mov byte [RES_LIN + 21], 1
+.t22_done:
+
+  ; ---- t23: ARPL raises the RPL, ZF reports the change -----------------------
+  mov ax, SEL_LDT0                         ; RPL 0
+  mov bx, 0x0003                           ; RPL 3
+  arpl ax, bx
+  pushfd
+  pop edx
+  test edx, 0x40
+  jz .t23_done
+  cmp ax, 0x0f                             ; index kept, RPL raised
+  jne .t23_done
+  arpl ax, bx                              ; already 3: ZF=0, unchanged
+  pushfd
+  pop edx
+  test edx, 0x40
+  jnz .t23_done
+  cmp ax, 0x0f
+  jne .t23_done
+  mov byte [RES_LIN + 22], 1
+.t23_done:
+
+  ; ---- t24: the task switch loads the incoming TSS's LDT ---------------------
+  mov dword [TSS2_LIN + 0x20], task5_entry
+  mov dword [TSS2_LIN + 0x24], 0x2
+  mov word [TSS2_LIN + 0x60], SEL_LDT
+  call far [ptr_tss2]
+t24_ret:
+  cmp dword [OBS_LIN + 0x88], SEL_LDT      ; the task SLDTs its own LDT
+  jne t24_done
+  cmp dword [OBS_LIN + 0x8c], 0xC0DE0019   ; read through an LDT segment
+  jne t24_done
+  cmp dword [OBS_LIN + 0x90], 0x40         ; VERR of an LDT code entry
+  jne t24_done
+  mov byte [RES_LIN + 23], 1
+t24_done:
 
   ; ---- t14: identity map 0-1MB, switch on paging (CR3, then PG|WP) ---------
   mov dword [PD_LIN], PT0_LIN | 7     ; PDE[0]: the one 4 MiB table, P|R/W
@@ -768,16 +999,17 @@ pg_resume:
   inc eax                       ; 1-based test number, two digits for 10+
   cmp eax, 10
   jl .single
-  push eax
-  mov al, '1'
-  call putc
-  pop eax
-  sub al, 10
+  xor edx, edx                ; two digits: divide out the tens
+  mov ecx, 10
+  div ecx
+  push edx
   add al, '0'
+  call putc                   ; the tens digit
+  pop eax
   jmp .digit
 .single:
-  add al, '0'
 .digit:
+  add al, '0'
   call putc
   mov esi, RES_LIN
   add esi, ebx
@@ -791,7 +1023,7 @@ pg_resume:
 .emit:
   call print
   inc ebx
-  cmp ebx, 18
+  cmp ebx, 24
   jl .loop
   mov esi, msg_done
   call print
@@ -818,6 +1050,7 @@ gdt:
   dq 0                         ; 40: DPL0 call gate, built at runtime
   dq 0                         ; 48: DPL3 call gate, count 2, built at runtime
   dq 0x0000890026000067        ; 50: 32-bit TSS #2 at TSS2_LIN, limit 0x67
+  dq 0                         ; 58: the LDT descriptor, filled at runtime
 gdt_end:
 
 gdtdesc:

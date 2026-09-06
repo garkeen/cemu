@@ -379,11 +379,13 @@ static uint32_t pop_w(void) { return stack_pop(d.w32 ? 4 : 2); }
 
 // The descriptor cache view (SDM vol.3 3.4.5): what a segment-register load
 // commits — base, effective limit (G already expanded), the access-rights
-// byte (P DPL S Type) and the D/B flag. The cache SURVIVES CR0.PE=0 — that
-// survival is big real mode (the kvm-unit-tests harness relies on it).
+// byte (P DPL S Type), the D/B flag, and the descriptor's high dword for
+// LAR. The cache SURVIVES CR0.PE=0 — that survival is big real mode (the
+// kvm-unit-tests harness relies on it).
 typedef struct seg_view {
   uint64_t base;
   uint32_t limit;
+  uint32_t hi;  // descriptor bytes 4-7, LAR's raw answer
   uint8_t ar;
   uint8_t dbit;
 } seg_view;
@@ -391,7 +393,10 @@ typedef struct seg_view {
 // Real mode synthesizes sel<<4 with a 64K limit (SDM vol.3 3.4.4); protected
 // mode parses the table entry. No checks here — the loaders validate before
 // committing, in the SDM vol.3 5.3 pseudocode order (the checks live in the
-// SDM, not in tiny386, whose limit/type checks are partial).
+// SDM, not in tiny386, whose limit/type checks are partial). TI=1 reads the
+// LDT through its descriptor cache (SDM vol.3 2.4.4): a null LDTR caches
+// limit 0, so the caller's table-limit check fails with the selector and no
+// special case exists (tiny386 read_desc, v86 lookup_segment_selector).
 static void desc_parse(uint16_t sel, seg_view* v) {
   if (!(s->cr0 & 1)) {
     v->base = (uint64_t)sel << 4;
@@ -400,8 +405,9 @@ static void desc_parse(uint16_t sel, seg_view* v) {
     v->dbit = 0;
     return;
   }
-  if (sel & 4) gp_fault(sel & ~3u);  // LDT machinery is D16: a TI=1 selector always lookup-fails
-  uint64_t desc = BusRead(cpu->bus, s->gdtr + (uint64_t)(sel >> 3) * 8, 8);
+  uint64_t table = sel & 4 ? s->ldtr_base : s->gdtr;
+  uint64_t desc = BusRead(cpu->bus, table + (uint64_t)(sel >> 3) * 8, 8);
+  v->hi = (uint32_t)(desc >> 32);
   v->base = ((desc >> 16) & 0xffffff) | (((desc >> 56) & 0xff) << 24);
   uint32_t lim = (uint32_t)(desc & 0xffff) | (uint32_t)((desc >> 32) & 0xf0000);
   v->limit = (desc >> 55) & 1 ? (lim << 12) | 0xfff : lim;
@@ -409,9 +415,12 @@ static void desc_parse(uint16_t sel, seg_view* v) {
   v->dbit = (uint8_t)((desc >> 54) & 1);
 }
 
+// The limit of the descriptor table a selector names (SDM vol.3 2.4/3.5).
+static uint32_t table_limit(uint16_t sel) { return sel & 4 ? s->ldtr_limit : s->gdtr_limit; }
+
 // Commits a validated load: fills the cache and marks the descriptor
 // accessed (SDM vol.3 5.3: the CPU sets the A bit when a segment register
-// is loaded from it).
+// is loaded from it) — in whichever table the selector names.
 static void seg_commit(int seg, uint16_t sel, const seg_view* v) {
   s->sreg[seg] = sel;
   s->base[seg] = v->base;
@@ -419,7 +428,8 @@ static void seg_commit(int seg, uint16_t sel, const seg_view* v) {
   s->ar[seg] = v->ar;
   s->dbit[seg] = v->dbit;
   if ((s->cr0 & 1) && (sel & 0xfffc) && !(v->ar & 1))
-    BusWrite(cpu->bus, s->gdtr + (uint64_t)(sel >> 3) * 8 + 5, 1, (uint8_t)(v->ar | 1));
+    BusWrite(cpu->bus, (sel & 4 ? s->ldtr_base : s->gdtr) + (uint64_t)(sel >> 3) * 8 + 5, 1,
+             (uint8_t)(v->ar | 1));
 }
 
 // CPL is the CS descriptor's DPL (SDM vol.1 3.4.5); the cache is the source.
@@ -468,12 +478,11 @@ static void load_data(int seg, uint16_t sel) {
     return;
   }
   if ((sel & 0xfffc) == 0) {  // null: legal for data, unusable until reloaded
-    seg_view z = {0, 0, 0, 0};
+    seg_view z = {0, 0, 0, 0, 0};
     seg_commit(seg, sel, &z);
     return;
   }
-  if (sel & 4) gp_fault(sel & ~3u);  // D16
-  if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(sel & ~3u);
+  if ((uint32_t)(sel >> 3) * 8 + 7 > table_limit(sel)) gp_fault(sel & ~3u);
   desc_parse(sel, &v);
   if (!(v.ar & 0x10) || ((v.ar & 0x08) && !(v.ar & 2)))
     gp_fault(sel & ~3u);  // system and execute-only descriptors don't load
@@ -494,8 +503,7 @@ static void load_ss(uint16_t sel) {
     return;
   }
   if ((sel & 0xfffc) == 0) gp_fault(0);
-  if (sel & 4) gp_fault(sel & ~3u);  // D16
-  if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) ss_fault(sel & ~3u);
+  if ((uint32_t)(sel >> 3) * 8 + 7 > table_limit(sel)) ss_fault(sel & ~3u);
   desc_parse(sel, &v);
   if ((v.ar & 0x1a) != 0x12) ss_fault(sel & ~3u);  // writable data: S=1 E=0 W=1
   if (((v.ar >> 5) & 3) != cpl() || (sel & 3) != cpl()) gp_fault(sel & ~3u);
@@ -516,8 +524,7 @@ static void load_cs(uint16_t sel) {
     return;
   }
   if ((sel & 0xfffc) == 0) gp_fault(0);
-  if (sel & 4) gp_fault(sel & ~3u);  // D16
-  if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(sel & ~3u);
+  if ((uint32_t)(sel >> 3) * 8 + 7 > table_limit(sel)) gp_fault(sel & ~3u);
   desc_parse(sel, &v);
   if ((v.ar & 0x18) != 0x18) gp_fault(sel & ~3u);  // code: S=1, E=1
   int conf = v.ar & 4;
@@ -542,8 +549,7 @@ static int vec_has_ec(int vec) {
 // becomes the return RPL.
 static void ret_cs_check(uint16_t sel, int newpl, seg_view* cv) {
   if ((sel & 0xfffc) == 0) gp_fault(0);
-  if (sel & 4) gp_fault(sel & ~3u);  // D16
-  if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(sel & ~3u);
+  if ((uint32_t)(sel >> 3) * 8 + 7 > table_limit(sel)) gp_fault(sel & ~3u);
   desc_parse(sel, cv);
   if ((cv->ar & 0x18) != 0x18) gp_fault(sel & ~3u);  // executable
   int conf = cv->ar & 4;
@@ -557,8 +563,7 @@ static void ret_cs_check(uint16_t sel, int newpl, seg_view* cv) {
 static void ret_ss_check(uint16_t new_ss, int newpl, seg_view* sv) {
   if ((new_ss & 3) != newpl) gp_fault(new_ss & ~3u);
   if ((new_ss & 0xfffc) == 0) gp_fault(0);
-  if (new_ss & 4) gp_fault(new_ss & ~3u);  // D16
-  if ((uint32_t)(new_ss >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(new_ss & ~3u);
+  if ((uint32_t)(new_ss >> 3) * 8 + 7 > table_limit(new_ss)) gp_fault(new_ss & ~3u);
   desc_parse(new_ss, sv);
   if ((sv->ar & 0x1a) != 0x12) gp_fault(new_ss & ~3u);  // writable data
   if (((sv->ar >> 5) & 3) != newpl) gp_fault(new_ss & ~3u);
@@ -578,12 +583,49 @@ static void tss_stack(int newpl, uint16_t* ss0, uint32_t* esp0, seg_view* sv) {
   *esp0 = tss32 ? rd32(s->tr_base + 4 + 8 * newpl) : rd16(s->tr_base + 2 + 4 * newpl);
   *ss0 = tss32 ? rd16(s->tr_base + 8 + 8 * newpl) : rd16(s->tr_base + 4 + 4 * newpl);
   if ((*ss0 & 0xfffc) == 0) ts_fault(0);
-  if (*ss0 & 4) ts_fault(*ss0 & ~3u);  // D16
-  if ((uint32_t)(*ss0 >> 3) * 8 + 7 > s->gdtr_limit) ts_fault(*ss0 & ~3u);
+  if ((uint32_t)(*ss0 >> 3) * 8 + 7 > table_limit(*ss0)) ts_fault(*ss0 & ~3u);
   desc_parse(*ss0, sv);
   if ((sv->ar & 0x1a) != 0x12) ts_fault(*ss0 & ~3u);  // writable data
   if (((sv->ar >> 5) & 3) != newpl || (*ss0 & 3) != newpl) ts_fault(*ss0 & ~3u);
   if (!(sv->ar & 0x80)) ts_fault(*ss0 & ~3u);
+}
+
+// The LDTR load shared by LLDT and the task switch (SDM vol.2 LLDT,
+// vol.3 7.2.1): a null selector clears the cache (no LDT); otherwise the
+// selector must name a present LDT descriptor in the GDT — LDT descriptors
+// never live in an LDT, so TI=1 faults outright. `task_switch` picks #TS
+// for the structural faults (SDM 7.2.1) where the instruction uses #GP.
+static void load_ldtr(uint16_t sel, int task_switch) {
+  if ((sel & 0xfffc) == 0) {  // null: the task runs without an LDT
+    s->ldtr = sel;
+    s->ldtr_base = 0;
+    s->ldtr_limit = 0;
+    return;
+  }
+  if (sel & 4) {
+    if (task_switch)
+      ts_fault(sel & ~3u);
+    else
+      gp_fault(sel & ~3u);
+  }
+  if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) {
+    if (task_switch)
+      ts_fault(sel & ~3u);
+    else
+      gp_fault(sel & ~3u);
+  }
+  seg_view v;
+  desc_parse(sel, &v);
+  if ((v.ar & 0x1f) != 0x02) {  // system, type 2 (SDM vol.3 table 3-2)
+    if (task_switch)
+      ts_fault(sel & ~3u);
+    else
+      gp_fault(sel & ~3u);
+  }
+  if (!(v.ar & 0x80)) np_fault(sel & ~3u);
+  s->ldtr = sel;
+  s->ldtr_base = v.base;
+  s->ldtr_limit = v.limit;
 }
 
 // Task switching (SDM vol.3 7.2.1, cross-checked against v86 do_task_switch
@@ -591,12 +633,13 @@ static void tss_stack(int newpl, uint16_t* ss0, uint32_t* esp0, seg_view* sv) {
 // clears the outgoing descriptor's busy bit, CALL/INT additionally writes
 // the back-link and forces NT in the new image, IRET requires a busy target
 // and clears NT in the saved image. The LDTR field is not written back to
-// the outgoing TSS (tiny386 and v86 agree; the LDT itself is D16).
+// the outgoing TSS (tiny386 and v86 agree; the incoming one is loaded below
+// so the new task's TI=1 selectors resolve through its own LDT).
 enum { kTaskJmp, kTaskCall, kTaskIret };
 static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_ec,
                            uint32_t ec) {
   if ((sel & 0xfffc) == 0) gp_fault(0);
-  if (sel & 4) gp_fault(sel & ~3u);  // D16
+  if (sel & 4) gp_fault(sel & ~3u);  // TSS descriptors are GDT-only (SDM 7.2)
   if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(sel & ~3u);
   seg_view v;
   desc_parse(sel, &v);
@@ -640,8 +683,10 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   s->tr_ar = (uint8_t)(v.ar | 2);
 
   s->cr3 = rd32(v.base + 0x1c);  // carried along (SDM 7.2.1); the walk uses bits 31:12
-  uint16_t ldt = rd16(v.base + 0x60);
-  if (ldt & 0xfffc) ts_fault(sel & ~3u);  // D16: no LDT to switch to
+  // The incoming LDT (TSS +0x60) loads BEFORE the segment selectors: their
+  // TI=1 lookups go through the new task's own LDT (SDM 7.2.1 step order).
+  // It is not written back to the outgoing TSS (tiny386 and v86 agree).
+  load_ldtr(rd16(v.base + 0x60), 1);
 
   uint32_t nf = rd32(v.base + 0x24);
   if (nf & 0x20000) Fatal("x86: VM86 not implemented (D14)");
@@ -653,8 +698,7 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   // specially). The new CPL is the CS RPL.
   uint16_t new_cs = rd16(v.base + 0x4c);
   if ((new_cs & 0xfffc) == 0) ts_fault(0);
-  if (new_cs & 4) ts_fault(new_cs & ~3u);  // D16
-  if ((uint32_t)(new_cs >> 3) * 8 + 7 > s->gdtr_limit) ts_fault(new_cs & ~3u);
+  if ((uint32_t)(new_cs >> 3) * 8 + 7 > table_limit(new_cs)) ts_fault(new_cs & ~3u);
   seg_view cv;
   desc_parse(new_cs, &cv);
   if ((cv.ar & 0x18) != 0x18) ts_fault(new_cs & ~3u);  // executable
@@ -751,10 +795,10 @@ static void call_gate(uint16_t sel, uint64_t desc, int is_call, uint32_t ret_eip
   uint32_t off = (uint32_t)(desc & 0xffff) | (uint32_t)((desc >> 48) & 0xffff) << 16;
   int count = (int)((desc >> 32) & 0x1f);
 
-  // The gate's code segment (same rules as an interrupt gate's target).
+  // The gate's code segment (same rules as an interrupt gate's target); a
+  // call gate may aim into the LDT the way any code load may (SDM vol.3 3.5).
   if ((code_sel & 0xfffc) == 0) gp_fault(0);
-  if (code_sel & 4) gp_fault(code_sel & ~3u);  // D16
-  if ((uint32_t)(code_sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(code_sel & ~3u);
+  if ((uint32_t)(code_sel >> 3) * 8 + 7 > table_limit(code_sel)) gp_fault(code_sel & ~3u);
   seg_view cv;
   desc_parse(code_sel, &cv);
   if ((cv.ar & 0x18) != 0x18) gp_fault(code_sel & ~3u);  // executable
@@ -835,9 +879,11 @@ static void pm_far(uint16_t sel, uint32_t off, int is_call, uint32_t ret_eip) {
     return;
   }
   if ((sel & 0xfffc) == 0) gp_fault(0);
-  if (sel & 4) gp_fault(sel & ~3u);  // D16
-  if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(sel & ~3u);
-  uint64_t desc = BusRead(cpu->bus, s->gdtr + (uint64_t)(sel >> 3) * 8, 8);
+  if ((uint32_t)(sel >> 3) * 8 + 7 > table_limit(sel)) gp_fault(sel & ~3u);
+  // Call gates may live in the LDT (SDM vol.3 3.5); task gates and TSSes
+  // are GDT-only, so the TI=1 system paths below reject first.
+  uint64_t desc =
+      BusRead(cpu->bus, (sel & 4 ? s->ldtr_base : s->gdtr) + (uint64_t)(sel >> 3) * 8, 8);
   if (!((desc >> 44) & 1)) {  // S=0: a system descriptor
     uint8_t ty = (uint8_t)((desc >> 40) & 0xf);
     int gdpl = (int)((desc >> 45) & 3);
@@ -845,6 +891,7 @@ static void pm_far(uint16_t sel, uint32_t off, int is_call, uint32_t ret_eip) {
       call_gate(sel, desc, is_call, ret_eip, ret_cs);
       return;
     }
+    if (sel & 4) gp_fault(sel & ~3u);
     if (gdpl < cpl() || gdpl < (sel & 3)) gp_fault(sel & ~3u);
     if (!((desc >> 47) & 1)) np_fault(sel & ~3u);
     if (ty == 5) {  // task gate: its selector field names the TSS
@@ -953,10 +1000,10 @@ void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
   uint32_t off = (uint32_t)(gate & 0xffff) | (uint32_t)((gate >> 48) & 0xffff) << 16;
 
   // The gate's code segment (SDM vol.2 INT: table limits, executable,
-  // DPL <= CPL, present — a faulting gate is never entered).
+  // DPL <= CPL, present — a faulting gate is never entered; the target may
+  // be an LDT code segment, SDM vol.3 3.5).
   if ((code_sel & 0xfffc) == 0) gp_fault(0);
-  if (code_sel & 4) gp_fault(code_sel & ~3u);  // D16
-  if ((uint32_t)(code_sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(code_sel & ~3u);
+  if ((uint32_t)(code_sel >> 3) * 8 + 7 > table_limit(code_sel)) gp_fault(code_sel & ~3u);
   seg_view cv;
   desc_parse(code_sel, &cv);
   if ((cv.ar & 0x18) != 0x18) gp_fault(code_sel & ~3u);  // executable
@@ -1639,16 +1686,29 @@ static void run_op2(uint8_t op2) {
     case 0x00: {  // 0f 00 group: sldt/str/lldt/ltr/verr/verw (reg field)
       modrm();
       switch (d.reg) {
+        case 0:  // sldt: the visible LDTR (SDM vol.2 SLDT; unprivileged)
+          if (d.w32)
+            set_rm32(s->ldtr);
+          else
+            set_rm16(s->ldtr);
+          break;
         case 1:  // str: the visible TR selector
           if (d.w32)
             set_rm32(s->tr);
           else
             set_rm16(s->tr);
           break;
+        case 2: {  // lldt (privileged: SDM vol.2)
+          if (!(s->cr0 & 1)) ud();  // PM-only (SDM vol.2 LLDT)
+          if (cpl() != 0) gp_fault(0);
+          uint16_t sel = rm16();
+          load_ldtr(sel, 0);
+          break;
+        }
         case 3: {  // ltr: a system descriptor for an available TSS
           uint16_t sel = rm16();
           if ((sel & 0xfffc) == 0) gp_fault(0);
-          if (sel & 4) gp_fault(sel & ~3u);  // D16
+          if (sel & 4) gp_fault(sel & ~3u);  // TSS descriptors are GDT-only (SDM 7.2)
           if ((uint32_t)(sel >> 3) * 8 + 7 > s->gdtr_limit) gp_fault(sel & ~3u);
           seg_view v;
           desc_parse(sel, &v);
@@ -1665,8 +1725,71 @@ static void run_op2(uint8_t op2) {
                    (uint8_t)(v.ar | 2));
           break;
         }
+        case 4:
+        case 5: {  // verr/verw: ZF answers "readable/writable at this CPL"
+          if (!(s->cr0 & 1)) ud();  // PM-only (SDM vol.2)
+          // A lookup defect (null selector, outside table) only clears ZF —
+          // the SDM's exception list has no selector faults for VERR/VERW
+          // (v86's verr/verw agree). VERR: any readable segment; VERW:
+          // writable data. Conforming code skips the DPL rule (v86 both).
+          uint16_t sel = rm16();
+          seg_view v;
+          int ok = 0;
+          if ((sel & 0xfffc) != 0 && (uint32_t)(sel >> 3) * 8 + 7 <= table_limit(sel)) {
+            desc_parse(sel, &v);
+            int dpl_ok = ((v.ar >> 5) & 3) >= cpl() && ((v.ar >> 5) & 3) >= (sel & 3);
+            if (v.ar & 0x10) {  // a code/data segment (S=1)
+              int conf_exec = (v.ar & 0x1c) == 0x1c;
+              if (d.reg == 4) {
+                int readable = (v.ar & 0x08) ? (v.ar & 0x1a) == 0x1a : 1;  // code: R bit; data: always
+                ok = readable && (conf_exec || dpl_ok);
+              } else {
+                ok = (v.ar & 0x1a) == 0x12 && dpl_ok;  // writable data
+              }
+            }
+          }
+          fl->zf = ok;
+          break;
+        }
         default:
-          ud();  // sldt/lldt/verr/verw: stage-3 item 5 (LDT machinery)
+          ud();
+      }
+      break;
+    }
+    case 0x02:
+    case 0x03: {  // lar/lsl: the descriptor's rights byte / effective limit
+      if (!(s->cr0 & 1)) ud();  // PM-only (SDM vol.2)
+      modrm();
+      uint16_t sel = rm16();
+      seg_view v;
+      uint32_t val = 0;
+      int ok = 0;
+      if ((sel & 0xfffc) != 0 && (uint32_t)(sel >> 3) * 8 + 7 <= table_limit(sel)) {
+        desc_parse(sel, &v);
+        uint8_t ty = v.ar & 0xf;
+        int conf_exec = (v.ar & 0x1c) == 0x1c;
+        int dpl_ok = ((v.ar >> 5) & 3) >= cpl() && ((v.ar >> 5) & 3) >= (sel & 3);
+        // Type validity (SDM vol.2 LAR/LSL valid-type lists, v86
+        // LAR_INVALID_TYPE / LSL_INVALID_TYPE): gates and reserved types
+        // fail, and every system type still needs DPL >= max(CPL, RPL).
+        static const uint16_t kLarBadTypes = 1 << 0 | 1 << 6 | 1 << 7 | 1 << 8 |
+                                             1 << 0xa | 1 << 0xd | 1 << 0xe | 1 << 0xf;
+        static const uint16_t kLslBadTypes = 1 << 0 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 7 |
+                                             1 << 8 | 1 << 0xa | 1 << 0xc | 1 << 0xd |
+                                             1 << 0xe | 1 << 0xf;
+        if (v.ar & 0x10) {  // code/data
+          ok = conf_exec || dpl_ok;
+        } else {
+          ok = !((op2 == 0x02 ? kLarBadTypes : kLslBadTypes) >> ty & 1) && dpl_ok;
+        }
+        if (ok) val = op2 == 0x02 ? v.hi & 0x00f0ff00u : v.limit;
+      }
+      fl->zf = ok;
+      if (ok) {
+        if (d.w32)
+          set_reg32(val);
+        else
+          set_reg16((uint16_t)val);
       }
       break;
     }
@@ -2707,6 +2830,21 @@ void run_op(uint8_t op) {
         dx = pop16();
         cx = pop16();
         ax = pop16();
+      }
+      break;
+    }
+    case 0x63: {  // arpl: raise r/m's RPL to the register's (SDM vol.2,
+                  // PM-only — v86 #UDs it outside protected mode)
+      if (!(s->cr0 & 1)) ud();
+      if (cpl() != 0) gp_fault(0);
+      modrm();
+      uint16_t dest = rm16();
+      uint16_t src = reg16();
+      if ((dest & 3) < (src & 3)) {
+        fl->zf = 1;
+        SET_RM16((uint16_t)((dest & ~3u) | (src & 3)));
+      } else {
+        fl->zf = 0;
       }
       break;
     }

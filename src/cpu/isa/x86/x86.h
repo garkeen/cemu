@@ -10,9 +10,9 @@
 // and the width lives in the function-name suffix. Scope: real mode plus
 // protected mode through segment protection (SDM vol.3 5.3: descriptor
 // parse, CPL/RPL/DPL and limit checks), the gate machinery (interrupt/trap/
-// call/task gates, SDM vol.3 6-7), task switching and two-level paging
-// (SDM vol.3 4); LDT is not in yet. The descriptor cache surviving
-// CR0.PE=0 IS big real mode.
+// call/task gates, SDM vol.3 6-7), task switching, two-level paging
+// (SDM vol.3 4) and the LDT through its descriptor cache (SDM vol.3 2.4.4,
+// 3.5); the descriptor cache surviving CR0.PE=0 IS big real mode.
 
 // Register cells follow the modrm reg/rm encoding order (SDM table 3-1).
 enum { eax_i, ecx_i, edx_i, ebx_i, esp_i, ebp_i, esi_i, edi_i };
@@ -86,6 +86,9 @@ typedef struct x86_state {
   uint64_t tr_base;   // task register descriptor cache (SDM vol.3 7.2)
   uint32_t tr_limit;
   uint8_t tr_ar;      // access byte; type bit 3 distinguishes 32-bit TSS
+  uint16_t ldtr;      // visible LDTR selector; 0 = no LDT (SDM vol.3 2.4.4)
+  uint64_t ldtr_base; // LDT descriptor cache: TI=1 selector lookups and
+  uint32_t ldtr_limit;  // VERR/VERW/LAR/LSL read through it
   uint32_t dr[8];
   int intr_pending;  // the machine's INTR line is asserted
   int intr_inhibit;  // SDM window: instruction after STI takes no INTR

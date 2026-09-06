@@ -230,7 +230,7 @@ CEMU_DEBUG="regs=100000" ./cemu.exe ... img 2> r.txt
 | D13 | x86 RDTSC/CMPXCHG/CMPXCHG8B/x87 FPU 判非法 #UD;DR7.GD 调试支持不设防 | 386 子集外指令与 FPU 未实现;LMSW/INVLPG/CLTS/MOV CR2/CR3 已随阶段 3 分页销账 | intel SDM vol.2；QEMU translate.c | 阶段 3 指令侧按需（保护模式/xv6）；x87 FPU 在 Linux 用户态（阶段 4+） | 登记中。现实表现：realmode 尾 test_fninit #UD→垃圾 IVT[6]→死循环，run.sh 以 timeout+输出判据容纳 |
 | D14 | x86 iret/popf 载入屏蔽 RF(bit16)/VM(bit17) | RF 瞬态建模（真机不可观测为 1，等价）；VM86 不进入 | intel SDM EFLAGS | DOS/BIOS 兼容路线需要 VM86 时评估（Linux 不需要） | 登记中 |
 | D15 | x86 16 位 TSS 任务切换（类型 1/3）Fatal | 任务切换只支持 32 位 TSS（类型 9/B）；门/任务门对 16 位 TSS 拒绝进入 | v86 do_task_switch（assert 32 位）；tiny386（assert 9/11） | 有验收件需要 286 任务时 | 登记中 |
-| D16 | x86 LDT/LDTR 机制未实现 | TI=1 选择器按查找失败抛 #GP(sel&~3)（任务切换内 #TS、ltr #GP）；任务切换载入 LDTR 仅接受空选择器；lldt/sldt/verr/verw 待项 5 | v86 lookup_segment_selector/load_ldt；SDM vol.3 5.3 | 阶段 3 项 5（LDT 机制整体） | 登记中 |
+| ~~D16~~ | ~~x86 LDT/LDTR 机制未实现~~ | 已销账（2026-09-06 阶段 3 项 5）：LDTR 描述符缓存、TI=1 经 LDT 查找、lldt/sldt/verr/verw/lar/lsl/arpl、任务切换 TSS +0x60 装载。null-LDTR 的 TI=1 引用按表限规则抛 GP/SS/TS（tiny386/v86/QEMU 三方一致；SDM 的 TS 读法无文本可查证，若日后有 SDM 文本推翻再修） | v86 lookup_segment_selector/load_ldt；tiny386 read_desc；SDM vol.3 2.4.4/5.3 | ~~阶段 3 项 5~~ | 已销账 |
 | E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中（先加 softfloat 测试向量回归对照） |
 
 已销账（历史存档，无需再管）：D1-D5（S 态机制/sret/wfi/sfence/time 真实

@@ -3,6 +3,48 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 3 项 5：LDT 机制整体（D16 销账，2026-09-06）
+
+exec.c 补齐 LDT/LDTR 全链（对照 v86 lookup_segment_selector/load_ldt、
+tiny386 read_desc、SDM vol.3 2.4.4/3.5/5.3）：
+
+- **LDTR 状态**：可见选择器 + 描述符缓存（base/limit），lldt null 清缓存。
+- **TI=1 查找**：desc_parse 按选择器 TI 位选 LDT 缓存；表限检查按
+  table_limit(sel) 双表化，落到各装载点自己的向量（data/CS→#GP、SS→#SS、
+  任务切换→#TS）。null LDTR 缓存 limit 0，任何 TI=1 引用按表限规则失败
+  ——tiny386/v86/QEMU 三方一致（一度按 #TS 实现后被 QEMU 双跑实测推翻，
+  见下）。
+- **指令组**：lldt（CPL0、GDT-only、type 2、#NP）、sldt、verr/verw（查
+  找缺陷只清 ZF 不故障；verr=可读、verw=可写数据、conforming 跳过 DPL
+  规则）、lar（hi dword & 00FxFF00——x nibble 未定义位清零，QEMU 实测校
+  准；v86 用 00FFFF00 保留之，两读法皆 SDM 兼容）、lsl（G 展开限长）、
+  arpl（0x63，PM-only #UD）。六条新指令 PM-only，与 SDM/v86 一致。
+- **任务切换**：TSS +0x60 装载 LDTR（null 合法、TI=1/#TS、越限/#TS、
+  type≠2/#TS、不present/#NP），且在段选择器装载**之前**——新任务的
+  TI=1 选择器走它自己的 LDT（SDM 7.2.1 步序）；旧任务 LDTR 不写回
+  （SDM 切出保存列表无 LDTR，v86 注释掉的 save 行印证）。
+- **seg_commit 的 A 位写**改按选择器所在表（GDT 或 LDT）。
+- **LAR/LSL** 补齐（0f 02/03）：类型有效表照 v86 LAR/LSL_INVALID_TYPE，
+  系统类型一律 DPL≥max(CPL,RPL)，失败 ZF=0 且目的寄存器不变。
+
+探针扩到 24 项：t19 建 LDT+lldt/sldt 回读+TI=1 数据装载、t20 段限
+#GP(0)+null LDTR 查找 #GP(0x0c)、t21 verr/verw 矩阵、t22 lar/lsl 值与
+失败（LAR 掩码 00FxFF00 的 x nibble 清零）、t23 arpl、t24 任务切换装载
+LDT 后任务体自用。**QEMU 对拍 22/24**（pm_qemu2.txt）：t7 与 t20 检查 1
+同根——此 dirty QEMU 的 TCG 不执行数据段限检查（LSL 证 limit 0x1ff、
+store 照落），GDT/LDT 一视同仁，SDM 卷 3 5.2.1/5.3 强制，按 cemu 输出
+判（run.sh 注释登记）。
+
+**调试教训（九.2 三度亲证）**：t20 曾按"SDM 要求 #TS"实现 ldt_check，
+QEMU 双跑 + 诊断字符（"00"=无 #TS 投递、"5"=限违例未抛）推翻了级联假说
+——三个参考实现（tiny386/v86/QEMU）一致走表限规则，SDM 文本无从查证时
+以实现共识落地并在 D16 销账行留痕。另有探针三处自伤（LDT 描述符 dword0
+字节序、跨段恢复时 `mov ax` 毁掉 eax 读回值、`pop eax` 覆盖 ax 里的选择
+器）全靠 CEMU_DEBUG trace/mem 定位。
+
+回归：riscv 127/127、x86 smoke+pm+realmode 全绿、depcheck ok；smoke
+state 流 194KB 全量一致，realmode state 流新旧二进制前 5MB 一致。
+
 ## 阶段 3 项 4：386 两级分页（2026-09-06）
 
 exec.c 新增 page_translate（对照 tiny386 tlb_refill/translate_lpgno 与
@@ -282,9 +324,9 @@ gp）；位段类 bug 用 llvm-objdump 对照 cemu trace 的 raw/dnpc 即可裁�
   `& 'C:\Program Files\Git\bin\bash.exe' -c '...'`
 - 回归：`bash test/run.sh`；单独 riscv `bash test/riscv64/run.sh`、
   x86 `bash test/x86/run.sh`
-- 回归基线（2026-09-06，分页落地后实测）：riscv64 **127 passed /
-  0 failed**；x86 smoke PASS + pm **18/18** + realmode 122/122（pm 判据
-  expected_pm=18，QEMU 对拍 17/18 见 pm 节；套件尾部 fninit #UD 死循环由
+- 回归基线（2026-09-06，LDT 落地后实测）：riscv64 **127 passed /
+  0 failed**；x86 smoke PASS + pm **24/24** + realmode 122/122（pm 判据
+  expected_pm=24，QEMU 对拍 22/24 见 pm 节；套件尾部 fninit #UD 死循环由
   D13 登记容纳，run.sh 的 timeout 判据容纳）
 - debug：`CEMU_DEBUG=...`（见 AGENTS.md 第十节），例
   `CEMU_DEBUG="trace:table,state,mem,budget=200" build/cemu.exe --machine x86 --isa x86 test/x86/realmode/realmode.elf`
