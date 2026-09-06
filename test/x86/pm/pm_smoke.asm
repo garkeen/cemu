@@ -1,8 +1,8 @@
 ; Protected-mode smoke probe for the x86_min machine (smoke-probe nature per
-; guideline 6: acceptance is kvm-unit-tests, this validates stage-3 items 1-2
+; guideline 6: acceptance is kvm-unit-tests, this validates stage-3 items 1-4
 ; under QEMU arbitration). A multiboot ELF enters flat protected mode (CS=0x08
 ; data=0x10, PE=1 — the QEMU -kernel contract), rebuilds GDT/IDT/TSS, and
-; walks the stage-3 segment and gate semantics:
+; walks the stage-3 segment, gate and paging semantics:
 ;   t1  segment loads from the new GDT + data write/readback
 ;   t2  data-segment limit violation -> #GP(0) delivered through gate 13
 ;   t3  same-privilege INT 0x20 through a DPL0 interrupt gate: no stack
@@ -26,8 +26,20 @@
 ;   t13 INT through an IDT task gate (NT forced), then a real #GP delivered
 ;       through a task gate: the error code lands on the task's stack and
 ;       the task resumes main past the faulting instruction
+;   t14 identity map 0-1MB through one page table, CR3 then CR0.PG|WP on:
+;       fetch and data accesses walk the two-level tables
+;   t15 ring-0 write to a linear whose PDE is absent -> #PF(ec=2, W only),
+;       CR2 == the faulting linear (runs paged)
+;   t16 PTE flipped read-only: ring-0 read succeeds, write -> #PF(ec=3,
+;       P|W — CR0.WP makes the supervisor honor R/O), then restored
+;   t17 A/D bits: a read sets A in PDE and PTE (D stays 0), a write sets
+;       PTE.D; every PTE change is followed by a CR3 reload (the QEMU side
+;       caches translations, a real 386 caches them too)
+;   t18 ring 3 paged: U/RW user page write succeeds; write to a
+;       supervisor-only page -> #PF(ec=7, P|W|U), exit through gate 0x24
 ; The tN numbers are report slots, not run order: t9 runs after t3 and t10
-; runs after t7 (both need the ring levels already established).
+; runs after t7 (both need the ring levels already established); t14-t18 run
+; at the end, inside the ring-0 resume flow after t13.
 ; Reports one "tN ok" line per test plus "pm-smoke done", then exits through
 ; the QEMU isa-debug-exit port 0xF4 with payload 5 (status = (5<<1)|1 = 11).
 ;
@@ -57,12 +69,19 @@
 %define IDT_LIN    0x2100      ; gates built at runtime, 0x2a slots
 %define TSS_LIN    0x2400      ; TSS image: ESP0 at +4, SS0 at +8
 %define TSS2_LIN   0x2600      ; second TSS image (filled at runtime)
-%define RES_LIN    0x2500      ; result bytes r1..r13 (1 = ok, RAM starts 0)
-%define OBS_LIN    0x2510      ; handler observation slots (dwords)
+%define RES_LIN    0x2500      ; result bytes r1..r18 (1 = ok, RAM starts 0)
+%define OBS_LIN    0x2700      ; handler observation slots (dwords)
+%define PD_LIN     0x60000     ; page directory (4 KiB aligned)
+%define PT0_LIN    0x61000     ; page table covering 0-4 MiB, identity
 %define RING0_TOP  0x4000
 %define TSS_ESP0   0x4800
 %define RING3_TOP  0x5000
 %define SCRATCH    0x5100
+
+%macro RELOAD_CR3 0
+  mov eax, PD_LIN
+  mov cr3, eax
+%endmacro
 
 section .multiboot
 align 4
@@ -137,6 +156,16 @@ _start:
   call mk_gate
   mov edi, IDT_LIN + 0x23 * 8
   mov eax, int23_handler
+  mov cx, SEL_CODE0
+  mov bl, 0xee
+  call mk_gate
+  mov edi, IDT_LIN + 14 * 8
+  mov eax, pf_handler
+  mov cx, SEL_CODE0
+  mov bl, 0x8e
+  call mk_gate
+  mov edi, IDT_LIN + 0x24 * 8
+  mov eax, int24_handler
   mov cx, SEL_CODE0
   mov bl, 0xee
   call mk_gate
@@ -408,6 +437,52 @@ int23_handler:                 ; exit: rewrite the gate frame into a ring-0
   mov dword [esp + 8], 0x2
   iretd
 
+int24_handler:                 ; t18 exit: same frame rewrite as int23, but
+  mov dword [esp], pg_resume   ; back into the paged half of the probe
+  mov word [esp + 4], SEL_CODE0
+  mov dword [esp + 8], 0x2
+  iretd
+
+pf_handler:                    ; #PF from any ring: record the error code and
+  push eax                     ; CR2, drop the error code, skip the 2-byte
+  push ds                      ; faulting MOV
+  mov ax, SEL_DATA0
+  mov ds, ax
+  mov eax, [esp + 8]           ; [esp]=ds, [esp+4]=eax, [esp+8]=error code
+  mov dword [OBS_LIN + 0x7c], eax
+  mov eax, cr2
+  mov dword [OBS_LIN + 0x80], eax
+  pop ds
+  pop eax
+  add esp, 4                   ; the error code is not part of the IRET frame
+  add dword [esp], 2
+  iretd
+
+ring3_paging_entry:            ; t18 body: the user-page write must succeed,
+  mov ax, SEL_DATA3R3          ; the supervisor-page write must #PF(ec=7)
+  mov ds, ax
+  mov ecx, 0x5800
+  mov [ecx], ecx
+  mov eax, [ecx]
+  cmp eax, 0x5800
+  jne .fault
+  mov byte [OBS_LIN + 0x84], 1
+.fault:
+  mov ecx, 0x9000
+  mov [ecx], ecx               ; pf_handler records ec + CR2 and skips 2
+  cmp byte [OBS_LIN + 0x84], 1
+  jne .done
+  cmp dword [OBS_LIN + 0x7c], 7
+  jne .done
+  cmp dword [OBS_LIN + 0x80], 0x9000
+  jne .done
+  mov byte [RES_LIN + 17], 1
+.done:
+  int 0x24                     ; exit vector back to ring 0
+.hang4:
+  hlt
+  jmp .hang4
+
 gate9_entry:                   ; t9: record the return frame, RETF back
   push eax
   push ds
@@ -592,6 +667,98 @@ t13_ret:
   mov byte [RES_LIN + 12], 1
 t13_done:
 
+  ; ---- t14: identity map 0-1MB, switch on paging (CR3, then PG|WP) ---------
+  mov dword [PD_LIN], PT0_LIN | 7     ; PDE[0]: the one 4 MiB table, P|R/W
+  mov esi, PT0_LIN
+  xor eax, eax                        ; PT0[i] = (i<<12) | P|R/W, 256 pages
+.pt0_fill:
+  mov edx, eax
+  shl edx, 12
+  or edx, 7
+  mov [esi + eax * 4], edx
+  inc eax
+  cmp eax, 256
+  jl .pt0_fill
+  RELOAD_CR3
+  mov eax, cr0
+  or eax, 0x80010000                  ; PG | WP (WP: the R/O test needs a
+  mov cr0, eax                        ; supervisor that honors read-only)
+  mov dword [0x20000], 0xC0DE0014     ; data access and instruction fetch
+  mov eax, [0x20000]                  ; both walk the tables now
+  cmp eax, 0xC0DE0014
+  jne pg_done
+  mov byte [RES_LIN + 13], 1
+
+  ; ---- t15: PDE[1] absent -> ring-0 write to 0x400000 is #PF(ec=2) ---------
+  mov ecx, 0x400000
+  mov [ecx], ecx                      ; pf_handler records ec + CR2, skips 2
+  cmp dword [OBS_LIN + 0x7c], 2       ; W set, P and U clear
+  jne pg_done
+  cmp dword [OBS_LIN + 0x80], 0x400000
+  jne pg_done
+  mov byte [RES_LIN + 14], 1
+
+  ; ---- t16: PTE for 0x7000 flipped read-only --------------------------------
+  and dword [PT0_LIN + 7 * 4], ~2     ; clear R/W; CR3 reload so a cached
+  RELOAD_CR3                          ; TLB (QEMU, real silicon) notices
+  mov eax, [0x7000]                   ; the read succeeds
+  mov ecx, 0x7000
+  mov [ecx], ecx                      ; -> #PF(ec=3, P|W at CPL 0)
+  cmp dword [OBS_LIN + 0x7c], 3
+  jne .pg_restore
+  cmp dword [OBS_LIN + 0x80], 0x7000
+  jne .pg_restore
+  mov byte [RES_LIN + 15], 1
+.pg_restore:
+  or dword [PT0_LIN + 7 * 4], 2
+  RELOAD_CR3
+
+  ; ---- t17: A/D bits on successful translations -----------------------------
+  and dword [PT0_LIN + 5 * 4], ~0x60  ; clear A|D in the SCRATCH page's PTE
+  and dword [PD_LIN], ~0x60           ; and in PDE[0] (the walk of THIS store
+                                      ; sets A first, the store then clears
+                                      ; it — the net content is A=0)
+  RELOAD_CR3
+  mov eax, [SCRATCH]                  ; a read: A in both levels, D untouched
+  mov edx, [PD_LIN]
+  and edx, 0x60
+  cmp edx, 0x20                       ; PDE: A set, D does not exist there
+  jne pg_done
+  mov edx, [PT0_LIN + 5 * 4]
+  and edx, 0x60
+  cmp edx, 0x20                       ; PTE: A set, D still clear
+  jne pg_done
+  and dword [PT0_LIN + 5 * 4], ~0x60  ; clear again for the write pass
+  RELOAD_CR3
+  mov dword [SCRATCH], 0xC0DE0017     ; a write sets PTE.D as well
+  mov edx, [PT0_LIN + 5 * 4]
+  and edx, 0x60
+  cmp edx, 0x60
+  jne pg_done
+  mov byte [RES_LIN + 16], 1
+
+  ; ---- t18: ring 3 under paging — user page ok, supervisor page faults ------
+  or dword [PD_LIN], 4                ; U on the directory entry: ring 3 can
+  mov eax, 255                        ; reach the table at all; U on every
+.pte_user:                            ; page (the image's code pages are in
+  or dword [PT0_LIN + eax * 4], 4     ; entries 16-18, well past the stacks)
+  dec eax
+  jns .pte_user
+  and dword [PT0_LIN + 9 * 4], ~4     ; 0x9000: the supervisor-only page
+  RELOAD_CR3                          ; a cached TLB must see the new rights
+  push dword SEL_DATA3R3
+  push dword RING3_TOP
+  push dword 0x2
+  push dword SEL_CODE3R3
+  push dword ring3_paging_entry
+  iretd
+
+pg_done:
+pg_resume:
+  mov esp, RING0_TOP
+  mov ax, SEL_DATA0
+  mov ds, ax
+
   ; ---- report ---------------------------------------------------------------------
   xor ebx, ebx
 .loop:
@@ -624,7 +791,7 @@ t13_done:
 .emit:
   call print
   inc ebx
-  cmp ebx, 13
+  cmp ebx, 18
   jl .loop
   mov esi, msg_done
   call print

@@ -21,22 +21,27 @@ else
 fi
 
 # PM: the protected-mode smoke probe (test/x86/pm). Multiboot ELF enters flat
-# PM, rebuilds GDT/IDT/TSS, and walks the stage-3 gate semantics: descriptor
+# PM, rebuilds GDT/IDT/TSS, and walks the stage-3 semantics: descriptor
 # loads, limit #GP, same-priv and cross-ring gate delivery with TSS stack
 # switch, gate-DPL violation #GP(ec=vec*8|2), IRET privilege round-trips,
 # call gates (same-priv, inward with stack-parameter copy), far RETF with the
 # SDM double-imm outer return, task switching (lcall/ljmp through a TSS,
 # state save/restore round trip, busy-bit #GP, IRET nested-task return,
-# IDT task gates incl. error-code delivery).
-# Self-reports 13 "tN ok" lines then "pm-smoke done", exits status 11.
+# IDT task gates incl. error-code delivery), and paging (identity map +
+# CR0.PG|WP on, not-present #PF ec=2 + CR2, read-only write #PF ec=3 under
+# CR0.WP=1, A/D bits on successful translations, ring-3 user/supervisor
+# #PF ec=7).
+# Self-reports 18 "tN ok" lines then "pm-smoke done", exits status 11.
 #
-# Calibration: byte-identical to qemu-system-i386 -kernel on 12 of 13 tests.
-# The one divergence, t7 (ring-3 store beyond a data-segment limit), is a
-# deficiency of the local arbiter build: this qemu (10.2.92,
+# Calibration: byte-identical to qemu-system-i386 -kernel on 17 of 18 tests
+# (pm_qemu2.txt). The one divergence, t7 (ring-3 store beyond a data-segment
+# limit), is a deficiency of the local arbiter build: this qemu (10.2.92,
 # v11.0.0-rc2-12119-gaa7f0eb8d8-dirty) loads the descriptor (LSL confirms
 # limit 0x1ff) yet lets the store land without #GP. SDM vol.3 5.2.1 mandates
 # the check, so cemu faults and the judge below counts on cemu's output.
-expected_pm=13
+# QEMU (same build) DOES emulate A/D bits: t17 passed there unchanged.
+# Pending: recalibrate t7 against a clean QEMU build.
+expected_pm=18
 out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$dir/pm/pm_smoke.elf" 2>&1)
 rc=$?
 n_ok=$(echo "$out" | grep -c ' ok$')

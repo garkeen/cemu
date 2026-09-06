@@ -5,9 +5,9 @@
 // (rd8, rm16, push32) — never in a parameter. C operators do the arithmetic;
 // helpers exist only for what C has no operator for (flags, stack, segments,
 // interrupt dispatch). Scope: the 386 real-mode set plus protected mode
-// through segment protection (SDM vol.3 5.3) — gates, task switching and
-// paging are not in yet; the descriptor cache surviving CR0.PE=0 IS big real
-// mode.
+// through segment protection (SDM vol.3 5.3), the gate machinery (vol.3
+// 6-7), task switching and two-level paging (vol.3 4); LDT is not in yet.
+// The descriptor cache surviving CR0.PE=0 IS big real mode.
 //
 // The step protocol around these switches (INTR sampling, prefix consumption,
 // the single commit) lives in step.c.
@@ -36,25 +36,36 @@ eflags* fl;
 
 // Open bus: nobody's address reads all ones and drops writes — real x86
 // never faults there (SDM; QEMU's unassigned behavior agrees). All accesses
-// funnel through bus_load/bus_store (the debug hub's observation points).
-static uint64_t bus_load(uint64_t lin, int size) {
+// funnel through bus_load/bus_store (the debug hub's observation points),
+// which walk the page tables first when CR0.PG=1; the debug events report
+// the PHYSICAL address — what the bus and the devices actually see.
+static uint64_t phys_load(uint64_t addr, int size) {
   BusRegion* r;
-  if (BusProbe(cpu->bus, lin, size, &r) != 0) return size == 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
-  uint64_t v = BusRead(cpu->bus, lin, size);
-  if (DebugOn(kDbgBus) && !r->host) DebugBus(fr, r->ops->name, lin, size, 1, v);
-  if (DebugOn(kDbgMem)) DebugMem(fr, lin, size, acc_read, v, 1);
+  if (BusProbe(cpu->bus, addr, size, &r) != 0) return size == 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
+  uint64_t v = BusRead(cpu->bus, addr, size);
+  if (DebugOn(kDbgBus) && !r->host) DebugBus(fr, r->ops->name, addr, size, 1, v);
+  if (DebugOn(kDbgMem)) DebugMem(fr, addr, size, acc_read, v, 1);
   return v;
 }
 
-static void bus_store(uint64_t lin, int size, uint64_t v) {
+static void phys_store(uint64_t addr, int size, uint64_t v) {
   BusRegion* r;
-  if (BusProbe(cpu->bus, lin, size, &r) != 0) return;
+  if (BusProbe(cpu->bus, addr, size, &r) != 0) return;
   if (DebugOn(kDbgBus) && !r->host) {
-    DebugBus(fr, r->ops->name, lin, size, 0, v);
+    DebugBus(fr, r->ops->name, addr, size, 0, v);
   } else if (DebugOn(kDbgMem)) {
-    DebugMem(fr, lin, size, acc_write, v, 0);
+    DebugMem(fr, addr, size, acc_write, v, 0);
   }
-  BusWrite(cpu->bus, lin, size, v);
+  BusWrite(cpu->bus, addr, size, v);
+}
+
+// The page walk lives with the segment machinery below (it faults through
+// the raise channel and reads the current CPL).
+static uint64_t page_translate(uint64_t lin, int write);
+
+static uint64_t bus_load(uint64_t lin, int size) { return phys_load(page_translate(lin, 0), size); }
+static void bus_store(uint64_t lin, int size, uint64_t v) {
+  phys_store(page_translate(lin, 1), size, v);
 }
 
 static uint8_t rd8(uint64_t lin) { return (uint8_t)bus_load(lin, 1); }
@@ -73,6 +84,12 @@ _Noreturn static void gp_fault(uint32_t code) { raise_(fr, vec_gp, code); }
 _Noreturn static void ss_fault(uint32_t code) { raise_(fr, vec_ss, code); }
 _Noreturn static void np_fault(uint32_t code) { raise_(fr, vec_np, code); }
 _Noreturn static void ts_fault(uint32_t code) { raise_(fr, vec_ts, code); }
+// #PF (SDM vol.3 4.7): CR2 takes the faulting linear address, the error code
+// carries P|W|U (vol.3 table 6-1; the 386 defines no RSVD/I bits).
+_Noreturn static void pf_fault(uint64_t lin, uint32_t code) {
+  s->cr2 = (uint32_t)lin;
+  raise_(fr, vec_pf, code);
+}
 
 // The per-access segment checks, protected mode only (SDM vol.3 5.3): the
 // segment must be usable (a null selector loads into DS/ES/FS/GS fine and
@@ -408,6 +425,37 @@ static void seg_commit(int seg, uint16_t sel, const seg_view* v) {
 // CPL is the CS descriptor's DPL (SDM vol.1 3.4.5); the cache is the source.
 static int cpl(void) { return (s->ar[cs_i] >> 5) & 3; }
 
+// The two-level 4KB page walk (SDM vol.3 4.3, 4.6, 4.7). CR3 names the page
+// directory; each level's R/W and U/S combine with the next (a page is
+// writable / user-accessible only where BOTH entries allow), then one
+// permission check against CPL: user mode needs U on both levels, a write
+// needs W unless it is a supervisor access with CR0.WP=0 (vol.3 4.6; WP is
+// 486+ but SDM defines the flag). A missing entry at either level faults as
+// not-present (error code P=0); every other violation faults with P=1. A
+// goes into PDE and PTE on each successful translation and D into the PTE on
+// a write (vol.3 4.7) — the RMW lands in RAM below this layer. The walk's
+// own reads are physical and bypass translation plus the debug mem/bus
+// events: page tables are machine state, not program accesses.
+static uint64_t page_translate(uint64_t lin, int write) {
+  if (!(s->cr0 & kCr0Pg)) return lin;
+  uint32_t code = (write ? 2u : 0u) | (cpl() == 3 ? 4u : 0u);
+  uint32_t pde_addr = (uint32_t)(s->cr3 & ~0xfffu) | ((uint32_t)(lin >> 20) & 0xffc);
+  uint32_t pde = phys_load(pde_addr, 4);
+  if (!(pde & kPdeP)) pf_fault(lin, code);
+  uint32_t pte_addr = (pde & ~0xfffu) | ((uint32_t)(lin >> 10) & 0xffc);
+  uint32_t pte = phys_load(pte_addr, 4);
+  if (!(pte & kPteP)) pf_fault(lin, code);
+  int user = cpl() == 3;
+  int writable = (pde & kPdeRw) != 0 && (pte & kPteRw) != 0;
+  if (user ? (!(pde & kPdeUs) || !(pte & kPteUs))
+           : (write && (s->cr0 & kCr0Wp) && !writable))
+    pf_fault(lin, code | 1);  // present: the entry was there, the right was not
+  uint32_t new_pte = pte | kPteA | (write ? kPteD : 0u);
+  if (new_pte != pte) phys_store(pte_addr, 4, new_pte);
+  if (!(pde & kPdeA)) phys_store(pde_addr, 4, pde | kPdeA);
+  return ((uint64_t)(pte & ~0xfffu)) | (lin & 0xfff);
+}
+
 // DS/ES/FS/GS (SDM vol.2 MOV to Sreg Operation): a null selector loads and
 // marks the segment unusable; otherwise the descriptor must be data or
 // readable code, DPL >= CPL and DPL >= RPL, and present — faults in that
@@ -591,7 +639,7 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   s->tr_limit = v.limit;
   s->tr_ar = (uint8_t)(v.ar | 2);
 
-  s->cr3 = rd32(v.base + 0x1c);  // carried along; paging is item 4
+  s->cr3 = rd32(v.base + 0x1c);  // carried along (SDM 7.2.1); the walk uses bits 31:12
   uint16_t ldt = rd16(v.base + 0x60);
   if (ldt & 0xfffc) ts_fault(sel & ~3u);  // D16: no LDT to switch to
 
@@ -1634,7 +1682,8 @@ static void run_op2(uint8_t op2) {
           break;
         }
         case 2:
-        case 3: {  // lgdt/lidt
+        case 3: {  // lgdt/lidt (privileged: SDM vol.2)
+          if (cpl() != 0) gp_fault(0);
           uint16_t limit = rd16(d.mlin);
           uint64_t base = rd32(d.mlin + 2);
           if (d.reg == 2) {
@@ -1659,34 +1708,72 @@ static void run_op2(uint8_t op2) {
               set_rm16((uint16_t)s->cr0);
           }
           break;
+        case 6: {  // lmsw: loads CR0[3:0], but PE can only be set, never
+                   // cleared, and PG is untouched (SDM vol.2 LMSW)
+          if (cpl() != 0) gp_fault(0);
+          uint16_t v = rm16();
+          s->cr0 = (s->cr0 & ~0xfu) | (v & 0xfu) | (s->cr0 & kCr0Pe);
+          break;
+        }
+        case 7:  // invlpg: nothing to flush — every access re-walks, and
+                 // INVLPG never faults on unmapped pages (SDM vol.2)
+          if (cpl() != 0) gp_fault(0);
+          break;
         default:
-          ud();  // lmsw/invlpg: stage-3 scope
+          ud();
       }
       break;
     }
+    case 0x06:  // clts: clear CR0.TS (privileged: SDM vol.2)
+      if (cpl() != 0) gp_fault(0);
+      s->cr0 &= ~kCr0Ts;
+      break;
     case 0x0b:
       ud();
       break;  // ud2
     case 0x1f:
       modrm();
       break;    // multi-byte nop
-    case 0x20:  // mov r32, cr0
+    case 0x20: {  // mov r32, crn: CR0/CR2/CR3 on the 386 (SDM vol.2; CR1 is
+                  // reserved, CR4 arrives with the 486)
       modrm();
-      if (d.reg != 0) ud();
-      s->r[d.rm].e = s->cr0;
-      break;
-    case 0x22: {  // mov cr0, r32 (PE drives the mode switches)
-      modrm();
-      if (d.reg != 0) ud();
-      s->cr0 = s->r[d.rm].e;
+      if (cpl() != 0) gp_fault(0);
+      if (d.reg == 0)
+        s->r[d.rm].e = s->cr0;
+      else if (d.reg == 2)
+        s->r[d.rm].e = s->cr2;
+      else if (d.reg == 3)
+        s->r[d.rm].e = s->cr3;
+      else
+        ud();
       break;
     }
-    case 0x21:  // mov r32, drn
+    case 0x22: {  // mov crn, r32 (PE drives the mode switches)
       modrm();
+      if (cpl() != 0) gp_fault(0);
+      if (d.reg == 0) {
+        uint32_t v = s->r[d.rm].e;
+        // PG can rise only out of protected mode (SDM vol.2 MOV to CR0:
+        // PG=1 with PE=0 is #GP(0); vol.3 9.9 sets PE first).
+        if ((v & kCr0Pg) && !(v & kCr0Pe)) gp_fault(0);
+        s->cr0 = v;
+      } else if (d.reg == 2) {
+        s->cr2 = s->r[d.rm].e;
+      } else if (d.reg == 3) {
+        s->cr3 = s->r[d.rm].e;  // PDBR; nothing to flush — every access re-walks
+      } else {
+        ud();
+      }
+      break;
+    }
+    case 0x21:  // mov r32, drn (privileged: SDM vol.2)
+      modrm();
+      if (cpl() != 0) gp_fault(0);
       s->r[d.rm].e = s->dr[d.reg];
       break;
-    case 0x23:  // mov drn, r32
+    case 0x23:  // mov drn, r32 (privileged: SDM vol.2)
       modrm();
+      if (cpl() != 0) gp_fault(0);
       s->dr[d.reg] = s->r[d.rm].e;
       break;
     case 0x80:

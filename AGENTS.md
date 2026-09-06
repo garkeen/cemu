@@ -98,11 +98,14 @@ ISA 头，`virt.c` 仅引 `platform.h`。
 - 每轮改动结束前限时跑回归：`bash test/run.sh`（分层入口：riscv
   `bash test/riscv64/run.sh`，x86 `bash test/x86/run.sh`）；依赖边用
   `cmake --build build --target check`。
-- 测试超时：任何测试套件/单测都必须有 time limit（run.sh 用 `timeout`
-  包裹 cemu 调用），防止被测程序死循环导致不退出的挂起。
-- 对比数据体积：凡需落地对比数据的测试（如导出万步状态流做对拍），其
-  数据/捕获文件不得超过 5MB；超出即视为测试设计违规，须改用采样、截断或
-  CEMU_DEBUG `budget=` 抑制等手段收敛体积。
+- 运行限时：**所有**运行一律限时——run.sh 用 `timeout` 包裹 cemu 调用；
+  会话内的临时手跑（调试观测、state 对拍、探针复现）同样必须前置
+  `timeout <秒>`，防止被测程序死循环导致不退出的挂起（realmode 套件
+  尾部 fninit #UD 死循环即由 timeout+输出判据容纳）。
+- 落盘体积：**任何**写入文件不得超过 5MB——测试对拍数据/捕获文件、
+  CEMU_DEBUG 观测落盘（`2>file` 的 trace/state/mem/regs 等）一律算；
+  超出即视为违规，须改用采样、截断或 CEMU_DEBUG `budget=` 抑制等
+  手段收敛体积。
 
 ## 八、统一执行抽象的架构铁律（V3 巨型 switch 直执）
 
@@ -224,7 +227,7 @@ CEMU_DEBUG="regs=100000" ./cemu.exe ... img 2> r.txt
 | D6 | csr.c tdata1/2/3 WARL 存储无触发匹配 | debug trigger（gem5 tselect 写 val+1 报告存在 trigger） | xiangshanNEMU trigger.c | 阶段 3.5 gdb stub（仅硬件断点 hbreak/watch；软件断点不依赖） | 登记中 |
 | D7 | LR/SC 单核预留集 | 无多核冲突语义 | spike 单核同款；规格允许 SC 假失败 | 多核引入时 | 登记中 |
 | D11 | htif.c HTIF syscall（dev0/cmd0）报错退出 | 无 fesvr syscall 设备 | fesvr htif_t::handle_syscall | 阶段 5 cesdk | 登记中 |
-| D13 | x86 LMSW/INVLPG/RDTSC/CMPXCHG/CMPXCHG8B/x87 FPU 判非法 #UD | 386 子集外指令与 FPU 未实现 | intel SDM vol.2；QEMU translate.c | 阶段 3 指令侧按需（保护模式/xv6）；x87 FPU 在 Linux 用户态（阶段 4+） | 登记中。现实表现：realmode 尾 test_fninit #UD→垃圾 IVT[6]→死循环，run.sh 以 timeout+输出判据容纳 |
+| D13 | x86 RDTSC/CMPXCHG/CMPXCHG8B/x87 FPU 判非法 #UD;DR7.GD 调试支持不设防 | 386 子集外指令与 FPU 未实现;LMSW/INVLPG/CLTS/MOV CR2/CR3 已随阶段 3 分页销账 | intel SDM vol.2；QEMU translate.c | 阶段 3 指令侧按需（保护模式/xv6）；x87 FPU 在 Linux 用户态（阶段 4+） | 登记中。现实表现：realmode 尾 test_fninit #UD→垃圾 IVT[6]→死循环，run.sh 以 timeout+输出判据容纳 |
 | D14 | x86 iret/popf 载入屏蔽 RF(bit16)/VM(bit17) | RF 瞬态建模（真机不可观测为 1，等价）；VM86 不进入 | intel SDM EFLAGS | DOS/BIOS 兼容路线需要 VM86 时评估（Linux 不需要） | 登记中 |
 | D15 | x86 16 位 TSS 任务切换（类型 1/3）Fatal | 任务切换只支持 32 位 TSS（类型 9/B）；门/任务门对 16 位 TSS 拒绝进入 | v86 do_task_switch（assert 32 位）；tiny386（assert 9/11） | 有验收件需要 286 任务时 | 登记中 |
 | D16 | x86 LDT/LDTR 机制未实现 | TI=1 选择器按查找失败抛 #GP(sel&~3)（任务切换内 #TS、ltr #GP）；任务切换载入 LDTR 仅接受空选择器；lldt/sldt/verr/verw 待项 5 | v86 lookup_segment_selector/load_ldt；SDM vol.3 5.3 | 阶段 3 项 5（LDT 机制整体） | 登记中 |

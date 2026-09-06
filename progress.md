@@ -3,6 +3,40 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 3 项 4：386 两级分页（2026-09-06）
+
+exec.c 新增 page_translate（对照 tiny386 tlb_refill/translate_lpgno 与
+SDM 卷 3 §4.3/4.6/4.7；v86 checkout 无可读分页核心，gem5 此版 walker 不写
+A/D，行为裁决靠 QEMU 双跑）：
+
+- **两级 4KB 页走**：CR3→PDE→PTE；R/W 与 U/S 两级组合（两级都允许才放
+  行），权限检查一把出：user 需两级 U=1，写需组合 W=1，supervisor 仅当
+  CR0.WP=1 才受 R/W 约束（WP 是 486 位，SDM 卷 3 4.6 定义了它，照实现）。
+  缺页（任一级 P=0）error code 不带 P 位，其余违例 P=1；W/U 按访问与 CPL。
+- **A/D 位**：成功翻译才置 A（PDE+PTE）、写成功才置 D——故障访问不动页
+  表。RMW 走物理侧直达 RAM；页表自身的读取是机器态，不进 debug mem/bus
+  事件。这版 dirty QEMU 实测会写 A/D 且与 cemu 时序吻合（t17 双跑一致）。
+- **#PF 通道**：pf_fault 置 CR2 = 故障线性地址再 raise（error code 经既有
+  vec_has_ec 压栈）；CR2 可经 MOV CR2 读写。
+- **翻译挂钩点**：bus_load/bus_store 唯一漏斗先 page_translate 再碰总线，
+  取指/数据/栈/串/系统表全被罩住（GDT/IDT/TSS 走线性地址、按 SDM 同样翻
+  译）。debug mem/bus 事件改报**物理**地址（总线与设备所见的地址；调试内
+  核页表/DMA 时才是有效观测面），realmode 线性==物理不受影响。
+- **控制寄存器组补全**：MOV r,CR2/CR3、MOV CR0 的 PG 需 PE（否则 #GP(0)，
+  SDM 卷 2）；0f 20-23 全组 CPL≠0 → #GP(0)；LMSW（PE 只能置不能清、PG 不
+  动）、CLTS、INVLPG（无 TLB，无操作、不对未映射页故障）照 SDM 销账；
+  LGDT/LIDT 补 CPL 检查。DR7.GD 调试支持并入 D13。
+- 任务切换的 CR3 携带（项 3 已写）现接分页生效；无 TLB，CR3/CR0 写无需冲
+  刷（探针里的 CR3 reload 是给 QEMU/真机缓存的，cemu 上是空操作）。
+
+探针扩到 18 项（t14 恒等映射+PG|WP 开启走表、t15 缺页 #PF ec=2+CR2、
+t16 只读页写 #PF ec=3（WP=1）、t17 A/D 位、t18 ring3 用户/监督页 ec=7；
+OBS 槽位挪 0x2700 避开扩容后的 RES）。**QEMU 对拍 17/18**（pm_qemu2.txt），
+唯一分歧仍是已登记的 t7 dirty-QEMU 段限缺陷；五个分页用例双跑逐字节一致。
+回归：riscv 127/127、x86 smoke+pm+realmode 全绿、depcheck ok；smoke state
+流与 9/5 基线逐字节一致，realmode state 流新旧二进制前 5MB 一致（debug
+枢纽 kOutLimit 硬顶，与本次改动无关）。
+
 ## 阶段 3 项 3：调用门（参数拷贝）+ 任务切换（2026-09-05）
 
 exec.c 新增 PM 门机制全链（对照 v86 far_jump/do_task_switch/call_interrupt_vector
@@ -248,11 +282,10 @@ gp）；位段类 bug 用 llvm-objdump 对照 cemu trace 的 raw/dnpc 即可裁�
   `& 'C:\Program Files\Git\bin\bash.exe' -c '...'`
 - 回归：`bash test/run.sh`；单独 riscv `bash test/riscv64/run.sh`、
   x86 `bash test/x86/run.sh`
-- 回归基线（2026-09-05，浮点/RVC 修复后实测）：riscv64 **127 passed /
-  0 failed**（fmv.x.w 符号扩展、fcvt 符号性字段、F2I 写回组、c.j 目标基址
-  四处修复，见上文）；x86 smoke PASS + realmode 122/122（grp2 C0/C1 立即数
-  计数在 modrm 前求值的 bug 修复，见下文；套件尾部 fninit #UD 死循环由
-  D13 登记容纳，run.sh 的 timeout 60 判据容纳）
+- 回归基线（2026-09-06，分页落地后实测）：riscv64 **127 passed /
+  0 failed**；x86 smoke PASS + pm **18/18** + realmode 122/122（pm 判据
+  expected_pm=18，QEMU 对拍 17/18 见 pm 节；套件尾部 fninit #UD 死循环由
+  D13 登记容纳，run.sh 的 timeout 判据容纳）
 - debug：`CEMU_DEBUG=...`（见 AGENTS.md 第十节），例
   `CEMU_DEBUG="trace:table,state,mem,budget=200" build/cemu.exe --machine x86 --isa x86 test/x86/realmode/realmode.elf`
 

@@ -10,8 +10,9 @@
 // and the width lives in the function-name suffix. Scope: real mode plus
 // protected mode through segment protection (SDM vol.3 5.3: descriptor
 // parse, CPL/RPL/DPL and limit checks), the gate machinery (interrupt/trap/
-// call/task gates, SDM vol.3 6-7) and task switching; paging is not in yet.
-// The descriptor cache surviving CR0.PE=0 IS big real mode.
+// call/task gates, SDM vol.3 6-7), task switching and two-level paging
+// (SDM vol.3 4); LDT is not in yet. The descriptor cache surviving
+// CR0.PE=0 IS big real mode.
 
 // Register cells follow the modrm reg/rm encoding order (SDM table 3-1).
 enum { eax_i, ecx_i, edx_i, ebx_i, esp_i, ebp_i, esi_i, edi_i };
@@ -22,6 +23,17 @@ enum {
   vec_de = 0, vec_ud = 6, vec_df = 8, vec_ts = 10, vec_np = 11,
   vec_ss = 12, vec_gp = 13, vec_pf = 14, vec_ac = 17
 };
+
+// CR0 flags (SDM vol.3 2.5). PE drives protected mode and PG the page
+// tables; WP makes supervisor stores honor read-only pages (486+; wired
+// because SDM vol.3 4.6 defines the flag); TS/EM/MP ride along for
+// LMSW/CLTS.
+enum { kCr0Pe = 1u, kCr0Mp = 2u, kCr0Em = 4u, kCr0Ts = 8u, kCr0Wp = 1u << 16,
+       kCr0Pg = 1u << 31 };
+// Page-directory / page-table entry flags for 4KB pages (SDM vol.3 4.3):
+// P, R/W, U/S and A exist at both levels, D only in the leaf.
+enum { kPdeP = 1u, kPdeRw = 2u, kPdeUs = 4u, kPdeA = 0x20u };
+enum { kPteP = 1u, kPteRw = 2u, kPteUs = 4u, kPteA = 0x20u, kPteD = 0x40u };
 
 // One general-purpose bank cell, named exactly the way the architecture
 // names its parts: a 32-bit register, whose low half is the 16-bit one,
@@ -63,8 +75,9 @@ typedef struct x86_state {
   uint8_t dbit[6];   // D/B flag: default operand size is 4 when set
   eflags fl;
   uint32_t cr0;
-  uint32_t cr3;       // page-table base: carried by task switches (TSS +1c);
-                      // paging itself is stage-3 item 4
+  uint32_t cr2;       // #PF stores the faulting linear address here (SDM vol.3 2.5)
+  uint32_t cr3;       // page-directory base (PDBR); carried by task switches
+                      // (TSS +1c); the walk uses bits 31:12
   uint64_t gdtr;
   uint16_t gdtr_limit;
   uint64_t idtr;
