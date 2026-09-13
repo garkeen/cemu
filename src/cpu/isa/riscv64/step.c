@@ -11,6 +11,22 @@
 #include "debug/debug.h"
 #include "exec.h"  // last: it defines the short register macros x/f/eax/...
 
+// gdb signal for a delivered trap (stage 3.5): breakpoints and environment
+// calls read as SIGTRAP, illegal as SIGILL, every access fault as SIGSEGV.
+static int GdbTrapSignal(uint64_t cause) {
+  switch (cause) {
+    case kExIllegal:
+      return 4;  // SIGILL
+    case kExBreakpoint:
+    case kExUserEcall:
+    case kExSupervisorEcall:
+    case kExMachineEcall:
+      return 5;  // SIGTRAP
+    default:
+      return 11;  // SIGSEGV: fetch/load/store faults and misaligned accesses
+  }
+}
+
 void riscv_step(CpuState* c) {
   cpu = c;
   rs = (RiscvState*)cpu->priv;
@@ -33,6 +49,9 @@ void riscv_step(CpuState* c) {
     // The trap consumer: take it and land on the vector.
     cpu->pc = riscv_trap(cpu, rs, fr->trap.cause, fr->trap.tval);
     fr->rec.dnpc = cpu->pc;
+    // gdb stub: a trap landed during the step that just ran (step.h hook).
+    rs->trap_seq++;
+    rs->trap_signal = (uint8_t)GdbTrapSignal(fr->trap.cause);
     DebugTrap(fr);
   } else {
     if (cpu->pc & 1) raise_(fr, kExFetchMisaligned, cpu->pc);
@@ -44,6 +63,7 @@ void riscv_step(CpuState* c) {
     fr->rec.pc = cpu->pc;
     fr->rec.dnpc = cpu->pc + 2;  // provisional; corrected to +4 below
     fr->rec.raw_len = 0;
+    fr->rec.mnemonic = NULL;  // per-step reset (the frame buffer is static)
     uint16_t half = (uint16_t)riscv_mem_load(fr, cpu->pc, 2, acc_ifetch);
     uint32_t inst;
     int ilen;
@@ -64,6 +84,11 @@ void riscv_step(CpuState* c) {
       fr->rec.raw[3] = (uint8_t)(inst >> 24);
     }
     fr->rec.len = (uint8_t)ilen;
+
+    // Execute triggers fire on the fetched pc before the instruction runs
+    // (Sdtrig 5.3.12; xiangshanNEMU checks at decode — after the fetch, so a
+    // fetch fault keeps precedence).
+    RiscvTriggerCheck(fr, rs, kTrigOpExecute, cpu->pc);
 
     // The one commit: the interpreter returns the new pc; x0 stays zero.
     x[0] = 0;

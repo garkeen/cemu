@@ -7,6 +7,8 @@
 #include "device/misc/htif.h"
 #include "mem/ram.h"
 
+struct GdbStub;  // debug/gdbstub.h; the stub owns run control when attached
+
 // A board (motherboard) is a device map plus reset state: it decides which
 // devices sit at which addresses, how their interrupt lines are wired to the
 // CPU, and where execution starts. Which CPU model is installed is not the
@@ -27,6 +29,10 @@ typedef struct Board {
   // Whether raw binaries of this board speak HTIF (spike does; the QEMU virt
   // and PC contracts do not). ELFs always declare HTIF by symbols.
   int bin_htif;
+  // gdb session (-s/-S/-gdb); NULL = plain run. The stub drives the run loop
+  // through BoardRunSteps' stop callback — the machine never knows it is
+  // being watched.
+  struct GdbStub* gdb;
   // Time-driven device refresh (CLINT MTIP, PIT counters); called by the run
   // loop every step and more often while the CPU sleeps.
   void (*poll)(struct Board* b);
@@ -50,6 +56,11 @@ Board* X86BoardCreate(const BoardOpts* opts);
 Board* VirtBoardCreate(const BoardOpts* opts);
 
 void BoardRun(Board* b, uint64_t max_inst);
+// The run loop's inner batch: steps until cpu->halted, the instruction limit,
+// or stop_cb returns nonzero (the gdb stub's per-step observation point).
+// Returns 1 when a stop callback ended the batch, 0 on halt/limit.
+int BoardRunSteps(Board* b, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuState* cpu),
+                  void* cb_ctx);
 void BoardDestroy(Board* b);
 
 #endif

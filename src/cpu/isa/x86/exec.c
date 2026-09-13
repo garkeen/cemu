@@ -75,6 +75,83 @@ static void wr8(uint64_t lin, uint8_t v) { bus_store(lin, 1, v); }
 static void wr16(uint64_t lin, uint16_t v) { bus_store(lin, 2, v); }
 static void wr32(uint64_t lin, uint32_t v) { bus_store(lin, 4, v); }
 
+// ---- debug registers (SDM vol.3 ch.17) ---------------------------------------
+
+// Breakpoint i is enabled by DR7.Li/Gi (bits 2i..2i+1) and matches by its
+// R/W field: 00 execute (LEN must be 00), 01 data writes, 10 I/O ports,
+// 11 data read/write. The R/Wi fields sit at DR7[17:16+4i] and LENi at
+// DR7[19:18+4i] (SDM vol.3 figure 17-3; the kvm debug test's 0x00d0040a
+// arms DR1 write/8-byte only under this layout).
+static int dr_enabled(int i) { return (s->dr[7] >> (2 * i)) & 3; }
+static int dr_rw(int i) { return (int)((s->dr[7] >> (16 + 4 * i)) & 3); }
+
+// Data watchpoints: the #DB is a trap delivered after the instruction
+// completes (SDM vol.3 17.3.1), so the match only records DR6.Bn here and
+// step.c delivers. Reads match only the read/write encoding.
+static void WatchData(uint64_t lin, int size, int write) {
+  if (!(s->dr[7] & 0xff)) return;
+  for (int i = 0; i < 4; i++) {
+    if (!dr_enabled(i)) continue;
+    int rw = dr_rw(i);
+    if (rw == 0 || rw == 2) continue;  // execute / I/O breakpoints don't match data
+    if (rw == 1 && !write) continue;
+    static const int kBytes[4] = {1, 2, 4, 8};
+    uint64_t lo = s->dr[i], hi = lo + kBytes[(s->dr[7] >> (18 + 4 * i)) & 3];
+    // The trap fires when any byte of the access lies in the watch range.
+    if (lin < hi && lo < lin + size) d.watch_hit |= 1u << i;
+  }
+}
+
+// I/O breakpoints (SDM vol.3 17.2.5): R/W=10 with LEN 00 = a 1-byte port
+// range or LEN 10 = a 4-byte range; the reserved LEN encodings never match.
+// Like data watchpoints this is a trap, recorded for post-instruction
+// delivery.
+static void IoBpHit(uint16_t port) {
+  if (!(s->dr[7] & 0xff)) return;
+  for (int i = 0; i < 4; i++) {
+    if (!dr_enabled(i) || dr_rw(i) != 2) continue;
+    int lenc = (int)((s->dr[7] >> (18 + 4 * i)) & 3);
+    int len = lenc == 0 ? 1 : lenc == 2 ? 4 : 0;
+    if (len && port >= s->dr[i] && port < s->dr[i] + len) d.watch_hit |= 1u << i;
+  }
+}
+
+// The port-I/O funnel: every IN/OUT runs the I/O breakpoint check after the
+// access.
+static uint32_t io_in(uint16_t port, int size) {
+  uint32_t v = (uint32_t)BusRead(cpu->io, port, size);
+  IoBpHit(port);
+  return v;
+}
+static void io_out(uint16_t port, int size, uint32_t v) {
+  BusWrite(cpu->io, port, size, v);
+  IoBpHit(port);
+}
+
+// DR7.GD (SDM vol.3 17.2.4): any access to the debug registers raises #DB
+// with DR6.BD, and GD self-clears so the handler can read DR6/DR7.
+static void dr_guard(void) {
+  if (s->dr[7] & kDr7Gd) {
+    s->dr[7] &= ~kDr7Gd;
+    s->dr[6] |= kDr6Bd;
+    raise_(fr, vec_db, 0);
+  }
+}
+
+// MOV DRn, r32 (SDM vol.3 17.2.2): DR6's B0-B3 clear on ANY write (the kvm
+// debug test pins this: set_dr6(0x4002) leaves B1 clear), BD/BS/BT take the
+// written value, and the reserved bits read 1. DR7 keeps bit 10 set and the
+// reserved bits 11/12, 14/15 clear.
+static void DrWrite(int reg, uint32_t v) {
+  if (reg == 6) {
+    s->dr[6] = kDr6Rsvd1 | (v & (kDr6Bd | kDr6Bs | kDr6Bt));
+  } else if (reg == 7) {
+    s->dr[7] = (v & 0xffff23ffu) | kDr7Rsvd1;
+  } else {
+    s->dr[reg] = v;
+  }
+}
+
 // ---- protection faults (SDM vol.3 5.3 / vol.2 exception pages) ---------------
 
 // Segment-protection faults carry an error code: the selector (index+TI,
@@ -276,6 +353,7 @@ static void set_reg32(uint32_t v) { s->r[d.reg].e = v; }
 static uint8_t rm8(void) {
   if (d.is_mem) {
     seg_use(d.mseg, d.moff, 1, 0);
+    WatchData(d.mlin, 1, 0);
     return rd8(d.mlin);
   }
   return d.rm < 4 ? s->r[d.rm].l : s->r[d.rm - 4].h;
@@ -283,6 +361,7 @@ static uint8_t rm8(void) {
 static void set_rm8(uint8_t v) {
   if (d.is_mem) {
     seg_use(d.mseg, d.moff, 1, 1);
+    WatchData(d.mlin, 1, 1);
     wr8(d.mlin, v);
   } else if (d.rm < 4) {
     s->r[d.rm].l = v;
@@ -293,6 +372,7 @@ static void set_rm8(uint8_t v) {
 static uint16_t rm16(void) {
   if (d.is_mem) {
     seg_use(d.mseg, d.moff, 2, 0);
+    WatchData(d.mlin, 2, 0);
     return rd16(d.mlin);
   }
   return s->r[d.rm].x;
@@ -300,6 +380,7 @@ static uint16_t rm16(void) {
 static void set_rm16(uint16_t v) {
   if (d.is_mem) {
     seg_use(d.mseg, d.moff, 2, 1);
+    WatchData(d.mlin, 2, 1);
     wr16(d.mlin, v);
   } else {
     s->r[d.rm].x = v;
@@ -308,6 +389,7 @@ static void set_rm16(uint16_t v) {
 static uint32_t rm32(void) {
   if (d.is_mem) {
     seg_use(d.mseg, d.moff, 4, 0);
+    WatchData(d.mlin, 4, 0);
     return rd32(d.mlin);
   }
   return s->r[d.rm].e;
@@ -315,6 +397,7 @@ static uint32_t rm32(void) {
 static void set_rm32(uint32_t v) {
   if (d.is_mem) {
     seg_use(d.mseg, d.moff, 4, 1);
+    WatchData(d.mlin, 4, 1);
     wr32(d.mlin, v);
   } else {
     s->r[d.rm].e = v;
@@ -343,6 +426,7 @@ static void stack_push(int size, uint32_t v) {
   uint32_t sp16 = (uint16_t)(esp - size);
   uint32_t off = s->dbit[ss_i] ? esp - (uint32_t)size : sp16;
   seg_use(ss_i, off, size, 1);
+  WatchData(s->base[ss_i] + off, size, 1);
   if (size == 4)
     wr32(s->base[ss_i] + off, v);
   else
@@ -352,6 +436,7 @@ static void stack_push(int size, uint32_t v) {
 static uint32_t stack_pop(int size) {
   uint32_t off = s->dbit[ss_i] ? esp : (uint16_t)esp;
   seg_use(ss_i, off, size, 0);
+  WatchData(s->base[ss_i] + off, size, 0);
   uint32_t v = size == 4 ? rd32(s->base[ss_i] + off) : rd16(s->base[ss_i] + off);
   esp = s->dbit[ss_i] ? esp + (uint32_t)size
                       : (esp & 0xffff0000u) | (uint16_t)(esp + size);
@@ -452,6 +537,19 @@ static uint64_t page_translate(uint64_t lin, int write) {
   uint32_t pde_addr = (uint32_t)(s->cr3 & ~0xfffu) | ((uint32_t)(lin >> 20) & 0xffc);
   uint32_t pde = phys_load(pde_addr, 4);
   if (!(pde & kPdeP)) pf_fault(lin, code);
+  if ((pde & kPdePs) && (s->cr4 & kCr4Pse)) {
+    // 4MB page (SDM vol.3 4.3): the PDE is the leaf — frame = bits 31:22,
+    // offset = linear[21:0]; the permission check uses the PDE alone and A/D
+    // update in the PDE. (Bits 21:13 are reserved-0 in the SDM layout; the
+    // 386-class #PF error code carries no RSVD flag, so a set reserved bit
+    // surfaces as an ordinary fault.)
+    int user = cpl() == 3;
+    if (user ? !(pde & kPdeUs) : (write && (s->cr0 & kCr0Wp) && !(pde & kPdeRw)))
+      pf_fault(lin, code | 1);
+    uint32_t new_pde = pde | kPdeA | (write ? kPdeD : 0u);
+    if (new_pde != pde) phys_store(pde_addr, 4, new_pde);
+    return ((uint64_t)(pde & 0xffc00000u)) | (lin & 0x3fffff);
+  }
   uint32_t pte_addr = (pde & ~0xfffu) | ((uint32_t)(lin >> 10) & 0xffc);
   uint32_t pte = phys_load(pte_addr, 4);
   if (!(pte & kPteP)) pf_fault(lin, code);
@@ -672,6 +770,10 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
              (uint8_t)(s->tr_ar & ~2u));
   if (source != kTaskIret)
     BusWrite(cpu->bus, s->gdtr + (uint64_t)(sel >> 3) * 8 + 5, 1, (uint8_t)(v.ar | 2));
+  // The incoming task's T flag (SDM vol.3 7.2.1, fig 7-4 byte 0 bit 0): a
+  // task-switch debug trap fires before the new task's first instruction.
+  // Read before the back-link write below lands on the same word.
+  s->bt_pending = rd8(v.base) & 1;
   if (source == kTaskCall) wr16(v.base, s->tr);  // the back-link (fig 7-4)
 
   // TR commits before the new state loads: a faulting load leaves the
@@ -690,6 +792,7 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
 
   uint32_t nf = rd32(v.base + 0x24);
   if (nf & 0x20000) Fatal("x86: VM86 not implemented (D14)");
+  d.rf_load = 1;  // the TSS image's RF is the authoritative one (SDM 7.2.1)
   fl->word = (fl->word & ~(0x7fd7u | 0x30000u)) | (nf & 0x7fd7u) | 2;
   if (source == kTaskCall) fl->nt = 1;
 
@@ -762,7 +865,9 @@ static void pm_iret(void) {
 
   // The flags image: CF..OF/TF/IF/DF always; IOPL and NT only on an outward
   // or CPL-0 return (SDM vol.2 IRET). RF/VM never load (D14).
-  uint32_t mask = outer || cpl() == 0 ? 0x7fd7u : 0x0fd7u;
+  // RF loads with the system-flag set (SDM IRET Operation); VM never does.
+  uint32_t mask = (outer || cpl() == 0 ? 0x17fd7u : 0x0fd7u);
+  d.rf_load = 1;
   fl->word = (fl->word & ~(mask | 0x30000u)) | (flv & mask) | 2;
 
   if (cv.ar & 4) cv.ar = (uint8_t)((cv.ar & ~0x60u) | (newpl << 5));
@@ -974,6 +1079,7 @@ void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
     desc_parse((uint16_t)seg, &v);
     seg_commit(cs_i, (uint16_t)seg, &v);
     eip = off;
+    d.delivered = 1;  // the TF trap postpones to the handler's first insn
     return;
   }
 
@@ -989,6 +1095,7 @@ void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
     // Task gate: the switch replaces the whole context, and an exception's
     // error code lands on the new task's stack (v86 do_task_switch).
     do_task_switch((uint16_t)(gate >> 16), kTaskCall, ret_eip, vec_has_ec(vec), ec);
+    d.delivered = 1;  // the exception went through a task gate
     return;
   }
   int gate16 = gt == 6 || gt == 7;
@@ -1053,6 +1160,7 @@ void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
   fl->nt = 0;
   if (gt == 6 || gt == 0xe) fl->if_ = 0;  // interrupt gates clear IF
   eip = gate16 ? (off & 0xffff) : off;
+  d.delivered = 1;  // the TF trap postpones to the handler's first insn
 }
 
 _Noreturn static void ud(void) { raise_(fr, vec_ud, (uint64_t)eip); }
@@ -1092,6 +1200,17 @@ static int cond(int c) {
   }
   return r ^ (c & 1);
 }
+
+// Condition mnemonics in cc order (SDM table Jcc) for the jcc/setcc families.
+static const char* const kJccNames[16] = {"jo",  "jno", "jb",   "jae", "je",  "jne",
+                                          "jbe", "ja",  "js",   "jns", "jp",  "jnp",
+                                          "jl",  "jge", "jle",  "jg"};
+static const char* const kSetccNames[16] = {"seto",  "setno", "setb", "setae", "sete",  "setne",
+                                            "setbe", "seta",  "sets", "setns", "setp",  "setnp",
+                                            "setl",  "setge", "setle", "setg"};
+static const char* const kCmovNames[16] = {"cmovo",  "cmovno", "cmovb", "cmovae", "cmove",  "cmovne",
+                                           "cmovbe", "cmova",  "cmovs", "cmovns", "cmovp",  "cmovnp",
+                                           "cmovl",  "cmovge", "cmovle", "cmovg"};
 
 // ---- the shift/rotate family (SDM GRP2) --------------------------------------
 
@@ -1221,7 +1340,9 @@ static uint32_t grp1_math(int kind, uint32_t a, uint32_t b, int size) {
 static void grp1(int size, int imm_form) {
   // imm_form: 0 = imm at the width, 1 = imm8 sign-extended (83), 2 = imm8 (82)
   static const int kind[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+  static const char* const kGrp1Names[8] = {"add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"};
   modrm();
+  fr->rec.mnemonic = kGrp1Names[d.reg];
   uint32_t src;
   if (imm_form == 1)
     src = (uint32_t)(int8_t)imm8();
@@ -1251,6 +1372,10 @@ static void grp1(int size, int imm_form) {
 // it after modrm() (tiny386 loads the count through an accessor resolved the
 // same way).
 static void grp2(int size, uint32_t cnt) {
+  // GRP2 reg-field order (SDM); 4 and 6 are both SHL/SAL.
+  static const char* const kShiftNames[8] = {"rol", "ror", "rcl", "rcr",
+                                             "shl", "shr", "shl", "sar"};
+  fr->rec.mnemonic = kShiftNames[d.reg];
   cnt &= 31;
   uint32_t v, r;
   if (size == 1) {
@@ -1438,7 +1563,10 @@ static void idiv_w(uint32_t src) {
 // ---- GRP3 (SDM f6/f7): test/not/neg/mul/imul/div/idiv ----------------------
 
 static void grp3(int size) {
+  static const char* const kGrp3Names[8] = {"test", "test", "not", "neg",
+                                            "mul",  "imul", "div", "idiv"};
   modrm();
+  fr->rec.mnemonic = kGrp3Names[d.reg];
   if (d.reg <= 1) {  // test rm, imm
     uint32_t imm = size == 1 ? imm8() : d.w32 ? imm32() : imm16();
     uint32_t a = size == 1 ? RM8() : size == 2 ? RM16() : RM32();
@@ -1531,7 +1659,10 @@ static void string_op(uint8_t op) {
   uint64_t dlin = s->base[es_i] + dio;
   switch (op) {
     case 0xa4:
-    case 0xa5:  // movs
+    case 0xa5: {  // movs
+      fr->rec.mnemonic = size == 1 ? "movsb" : size == 2 ? "movsw" : "movsd";
+      WatchData(slin, size, 0);
+      WatchData(dlin, size, 1);
       if (size == 1)
         wr8(dlin, rd8(slin));
       else if (size == 2)
@@ -1539,8 +1670,12 @@ static void string_op(uint8_t op) {
       else
         wr32(dlin, rd32(slin));
       break;
+    }
     case 0xa6:
     case 0xa7: {  // cmps: [si] - [di]
+      fr->rec.mnemonic = size == 1 ? "cmpsb" : size == 2 ? "cmpsw" : "cmpsd";
+      WatchData(slin, size, 0);
+      WatchData(dlin, size, 0);
       uint32_t a = size == 1 ? rd8(slin) : size == 2 ? rd16(slin) : rd32(slin);
       uint32_t b = size == 1 ? rd8(dlin) : size == 2 ? rd16(dlin) : rd32(dlin);
       uint32_t r = (a - b) & vmask(size);
@@ -1548,7 +1683,9 @@ static void string_op(uint8_t op) {
       break;
     }
     case 0xaa:
-    case 0xab:  // stos
+    case 0xab: {  // stos
+      fr->rec.mnemonic = size == 1 ? "stosb" : size == 2 ? "stosw" : "stosd";
+      WatchData(dlin, size, 1);
       if (size == 1)
         wr8(dlin, al);
       else if (size == 2)
@@ -1556,8 +1693,11 @@ static void string_op(uint8_t op) {
       else
         wr32(dlin, eax);
       break;
+    }
     case 0xac:
-    case 0xad:  // lods
+    case 0xad: {  // lods
+      fr->rec.mnemonic = size == 1 ? "lodsb" : size == 2 ? "lodsw" : "lodsd";
+      WatchData(slin, size, 0);
       if (size == 1)
         al = rd8(slin);
       else if (size == 2)
@@ -1565,7 +1705,10 @@ static void string_op(uint8_t op) {
       else
         eax = rd32(slin);
       break;
+    }
     default: {  // 0xae/0xaf scas: eAX - [di]
+      fr->rec.mnemonic = size == 1 ? "scasb" : size == 2 ? "scasw" : "scasd";
+      WatchData(dlin, size, 0);
       uint32_t a = size == 1 ? al : size == 2 ? ax : eax;
       uint32_t b = size == 1 ? rd8(dlin) : size == 2 ? rd16(dlin) : rd32(dlin);
       uint32_t r = (a - b) & vmask(size);
@@ -1687,18 +1830,21 @@ static void run_op2(uint8_t op2) {
       modrm();
       switch (d.reg) {
         case 0:  // sldt: the visible LDTR (SDM vol.2 SLDT; unprivileged)
+          fr->rec.mnemonic = "sldt";
           if (d.w32)
             set_rm32(s->ldtr);
           else
             set_rm16(s->ldtr);
           break;
         case 1:  // str: the visible TR selector
+          fr->rec.mnemonic = "str";
           if (d.w32)
             set_rm32(s->tr);
           else
             set_rm16(s->tr);
           break;
         case 2: {  // lldt (privileged: SDM vol.2)
+          fr->rec.mnemonic = "lldt";
           if (!(s->cr0 & 1)) ud();  // PM-only (SDM vol.2 LLDT)
           if (cpl() != 0) gp_fault(0);
           uint16_t sel = rm16();
@@ -1706,6 +1852,7 @@ static void run_op2(uint8_t op2) {
           break;
         }
         case 3: {  // ltr: a system descriptor for an available TSS
+          fr->rec.mnemonic = "ltr";
           uint16_t sel = rm16();
           if ((sel & 0xfffc) == 0) gp_fault(0);
           if (sel & 4) gp_fault(sel & ~3u);  // TSS descriptors are GDT-only (SDM 7.2)
@@ -1727,6 +1874,7 @@ static void run_op2(uint8_t op2) {
         }
         case 4:
         case 5: {  // verr/verw: ZF answers "readable/writable at this CPL"
+          fr->rec.mnemonic = d.reg == 4 ? "verr" : "verw";
           if (!(s->cr0 & 1)) ud();  // PM-only (SDM vol.2)
           // A lookup defect (null selector, outside table) only clears ZF —
           // the SDM's exception list has no selector faults for VERR/VERW
@@ -1758,6 +1906,7 @@ static void run_op2(uint8_t op2) {
     }
     case 0x02:
     case 0x03: {  // lar/lsl: the descriptor's rights byte / effective limit
+      fr->rec.mnemonic = op2 == 0x02 ? "lar" : "lsl";
       if (!(s->cr0 & 1)) ud();  // PM-only (SDM vol.2)
       modrm();
       uint16_t sel = rm16();
@@ -1798,6 +1947,7 @@ static void run_op2(uint8_t op2) {
       switch (d.reg) {
         case 0:
         case 1: {  // sgdt/sidt: store limit(2) then base(4)
+          fr->rec.mnemonic = d.reg == 0 ? "sgdt" : "sidt";
           uint64_t base = d.reg == 0 ? s->gdtr : s->idtr;
           uint16_t limit = d.reg == 0 ? s->gdtr_limit : s->idtr_limit;
           wr16(d.mlin, limit);
@@ -1806,6 +1956,7 @@ static void run_op2(uint8_t op2) {
         }
         case 2:
         case 3: {  // lgdt/lidt (privileged: SDM vol.2)
+          fr->rec.mnemonic = d.reg == 2 ? "lgdt" : "lidt";
           if (cpl() != 0) gp_fault(0);
           uint16_t limit = rd16(d.mlin);
           uint64_t base = rd32(d.mlin + 2);
@@ -1819,6 +1970,7 @@ static void run_op2(uint8_t op2) {
           break;
         }
         case 4:  // smsw: CR0 at the rm width
+          fr->rec.mnemonic = "smsw";
           if (d.is_mem) {
             if (d.w32)
               wr32(d.mlin, s->cr0);
@@ -1833,6 +1985,7 @@ static void run_op2(uint8_t op2) {
           break;
         case 6: {  // lmsw: loads CR0[3:0], but PE can only be set, never
                    // cleared, and PG is untouched (SDM vol.2 LMSW)
+          fr->rec.mnemonic = "lmsw";
           if (cpl() != 0) gp_fault(0);
           uint16_t v = rm16();
           s->cr0 = (s->cr0 & ~0xfu) | (v & 0xfu) | (s->cr0 & kCr0Pe);
@@ -1840,6 +1993,7 @@ static void run_op2(uint8_t op2) {
         }
         case 7:  // invlpg: nothing to flush — every access re-walks, and
                  // INVLPG never faults on unmapped pages (SDM vol.2)
+          fr->rec.mnemonic = "invlpg";
           if (cpl() != 0) gp_fault(0);
           break;
         default:
@@ -1848,17 +2002,21 @@ static void run_op2(uint8_t op2) {
       break;
     }
     case 0x06:  // clts: clear CR0.TS (privileged: SDM vol.2)
+      fr->rec.mnemonic = "clts";
       if (cpl() != 0) gp_fault(0);
       s->cr0 &= ~kCr0Ts;
       break;
     case 0x0b:
+      fr->rec.mnemonic = "ud2";
       ud();
-      break;  // ud2
+      break;
     case 0x1f:
+      fr->rec.mnemonic = "nop";
       modrm();
       break;    // multi-byte nop
-    case 0x20: {  // mov r32, crn: CR0/CR2/CR3 on the 386 (SDM vol.2; CR1 is
-                  // reserved, CR4 arrives with the 486)
+    case 0x20: {  // mov r32, crn: CR0/CR2/CR3 (386) and CR4 for PSE (SDM
+                  // vol.2; CR1 is reserved)
+      fr->rec.mnemonic = "mov";
       modrm();
       if (cpl() != 0) gp_fault(0);
       if (d.reg == 0)
@@ -1867,11 +2025,14 @@ static void run_op2(uint8_t op2) {
         s->r[d.rm].e = s->cr2;
       else if (d.reg == 3)
         s->r[d.rm].e = s->cr3;
+      else if (d.reg == 4)
+        s->r[d.rm].e = s->cr4;
       else
         ud();
       break;
     }
     case 0x22: {  // mov crn, r32 (PE drives the mode switches)
+      fr->rec.mnemonic = "mov";
       modrm();
       if (cpl() != 0) gp_fault(0);
       if (d.reg == 0) {
@@ -1884,21 +2045,72 @@ static void run_op2(uint8_t op2) {
         s->cr2 = s->r[d.rm].e;
       } else if (d.reg == 3) {
         s->cr3 = s->r[d.rm].e;  // PDBR; nothing to flush — every access re-walks
+      } else if (d.reg == 4) {
+        s->cr4 = s->r[d.rm].e;
       } else {
         ud();
       }
       break;
     }
     case 0x21:  // mov r32, drn (privileged: SDM vol.2)
+    case 0x23: {  // mov drn, r32
+      fr->rec.mnemonic = "mov";
       modrm();
       if (cpl() != 0) gp_fault(0);
-      s->r[d.rm].e = s->dr[d.reg];
+      // CR4.DE (SDM vol.3 17.2.1): DR4/DR5 alias DR6/DR7 with DE=0 and #UD
+      // with DE=1. GD guards every debug-register access (vol.3 17.2.4).
+      int drn = d.reg;
+      if (drn == 4 || drn == 5) {
+        if (s->cr4 & kCr4De) ud();
+        drn = drn == 4 ? 6 : 7;
+      }
+      dr_guard();
+      if (op2 == 0x21) {
+        s->r[d.rm].e = s->dr[drn];
+      } else {
+        DrWrite(drn, s->r[d.rm].e);
+      }
       break;
-    case 0x23:  // mov drn, r32 (privileged: SDM vol.2)
-      modrm();
+    }
+    case 0x30: {  // wrmsr EDX:EAX -> MSR[ECX] (SDM vol.2; privileged)
+      fr->rec.mnemonic = "wrmsr";
       if (cpl() != 0) gp_fault(0);
-      s->dr[d.reg] = s->r[d.rm].e;
+      uint64_t v = ((uint64_t)edx << 32) | eax;
+      if (ecx == 0x1b) {
+        s->msr_apic_base = v;  // the MMIO page itself is fixed at reset
+      } else if (ecx == 0xc0000100 || ecx == 0xc0000101) {
+        // long-mode FS/GS bases: no architectural effect on this machine
+        // (QEMU accepts the write; the kvm boot programs GS base)
+        s->msr_fs_gs_base[ecx - 0xc0000100] = v;
+      } else {
+        gp_fault(0);  // an MSR this machine does not implement
+      }
       break;
+    }
+    case 0x31:  // rdtsc — unimplemented, D13 (AGENTS.md 简化登记)
+      ud();
+    case 0x32: {  // rdmsr MSR[ECX] -> EDX:EAX (SDM vol.2 0F 32; privileged)
+      fr->rec.mnemonic = "rdmsr";
+      if (cpl() != 0) gp_fault(0);
+      if (ecx == 0x1b) {
+        eax = (uint32_t)s->msr_apic_base;
+        edx = (uint32_t)(s->msr_apic_base >> 32);
+      } else if (ecx == 0xc0000100 || ecx == 0xc0000101) {
+        uint64_t v = s->msr_fs_gs_base[ecx - 0xc0000100];
+        eax = (uint32_t)v;
+        edx = (uint32_t)(v >> 32);
+      } else if (ecx == 0x1a0) {
+        // IA32_MISC_ENABLE (SDM vol.4 table 2-24): fast strings on, PEBS/BTS
+        // report unavailable — the QEMU default policy for a machine with
+        // no performance-monitoring unit (the kvm debug test single-steps
+        // across this read).
+        eax = 0x1801;
+        edx = 0;
+      } else {
+        gp_fault(0);
+      }
+      break;
+    }
     case 0x80:
     case 0x81:
     case 0x82:
@@ -1915,6 +2127,7 @@ static void run_op2(uint8_t op2) {
     case 0x8d:
     case 0x8e:
     case 0x8f: {  // jcc rel16/32
+      fr->rec.mnemonic = kJccNames[op2 & 0xf];
       int32_t rel = d.w32 ? (int32_t)fetch32() : (int16_t)fetch16();
       if (cond(op2 & 0xf)) d.nxt += (uint32_t)rel;
       break;
@@ -1935,23 +2148,56 @@ static void run_op2(uint8_t op2) {
     case 0x9d:
     case 0x9e:
     case 0x9f: {  // setcc rm8
+      fr->rec.mnemonic = kSetccNames[op2 & 0xf];
       modrm();
       SET_RM8(cond(op2 & 0xf));
       break;
     }
+    case 0x40:
+    case 0x41:
+    case 0x42:
+    case 0x43:
+    case 0x44:
+    case 0x45:
+    case 0x46:
+    case 0x47:
+    case 0x48:
+    case 0x49:
+    case 0x4a:
+    case 0x4b:
+    case 0x4c:
+    case 0x4d:
+    case 0x4e:
+    case 0x4f: {  // cmovcc r, rm (SDM vol.2; 686+, flags untouched)
+      fr->rec.mnemonic = kCmovNames[op2 & 0xf];
+      modrm();
+      if (d.w32) {
+        uint32_t v = RM32();
+        if (cond(op2 & 0xf)) set_reg32(v);
+      } else {
+        uint16_t v = RM16();
+        if (cond(op2 & 0xf)) set_reg16(v);
+      }
+      break;
+    }
     case 0xa0:
+      fr->rec.mnemonic = "push";
       push_w(s->sreg[fs_i]);
       break;  // push fs
     case 0xa1:
+      fr->rec.mnemonic = "pop";
       load_data(fs_i, (uint16_t)pop_w());
       break;      // pop fs
     case 0xa8:
+      fr->rec.mnemonic = "push";
       push_w(s->sreg[gs_i]);
       break;  // push gs
     case 0xa9:
+      fr->rec.mnemonic = "pop";
       load_data(gs_i, (uint16_t)pop_w());
       break;      // pop gs
     case 0xa2: {  // cpuid
+      fr->rec.mnemonic = "cpuid";
       uint32_t leaf = eax;
       if (leaf == 0) {
         eax = 1;
@@ -1971,6 +2217,7 @@ static void run_op2(uint8_t op2) {
     case 0xab:
     case 0xb3:
     case 0xbb: {  // bt/bts/btr/btc rm, reg
+      fr->rec.mnemonic = op2 == 0xa3 ? "bt" : op2 == 0xab ? "bts" : op2 == 0xb3 ? "btr" : "btc";
       modrm();
       uint32_t v, bit, pos;
       if (d.w32) {
@@ -1999,6 +2246,7 @@ static void run_op2(uint8_t op2) {
     }
     case 0xa4:
     case 0xa5: {  // shld rm, reg, imm8/cl
+      fr->rec.mnemonic = "shld";
       modrm();
       uint32_t cnt = (op2 == 0xa4 ? imm8() : cl) & 31;
       if (d.w32) {
@@ -2025,6 +2273,7 @@ static void run_op2(uint8_t op2) {
     }
     case 0xac:
     case 0xad: {  // shrd rm, reg, imm8/cl
+      fr->rec.mnemonic = "shrd";
       modrm();
       uint32_t cnt = (op2 == 0xac ? imm8() : cl) & 31;
       if (d.w32) {
@@ -2049,6 +2298,7 @@ static void run_op2(uint8_t op2) {
       break;
     }
     case 0xaf: {  // imul r, rm
+      fr->rec.mnemonic = "imul";
       modrm();
       if (d.w32) {
         int64_t prod = (int64_t)(int32_t)RM32() * (int32_t)reg32();
@@ -2064,6 +2314,7 @@ static void run_op2(uint8_t op2) {
     case 0xb2:
     case 0xb4:
     case 0xb5: {  // lss/lfs/lgs r, m16:16/32
+      fr->rec.mnemonic = op2 == 0xb2 ? "lss" : op2 == 0xb4 ? "lfs" : "lgs";
       modrm();
       if (!d.is_mem) ud();
       int seg = op2 == 0xb2 ? ss_i : op2 == 0xb4 ? fs_i : gs_i;
@@ -2085,6 +2336,7 @@ static void run_op2(uint8_t op2) {
       break;
     }
     case 0xb6: {  // movzx r16/32, rm8
+      fr->rec.mnemonic = "movzx";
       modrm();
       if (d.w32)
         set_reg32(rm8());
@@ -2093,10 +2345,12 @@ static void run_op2(uint8_t op2) {
       break;
     }
     case 0xb7:  // movzx r32, rm16
+      fr->rec.mnemonic = "movzx";
       modrm();
       set_reg32(rm16());
       break;
     case 0xba: {  // grp8: bt/bts/btr/btc rm, imm8 (reg field 4-7)
+      fr->rec.mnemonic = d.reg == 4 ? "bt" : d.reg == 5 ? "bts" : d.reg == 6 ? "btr" : "btc";
       modrm();
       if (d.reg < 4) ud();
       uint32_t v, pos = imm8();
@@ -2121,6 +2375,7 @@ static void run_op2(uint8_t op2) {
       break;
     }
     case 0xbe: {  // movsx r16/32, rm8
+      fr->rec.mnemonic = "movsx";
       modrm();
       uint32_t v = (uint32_t)(int8_t)rm8();
       if (d.w32)
@@ -2130,11 +2385,13 @@ static void run_op2(uint8_t op2) {
       break;
     }
     case 0xbf:  // movsx r32, rm16
+      fr->rec.mnemonic = "movsx";
       modrm();
       set_reg32((uint32_t)(int32_t)(int16_t)rm16());
       break;
     case 0xc0:
     case 0xc1: {  // xadd rm, reg
+      fr->rec.mnemonic = "xadd";
       modrm();
       if (op2 & 1) {
         if (d.w32) {
@@ -2159,6 +2416,29 @@ static void run_op2(uint8_t op2) {
       }
       break;
     }
+    case 0xc7: {  // cmpxchg8b m64 (SDM vol.2: /1 only, memory only; the 66
+                  // form is CMPXCHG16B and does not exist in 32-bit mode —
+                  // the prefix flips w32 to 0, which is the tell)
+      fr->rec.mnemonic = "cmpxchg8b";
+      if (!d.w32) ud();
+      modrm();
+      if (d.reg != 1 || !d.is_mem) ud();
+      seg_use(d.mseg, d.moff, 8, 0);
+      uint64_t old = (uint64_t)rd32(d.mlin) | ((uint64_t)rd32(d.mlin + 4) << 32);
+      uint64_t acc = ((uint64_t)edx << 32) | eax;
+      if (old == acc) {
+        fl->zf = 1;
+        uint64_t nv = ((uint64_t)ecx << 32) | ebx;
+        seg_use(d.mseg, d.moff, 8, 1);
+        wr32(d.mlin, (uint32_t)nv);
+        wr32(d.mlin + 4, (uint32_t)(nv >> 32));
+      } else {
+        fl->zf = 0;
+        eax = (uint32_t)old;
+        edx = (uint32_t)(old >> 32);
+      }
+      break;
+    }
     case 0xc8:
     case 0xc9:
     case 0xca:
@@ -2167,6 +2447,7 @@ static void run_op2(uint8_t op2) {
     case 0xcd:
     case 0xce:
     case 0xcf: {  // bswap r32
+      fr->rec.mnemonic = "bswap";
       uint32_t v = s->r[op2 & 7].e;
       s->r[op2 & 7].e = ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >> 8) & 0xff00) | (v >> 24);
       break;
@@ -2185,6 +2466,7 @@ void run_op(uint8_t op) {
   }  // two-byte escape (SDM 0f)
   switch (op) {
     case 0x00: {
+      fr->rec.mnemonic = "add";
       modrm();
       uint8_t a = RM8(), b = reg8();
       uint8_t r = a + b;
@@ -2193,6 +2475,7 @@ void run_op(uint8_t op) {
       break;
     }  // add rm8, r8
     case 0x01: {
+      fr->rec.mnemonic = "add";
       modrm();
       if (d.w32) {
         uint32_t a = RM32(), b = reg32();
@@ -2208,6 +2491,7 @@ void run_op(uint8_t op) {
       break;
     }  // add rm, r
     case 0x02: {
+      fr->rec.mnemonic = "add";
       modrm();
       uint8_t a = reg8(), b = RM8();
       uint8_t r = a + b;
@@ -2216,6 +2500,7 @@ void run_op(uint8_t op) {
       break;
     }  // add r8, rm8
     case 0x03: {
+      fr->rec.mnemonic = "add";
       modrm();
       if (d.w32) {
         uint32_t a = reg32(), b = RM32();
@@ -2231,12 +2516,14 @@ void run_op(uint8_t op) {
       break;
     }  // add r, rm
     case 0x04: {
+      fr->rec.mnemonic = "add";
       uint8_t a = al, b = imm8();
       al = a + b;
       flags_add(a, b, al, 1, 0);
       break;
     }  // add al, imm8
     case 0x05: {
+      fr->rec.mnemonic = "add";
       if (d.w32) {
         uint32_t a = eax, b = imm32();
         eax = a + b;
@@ -2249,12 +2536,15 @@ void run_op(uint8_t op) {
       break;
     }  // add eAX, imm
     case 0x06:
+      fr->rec.mnemonic = "push es";
       push_w(s->sreg[es_i]);
       break;  // push es
     case 0x07:
+      fr->rec.mnemonic = "pop es";
       load_data(es_i, (uint16_t)pop_w());
       break;  // pop es
     case 0x08: {
+      fr->rec.mnemonic = "or";
       modrm();
       uint8_t a = RM8(), b = reg8();
       uint8_t r = a | b;
@@ -2263,6 +2553,7 @@ void run_op(uint8_t op) {
       break;
     }  // or rm8, r8
     case 0x09: {
+      fr->rec.mnemonic = "or";
       modrm();
       if (d.w32) {
         uint32_t a = RM32(), b = reg32();
@@ -2278,6 +2569,7 @@ void run_op(uint8_t op) {
       break;
     }  // or rm, r
     case 0x0a: {
+      fr->rec.mnemonic = "or";
       modrm();
       uint8_t a = reg8(), b = RM8();
       uint8_t r = a | b;
@@ -2286,6 +2578,7 @@ void run_op(uint8_t op) {
       break;
     }  // or r8, rm8
     case 0x0b: {
+      fr->rec.mnemonic = "or";
       modrm();
       if (d.w32) {
         uint32_t a = reg32(), b = RM32();
@@ -2301,12 +2594,14 @@ void run_op(uint8_t op) {
       break;
     }  // or r, rm
     case 0x0c: {
+      fr->rec.mnemonic = "or";
       uint8_t a = al, b = imm8();
       al = a | b;
       flags_logic(al, 1);
       break;
     }  // or al, imm8
     case 0x0d: {
+      fr->rec.mnemonic = "or";
       if (d.w32) {
         uint32_t a = eax, b = imm32();
         eax = a | b;
@@ -2319,9 +2614,11 @@ void run_op(uint8_t op) {
       break;
     }  // or eAX, imm
     case 0x0e:
+      fr->rec.mnemonic = "push cs";
       push_w(s->sreg[cs_i]);
       break;  // push cs
     case 0x10: {
+      fr->rec.mnemonic = "adc";
       modrm();
       uint8_t a = RM8(), b = reg8();
       int cin = fl->cf;
@@ -2331,6 +2628,7 @@ void run_op(uint8_t op) {
       break;
     }  // adc rm8, r8
     case 0x11: {
+      fr->rec.mnemonic = "adc";
       modrm();
       int cin = fl->cf;
       if (d.w32) {
@@ -2347,6 +2645,7 @@ void run_op(uint8_t op) {
       break;
     }  // adc rm, r
     case 0x12: {
+      fr->rec.mnemonic = "adc";
       modrm();
       uint8_t a = reg8(), b = RM8();
       int cin = fl->cf;
@@ -2356,6 +2655,7 @@ void run_op(uint8_t op) {
       break;
     }  // adc r8, rm8
     case 0x13: {
+      fr->rec.mnemonic = "adc";
       modrm();
       int cin = fl->cf;
       if (d.w32) {
@@ -2372,6 +2672,7 @@ void run_op(uint8_t op) {
       break;
     }  // adc r, rm
     case 0x14: {
+      fr->rec.mnemonic = "adc";
       uint8_t a = al, b = imm8();
       int cin = fl->cf;
       al = (uint8_t)(a + b + cin);
@@ -2379,6 +2680,7 @@ void run_op(uint8_t op) {
       break;
     }  // adc al, imm8
     case 0x15: {
+      fr->rec.mnemonic = "adc";
       int cin = fl->cf;
       if (d.w32) {
         uint32_t a = eax, b = imm32();
@@ -2392,13 +2694,16 @@ void run_op(uint8_t op) {
       break;
     }  // adc eAX, imm
     case 0x16:
+      fr->rec.mnemonic = "push ss";
       push_w(s->sreg[ss_i]);
       break;  // push ss
     case 0x17:
+      fr->rec.mnemonic = "pop ss";
       load_ss((uint16_t)pop_w());
       s->intr_inhibit = 1;  // POP SS: one-instruction interrupt shadow (SDM)
       break;  // pop ss
     case 0x18: {
+      fr->rec.mnemonic = "sbb";
       modrm();
       uint8_t a = RM8(), b = reg8();
       int cin = fl->cf;
@@ -2408,6 +2713,7 @@ void run_op(uint8_t op) {
       break;
     }  // sbb rm8, r8
     case 0x19: {
+      fr->rec.mnemonic = "sbb";
       modrm();
       int cin = fl->cf;
       if (d.w32) {
@@ -2424,6 +2730,7 @@ void run_op(uint8_t op) {
       break;
     }  // sbb rm, r
     case 0x1a: {
+      fr->rec.mnemonic = "sbb";
       modrm();
       uint8_t a = reg8(), b = RM8();
       int cin = fl->cf;
@@ -2433,6 +2740,7 @@ void run_op(uint8_t op) {
       break;
     }  // sbb r8, rm8
     case 0x1b: {
+      fr->rec.mnemonic = "sbb";
       modrm();
       int cin = fl->cf;
       if (d.w32) {
@@ -2449,6 +2757,7 @@ void run_op(uint8_t op) {
       break;
     }  // sbb r, rm
     case 0x1c: {
+      fr->rec.mnemonic = "sbb";
       uint8_t a = al, b = imm8();
       int cin = fl->cf;
       al = (uint8_t)(a - b - cin);
@@ -2456,6 +2765,7 @@ void run_op(uint8_t op) {
       break;
     }  // sbb al, imm8
     case 0x1d: {
+      fr->rec.mnemonic = "sbb";
       int cin = fl->cf;
       if (d.w32) {
         uint32_t a = eax, b = imm32();
@@ -2469,12 +2779,15 @@ void run_op(uint8_t op) {
       break;
     }  // sbb eAX, imm
     case 0x1e:
+      fr->rec.mnemonic = "push ds";
       push_w(s->sreg[ds_i]);
       break;  // push ds
     case 0x1f:
+      fr->rec.mnemonic = "pop ds";
       load_data(ds_i, (uint16_t)pop_w());
       break;  // pop ds
     case 0x20: {
+      fr->rec.mnemonic = "and";
       modrm();
       uint8_t a = RM8(), b = reg8();
       uint8_t r = a & b;
@@ -2483,6 +2796,7 @@ void run_op(uint8_t op) {
       break;
     }  // and rm8, r8
     case 0x21: {
+      fr->rec.mnemonic = "and";
       modrm();
       if (d.w32) {
         uint32_t a = RM32(), b = reg32();
@@ -2498,6 +2812,7 @@ void run_op(uint8_t op) {
       break;
     }  // and rm, r
     case 0x22: {
+      fr->rec.mnemonic = "and";
       modrm();
       uint8_t a = reg8(), b = RM8();
       uint8_t r = a & b;
@@ -2506,6 +2821,7 @@ void run_op(uint8_t op) {
       break;
     }  // and r8, rm8
     case 0x23: {
+      fr->rec.mnemonic = "and";
       modrm();
       if (d.w32) {
         uint32_t a = reg32(), b = RM32();
@@ -2521,12 +2837,14 @@ void run_op(uint8_t op) {
       break;
     }  // and r, rm
     case 0x24: {
+      fr->rec.mnemonic = "and";
       uint8_t a = al, b = imm8();
       al = a & b;
       flags_logic(al, 1);
       break;
     }  // and al, imm8
     case 0x25: {
+      fr->rec.mnemonic = "and";
       if (d.w32) {
         uint32_t a = eax, b = imm32();
         eax = a & b;
@@ -2539,9 +2857,11 @@ void run_op(uint8_t op) {
       break;
     }  // and eAX, imm
     case 0x27:
+      fr->rec.mnemonic = "daa";
       daa();
       break;  // daa
     case 0x28: {
+      fr->rec.mnemonic = "sub";
       modrm();
       uint8_t a = RM8(), b = reg8();
       uint8_t r = a - b;
@@ -2550,6 +2870,7 @@ void run_op(uint8_t op) {
       break;
     }  // sub rm8, r8
     case 0x29: {
+      fr->rec.mnemonic = "sub";
       modrm();
       if (d.w32) {
         uint32_t a = RM32(), b = reg32();
@@ -2565,6 +2886,7 @@ void run_op(uint8_t op) {
       break;
     }  // sub rm, r
     case 0x2a: {
+      fr->rec.mnemonic = "sub";
       modrm();
       uint8_t a = reg8(), b = RM8();
       uint8_t r = a - b;
@@ -2573,6 +2895,7 @@ void run_op(uint8_t op) {
       break;
     }  // sub r8, rm8
     case 0x2b: {
+      fr->rec.mnemonic = "sub";
       modrm();
       if (d.w32) {
         uint32_t a = reg32(), b = RM32();
@@ -2588,12 +2911,14 @@ void run_op(uint8_t op) {
       break;
     }  // sub r, rm
     case 0x2c: {
+      fr->rec.mnemonic = "sub";
       uint8_t a = al, b = imm8();
       al = (uint8_t)(a - b);
       flags_sub(a, b, al, 1, 0);
       break;
     }  // sub al, imm8
     case 0x2d: {
+      fr->rec.mnemonic = "sub";
       if (d.w32) {
         uint32_t a = eax, b = imm32();
         eax = a - b;
@@ -2606,9 +2931,11 @@ void run_op(uint8_t op) {
       break;
     }  // sub eAX, imm
     case 0x2f:
+      fr->rec.mnemonic = "das";
       das();
       break;  // das
     case 0x30: {
+      fr->rec.mnemonic = "xor";
       modrm();
       uint8_t a = RM8(), b = reg8();
       uint8_t r = a ^ b;
@@ -2617,6 +2944,7 @@ void run_op(uint8_t op) {
       break;
     }  // xor rm8, r8
     case 0x31: {
+      fr->rec.mnemonic = "xor";
       modrm();
       if (d.w32) {
         uint32_t a = RM32(), b = reg32();
@@ -2632,6 +2960,7 @@ void run_op(uint8_t op) {
       break;
     }  // xor rm, r
     case 0x32: {
+      fr->rec.mnemonic = "xor";
       modrm();
       uint8_t a = reg8(), b = RM8();
       uint8_t r = a ^ b;
@@ -2640,6 +2969,7 @@ void run_op(uint8_t op) {
       break;
     }  // xor r8, rm8
     case 0x33: {
+      fr->rec.mnemonic = "xor";
       modrm();
       if (d.w32) {
         uint32_t a = reg32(), b = RM32();
@@ -2655,12 +2985,14 @@ void run_op(uint8_t op) {
       break;
     }  // xor r, rm
     case 0x34: {
+      fr->rec.mnemonic = "xor";
       uint8_t a = al, b = imm8();
       al = a ^ b;
       flags_logic(al, 1);
       break;
     }  // xor al, imm8
     case 0x35: {
+      fr->rec.mnemonic = "xor";
       if (d.w32) {
         uint32_t a = eax, b = imm32();
         eax = a ^ b;
@@ -2673,15 +3005,18 @@ void run_op(uint8_t op) {
       break;
     }  // xor eAX, imm
     case 0x37:
+      fr->rec.mnemonic = "aaa";
       aaa();
       break;  // aaa
     case 0x38: {
+      fr->rec.mnemonic = "cmp";
       modrm();
       uint8_t a = RM8(), b = reg8();
       flags_sub(a, b, (uint8_t)(a - b), 1, 0);
       break;
     }  // cmp rm8, r8
     case 0x39: {
+      fr->rec.mnemonic = "cmp";
       modrm();
       if (d.w32) {
         uint32_t a = RM32(), b = reg32();
@@ -2693,12 +3028,14 @@ void run_op(uint8_t op) {
       break;
     }  // cmp rm, r
     case 0x3a: {
+      fr->rec.mnemonic = "cmp";
       modrm();
       uint8_t a = reg8(), b = RM8();
       flags_sub(a, b, (uint8_t)(a - b), 1, 0);
       break;
     }  // cmp r8, rm8
     case 0x3b: {
+      fr->rec.mnemonic = "cmp";
       modrm();
       if (d.w32) {
         uint32_t a = reg32(), b = RM32();
@@ -2710,11 +3047,13 @@ void run_op(uint8_t op) {
       break;
     }  // cmp r, rm
     case 0x3c: {
+      fr->rec.mnemonic = "cmp";
       uint8_t a = al, b = imm8();
       flags_sub(a, b, (uint8_t)(a - b), 1, 0);
       break;
     }  // cmp al, imm8
     case 0x3d: {
+      fr->rec.mnemonic = "cmp";
       if (d.w32) {
         uint32_t a = eax, b = imm32();
         flags_sub(a, b, a - b, 4, 0);
@@ -2725,6 +3064,7 @@ void run_op(uint8_t op) {
       break;
     }  // cmp eAX, imm
     case 0x3f:
+      fr->rec.mnemonic = "aas";
       aas();
       break;  // aas
     case 0x40:
@@ -2735,6 +3075,7 @@ void run_op(uint8_t op) {
     case 0x45:
     case 0x46:
     case 0x47: {  // inc r
+      fr->rec.mnemonic = "inc";
       if (d.w32) {
         uint32_t r = s->r[op & 7].e + 1;
         s->r[op & 7].e = r;
@@ -2754,6 +3095,7 @@ void run_op(uint8_t op) {
     case 0x4d:
     case 0x4e:
     case 0x4f: {  // dec r
+      fr->rec.mnemonic = "dec";
       if (d.w32) {
         uint32_t r = s->r[op & 7].e - 1;
         s->r[op & 7].e = r;
@@ -2773,6 +3115,7 @@ void run_op(uint8_t op) {
     case 0x55:
     case 0x56:
     case 0x57:  // push r
+      fr->rec.mnemonic = "push";
       push_w(d.w32 ? s->r[op & 7].e : s->r[op & 7].x);
       break;
     case 0x58:
@@ -2783,12 +3126,14 @@ void run_op(uint8_t op) {
     case 0x5d:
     case 0x5e:
     case 0x5f:  // pop r
+      fr->rec.mnemonic = "pop";
       if (d.w32)
         s->r[op & 7].e = pop32();
       else
         s->r[op & 7].x = pop16();
       break;
     case 0x60: {  // pusha: ax cx dx bx sp bp si di, sp = the ORIGINAL value
+      fr->rec.mnemonic = "pusha";
       uint32_t sp0 = d.w32 ? esp : sp;
       if (d.w32) {
         push32(eax);
@@ -2812,6 +3157,7 @@ void run_op(uint8_t op) {
       break;
     }
     case 0x61: {  // popa: di si bp (skip sp) bx dx cx ax
+      fr->rec.mnemonic = "popa";
       if (d.w32) {
         edi = pop32();
         esi = pop32();
@@ -2834,6 +3180,7 @@ void run_op(uint8_t op) {
       break;
     }
     case 0x63: {  // arpl: raise r/m's RPL to the register's (SDM vol.2,
+      fr->rec.mnemonic = "arpl";
                   // PM-only — v86 #UDs it outside protected mode)
       if (!(s->cr0 & 1)) ud();
       if (cpl() != 0) gp_fault(0);
@@ -2849,9 +3196,11 @@ void run_op(uint8_t op) {
       break;
     }
     case 0x68:
+      fr->rec.mnemonic = "push";
       push_w(d.w32 ? imm32() : imm16());
       break;      // push imm
     case 0x69: {  // imul r, rm, imm
+      fr->rec.mnemonic = "imul";
       modrm();
       if (d.w32) {
         int64_t prod =
@@ -2867,9 +3216,11 @@ void run_op(uint8_t op) {
       break;
     }
     case 0x6a:
+      fr->rec.mnemonic = "push";
       push_w((uint32_t)(int32_t)(int8_t)imm8());
       break;      // push imm8 (sign-extended)
     case 0x6b: {  // imul r, rm, imm8
+      fr->rec.mnemonic = "imul";
       modrm();
       if (d.w32) {
         int64_t prod = (int64_t)(int32_t)(d.is_mem ? rd32(d.mlin) : s->r[d.rm].e) * (int8_t)imm8();
@@ -2898,6 +3249,7 @@ void run_op(uint8_t op) {
     case 0x7d:
     case 0x7e:
     case 0x7f: {  // jcc rel8
+      fr->rec.mnemonic = kJccNames[op & 0xf];
       int8_t rel = (int8_t)imm8();
       if (cond(op & 0xf)) d.nxt += (uint32_t)(int32_t)rel;
       break;
@@ -2915,12 +3267,14 @@ void run_op(uint8_t op) {
       grp1(d.w32 ? 4 : 2, 1);
       break;
     case 0x84: {
+      fr->rec.mnemonic = "test";
       modrm();
       uint8_t a = RM8(), b = reg8();
       flags_logic(a & b, 1);
       break;
     }  // test rm8, r8
     case 0x85: {
+      fr->rec.mnemonic = "test";
       modrm();
       if (d.w32) {
         uint32_t a = RM32(), b = reg32();
@@ -2932,6 +3286,7 @@ void run_op(uint8_t op) {
       break;
     }  // test rm, r
     case 0x86: {
+      fr->rec.mnemonic = "xchg";
       modrm();
       uint8_t t = RM8();
       SET_RM8(reg8());
@@ -2939,6 +3294,7 @@ void run_op(uint8_t op) {
       break;
     }  // xchg rm8, r8
     case 0x87: {
+      fr->rec.mnemonic = "xchg";
       modrm();
       if (d.w32) {
         uint32_t t = RM32();
@@ -2952,11 +3308,13 @@ void run_op(uint8_t op) {
       break;
     }  // xchg rm, r
     case 0x88: {
+      fr->rec.mnemonic = "mov";
       modrm();
       SET_RM8(reg8());
       break;
     }  // mov rm8, r8
     case 0x89: {
+      fr->rec.mnemonic = "mov";
       modrm();
       if (d.w32)
         SET_RM32(reg32());
@@ -2965,11 +3323,13 @@ void run_op(uint8_t op) {
       break;
     }  // mov rm, r
     case 0x8a: {
+      fr->rec.mnemonic = "mov";
       modrm();
       set_reg8(RM8());
       break;
     }  // mov r8, rm8
     case 0x8b: {
+      fr->rec.mnemonic = "mov";
       modrm();
       if (d.w32)
         set_reg32(RM32());
@@ -2978,6 +3338,7 @@ void run_op(uint8_t op) {
       break;
     }  // mov r, rm
     case 0x8c: {
+      fr->rec.mnemonic = "mov";
       modrm();
       if (d.w32)
         SET_RM32(s->sreg[d.reg]);
@@ -2986,6 +3347,7 @@ void run_op(uint8_t op) {
       break;
     }             // mov rm16, sreg
     case 0x8d: {  // lea r, m
+      fr->rec.mnemonic = "lea";
       modrm();
       if (!d.is_mem) ud();
       if (d.w32)
@@ -2995,6 +3357,7 @@ void run_op(uint8_t op) {
       break;
     }
     case 0x8e: {
+      fr->rec.mnemonic = "mov";
       modrm();
       if (d.reg > gs_i) ud();
       uint16_t sel = rm16();
@@ -3009,6 +3372,7 @@ void run_op(uint8_t op) {
       break;
     }  // mov sreg, rm16
     case 0x8f: {
+      fr->rec.mnemonic = "pop";
       modrm();
       uint32_t v = pop_w();
       if (d.w32)
@@ -3018,6 +3382,7 @@ void run_op(uint8_t op) {
       break;
     }  // pop rm
     case 0x90:
+      fr->rec.mnemonic = "nop";
       break;  // nop
     case 0x91:
     case 0x92:
@@ -3026,6 +3391,7 @@ void run_op(uint8_t op) {
     case 0x95:
     case 0x96:
     case 0x97: {  // xchg eAX, r
+      fr->rec.mnemonic = "xchg";
       if (d.w32) {
         uint32_t t = eax;
         eax = s->r[op & 7].e;
@@ -3038,55 +3404,69 @@ void run_op(uint8_t op) {
       break;
     }
     case 0x98:  // cbw/cwde: sign-extend AL->AX or AX->EAX
+      fr->rec.mnemonic = d.w32 ? "cwde" : "cbw";
       if (d.w32)
         eax = (uint32_t)(int32_t)(int16_t)ax;
       else
         ax = (uint16_t)(int16_t)(int8_t)al;
       break;
     case 0x99:  // cwd/cdq: sign-extend AX->DX:AX or EAX->EDX:EAX
+      fr->rec.mnemonic = d.w32 ? "cdq" : "cwd";
       if (d.w32)
         edx = (int32_t)eax < 0 ? 0xffffffffu : 0;
       else
         dx = (int16_t)ax < 0 ? 0xffffu : 0;
       break;
     case 0x9a: {  // call ptr16:16/32 — gate/code dispatch, then CS/IP pushed
+      fr->rec.mnemonic = "lcall";
       uint32_t off = d.w32 ? imm32() : imm16();
       uint16_t sel = imm16();
       pm_far(sel, off, 1, (uint32_t)(fr->rec.pc + d.nxt));
       break;
     }
     case 0x9b:
+      fr->rec.mnemonic = "wait";
       break;  // wait: no x87 in this machine
     case 0x9c:
+      fr->rec.mnemonic = "pushf";
       push_w(fl->word | 2);
       break;      // pushf
-    case 0x9d: {  // popf: bit 1 stays set; RF/VM never load (SDM)
+    case 0x9d: {  // popf: bit 1 stays set; VM never loads, RF does (SDM
+                  // EFLAGS.RF: the #DB handler re-arms RF through its image)
+      fr->rec.mnemonic = "popf";
       uint32_t v = pop_w();
+      d.rf_load = 1;
       if (d.w32)
-        fl->word = (v & ~(0x30000u)) | 2;
+        fl->word = (v & ~(0x20000u)) | 2;
       else
         fl->word = (fl->word & 0xffff0000u) | (v | 2);
       break;
     }
     case 0x9e: {  // sahf: AH -> SF ZF AF PF CF (SDM)
+      fr->rec.mnemonic = "sahf";
       uint32_t ahv = ah;
       fl->word = (fl->word & ~0xd5u) | (ahv & 0xd5u) | 2;
       break;
     }
     case 0x9f:
+      fr->rec.mnemonic = "lahf";
       ah = (uint8_t)(fl->word & 0xd5u) | 2;
       break;  // lahf
     case 0xa0: {
+      fr->rec.mnemonic = "mov";
       int sseg = d.seg >= 0 ? d.seg : ds_i;
       uint32_t off = d.a32 ? imm32() : imm16();
       seg_use(sseg, off, 1, 0);
+      WatchData(s->base[sseg] + off, 1, 0);
       al = rd8(s->base[sseg] + off);
       break;
     }  // mov al, moffs8
     case 0xa1: {
+      fr->rec.mnemonic = "mov";
       int sseg = d.seg >= 0 ? d.seg : ds_i;
       uint32_t off = d.a32 ? imm32() : imm16();
       seg_use(sseg, off, d.w32 ? 4 : 2, 0);
+      WatchData(s->base[sseg] + off, d.w32 ? 4 : 2, 0);
       if (d.w32)
         eax = rd32(s->base[sseg] + off);
       else
@@ -3094,16 +3474,20 @@ void run_op(uint8_t op) {
       break;
     }  // mov eAX, moffs
     case 0xa2: {
+      fr->rec.mnemonic = "mov";
       int sseg = d.seg >= 0 ? d.seg : ds_i;
       uint32_t off = d.a32 ? imm32() : imm16();
       seg_use(sseg, off, 1, 1);
+      WatchData(s->base[sseg] + off, 1, 1);
       wr8(s->base[sseg] + off, al);
       break;
     }  // mov moffs8, al
     case 0xa3: {
+      fr->rec.mnemonic = "mov";
       int sseg = d.seg >= 0 ? d.seg : ds_i;
       uint32_t off = d.a32 ? imm32() : imm16();
       seg_use(sseg, off, d.w32 ? 4 : 2, 1);
+      WatchData(s->base[sseg] + off, d.w32 ? 4 : 2, 1);
       if (d.w32)
         wr32(s->base[sseg] + off, eax);
       else
@@ -3123,11 +3507,13 @@ void run_op(uint8_t op) {
       string_op(op);
       break;
     case 0xa8: {
+      fr->rec.mnemonic = "test";
       uint8_t a = al, b = imm8();
       flags_logic(a & b, 1);
       break;
     }  // test al, imm8
     case 0xa9: {
+      fr->rec.mnemonic = "test";
       if (d.w32) {
         uint32_t a = eax, b = imm32();
         flags_logic(a & b, 4);
@@ -3145,6 +3531,7 @@ void run_op(uint8_t op) {
     case 0xb5:
     case 0xb6:
     case 0xb7:  // mov r8, imm8
+      fr->rec.mnemonic = "mov";
       if (op < 0xb4)
         s->r[op & 7].l = imm8();
       else
@@ -3158,6 +3545,7 @@ void run_op(uint8_t op) {
     case 0xbd:
     case 0xbe:
     case 0xbf:  // mov r, imm
+      fr->rec.mnemonic = "mov";
       if (d.w32)
         s->r[op & 7].e = imm32();
       else
@@ -3172,6 +3560,7 @@ void run_op(uint8_t op) {
       grp2(d.w32 ? 4 : 2, imm8());
       break;
     case 0xc2: {  // ret imm16
+      fr->rec.mnemonic = "ret";
       uint32_t n = imm16();
       eip = pop_w();
       if (d.w32)
@@ -3181,10 +3570,12 @@ void run_op(uint8_t op) {
       break;
     }
     case 0xc3:
+      fr->rec.mnemonic = "ret";
       eip = pop_w();
       break;  // ret
     case 0xc4:
     case 0xc5: {  // les/lds r, m16:16/32
+      fr->rec.mnemonic = op == 0xc4 ? "les" : "lds";
       modrm();
       if (!d.is_mem) ud();
       int seg = op == 0xc4 ? es_i : ds_i;
@@ -3200,11 +3591,13 @@ void run_op(uint8_t op) {
       break;
     }
     case 0xc6: {
+      fr->rec.mnemonic = "mov";
       modrm();
       SET_RM8(imm8());
       break;
     }  // mov rm8, imm8
     case 0xc7: {
+      fr->rec.mnemonic = "mov";
       modrm();
       if (d.w32)
         SET_RM32(imm32());
@@ -3213,6 +3606,7 @@ void run_op(uint8_t op) {
       break;
     }             // mov rm, imm
     case 0xc8: {  // enter imm16, imm8 (SDM ENTER)
+      fr->rec.mnemonic = "enter";
       uint32_t alloc = imm16();
       uint32_t level = imm8() & 31;
       push_w(d.w32 ? ebp : bp);
@@ -3243,6 +3637,7 @@ void run_op(uint8_t op) {
       break;
     }
     case 0xc9: {  // leave: sp = bp, then pop bp
+      fr->rec.mnemonic = "leave";
       if (d.w32) {
         esp = ebp;
         ebp = pop32();
@@ -3253,6 +3648,7 @@ void run_op(uint8_t op) {
       break;
     }
     case 0xca: {  // retf imm16
+      fr->rec.mnemonic = "retf";
       uint32_t n = imm16();
       if (s->cr0 & 1) {
         pm_ret(n);
@@ -3267,6 +3663,7 @@ void run_op(uint8_t op) {
       break;
     }
     case 0xcb:
+      fr->rec.mnemonic = "retf";
       if (s->cr0 & 1) {
         pm_ret(0);
         break;
@@ -3275,9 +3672,11 @@ void run_op(uint8_t op) {
       load_cs((uint16_t)pop_w());
       break;  // retf
     case 0xcc:
+      fr->rec.mnemonic = "int3";
       do_int(3, (uint32_t)(fr->rec.pc + d.nxt), 1, 0);
       return;  // int3
     case 0xcd: {
+      fr->rec.mnemonic = "int";
       int v = imm8();  // evaluate the immediate first: d.nxt must count it
                        // before the return address is formed (arg order in C
                        // is unspecified)
@@ -3285,18 +3684,20 @@ void run_op(uint8_t op) {
       return;
     }  // int imm8
     case 0xce:
+      fr->rec.mnemonic = "into";
       if (fl->of) {
         do_int(4, (uint32_t)(fr->rec.pc + d.nxt), 1, 0);
         return;
       }
       break;      // into
     case 0xcf: {
+      fr->rec.mnemonic = "iret";
       if (s->cr0 & 1) {
         pm_iret();  // SDM vol.2 IRET: the gate-return rules apply
         break;
       }
-      // Real mode: pop (E)IP, CS, (E)FLAGS. RF/VM never load from the
-      // stored image (SDM IRET Operation: RF=0; VM stays 0 in real mode).
+      // Real mode: pop (E)IP, CS, (E)FLAGS. VM never loads; RF does (SDM
+      // IRET Operation — the #DB handler re-arms RF through its image).
       // 16-bit form loads only the low half.
       uint32_t new_eip = pop_w();
       uint16_t sel = (uint16_t)pop_w();
@@ -3305,8 +3706,9 @@ void run_op(uint8_t op) {
       desc_parse(sel, &v);
       seg_commit(cs_i, sel, &v);
       eip = new_eip;
+      d.rf_load = 1;
       if (d.w32)
-        fl->word = (flv & ~(0x30000u)) | 2;
+        fl->word = (flv & ~(0x20000u)) | 2;
       else
         fl->word = (fl->word & 0xffff0000u) | ((flv & 0xffffu) | 2);
       break;
@@ -3328,6 +3730,7 @@ void run_op(uint8_t op) {
       grp2(d.w32 ? 4 : 2, cl);
       break;
     case 0xd4: {  // aam imm8: AH = AL/base, AL = AL%base (base 0 -> #DE)
+      fr->rec.mnemonic = "aam";
       uint32_t base = imm8();
       if (base == 0) de();
       uint8_t q = al / (uint8_t)base;
@@ -3337,6 +3740,7 @@ void run_op(uint8_t op) {
       break;
     }
     case 0xd5: {  // aad imm8: AL = (AL + AH*base) & 0xff, AH = 0
+      fr->rec.mnemonic = "aad";
       uint32_t base = imm8();
       uint8_t r = (uint8_t)(al + ah * (uint8_t)base);
       al = r;
@@ -3345,12 +3749,15 @@ void run_op(uint8_t op) {
       break;
     }
     case 0xd6:
+      fr->rec.mnemonic = "salc";
       al = fl->cf ? 0xff : 0x00;
       break;      // salc (undocumented)
     case 0xd7: {  // xlat: AL = [seg:(BX + AL) mod 2^addr_size] (SDM XLAT)
+      fr->rec.mnemonic = "xlat";
       int sseg = d.seg >= 0 ? d.seg : ds_i;
       uint32_t off = d.a32 ? ebx + al : (uint16_t)(bx + al);
       seg_use(sseg, off, 1, 0);
+      WatchData(s->base[sseg] + off, 1, 0);
       al = rd8(s->base[sseg] + off);
       break;
     }
@@ -3362,14 +3769,17 @@ void run_op(uint8_t op) {
     case 0xdd:
     case 0xde:
     case 0xdf: {  // x87 escape
+      fr->rec.mnemonic = "x87";
       modrm();
       // Only FNINIT (DB /3) is accepted; this machine has no FPU (D13).
       if (!(op == 0xdb && d.mod == 3 && d.reg == 3)) ud();
+      fr->rec.mnemonic = "fninit";
       break;
     }
     case 0xe0:
     case 0xe1:
     case 0xe2: {  // loopne/loope/loop rel8
+      fr->rec.mnemonic = op == 0xe0 ? "loopne" : op == 0xe1 ? "loope" : "loop";
       int8_t rel = (int8_t)imm8();
       uint32_t cnt = (d.w32 ? ecx : cx) - 1;
       if (d.w32)
@@ -3381,67 +3791,88 @@ void run_op(uint8_t op) {
       break;
     }
     case 0xe3: {  // jcxz/jecxz rel8 (counts at the ADDRESS size)
+      fr->rec.mnemonic = d.a32 ? "jecxz" : "jcxz";
       int8_t rel = (int8_t)imm8();
       if ((d.a32 ? ecx : cx) == 0) d.nxt += (uint32_t)(int32_t)rel;
       break;
     }
     case 0xe4: {
+      fr->rec.mnemonic = "in";
       uint16_t port = imm8();
-      al = (uint8_t)BusRead(cpu->io, port, 1);
+      al = (uint8_t)io_in(port, 1);
       break;
     }  // in al, imm8
     case 0xe5: {
+      fr->rec.mnemonic = "in";
       uint16_t port = imm8();
       if (d.w32)
-        eax = BusRead(cpu->io, port, 4);
+        eax = io_in(port, 4);
       else
-        ax = (uint16_t)BusRead(cpu->io, port, 2);
+        ax = (uint16_t)io_in(port, 2);
       break;
     }  // in eAX, imm8
     case 0xe6:
-      BusWrite(cpu->io, imm8(), 1, al);
+      fr->rec.mnemonic = "out";
+      io_out(imm8(), 1, al);
       break;  // out imm8, al
     case 0xe7:
-      BusWrite(cpu->io, imm8(), d.w32 ? 4 : 2, d.w32 ? eax : ax);
+      fr->rec.mnemonic = "out";
+      uint16_t port = imm8();
+      io_out(port, d.w32 ? 4 : 2, d.w32 ? eax : ax);
       break;      // out imm8, eAX
     case 0xe8: {  // call rel16/32
+      fr->rec.mnemonic = "call";
       int32_t rel = d.w32 ? (int32_t)imm32() : (int16_t)imm16();
       push_w((uint32_t)(fr->rec.pc + d.nxt));  // return: next instruction
       d.nxt += (uint32_t)rel;
       break;
     }
     case 0xe9: {  // jmp rel16/32
+      fr->rec.mnemonic = "jmp";
       int32_t rel = d.w32 ? (int32_t)imm32() : (int16_t)imm16();
       d.nxt += (uint32_t)rel;
       break;
     }
     case 0xea: {  // jmp ptr16:16/32 — gate/code dispatch
+      fr->rec.mnemonic = "ljmp";
       uint32_t off = d.w32 ? imm32() : imm16();
       uint16_t sel = imm16();
       pm_far(sel, off, 0, (uint32_t)(fr->rec.pc + d.nxt));
       break;
     }
     case 0xeb: {
+      fr->rec.mnemonic = "jmp";
       int8_t rel = (int8_t)imm8();
       d.nxt += (uint32_t)(int32_t)rel;
       break;
     }  // jmp rel8
     case 0xec:
-      al = (uint8_t)BusRead(cpu->io, dx, 1);
+      fr->rec.mnemonic = "in";
+      al = (uint8_t)io_in(dx, 1);
       break;  // in al, dx
     case 0xed:
+      fr->rec.mnemonic = "in";
       if (d.w32)
-        eax = BusRead(cpu->io, dx, 4);
+        eax = io_in(dx, 4);
       else
-        ax = (uint16_t)BusRead(cpu->io, dx, 2);
+        ax = (uint16_t)io_in(dx, 2);
       break;  // in eAX, dx
     case 0xee:
-      BusWrite(cpu->io, dx, 1, al);
+      fr->rec.mnemonic = "out";
+      io_out(dx, 1, al);
       break;  // out dx, al
     case 0xef:
-      BusWrite(cpu->io, dx, d.w32 ? 4 : 2, d.w32 ? eax : ax);
+      fr->rec.mnemonic = "out";
+      io_out(dx, d.w32 ? 4 : 2, d.w32 ? eax : ax);
       break;      // out dx, eAX
+    case 0xf1: {  // icebp/int1: #DB as a trap, rip after the byte (kvm debug:
+                  // dr6 unchanged — no Bn/BS bits come from icebp itself)
+      fr->rec.mnemonic = "icebp";
+      do_int(vec_db, (uint32_t)(fr->rec.pc + d.nxt), 0, 0);
+      return;
+    }  // icebp
     case 0xf4: {  // hlt: sleeps until an unmasked external interrupt (SDM)
+      fr->rec.mnemonic = "hlt";
       if (fl->if_ && cpu->int_ack) {
         cpu->wait = 1;
       } else {
@@ -3452,25 +3883,32 @@ void run_op(uint8_t op) {
       break;
     }
     case 0xf5:
+      fr->rec.mnemonic = "cmc";
       fl->cf = !fl->cf;
       break;  // cmc
     case 0xf8:
+      fr->rec.mnemonic = "clc";
       fl->cf = 0;
       break;  // clc
     case 0xf9:
+      fr->rec.mnemonic = "stc";
       fl->cf = 1;
       break;  // stc
     case 0xfa:
+      fr->rec.mnemonic = "cli";
       fl->if_ = 0;
       break;    // cli
     case 0xfb:  // sti: the next instruction is not interruptible (SDM)
+      fr->rec.mnemonic = "sti";
       fl->if_ = 1;
       s->intr_inhibit = 1;
       break;
     case 0xfc:
+      fr->rec.mnemonic = "cld";
       fl->df = 0;
       break;  // cld
     case 0xfd:
+      fr->rec.mnemonic = "std";
       fl->df = 1;
       break;  // std
     case 0xf6:
@@ -3482,6 +3920,7 @@ void run_op(uint8_t op) {
     case 0xfe: {  // grp4: inc/dec rm8 (reg field)
       modrm();
       if (d.reg > 1) ud();
+      fr->rec.mnemonic = d.reg ? "dec" : "inc";
       uint8_t v = RM8();
       uint8_t r = d.reg ? (uint8_t)(v - 1) : (uint8_t)(v + 1);
       SET_RM8(r);
@@ -3496,6 +3935,7 @@ void run_op(uint8_t op) {
       switch (d.reg) {
         case 0:
         case 1: {
+          fr->rec.mnemonic = d.reg ? "dec" : "inc";
           if (d.w32) {
             uint32_t v = RM32();
             uint32_t r = d.reg ? v - 1 : v + 1;
@@ -3516,12 +3956,14 @@ void run_op(uint8_t op) {
           break;
         }
         case 2: {  // call near rm
+          fr->rec.mnemonic = "call";
           uint32_t t = d.w32 ? RM32() : RM16();
           push_w((uint32_t)(fr->rec.pc + d.nxt));
           eip = t;
           break;
         }
         case 3: {  // call far m16:16/32
+          fr->rec.mnemonic = "lcall";
           if (!d.is_mem) ud();
           uint32_t t = d.w32 ? rd32(d.mlin) : rd16(d.mlin);
           seg_use(d.mseg, d.moff + (d.w32 ? 4 : 2), 2, 0);
@@ -3530,9 +3972,11 @@ void run_op(uint8_t op) {
           break;
         }
         case 4:
+          fr->rec.mnemonic = "jmp";
           eip = d.w32 ? RM32() : RM16();
           break;   // jmp near rm
         case 5: {  // jmp far m16:16/32
+          fr->rec.mnemonic = "ljmp";
           if (!d.is_mem) ud();
           uint32_t t = d.w32 ? rd32(d.mlin) : rd16(d.mlin);
           seg_use(d.mseg, d.moff + (d.w32 ? 4 : 2), 2, 0);
@@ -3541,6 +3985,7 @@ void run_op(uint8_t op) {
           break;
         }
         case 6:
+          fr->rec.mnemonic = "push";
           push_w(d.w32 ? RM32() : RM16());
           break;  // push rm
         default:
@@ -3588,6 +4033,13 @@ void x86_init(CpuState* c) {
   }
   st->r = (cell*)c->gpr;
   st->fl.word = 0x202;  // IF set, reserved bit 1 on (SDM reset state)
+  // Debug-register reset state (SDM vol.3 17.2.2/17.2.4): DR6's reserved
+  // bits read 1; DR7's bit 10 reads 1 and every breakpoint is disabled.
+  st->dr[6] = kDr6Rsvd1;
+  st->dr[7] = kDr7Rsvd1;
+  // IA32_APIC_BASE reset state (SDM vol.3 11.4.3): default base, APIC
+  // enabled, BSP.
+  st->msr_apic_base = 0xFEE00000ULL | 0x800ULL | 0x100ULL;
   c->set_irq = x86_set_irq_line;
 
   // Multiboot images (header in the first 8 KiB, 4-aligned) enter in flat
@@ -3601,6 +4053,11 @@ void x86_init(CpuState* c) {
     }
   if (multiboot) {
     st->cr0 = 1;  // PE
+    // Boot stack (multiboot leaves ESP undefined; QEMU's loader hands the
+    // image a stack just below the multiboot info struct — measured
+    // 0x6f07 post-push on qemu-system-i386 -kernel). Our info scratch sits
+    // at 0x7000, so the same region works.
+    st->r[esp_i].e = 0x6f00;
     // Flat CS=0x08 / data=0x10 descriptors (QEMU multiboot GDT: 00cf9b00...,
     // 00cf93...): 4 GiB limit, DPL0, D/B set.
     st->sreg[cs_i] = 0x08;

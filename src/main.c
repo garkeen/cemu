@@ -4,6 +4,7 @@
 
 #include "board/board.h"
 #include "board/loader.h"
+#include "debug/gdbstub.h"
 #include "host/host.h"
 #include "util/log.h"
 
@@ -18,6 +19,8 @@ typedef struct Args {
   uint64_t bin_tohost;
   uint64_t max_inst;
   int dump_regs;
+  int gdb_port;  // -s / -gdb tcp::PORT; 0 = no stub
+  int gdb_wait;  // -S: stopped until a client resumes (QEMU convention)
 } Args;
 
 static void Usage(void) {
@@ -32,7 +35,10 @@ static void Usage(void) {
       "  --htif ADDR       tohost address for raw bins (default base+0x1000)\n"
       "  --max-inst N      stop after N instructions (default unlimited)\n"
       "  --log FILE        also write logs to FILE\n"
-      "  --dump-regs       dump registers on any exit\n";
+      "  --dump-regs       dump registers on any exit\n"
+      "  -s                gdb stub on tcp::1234 (guest runs until attached)\n"
+      "  -gdb tcp::PORT    gdb stub on PORT\n"
+      "  -S                with -s: do not start until the client resumes\n";
   HostWriteErr(msg, sizeof(msg) - 1);
 }
 
@@ -68,12 +74,33 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       if (ParseU64(argv[++i], &a->max_inst)) return -1;
     } else if (strcmp(arg, "--dump-regs") == 0)
       a->dump_regs = 1;
+    else if (strcmp(arg, "-s") == 0)
+      a->gdb_port = 1234;  // the QEMU -s convention
+    else if (strcmp(arg, "-gdb") == 0) {
+      // QEMU: -gdb tcp::PORT (the host part is empty = all interfaces).
+      const char* spec = argv[++i];
+      const char* p = strncmp(spec, "tcp::", 5) == 0 ? spec + 5 : NULL;
+      if (!p || !*p) {
+        LogError("-gdb expects tcp::PORT");
+        return -1;
+      }
+      a->gdb_port = (int)strtoul(p, NULL, 10);
+      if (a->gdb_port <= 0 || a->gdb_port > 65535) {
+        LogError("-gdb: bad port");
+        return -1;
+      }
+    } else if (strcmp(arg, "-S") == 0)
+      a->gdb_wait = 1;
     else if (arg[0] == '-' && arg[1] == '-')
       return -1;
     else
       a->image = arg;
   }
   if (!a->image) return -1;
+  if (a->gdb_wait && !a->gdb_port) {
+    LogError("-S needs -s or -gdb");
+    return -1;
+  }
   return 0;
 }
 
@@ -107,6 +134,14 @@ int main(int argc, char** argv) {
   LogInfo("loaded %s: entry=%llx isa=%s htif=%d", a.image, (unsigned long long)lr.entry,
           lr.isa->name, lr.has_htif);
 
+  if (a.gdb_port) {
+    m->gdb = GdbStubStart(m, a.gdb_port, a.gdb_wait);
+    if (!m->gdb) {
+      BoardDestroy(m);
+      return 1;
+    }
+  }
+
   BoardRun(m, a.max_inst);
 
   int code = m->cpu.exit_code;
@@ -114,6 +149,7 @@ int main(int argc, char** argv) {
           (unsigned long long)m->cpu.pc, code);
   if (code != 0 || a.dump_regs) lr.isa->dump_regs(&m->cpu);
 
+  GdbStubFree(m->gdb);
   BoardDestroy(m);
   return code & 0xff;
 }

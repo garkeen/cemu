@@ -215,7 +215,8 @@ CEMU_DEBUG="regs=100000" ./cemu.exe ... img 2> r.txt
 ```
 
 - 交互式调试器/REPL、反汇编器、GUI 输出已立项为阶段 3.5（2026-09-05，见
-  arch.md 阶段计划：gdb RSP stub / Win32 显示通道 / LLVM 反汇编）。在
+  arch.md 阶段计划：gdb RSP stub / Win32 显示通道 / 图形调试前端；
+  2026-09-12 修订：前端不内置反汇编，反汇编一律走外部工具）。在
   3.5 落地前 CEMU_DEBUG 仍是唯一调试入口（mnemonic 由译码表给出）。
 
 ## X、简化登记（原准则审查 D/E 表，2026-09-03 按代码逐条核实后仅存存活项）
@@ -224,11 +225,11 @@ CEMU_DEBUG="regs=100000" ./cemu.exe ... img 2> r.txt
 
 | 编号 | 位置 | 缺失 | 参考出处 | 恢复阶段 | 状态 |
 |---|---|---|---|---|---|
-| D6 | csr.c tdata1/2/3 WARL 存储无触发匹配 | debug trigger（gem5 tselect 写 val+1 报告存在 trigger） | xiangshanNEMU trigger.c | 阶段 3.5 gdb stub（仅硬件断点 hbreak/watch；软件断点不依赖） | 登记中 |
+| ~~D6~~ | ~~csr.c tdata1/2/3 WARL 存储无触发匹配~~ | 已销账（2026-09-13 阶段 3.5 片 1d）：trigger.c 按 Sdtrig 实现 mcontrol6 匹配（execute 取指 PC / load/store 访存漏斗按 vaddr、EQ/GE/LT、chain、mode 门控、重入门 = xiangshanNEMU 同款），action=0 走 breakpoint 异常（mtval=匹配地址）、action=1 无 debug mode 触发即 Fatal；tdata1/2/3 按 tselect 每触发器三元组（顺带修正了旧代码 tselect 不索引的错位）；新增 scontext（0x5a8），tdata3 的 mh 字段无 H 强制 WARL-0。配套：riscv 探针 probe_triggers.S（六位全 1） | xiangshanNEMU system/trigger.c + trigger.h；RISC-V debug spec ch.5 | ~~阶段 3.5 gdb stub~~ | 已销账 |
 | D7 | LR/SC 单核预留集 | 无多核冲突语义 | spike 单核同款；规格允许 SC 假失败 | 多核引入时 | 登记中 |
 | D11 | htif.c HTIF syscall（dev0/cmd0）报错退出 | 无 fesvr syscall 设备 | fesvr htif_t::handle_syscall | 阶段 5 cesdk | 登记中 |
-| D13 | x86 RDTSC/CMPXCHG/CMPXCHG8B/x87 FPU 判非法 #UD;DR7.GD 调试支持不设防 | 386 子集外指令与 FPU 未实现;LMSW/INVLPG/CLTS/MOV CR2/CR3 已随阶段 3 分页销账 | intel SDM vol.2；QEMU translate.c | 阶段 3 指令侧按需（保护模式/xv6）；x87 FPU 在 Linux 用户态（阶段 4+） | 登记中。现实表现：realmode 尾 test_fninit #UD→垃圾 IVT[6]→死循环，run.sh 以 timeout+输出判据容纳 |
-| D14 | x86 iret/popf 载入屏蔽 RF(bit16)/VM(bit17) | RF 瞬态建模（真机不可观测为 1，等价）；VM86 不进入 | intel SDM EFLAGS | DOS/BIOS 兼容路线需要 VM86 时评估（Linux 不需要） | 登记中 |
+| D13 | x86 RDTSC/x87 FPU 判非法 #UD | 386 子集外指令与 FPU 未实现；CMPXCHG/CMPXCHG8B 已随 A 档销账；**DR 全套已随阶段 3.5 片 1d 销账**（DR0-3 执行/写/读写/I-O 断点、DR6 写清除 B 位+保留位读 1、DR7 GD/LE/GE 与 R/W、LEN 字段、CR4.DE 对 DR4/5 的别名与 #UD、TF 单步、RF 经 iret/popf 装载并在受保护指令完成后清除、icebp(0xF1)、TSS.T 任务切换陷阱）；RDTSC 现为显式 ud()（0F 31） | intel SDM vol.3 ch.17 终裁；DR 存取层有 in-tree 佐证——v86 rust instr_0F21/0F23（CPL→GP、DR4/5+DE→#UD、否则 +2 别名，与 cemu 逐条同）与 gem5 isa.cc（DR4/5 fallthrough、DR6/DR7 BitUnion 位布局）；匹配/投递层（#DB/TF/GD/icebp）三方皆无，以 kvm-unit-tests debug 测试（KVM 硬件语义）+ QEMU TCG 对拍 8/8 双绿锚定 | x87 FPU 在 Linux 用户态（阶段 4+） | 登记中。现实表现：realmode 尾 test_fninit #UD→垃圾 IVT[6]→死循环，run.sh 以 timeout+输出判据容纳 |
+| D14 | x86 iret/popf 载入屏蔽 VM(bit17)（RF 部分已销账） | RF 现按 SDM EFLAGS.RF 由 iret/popf/task-switch 正常装载（kvm debug 测试锚定），本登记只剩 VM86 不进入 | intel SDM vol.3 17.3.1 | DOS/BIOS 兼容路线需要 VM86 时评估（Linux 不需要） | 登记中 |
 | D15 | x86 16 位 TSS 任务切换（类型 1/3）Fatal | 任务切换只支持 32 位 TSS（类型 9/B）；门/任务门对 16 位 TSS 拒绝进入 | v86 do_task_switch（assert 32 位）；tiny386（assert 9/11） | 有验收件需要 286 任务时 | 登记中 |
 | ~~D16~~ | ~~x86 LDT/LDTR 机制未实现~~ | 已销账（2026-09-06 阶段 3 项 5）：LDTR 描述符缓存、TI=1 经 LDT 查找、lldt/sldt/verr/verw/lar/lsl/arpl、任务切换 TSS +0x60 装载。null-LDTR 的 TI=1 引用按表限规则抛 GP/SS/TS（tiny386/v86/QEMU 三方一致；SDM 的 TS 读法无文本可查证，若日后有 SDM 文本推翻再修） | v86 lookup_segment_selector/load_ldt；tiny386 read_desc；SDM vol.3 2.4.4/5.3 | ~~阶段 3 项 5~~ | 已销账 |
 | E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中（先加 softfloat 测试向量回归对照） |
@@ -250,3 +251,24 @@ mepc WIRI 随重构落地）。
   的 AL，实机用原始 AL），按实机（QEMU/v86）模型实现，全表对拍 0 分歧。
 - **HTIF**：单通道语义——组装写出的字节到影子寄存器，非零即处理并清零
   （等价 fesvr 轮询）；fromhost 应答 `(dev<<56)|(cmd<<48)`。
+- **x86 DR7 字段布局**：R/Wi@17:16+4i、LENi@19:18+4i（4 位间隔，SDM vol.3
+  figure 17-3，模式无关——64 位无重排，检索证实）；LEN 编码取 QEMU/KVM 的
+  {1,2,4,8} 字节（32 位下 LEN=11 属 SDM 未定义域，kvm debug 测试在 32 位
+  移植中按 8 字节对拍双绿，故从 QEMU 真值）。
+- **x86 DR6 写语义**：B0-B3 任意写清除、BD/BS/BT 按写入值、保留位强制读 1
+  ——由 kvm debug 测试 set_dr6(0x4002) 的读回值锚定（W1C 假设被
+  single-step 用例证伪）。注意 gem5 此处取"按写入值"模型，与 KVM 实机分
+  歧（gem5 从不发射 B 位、断点使能即 panic，该路径无实机对拍）——按
+  规则"参考分歧以手册/实机裁决"，从实机。v86 则原样存（同样无投递层，
+  写 0 会丢保留位 1，不可对拍）。
+- **x86 DR 存取层三方佐证（2026-09-13 补查）**：复位值 DR6=0xffff0ff0、
+  DR7=0x400 三方一致（gem5 isa.cc:136、v86 cpu.rs:4610、SDM）；DR4/5 在
+  CR4.DE=0 时别名 DR6/7、DE=1 时 #UD 三方一致（v86 `dreg_index += 2`、
+  gem5 fallthrough、cemu 同款）；DR7 BitUnion 位布局（gem5
+  rw0@17:16/len0@19:18…）与 SDM figure 17-3、Wikipedia 表三方一致。
+- **kvm debug 测试 32 位移植**：上游 64 位专用（Makefile.i386 注释掉；
+  asm 用 %rax/%rip）。32 位移植件 test/x86/kut_debug.c 的期望地址按 clang
+  实际编码重推导（AND 累加器格式 5 字节 vs 原版 81/4 假设 6 字节；
+  `lea (%%rip)` 改 call/pop 锚点 +3），语义全部模式无关（SDM ch.17 单处
+  定义），QEMU TCG 32 位与 cemu 双绿 8/8——用户 2026-09-13 批准作为 A 档
+  验收件。

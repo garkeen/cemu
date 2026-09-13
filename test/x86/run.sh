@@ -58,6 +58,25 @@ else
   echo "FAIL (pm: rc=$rc, $n_ok ok, $n_bad bad)"
 fi
 
+# kvm-unit-tests 32-bit flat images (built from the v86 checkout by
+# build_kut.sh; boot via multiboot, exit via 0xF4 debug-exit — payload 0
+# (pass) shows up as status 1). taskswitch/taskswitch2 exercise the stage-3
+# gate/task-switch semantics, cmpxchg8b the 0F C7 instruction, memory the
+# vm.c allocator over 4MB pages, debug the SDM ch.17 DR breakpoints (32-bit
+# port of the upstream 64-bit-only test — mode-independent semantics, see
+# AGENTS.md D6). The kvm exit convention: report_summary
+# failures call exit(failures) — payload 0 only when every test passed.
+for t in taskswitch taskswitch2 cmpxchg8b memory debug; do
+  timeout 60 "$CEMU" --machine x86 --isa x86 "$dir/$t.elf" > /dev/null 2>&1
+  rc=$?
+  if [ "$rc" -eq 1 ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL (kvm-$t: rc=$rc)"
+  fi
+done
+
 # Realmode: suite self-reports PASS/FAIL lines. Stage 2 added the 8259 PIC
 # + 8254 PIT so hlt wakes on IRQ0, and the whole suite now runs: 122 PASS.
 # QEMU reference (qemu-system-i386 -kernel realmode.elf) prints the same

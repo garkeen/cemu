@@ -36,8 +36,8 @@ forbid "an interpreter must not include device/" \
 forbid "an interpreter must not include board/" \
        -e '#include[[:space:]]*"board/' src/cpu/isa
 
-# windows.h is host/ property; everything else stays portable C.
-out=$(grep -rn '#include[[:space:]]*<windows\.h>' src --include=*.c --include=*.h 2>/dev/null |
+# windows.h and winsock are host/ property; everything else stays portable C.
+out=$(grep -rnE '#include[[:space:]]*<(windows\.h|winsock2\.h|ws2tcpip\.h)>' src --include=*.c --include=*.h 2>/dev/null |
       grep -v '^src/host/')
 if [ -n "$out" ]; then
   echo "$out" | while IFS= read -r line; do echo "dep: $line  <- windows.h outside host/"; done

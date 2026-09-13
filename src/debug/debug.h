@@ -20,7 +20,8 @@ enum {
   kDbgTrap = 1 << 5,        // exceptions/interrupts
   kDbgBus = 1 << 6,         // MMIO/IO port hits
   kDbgRegs = 1 << 7,        // periodic full register table
-  kDbgAny = 0xff,
+  kDbgGdb = 1 << 8,         // gdb stub protocol packets (tx/rx)
+  kDbgAny = 0x1ff,
 };
 
 int DebugOn(uint32_t cat);
@@ -45,6 +46,9 @@ void DebugMem(struct frame* f, uint64_t addr, int size, int acc, uint64_t val_or
 // RAM backing. name comes from DeviceOps.
 void DebugBus(struct frame* f, const char* dev_name, uint64_t addr, int size, int is_load,
               uint64_t val);
+
+// gdb stub packet row (stage 3.5): the stub's tx/rx protocol traffic.
+void DebugGdbPkt(int is_tx, const char* pkt);
 
 // True when a watchpoint matches (funnels ask before doing the access so
 // the row prints even when the access itself faults).

@@ -65,6 +65,14 @@ typedef struct dec {
   int mseg;       // the effective segment (override or default)
   uint64_t mlin;  // linear address of the memory operand
   uint32_t moff;  // the segment-relative offset (LEA's answer)
+
+  // Per-instruction debug bookkeeping: the data/I-O breakpoint hits (DR6.Bn
+  // bits, delivered as one post-instruction #DB) and whether the instruction
+  // itself loaded EFLAGS from a stack image or TSS (that image's RF is the
+  // authoritative one — the post-instruction RF clear must not clobber it).
+  uint32_t watch_hit;
+  int rf_load;
+  int delivered;  // the instruction delivered an exception frame (do_int)
 } dec;
 
 // One decode context for the instruction being executed; `d` is the short

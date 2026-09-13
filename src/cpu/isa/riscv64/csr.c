@@ -262,17 +262,20 @@ int riscv_csr_read(const CpuState* cpu, RiscvState* s, uint64_t addr, uint64_t* 
     case 0x344:
       *out = MipAll(s);
       return 0;
+    case 0x5A8:
+      *out = s->scontext;
+      return 0;  // scontext (Sdtrig Sscontext; M/S via the CSR priv bits)
     case 0x7A0:
       *out = s->tselect;
       return 0;  // tselect
     case 0x7A1:
-      *out = s->tdata[0];
-      return 0;  // tdata1
+      *out = s->tdata1[s->tselect];
+      return 0;  // tdata1 of the tselect-selected trigger
     case 0x7A2:
-      *out = s->tdata[1];
+      *out = s->tdata2[s->tselect];
       return 0;  // tdata2
     case 0x7A3:
-      *out = s->tdata[2];
+      *out = s->tdata3[s->tselect];
       return 0;  // tdata3
     case 0x7A4:
       *out = 1ULL << 6;
@@ -471,22 +474,25 @@ int riscv_csr_write(RiscvState* s, uint64_t addr, uint64_t val, uint64_t next_pc
     case 0x344:  // mip: only SSIP is writable (priv spec 3.1.9)
       s->mip = (s->mip & ~kIrqSsip) | (val & kIrqSsip);
       return 0;
+    case 0x5A8:
+      s->scontext = val;
+      return 0;  // scontext (Sdtrig Sscontext)
     case 0x7A0:
       // tselect WARL-clamps to the implemented trigger count (Sdtrig).
       s->tselect = val < kTrigCount ? val : kTrigCount - 1;
       return 0;
-    case 0x7A1:  // tdata1: type and dmode hold, the rest is WARL-stored
-      s->tdata[0] = (s->tdata[0] & (kTrigTypeMask | (1ULL << 59))) | (val & kTrigWmask);
+    case 0x7A1:
+      RiscvTriggerWriteTdata1(s, val);  // mcontrol6 WARL policy (trigger.c)
       return 0;
     case 0x744:
       s->mnstatus = val;
       return 0;  // mnstatus (Smrnig, WARL)
     case 0x7A2:
-      s->tdata[1] = val;
-      return 0;  // tdata2
+      s->tdata2[s->tselect] = val;
+      return 0;  // tdata2 of the tselect-selected trigger
     case 0x7A3:
-      s->tdata[2] = val;
-      return 0;  // tdata3
+      RiscvTriggerWriteTdata3(s, val);  // mh fields WARL-0 without H
+      return 0;
     case 0x7A5:
       s->tcontrol = val & (kTcontrolMte | kTcontrolMpte);
       return 0;

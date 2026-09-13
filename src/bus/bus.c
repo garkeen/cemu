@@ -22,6 +22,11 @@ void BusAddRamRegion(Bus* bus, uint64_t base, uint64_t size, const DeviceOps* op
 // Overlapping regions resolve to the smallest match, so a narrow device window
 // takes precedence over the RAM backing it sits inside.
 static BusRegion* FindRegion(Bus* bus, uint64_t addr, int len) {
+  // A range wrapping 2^64 can never name one access: reject it up front
+  // instead of letting addr+len overflow into a bogus match (a debugger
+  // probing near the top of the address space, or a bare-metal guest access,
+  // reaches this edge).
+  if ((uint64_t)len > ~addr) return NULL;
   BusRegion* best = NULL;
   for (int i = 0; i < bus->count; i++) {
     BusRegion* r = &bus->regions[i];

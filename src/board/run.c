@@ -2,11 +2,12 @@
 
 #include "board/board.h"
 #include "debug/debug.h"
+#include "debug/gdbstub.h"
 #include "host/host.h"
 #include "util/log.h"
 
-void BoardRun(Board* m, uint64_t max_inst) {
-  DebugInit();
+int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuState* cpu),
+                  void* cb_ctx) {
   while (!m->cpu.halted) {
     if (m->poll) m->poll(m);
     int asleep = m->cpu.wait;
@@ -18,11 +19,24 @@ void BoardRun(Board* m, uint64_t max_inst) {
     m->isa->step(&m->cpu);
     if (asleep && m->cpu.wait) continue;  // no instruction retired
     m->cpu.inst_count++;
+    if (stop_cb && stop_cb(cb_ctx, &m->cpu)) return 1;
     if (max_inst && m->cpu.inst_count >= max_inst) {
       LogError("instruction limit %llu reached at pc=%llx", (unsigned long long)max_inst,
                (unsigned long long)m->cpu.pc);
-      break;
+      return 0;
     }
+  }
+  return 0;
+}
+
+void BoardRun(Board* m, uint64_t max_inst) {
+  DebugInit();
+  if (m->gdb) {
+    // The stub owns run control: sessions (attach/step/continue) alternate
+    // with free runs until the emulation ends.
+    GdbStubRun(m->gdb, max_inst);
+  } else {
+    BoardRunSteps(m, max_inst, NULL, NULL);
   }
   frame end;
   end.cpu = &m->cpu;

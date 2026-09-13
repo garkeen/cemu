@@ -3,18 +3,22 @@
 #include "board/board.h"
 #include "device/char/uart16550.h"
 #include "device/intc/i8259.h"
+#include "device/intc/lapic.h"
 #include "device/misc/debug_exit.h"
+#include "device/misc/fwcfg.h"
 #include "device/timer/i8254.h"
 #include "util/log.h"
 
-// IBM PC real-mode machine, the x86 counterpart of spike_min. Memory is 1MB
-// at linear 0 (real mode). The PC platform devices present since the
-// PC/AT: 8259 PIC pair at 0x20/0xA0 (IRQ0..15), 8254 PIT at 0x40-0x43
+// IBM PC machine, the x86 counterpart of spike_min. Real-mode memory is 1MB
+// at linear 0; the machine carries 32MB of RAM total (kvm-unit-tests images
+// link at 4MB and identity-map through the 4MB-page directory). Platform
+// devices: 8259 PIC pair at 0x20/0xA0 (IRQ0..15), 8254 PIT at 0x40-0x43
 // (channel 0 -> IRQ0, the periodic timer that wakes hlt), COM1 at
-// 0x3F8-0x3FF and the debug-exit device at 0xF4, all in a separate x86 I/O
-// space (CpuState.io). Ports nobody claims read all-ones and drop writes —
-// x86 I/O decode never faults.
-static const uint64_t kRamSize = 1ULL << 20;
+// 0x3F8-0x3FF, the debug-exit device at 0xF4 and fw_cfg at 0x510/0x511
+// (QEMU contract) — all in a separate x86 I/O space (CpuState.io) — and the
+// Local APIC register page at 0xFEE00000 on the memory bus. Ports and MMIO
+// nobody claims read all-ones and drop writes — x86 I/O decode never faults.
+static const uint64_t kRamSize = 32ULL << 20;
 static const uint16_t kPicMasterBase = 0x20;
 static const uint16_t kPicSlaveBase = 0xA0;
 static const uint16_t kPitBase = 0x40;
@@ -33,6 +37,8 @@ typedef struct X86Board {
   DebugExitDevice dexit;
   PicDevice pic;
   PitDevice pit;
+  FwCfgDevice fwcfg;
+  LapicDevice lapic;
 } X86Board;
 
 static uint64_t UnclaimedRead(void* dev, uint64_t addr, int size) {
@@ -94,15 +100,21 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   DebugExitDevice* dexit = &xm->dexit;
   PicDevice* pic = &xm->pic;
   PitDevice* pit = &xm->pit;
+  FwCfgDevice* fwcfg = &xm->fwcfg;
+  LapicDevice* lapic = &xm->lapic;
   Uart16550Init(uart);
   DebugExitBind(dexit, &m->cpu);
   PicInit(pic);
   PitInit(pit);
+  FwCfgInit(fwcfg);
+  LapicInit(lapic);
   BusAddRegion(&m->io, 0, kPortSpaceSize, &kUnclaimedPortOps, NULL);
   BusAddRegion(&m->io, kCom1Base, kCom1Size, &kUart16550Ops, uart);
   BusAddRegion(&m->io, kDebugExitPort, kDebugExitSize, &kDebugExitOps, dexit);
   PicRegister(&m->io, pic, kPicMasterBase, kPicSlaveBase);
   PitRegister(&m->io, pit, kPitBase);
+  FwCfgRegister(&m->io, fwcfg);
+  LapicRegister(&m->bus, lapic);
 
   // Wiring: PIT ch0 -> PIC IRQ0 -> CPU INTR; INTA -> PicAcknowledge. The
   // hooks live on CpuState (like timer_read/timer_dev), so the machine can

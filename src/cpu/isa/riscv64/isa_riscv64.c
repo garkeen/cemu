@@ -22,7 +22,8 @@ void riscv_init(CpuState* cpu) {
   s->priv = kPrivMachine;
   s->mstatus = 2ULL << 32;           // mstatus.UXL = 2 (U-mode is RV64)
   s->misa = kMisaSupported;          // RV64IMAFDC + S-mode
-  s->tdata[0] = kTrigTypeMcontrol6;  // both triggers are mcontrol6 (Sdtrig)
+  s->tdata1[0] = kTrigTypeMcontrol6;  // both triggers are mcontrol6 (Sdtrig)
+  s->tdata1[1] = kTrigTypeMcontrol6;
   s->stimecmp = ~0ULL;               // Sstc: no S-level timer interrupt until programmed
   // How boards drive our interrupt lines: line is a mip bit (platform.h).
   // Boards call this hook instead of naming a CPU-model function.
@@ -101,6 +102,47 @@ static void riscv_debug_state_line(char* buf, int cap, frame* f) {
            f->cpu->wait);
 }
 
+// ---- gdb stub (stage 3.5) -----------------------------------------------------
+
+static void Le64Put(uint8_t** p, uint64_t v) {
+  for (int i = 0; i < 8; i++) (*p)[i] = (uint8_t)(v >> (8 * i));
+  *p += 8;
+}
+
+static uint64_t Le64Get(const uint8_t** p) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; i++) v |= (uint64_t)(*p)[i] << (8 * i);
+  *p += 8;
+  return v;
+}
+
+// gdb's riscv64 integer register file (org.gnu.gdb.riscv.cpu): x0..x31 then
+// pc, 8 bytes each.
+static int riscv_gdb_read_regs(CpuState* cpu, uint8_t* buf, int cap) {
+  if (cap < 33 * 8) return 0;
+  uint8_t* p = buf;
+  for (int i = 0; i < 32; i++) Le64Put(&p, cpu->gpr[i]);
+  Le64Put(&p, cpu->pc);
+  return 33 * 8;
+}
+
+static int riscv_gdb_write_regs(CpuState* cpu, const uint8_t* buf, int len) {
+  if (len < 33 * 8) return -1;
+  const uint8_t* p = buf;
+  for (int i = 0; i < 32; i++) {
+    uint64_t v = Le64Get(&p);
+    if (i) cpu->gpr[i] = v;  // x0 stays hardwired to zero
+  }
+  cpu->pc = Le64Get(&p);
+  return 0;
+}
+
+static int riscv_gdb_last_trap(CpuState* cpu, uint64_t* seq) {
+  RiscvState* s = (RiscvState*)cpu->priv;
+  *seq = s->trap_seq;
+  return s->trap_signal;
+}
+
 const isa_ops k_isa_riscv64 = {
     "riscv64",
     243,  // EM_RISCV
@@ -113,4 +155,8 @@ const isa_ops k_isa_riscv64 = {
     NULL,  // (flag_word)
     riscv_has_fpr,
     riscv_debug_state_line,
+    // gdb stub hooks
+    riscv_gdb_read_regs,
+    riscv_gdb_write_regs,
+    riscv_gdb_last_trap,
 };

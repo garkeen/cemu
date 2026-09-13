@@ -86,13 +86,32 @@ static const uint64_t kSenvcfgWmask = 0xffULL;
 enum { kMhpmFirst = 3, kMhpmCount = 16, kMhpmLast = 18 };
 
 // Sdtrig (debug triggers): QEMU virt has 2 mcontrol6 triggers (banner
-// "Debug Triggers : 2 triggers"); the type field sits in tdata1[63:60].
+// "Debug Triggers : 2 triggers"). tdata1 bit layout per the debug spec 5.3.12
+// (xiangshanNEMU trigger.h): load[0] store[1] execute[2] u[3] s[4] m[6]
+// match[10:7] chain[11] action[15:12] select[21] hit0[22] vu[23] vs[24]
+// hit1[25] dmode[59] type[63:60].
 enum { kTrigCount = 2 };
 static const uint64_t kTrigTypeMcontrol6 = 6ULL << 60;
-static const uint64_t kTrigTypeMask = 0xfULL << 60;
-// Bits outside type and dmode are WARL-stored; the match/action machinery
-// is registered in AGENTS.md 简化登记 and lands with the gdb stub.
-static const uint64_t kTrigWmask = ~(kTrigTypeMask | (1ULL << 59));
+static const uint64_t kMc6Load = 1ULL << 0;
+static const uint64_t kMc6Store = 1ULL << 1;
+static const uint64_t kMc6Execute = 1ULL << 2;
+static const uint64_t kMc6U = 1ULL << 3;
+static const uint64_t kMc6S = 1ULL << 4;
+static const uint64_t kMc6M = 1ULL << 6;
+static const uint64_t kMc6Chain = 1ULL << 11;
+static const uint64_t kMc6Dmode = 1ULL << 59;
+// match encodings (debug spec table 5.4); the machine accepts only EQ/GE/LT
+// (xiangshanNEMU mcontrol6_checked_write WARLs every other encoding to EQ).
+enum { kMc6MatchEq = 0, kMc6MatchGe = 2, kMc6MatchLt = 3 };
+// tdata3 (debug spec 5.3.10): sselect[1:0], svalue[33:2], sbytemask[39:36],
+// mhselect[50:48], mhvalue[63:51]. The mh fields are WARL-0 without the H
+// extension; sselect rides Sscontext.
+static const uint64_t kTd3SselectMask = 3ULL;
+static const uint64_t kTd3SvalueShift = 2;
+static const uint64_t kTd3SbytemaskShift = 36;
+static const uint64_t kTd3MhMask = (0x7ULL << 48) | (0x1fffULL << 51);
+// Trigger operations: one check per operation class (debug spec 5.3).
+enum { kTrigOpExecute = 1, kTrigOpStore = 2, kTrigOpLoad = 4 };
 
 // Cache-block size for Zicboz/Zicbom (virt DTB riscv,cboz-block-size /
 // cbom-block-size = 64).
@@ -134,7 +153,8 @@ enum {
 // Interrupt causes carry this bit (priv spec 1.3).
 static const uint64_t kIntBit = 0x8000000000000000ULL;
 
-// Exception causes (priv spec 1.3, table 1.2).
+// Exception causes (priv spec 1.3, table 1.2). 14 is reserved — store page
+// fault is 15 (rv64si-p-dirty was the first suite to pin the value).
 enum {
   kExFetchMisaligned = 0,
   kExFetchFault = 1,
@@ -149,7 +169,7 @@ enum {
   kExMachineEcall = 11,
   kExFetchPageFault = 12,
   kExLoadPageFault = 13,
-  kExStorePageFault = 14,
+  kExStorePageFault = 15,
 };
 
 typedef struct RiscvState {
@@ -177,7 +197,12 @@ typedef struct RiscvState {
   uint64_t satp;
   uint64_t tselect;
   uint64_t tcontrol;
-  uint64_t tdata[3];  // tdata1/2/3; tdata1 resets to an mcontrol6 type
+  // Per-trigger tdata1/2/3 (Sdtrig: tselect indexes tdata1/2/3); both
+  // triggers reset to an mcontrol6 type.
+  uint64_t tdata1[kTrigCount];
+  uint64_t tdata2[kTrigCount];
+  uint64_t tdata3[kTrigCount];
+  uint64_t scontext;  // Sdtrig Sscontext: the trigger qualification context
   uint64_t menvcfg;
   uint64_t senvcfg;
   uint64_t stimecmp;                 // Sstc: S-level timer compare, drives STIP
@@ -195,6 +220,10 @@ typedef struct RiscvState {
   uint64_t ext_irq;
   int res_valid;  // the LR reservation (single hart)
   uint64_t res_addr;
+  // gdb stub (stage 3.5): bumped on every delivered trap; signal is the gdb
+  // mapping of the last cause (step.c, where the cause is in hand).
+  uint64_t trap_seq;
+  uint8_t trap_signal;
 } RiscvState;
 
 enum {
@@ -222,6 +251,12 @@ void riscv_dump_regs(const CpuState* cpu);
 // and every load/store case share it.
 uint64_t riscv_mem_load(frame* f, uint64_t vaddr, int size, int acc);
 void riscv_mem_store(frame* f, uint64_t vaddr, int size, uint64_t val);
+// Sdtrig trigger module (trigger.c): the check fires a breakpoint exception
+// through the raise channel when an armed mcontrol6 matches; the two write
+// helpers apply the tdata1/tdata3 WARL policies.
+void RiscvTriggerCheck(frame* f, RiscvState* s, int op, uint64_t addr);
+void RiscvTriggerWriteTdata1(RiscvState* s, uint64_t val);
+void RiscvTriggerWriteTdata3(RiscvState* s, uint64_t val);
 // Interrupt line input; installed as CpuState.set_irq so boards never name a
 // CPU-model function. `bit` is one of kIrq* (platform.h).
 void riscv_set_ext_irq(CpuState* cpu, uint64_t bit, int level);

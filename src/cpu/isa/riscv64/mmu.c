@@ -164,21 +164,27 @@ int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int acc, uint64_t* p
             // xiangshanNEMU uses EX_SPF for cpu.amo)
     if (!ok || !(pte & kPteW)) goto page_fault;
   }
-  // A/D handling (Svadu, priv spec 4.3.1): with menvcfg.ADUE set the
-  // hardware sets the bits and writes the PTE back (QEMU's default); with
-  // ADUE clear the access faults instead (spike / xiangshanNEMU behavior).
-  if (!(pte & kPteA) || (acc != acc_read && !(pte & kPteD))) {
+  // A/D handling (priv spec 4.3.1 + Svadu): the A bit is updated by
+  // hardware unconditionally on any successful access; the D bit matters
+  // for stores and AMOs only (a fetch never sets D) and its update is
+  // Svadu's ADUE-gated choice — set silently when menvcfg.ADUE=1, otherwise
+  // a page fault hands the job to software. riscv-tests rv64si-p-dirty pins
+  // exactly this split: a store to D=0 faults to the handler (which sets D
+  // by hand), while accesses that only need A proceed silently.
+  uint64_t new_pte = pte;
+  int is_store = acc == acc_write || acc == acc_amo;
+  if (is_store && !(pte & kPteD)) {
     if (!(s->menvcfg & kMenvcfgAdue)) goto page_fault;
-    uint64_t new_pte = pte | kPteA;
-    if (acc != acc_read) new_pte |= kPteD;
-    if (new_pte != pte) {
-      // The PTE lives in RAM on every machine that pages; a missing region
-      // means it no longer does, which is an access fault.
-      if (BusProbe(f->cpu->bus, pte_addr, 8, NULL) != 0) {
-        raise_(f, AccessFaultCause(acc), vaddr);
-      }
-      BusWrite(f->cpu->bus, pte_addr, 8, new_pte);
+    new_pte |= kPteD;
+  }
+  if (!(pte & kPteA)) new_pte |= kPteA;
+  if (new_pte != pte) {
+    // The PTE lives in RAM on every machine that pages; a missing region
+    // means it no longer does, which is an access fault.
+    if (BusProbe(f->cpu->bus, pte_addr, 8, NULL) != 0) {
+      raise_(f, AccessFaultCause(acc), vaddr);
     }
+    BusWrite(f->cpu->bus, pte_addr, 8, new_pte);
     pte = new_pte;
   }
 

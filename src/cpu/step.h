@@ -76,6 +76,20 @@ typedef struct isa_ops {
   uint64_t (*flag_word)(frame* f);            // the flag word; 0 when flag_names is NULL
   int (*has_fpr)(frame* f);                   // state stream includes the FPR bank?
   void (*debug_state_line)(char* buf, int cap, frame* f);  // one-line summary
+
+  // ---- gdb stub hooks (stage 3.5): optional, NULL = feature absent ----
+  // The register file in the gdb target-description order, little-endian:
+  // read fills buf (cap bytes) and returns the image length, write applies a
+  // full image; 0/-1 = unsupported. x86 segment registers follow QEMU's
+  // gdbstub: the visible selector is stored, the descriptor caches are not
+  // re-walked (a blind descriptor load has no fault channel from a debugger).
+  int (*gdb_read_regs)(CpuState* cpu, uint8_t* buf, int cap);
+  int (*gdb_write_regs)(CpuState* cpu, const uint8_t* buf, int len);
+  // The most recently delivered exception: writes the trap's sequence number
+  // (bumped on every delivery) and returns the gdb signal for it, 0 = none.
+  // The stub detects "the step that just ran delivered a trap" by comparing
+  // sequence numbers across the step.
+  int (*gdb_last_trap)(CpuState* cpu, uint64_t* seq);
 } isa_ops;
 
 extern const isa_ops k_isa_x86;

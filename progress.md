@@ -3,6 +3,255 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 3.5 片 1d：D6 销账——Sdtrig 触发器 + x86 DR 断点（2026-09-13）
+
+**riscv 侧（D6）**：新增 `cpu/isa/riscv64/trigger.c`——mcontrol6 匹配（execute
+在 step.c 取指后按 pc、load/store 在 exec.c 漏斗按 vaddr 于访存前；EQ/GE/LT
+写策略、chain、mode 门控、重入门），action=0 → breakpoint 异常（mtval=匹配
+地址）、action=1（debug mode）Fatal。tdata1/2/3 改为 tselect 索引的每触发器
+三元组（顺带修正旧代码 tselect 不索引的错位），tdata1 写策略 = checked_write
+（type 固定、dmode 只许清、select WARL-0、hit/size/uncertain 清零），tdata3
+mh 字段无 H 强制 0；新增 scontext CSR（0x5a8，M/S 由 priv 位自动门控）。探针
+`test/riscv64/probe/probe_triggers.S` 六位全 1（执行/读/写/GE/tselect 钳制/
+WARL）。riscv 套件 136/136 保持。
+
+**x86 侧（D13 DR 部分 + D14 RF 部分）**：DR0-3 执行（fault，rip=断点指令，
+RF=1 入映像）/写/读写/I-O 断点（trap，指令完成后统一投递）、DR6 写清除 B 位 +
+BD/BS/BT + 保留位读 1、DR7 GD（MOV DR 触发 #DB+BD 且自清）/LE/GE、CR4.DE 对
+DR4/5 别名与 #UD、TF 逐指令单步（BS）、RF 经 iret/popf/任务切换装载并在受保护
+指令完成后清除、icebp(0xF1) #DB trap、TSS.T 任务切换 #DB（BT）。step.c 落地
+landing-pad/提交点两处调试陷阱投递，数据断点检查挂 rm*/栈/串指令/xlat/moffs
+漏斗（fetch/描述符/TSS/中断帧走原始通道不触发）。**顺带修正 rdmsr 编码错位**
+（原接 0F 31 = RDTSC；SDM 规定 RDMSR = 0F 32，0F 31 现为显式 ud()）。
+
+**验收**：kvm `debug` 测试 32 位移植件（上游 64 位专用）入库 run.sh 门禁，
+cemu 与 QEMU TCG **双绿 8/8**（#BP/执行断点×2/单步/单步模拟指令/观察点×2/
+icebp）；期望地址按 clang 实际编码重推导（AND 5 字节 vs 原版假设 6 字节、
+call/pop 锚点），DR7 字段布局检索证实 4 位间隔且模式无关，DR6 写语义由测试
+锚定（W1C 假设被证伪）——细节与用户裁决记录在 AGENTS.md 附录。DR 无第三方
+oracle（tiny386/nemu-x86/TQemu 均未实现），SDM vol.3 ch.17 终裁。
+**回归**：x86 **8 passed / 0 failed**（smoke + pm + realmode + kvm×5）、
+riscv 136/136、depcheck ok；pm/realmode 状态流双跑确定性（状态行新增
+dr6/dr7，复位值 ffff0ff0/400 可观测）。
+
+## 阶段 3.5 A 档：kvm-unit-tests 32 位镜像入库，x86 平台补全（2026-09-12）
+
+采纳 v86 checkout 的 kvm-unit-tests i386 flat 镜像（test/x86/build_kut.sh：
+clang i386 + ld.lld + llvm-ar；三处构建适配记录在脚本头——IAS 的 %gs:6
+movzwl 宽度、exception_table 符号数组化、stack.c 同名冲突改名）。四个镜像
+入库：**taskswitch、taskswitch2、cmpxchg8b、memory**，rc=1（payload 0）
+判据入 run.sh，x86 套件 3 → 7。
+
+x86 机器平台补全（阶段 4 设备按需拉前，SDM/QEMU 文档出处随码）：
+
+1. **CR4**（0f 20/22 reg 4）+ **PSE 4MB 页**（kPdePs × kCr4Pse，SDM vol.3
+   4.3；A/D 更新在 PDE）——cstart 以 4MB 恒等映射开分页，硬前置。
+2. **Local APIC 寄存器页** device/intc/lapic.c（0xFEE00000，SDM vol.3
+   ch.11；寄存器存储语义，ID=0 单 BSP；中断投递仍属阶段 4）。cstart 的
+   load_tss 读 APIC ID 决定 CPU 号，开放总线全 1 会使 LTR 越限 #GP。
+3. **fw_cfg** device/misc/fwcfg.c（0x510 selector/0x511 data，QEMU
+   docs/specs/fw_cfg.txt；signature/RAM_SIZE/NB_CPUS=1）。selector 是
+   16 位写但 32 位代码段的 `out %ax` 生成 4 字节写——区域放宽到 4。
+4. **WRMSR/RDMSR**（0f 30/31，CPL0；0x1B APIC base、0xc0000100/101 长模式
+   FS/GS base 读写回；未知 MSR #GP）——套件 boot（setup_percpu_area）写
+   长模式 GS base，QEMU 宽松语义有测试锚定。
+5. **CMPXCHG8B**（0f c7 /1，mem-only；66 形式 CMPXCHG16B 不存在于 32 位
+   ——判定用 !w32 而非 w32，初版写反被套件当场纠正）；LOCK 单核无操作。
+6. **CMOVcc**（0f 40-4f，686+）——report 的 printf 路径使用。
+7. **multiboot 引导栈 ESP=0x6f00**：multiboot 规范 ESP 未定义，QEMU
+   -kernel 实测进入时栈在 mb info（0x7000）下方。旧 ESP=0 使早期 push 落
+   入未映射被丢弃——真 bug 修复，pm/realmode state 流随之正当漂移，基线
+   重采并双跑自洽。
+8. x86 机器 RAM 1MB → 32MB（kvm 镜像链接在 4M+）。
+
+**关键裁决（cmpxchg8b 的异常表扫描崩溃）**：exception_table_start/end 是
+linker-script 同址符号对，clang 按 C 对象模型"不同对象地址不同"丢弃循环
+入口检查（GCC 没做此假设），空表被扫过整个地址空间踩进未映射页。修复 =
+声明为数组（linker-script 符号对的 canonical 写法），存档于脚本头。
+另一件：本机 LLVM 无 ELF i386 compiler-rt，__udivdi3 族手写移位减法 +
+宿主 / % 边界与随机对拍验证（校验程序自身曾因 INT64_MIN/-1 宿主除法溢出
+假死，加边界保护）。
+
+回归：x86 **7/7**（smoke+pm+4 kvm+realmode）、riscv **136/136**、depcheck
+ok、零告警；state 漂移仅 g4(ESP) 及其下游 push 流（引导栈修复的正当结
+果），pm/realmode 基线重采自洽。QEMU 对拍口径：esp/fw_cfg/APIC ID 均以
+D:/qemu 二进制实测校准。
+
+## riscv-tests 补全：rv64si/mzicbo/ssvnapot 入套件，三个语义 bug 修复（2026-09-12）
+
+用户指出 riscv64 "没有完全通过"——实况：原 127/127 绿，但参照仓的
+rv64si（7 个 S 态测试）、rv64mzicbo、rv64ssvnapot 从未构建入套件（阶段 1
+只搬了 M 态批量）。clang riscv64 交叉补位构建（xpack gcc 已出工具清单，
+reference.md 三预留的路）：两个 lld 适配——link.ld 的 SHF_* 换数值 FLAGS
+(0x7)、测试源 `.global stvec/mtvec_handler` 行改 `.weak`（lld 拒绝
+weak→global 升级，GNU ld 容忍；改后绑定不变）。配方入库
+test/riscv64/build_si_extras.sh，9 个 elf 入 test/riscv64/。
+
+三个真语义 bug（前两个由 rv64si-p-dirty / icache-alias 钉死）：
+
+1. **kExStorePageFault = 14 → 15**（priv spec 表 1.2：14 保留，15 才是
+   store page fault）。127 项旧套件没有校验 store PF cause 值的用例，
+   OpenSBI 引导也未触发——套件缺口正是漏洞藏身处。
+2. **Sv39 A/D 语义**：A 位无条件硬件置位；D 位仅 store/amo 需要，更新由
+   menvcfg.ADUE 门控（ADUE=0 → store 故障交软件置 D）。原实现 A=0 也
+   故障，dirty 的 handler 流程（手工置 D 后重试）走死。
+3. **取指误要求 D 位**：`acc != acc_read` 惯用法把 ifetch 当写。取指永不
+   置 D；icache-alias 的代码页 PTE 只有 V|X|A，一踩即炸。
+
+修复后 rv64si 7/7、mzicbo 1/1、ssvnapot 1/1，套件 127 → **136/136**（参照
+仓 rv64 全集）；x86 3/3、depcheck ok、state 零漂移（smoke/rv_csr，mmu 与
+cause 改动后重验）。调试全程 CEMU_DEBUG（trap 行暴露 cause=14、gp 反解
+TESTNUM、mem 行看 PTE 写入），无临时探针。
+
+## 阶段 3.5 片 1（核心）：gdb RSP stub（2026-09-12）
+
+- **结构**：`host/sock_win.c`（winsock 只进 host/，depcheck 规则同步扩
+  winsock2/ws2tcpip）+ `debug/gdbstub.{h,c}`（RSP 会话：包帧/转义/校验和、
+  qSupported、qXfer target.xml、g/G/m/M/Z0/z0/Z1/z1、c/s/vCont;c|s、?/D/k/
+  H/qfThreadInfo/qAttached、Ctrl-C 0x03 异步中断）+ `BoardRunSteps`（从
+  BoardRun 拆出的批次循环，stop 回调 = 每步提交后观测点）+ main.c
+  `-s`/`-S`/`-gdb tcp::PORT`（QEMU 惯例）。
+- **断点 = 模拟器侧 pc 匹配表**（QEMU/gem5 同款，不写客户内存；提交后
+  检查 = 命中处指令未执行，可观测语义同硬件断点）。isa_ops 新增
+  gdb_read_regs/gdb_write_regs/gdb_last_trap 三钩子（step.h）；两 ISA 私有态
+  加 trap_seq/trap_signal（x86 INTR 投递不计——硬件中断不是调试事件）。
+- **观测设施**：CEMU_DEBUG 新 `gdb` 类别（stub 协议包 tx/rx 事件行）——
+  本轮 lldb 排查全程靠它定位，无临时探针。
+- **裁决与修复**：
+  1. gdb 的 i386 校验要求 core 特征内含 x87 组（st0-7 + fctrl..fop）且
+     带 `<architecture>` 元素，"纯 16 寄存器"描述被拒（离线
+     `set tdesc filename` 二分定位；期间一次 sed 模式未匹配导致四例假
+     通过——教训：验证脚本自身要先验证）。形状照 QEMU 端上的 gdb 官方
+     32bit-core.xml；本机无 FPU（D13），FPU 镜像全零读写并在注释登记。
+  2. bus.c FindRegion 区间回绕 2^64 误判映射：lldb 探测读
+     0xfffffffffffffe00+0x200 触发 Fatal。共享漏斗修复（addr+len 溢出
+     预拒绝），guest M 态裸机对顶地址访问同边可达。
+  3. mingw64 自带 gdb 不含 riscv 架构 → riscv 侧验收客户端用 lldb
+     （LLVM 白名单内），x86 侧用 gdb。
+- **单线程模型记录**：attach 即停（QEMU 的 io-thread 异步应答在单线程
+  下不可得，登记为对 QEMU 的已知偏差）；`-s` 不带 `-S` 时 guest 先跑，
+  连接后停。
+- **验收**：gdb.exe 走 x86 realmode（attach/`break *0x8061`/continue 命中
+  inst=1/寄存器 eip eax cs eflags/内存读 0f 01 15 48/kill 干净退出）；
+  lldb 走 riscv（attach SIGTRAP/断点命中 0x80000008/寄存器读+写 pc 生效/
+  内存读与镜像一致/detach 后 guest 跑完 exit=0）；lldb 客户端侧反汇编
+  （csrwi/csrr）与 CEMU_DEBUG trace mnemonic 逐条一致。
+- **回归**：riscv 127/127、x86 3/3、depcheck ok（含新 winsock 边）、零告
+  警、state 零漂移（smoke/rv_csr 重采对拍）。
+- **stub 层已知限制**（工具语义，非 CPU 语义）：stub 内存访问为物理地址
+  （realmode/裸机 M 态 linear==物理；PM 虚拟视图需无故障 translate probe，
+  挂后续）；p/P 单寄存器包回空（RSP 内回退到 g/G，非简化）。
+
+## 阶段 3.5 前置任务：exec.c 名字级 mnemonic 填充（2026-09-12）
+
+arch.md 阶段 3.5 新增前置任务后本轮完成：insn_rec.mnemonic 全链填到
+SDM/手册指令名（名字级；语法级反汇编形式不做，见同日范围修订）。
+
+- **riscv64**（exec.c + step.c）：主 switch 逐 case、csr_op（f3 名表）、
+  system_op 六叶、amo_op（lr/sc + 两宽度内表 18 臂）、fp_op/fma_op/fp_ldst
+  （.s/.d 后缀名表）、cbo、压缩三象限全臂；c.fld/c.fsd/c.fldsp/c.fsdsp 在
+  fp_ldst 调用后覆写 c 前缀名。step.c 补每步 rec.mnemonic=NULL 复位
+  （x86 本有；riscv 静态 frame 会把上一步名字串进下一步——填充过程中
+  自查抓到）。
+- **x86**（exec.c）：run_op/run_op2 case 入口逐一填（脚本对 129 个单标签
+  case 做锚定插入 + 手改共享体/组/reg 子字段 ~66 处，一次性脚本用后即删）；
+  grp1/2/3 按 reg 查名（kGrp1/kShift/kGrp3Names），jcc/setcc 两张 cc 序名表
+  挂 cond() 旁；串操作按宽度 b/w/d 三态；0f 00/01 组、bt 族、lar/lsl、
+  lss/lfs/lgs、movzx/movsx、xadd、bswap 全覆盖。x87 escape 显示 x87，
+  FNINIT 接受后覆写 fninit。
+- **顺带修复（规范裁决）**：OP-32（0x3b）f3=4/6/7 在 f7=0 处接受未定义编码
+  xorw/orw/andw——clang riscv64 汇编器实证三助记符不存在（mulw/sllw/
+  remw 均可编），该三臂改 illegal，仅保留 divw/remw/remuw。MULW 在
+  f3=0/f7=1 曾自疑错位，llvm-objdump 反汇编 rv64um-p-mulw 证实 cemu
+  解码与规范一致（教训：手册记忆不可靠时用工具实证，勿手算编码）。
+- 填充位置一律 case 入口：指令中途故障（raise longjmp）时 trap 行同样带名。
+
+回归：riscv 127/127、x86 3/3（smoke+pm+realmode）、depcheck ok，零告警；
+state 零漂移——smoke/pm/realmode/rv_csr/probe_counters 五条 state 流与
+改动前逐字节一致（pm/realmode 撞 debug 枢纽 5MB 硬顶，按规则收敛到
+4.9MB 前缀后 diff）。trace 名列效果：`CEMU_DEBUG="trace:table"` 的
+MNEMONIC 列由空 → 逐指令指令名。
+
+## 阶段 3.5 范围修订：GUI 前端不内置反汇编（2026-09-12）
+
+用户决定：图形调试前端降为纯 RSP 客户端（寄存器/内存/断点/单步），不含
+反汇编视图；需要反汇编一律外部工具——gdb/lldb attach 同一 stub（客户端
+侧反汇编，QEMU gdbstub 同款）或 llvm-objdump 离线看镜像。连带效果：无
+LLVM 子进程选型问题（llvm-mc 缺失一事作废），cemu 本体与前端均零新依赖。
+cemu 侧执行流观测仍由 CEMU_DEBUG trace 的译码表 mnemonic 覆盖。arch.md
+阶段 3.5 与 AGENTS.md §十已同步修订。
+
+## seabios clang 构建修复：完整 POST 跑通（2026-09-06）
+
+用户约束续：compare/ 放了官方 1.17.0 源码+tarball+官方 bios.bin（未动），
+外层树去掉全部 make/mingw 遗留后，继续修 clang 构建的引导挂死。
+
+- **清理**：gen-ninja.py 源文件清单改为按 1.17.0 Makefile 原序钉死（include
+  顺序进 tmp.c 影响段布局，承重）；删除 Makefile/Makefile.probe/probe6.c/
+  scripts/kconfig/tarball.sh/test-build.sh 及六个 make 管线孤儿脚本
+  （checkrom import 的 buildrom 保留）、kconfig 运行残留。清理后再生
+  build.ninja/.includes 与拆前逐字节一致。树里只剩 ninja 链 8 脚本+纯源码。
+- **依赖跟踪修复（关键）**：全程序编译规则原先不跟踪 src/*.c——clang
+  `-MD` 的 depfile 按输入名落盘（ccode32flat.d 而非 ccode32flat.o.d），
+  ninja 从未用过。补 `deps=gcc`+`-MF $out.d` 后增量构建才可信；此前两轮
+  调试被陈旧对象污染。
+- **挂死根因（分层取证）**：#UD 风暴（-d int）→ f000:4001 等地址
+  （monitor 寄存器+栈对符号表）→ **`transition32_nmi_off` 是
+  `.text.asm.transition32` 内偏移 +0x18 的局部标签，layoutrom 只为
+  offset-0 段符号发 LDS 方程 → 标签在两个 LDS 里都没有方程 → 各 pass
+  解析值互不一致（rom16 内部=段内偏移；xref 导出=线性绝对），且
+  移植补丁的 `ljmpl $imm,$sym` 在 32 位汇编上下文被 clang 编成 o32
+  `66 ea` 远跳、偏移字段装完整线性地址，实模式执行 EIP=0xfc9be 直接
+  出轨**。
+- **修复**：romlayout.S 给 `transition32_nmi_off` 独立成段
+  （`DECLFUNC`，offset-0 → 两个 LDS 都出方程）；stacks.c 的
+  __call32/call16 远跳改为**寄存器间接 o16 近跳**：`movl $sym,%edi /
+  subl $BUILD_BIOS_ADDR,%edi / jmp *%edi`——线性减法用 asm 立即数做
+  （C 算术会被 IAS/链接器符号算术搞坏：lea 带 eax 基址、addend 重定位
+  丢失、R_386_16 越界三连）。16 位 pass 的 rom16 链接值本来就是段内
+  偏移，__call32 不减。
+- **结果**：自建 bios.bin 119 行 debugcon 日志 vs 官方 bios.bin-1.17.0
+  120 行，除版本串/重定位地址/UMB 尺寸（代码生成差）与一行 floppy 错误
+  打印（上游 main 漂移）外逐行一致，走完初始化搬运、ACPI、SeaVGABIOS
+  option rom、pmm 往返、四轮引导尝试至 "No bootable device."。
+- `.version` 文件（内容 1.17.0，抄官方 tarball 惯例）→ 横幅显示
+  "SeaBIOS (version 1.17.0-20260906_152920-…)"。
+- 调试方法沉淀：#UD 风暴用 `-d int` 限时采样（3.6MB/s 超 5MB 预算，
+  必须 ≤1s 窗口）；挂死现场用 monitor `info registers`+栈对符号表；
+  `-debugcon` 简写静默不挂接，必须显式 `-chardev`+`-device isa-debugcon`。
+
+## seabios 构建链去 mingw 化：ninja + 纯 LLVM（2026-09-06）
+
+用户约束：seabios 只许 clang/lld/ninja，不许 mingw（gcc、GNU binutils）、
+WSL/MSYS2、MSVC。此前 build.ninja（scripts/gen-ninja.py 生成）仍有两处
+mingw 残留：layoutrom/checkrom 消费的 dump 由 mingw64 GNU objdump 产出；
+asm-offsets.h 靠 kconfig/make 附带产物。本轮收掉：
+
+- **scripts/llvmdump.py**（新）：llvm-readobj --sections 产 GNU 形状
+  Sections 块（关键缺列 Algn=2**n），llvm-objdump -thr 符号/重定位块透传
+  （实测与 GNU 逐列一致）；跳过 SHT_REL/SHT_SYMTAB/SHT_STRTAB 与 GNU -h
+  行为对齐。等价性以 layoutrom.parseObjDump 实证：code32seg
+  115 段/142 符号/174 重定位、code32flat 1014/2088/5820，与 GNU dump
+  解析结果全等。
+- **asm-offsets.h 收进 ninja**：clang -S（F16 flags）+ gen-offsets.sh，
+  再生输出与 gcc 时代逐字节一致（仅头注释里的调用路径不同）。
+- **净室重建**：out/ 清空仅保留 autoconf.h，gen-ninja.py 重生输入 +
+  ninja 17/17 全绿；bios.bin 262144 字节，复位向量 ljmp f000:e05b 与
+  LAYOUT 报告一致；两次构建仅差 buildversion 时间戳秒数 2 字节（唯一非
+  确定性源，修不了也不需要修）。
+- **功能冒烟**：qemu-system-i386 引导自建 bios.bin，isa-debugcon 捕获
+  （注意：本版 QEMU 的 `-debugcon` 简写**静默不挂接**，必须显式
+  `-chardev stdio,id=dbg -device isa-debugcon,iobase=0x402,chardev=dbg`），
+  打出 "SeaBIOS (version ?-20260906_124119-…)" 并走完 fw_cfg/e820/
+  init 搬运（96560 字节重定位到 6fe8640，flat 布局正确性的硬证据）/
+  PCI 全枚举。
+- **不可再生项**：kconfig conf.exe 是宿主 C 程序，本机无 MSVC、clang 编
+  Windows 宿主程序必须挂 mingw 头或 MSVC 头——两条路都违反约束。
+  .config/out/autoconf.h 定位为配置输入（等价内核项目提交的 .config），
+  ninja 构建不执行任何宿主编译。
+- build.ninja 里已无 gcc/mingw/GNU binutils 引用；bash.exe（Git Bash）
+  仅作命令壳，与 cemu 回归脚本同一约定。
+
 ## 阶段 3 项 5：LDT 机制整体（D16 销账，2026-09-06）
 
 exec.c 补齐 LDT/LDTR 全链（对照 v86 lookup_segment_selector/load_ldt、
@@ -324,9 +573,10 @@ gp）；位段类 bug 用 llvm-objdump 对照 cemu trace 的 raw/dnpc 即可裁�
   `& 'C:\Program Files\Git\bin\bash.exe' -c '...'`
 - 回归：`bash test/run.sh`；单独 riscv `bash test/riscv64/run.sh`、
   x86 `bash test/x86/run.sh`
-- 回归基线（2026-09-06，LDT 落地后实测）：riscv64 **127 passed /
-  0 failed**；x86 smoke PASS + pm **24/24** + realmode 122/122（pm 判据
-  expected_pm=24，QEMU 对拍 22/24 见 pm 节；套件尾部 fninit #UD 死循环由
+- 回归基线（2026-09-13，DR/触发器落地后实测）：riscv64 **136 passed /
+  0 failed**；x86 **8 passed / 0 failed**（smoke + pm 24/24 + realmode
+  122/122 + kvm taskswitch/taskswitch2/cmpxchg8b/memory/debug；debug 为
+  32 位移植件，QEMU 对拍 8/8 见片 1d 节；套件尾部 fninit #UD 死循环由
   D13 登记容纳，run.sh 的 timeout 判据容纳）
 - debug：`CEMU_DEBUG=...`（见 AGENTS.md 第十节），例
   `CEMU_DEBUG="trace:table,state,mem,budget=200" build/cemu.exe --machine x86 --isa x86 test/x86/realmode/realmode.elf`

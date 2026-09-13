@@ -49,6 +49,27 @@ static void do_step(void) {
   }
 }
 
+// gdb signal for a delivered exception (stage 3.5): #DB/#BP and the INT n
+// family read as SIGTRAP, #DE as SIGFPE, #UD as SIGILL, the access-fault
+// family as SIGSEGV.
+static int GdbTrapSignal(int vec) {
+  switch (vec) {
+    case 0:
+      return 8;  // SIGFPE (#DE)
+    case vec_ud:
+      return 4;  // SIGILL (#UD)
+    case vec_ts:
+    case vec_np:
+    case vec_ss:
+    case vec_gp:
+    case vec_pf:
+    case vec_ac:
+      return 11;  // SIGSEGV
+    default:
+      return 5;  // SIGTRAP: #DB, #BP, #OF, #BR, ...
+  }
+}
+
 void x86_step(CpuState* c) {
   cpu = c;
   s = (x86_state*)cpu->priv;
@@ -64,26 +85,10 @@ void x86_step(CpuState* c) {
   // between the two forever.
   static int delivering_vec = -1;
 
-  // Hardware interrupts are sampled between instructions, when IF=1 and
-  // outside the SDM inhibit window (the instruction after STI/MOV SS/POP
-  // SS). A hardware interrupt is a trap: the pushed return address is the
-  // next instruction. The shadow blocks one sample and expires here.
+  // The one-instruction INTR inhibit shadow expires here (read once, then
+  // cleared below with the sample point after the landing pad).
   int intr_shadow = s->intr_inhibit;
   s->intr_inhibit = 0;
-  if (s->intr_pending && !intr_shadow && fl->if_ && cpu->int_ack) {
-    int vec = cpu->int_ack(cpu->ack_dev);
-    s->intr_pending = 0;
-    cpu->wait = 0;
-    fr->rec.pc = cpu->pc;
-    fr->rec.dnpc = cpu->pc;
-    fr->rec.raw_len = 0;
-    fr->rec.mnemonic = "intr";
-    delivering_vec = vec;
-    do_int(vec, (uint32_t)cpu->pc, 0, 0);
-    delivering_vec = -1;
-    DebugInsn(fr);
-    return;
-  }
 
   memset(&g, 0, sizeof(g));
   d.seg = -1;
@@ -116,10 +121,58 @@ void x86_step(CpuState* c) {
     delivering_vec = cause;
     do_int(cause, (uint32_t)cpu->pc, 0, tval);
     delivering_vec = -1;
+    // Live RF clears on exception entry; the pushed image kept whatever the
+    // interrupted context held (an instruction-breakpoint #DB forces RF=1 in
+    // its image so the resumed instruction reports nothing, SDM vol.3 17.3.1).
+    fl->rf = 0;
+    // gdb stub: an exception landed during the step that just ran (step.h
+    // hook). Hardware INTR delivery above intentionally does not count.
+    s->trap_seq++;
+    s->trap_signal = (uint8_t)GdbTrapSignal(cause);
     DebugTrap(fr);
     return;
   }
 
+  // Instruction breakpoints (SDM vol.3 17.3.1): a #DB FAULT on the fetched
+  // linear address, before the instruction runs — priority above the pending
+  // INTR (vol.3 table 6-2). RF suppresses the match for one instruction.
+  if (s->dr[7] & 0xff) {
+    uint64_t lin = s->base[cs_i] + (uint32_t)cpu->pc;
+    for (int i = 0; i < 4; i++) {
+      if (!(s->dr[7] & (3u << (2 * i)))) continue;          // Li/Gi enable
+      if (((s->dr[7] >> (16 + 4 * i)) & 3) != 0) continue;  // R/W=00: execute
+      if (lin == (uint64_t)s->dr[i] && !fl->rf) {
+        s->dr[6] |= 1u << i;
+        fl->rf = 1;  // the saved image resumes past this instruction
+        raise_(fr, vec_db, 0);
+      }
+    }
+  }
+
+  // Hardware interrupts are sampled between instructions (after the landing
+  // pad, so a fault during delivery escalates inside this step), when IF=1
+  // and outside the SDM inhibit window (the instruction after STI/MOV SS/
+  // POP SS — the shadow was read and cleared at step entry). A hardware
+  // interrupt is a trap: the pushed return address is the next instruction.
+  if (s->intr_pending && !intr_shadow && fl->if_ && cpu->int_ack) {
+    int vec = cpu->int_ack(cpu->ack_dev);
+    s->intr_pending = 0;
+    cpu->wait = 0;
+    fr->rec.pc = cpu->pc;
+    fr->rec.dnpc = cpu->pc;
+    fr->rec.raw_len = 0;
+    fr->rec.mnemonic = "intr";
+    delivering_vec = vec;
+    do_int(vec, (uint32_t)cpu->pc, 0, 0);
+    delivering_vec = -1;
+    DebugInsn(fr);
+    return;
+  }
+
+  // Single-step is decided at the instruction boundary: the TF value before
+  // the instruction ran, not after (POPF/IRET setting TF trap one
+  // instruction later, SDM vol.3 17.3.1).
+  int tf0 = fl->tf;
   do_step();
   // The one commit. d.nxt counts consumed bytes from the instruction start;
   // relative jumps rewrote it relatively, absolute cases set eip themselves.
@@ -128,5 +181,29 @@ void x86_step(CpuState* c) {
   if (eip == fr->rec.pc) cpu->pc = (uint32_t)(fr->rec.pc + d.nxt);
   if (d.code16) cpu->pc &= 0xffff;
   fr->rec.dnpc = cpu->pc;
+  // RF clears after the instruction it protected completed successfully —
+  // unless this instruction itself loaded an EFLAGS image (iret/popf/task
+  // switch), whose RF is the authoritative one (SDM vol.3 17.3.1).
+  if (!d.rf_load) fl->rf = 0;
+  // Debug traps (SDM vol.3 17.3.1, priority table 6-2): the task-switch trap
+  // (TSS.T), data/I-O watchpoints and single-step all fire after the
+  // instruction completes, reporting the next instruction's address in one
+  // #DB. A step that delivered an exception frame (int3/icebp/INT n) takes
+  // no debug trap here — its handler runs unstepped (do_int clears live TF;
+  // the saved image keeps it so IRET resumes stepping).
+  uint32_t dr6set = d.watch_hit;
+  if (s->bt_pending) dr6set |= kDr6Bt;
+  if (tf0) dr6set |= kDr6Bs;
+  if (s->bt_pending || (!d.delivered && (d.watch_hit || tf0))) {
+    s->dr[6] |= dr6set;
+    s->bt_pending = 0;
+    cpu->wait = 0;  // a #DB after hlt wakes the processor
+    DebugInsn(fr);
+    do_int(vec_db, (uint32_t)cpu->pc, 0, 0);
+    s->trap_seq++;
+    s->trap_signal = (uint8_t)GdbTrapSignal(vec_db);
+    DebugTrap(fr);
+    return;
+  }
   DebugInsn(fr);
 }

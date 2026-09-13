@@ -126,6 +126,8 @@ void DebugInit(void) {
       g_mask |= kDbgTrap;
     else if (!strcmp(tok, "bus"))
       g_mask |= kDbgBus;
+    else if (!strcmp(tok, "gdb"))
+      g_mask |= kDbgGdb;
     else if (!strncmp(tok, "regs=", 5))
       g_regs_period = atoi(tok + 5);
     else if (!strncmp(tok, "watch=", 6))
@@ -139,7 +141,7 @@ void DebugInit(void) {
     else
       LogError("debug: unknown CEMU_DEBUG item '%s'", tok);
   }
-  if (g_mask & (kDbgTraceTable | kDbgMem | kDbgTrap | kDbgBus) || g_nwatch) {
+  if (g_mask & (kDbgTraceTable | kDbgMem | kDbgTrap | kDbgBus | kDbgGdb) || g_nwatch) {
     g_tbl = TableOpen(kEventCols, 6, g_ascii, g_header_every);
     TableHeader(g_tbl);
   }
@@ -358,6 +360,17 @@ void DebugBus(frame* f, const char* dev_name, uint64_t addr, int size, int is_lo
            (unsigned long long)(val & 0xffffffffULL));
   TableRowCell(g_tbl, det);
   CellFlags(g_tbl, f);
+  TableRowEnd(g_tbl);
+}
+
+// gdb stub protocol packets (stage 3.5): tx/rx rows, no frame — the stub is
+// outside the guest's step stream. Payload is truncated to one line.
+void DebugGdbPkt(int is_tx, const char* pkt) {
+  if (!DebugOn(kDbgGdb) || !Allow(kDbgGdb)) return;
+  RowBeginBare(g_tbl, 'G');
+  char det[80];
+  snprintf(det, sizeof(det), "%s %.60s", is_tx ? "tx" : "rx", pkt);
+  TableRowCell(g_tbl, det);
   TableRowEnd(g_tbl);
 }
 
