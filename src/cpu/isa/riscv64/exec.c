@@ -21,6 +21,12 @@
 
 // Fixed names: `cpu` (CpuState), `rs` (RiscvState), `fr` (step frame). The
 // banks and their manual-notation aliases (x, f) come from exec.h.
+// `cpu` is THE per-process per-step pointer, defined here and also used by
+// the x86 interpreter: each step installs its own at entry and the loader
+// instantiates exactly one ISA per process. gcc's -fcommon silently merged
+// the two exec.c tentative definitions into this one variable; clang's
+// -fno-common forces the sharing to be declared (the x86 exec.c carries only
+// the extern).
 CpuState* cpu;
 RiscvState* rs;
 

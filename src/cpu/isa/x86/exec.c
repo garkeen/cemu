@@ -26,8 +26,8 @@
 
 // The per-step view (cpu/s/fr/fl), the register and eip spellings, the decoder
 // context `d` and the opcode switches' entry points' declarations all come
-// from exec.h; these are the definitions.
-CpuState* cpu;
+// from exec.h; these are the definitions — except `cpu`, whose single
+// definition lives in the riscv64 exec.c (one ISA per process; see there).
 x86_state* s;
 frame* fr;
 eflags* fl;

@@ -4,19 +4,17 @@
 // the memory view and decoded with an external tool (llvm-objdump, or gdb /
 // lldb attached to the same stub).
 //
-// Presentation: dark Win10/11 theme built only from system APIs — the DWM
-// immersive-dark titlebar attribute, uxtheme's DarkMode_Explorer control
-// theme (the same one Explorer uses), owner-drawn flat buttons with hover
-// tracking, per-monitor-V2 DPI awareness and a scaled layout. Every API here
-// ships with Windows; there are no third-party dependencies.
+// Presentation: the simplest form that works — native controls with system
+// colors (nothing custom-painted, so nothing can garble) and an ADAPTIVE
+// layout: every zone is derived from the client rectangle by one
+// ComputeLayout() that Relayout uses; control sizes scale with the monitor
+// DPI and the initial window size scales with it too.
 //
-// Single-threaded, the same shape as the display window: a 100ms timer
-// polls the socket while the guest runs (stop replies only arrive then);
-// everything else is a request/response exchange while stopped.
+// Single-threaded, the same shape as the display window: a 100ms timer polls
+// the socket while the guest runs (stop replies only arrive then); everything
+// else is a request/response exchange while stopped.
 #include <windows.h>
 #include <commctrl.h>
-#include <dwmapi.h>
-#include <uxtheme.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -27,29 +25,6 @@
 
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0  // pre-1607 SDK headers
-#endif
-
-// GetProcAddress is untyped by nature; the strict prototype-cast warning is
-// suppressed only around these resolutions.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wcast-function-type"
-#pragma GCC diagnostic ignored "-Wincompatible-function-pointer-types"
-
-#ifndef WM_DPICHANGED
-#define WM_DPICHANGED 0x02E0  // pre-1607 SDK headers
-#endif
-
-// GetProcAddress is untyped by nature; the strict prototype-cast warning is
-// suppressed only around these resolutions.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wcast-function-type"
-#pragma GCC diagnostic ignored "-Wincompatible-function-pointer-types"
-
-#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
-#define DWMWA_USE_IMMERSIVE_DARK_MODE 20  // Win10 1809+ (19 on early builds)
-#endif
-#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
-#define DWMWA_WINDOW_CORNER_PREFERENCE 33  // Win11: round the corners
 #endif
 
 // ---- control ids -----------------------------------------------------------------
@@ -77,19 +52,9 @@ enum { ST_DOWN = 0, ST_STOPPED, ST_RUNNING, ST_EXITED };
 
 enum { kMemRows = 16, kMaxBps = 64 };  // 256 bytes per fetch fits PacketSize
 
-// dark palette (Win11-style grays + the system accent blue)
-static const COLORREF kColBg = RGB(32, 32, 32);          // window background
-static const COLORREF kColPanelLine = RGB(58, 58, 58);   // pane borders
-static const COLORREF kColCaption = RGB(148, 148, 148);  // pane captions
-static const COLORREF kColEditBg = RGB(37, 37, 37);      // edits / list body
-static const COLORREF kColEditText = RGB(212, 212, 212);
-static const COLORREF kColMemText = RGB(186, 186, 186);
-static const COLORREF kColBtnBg = RGB(45, 45, 45);
-static const COLORREF kColBtnHover = RGB(58, 58, 58);
-static const COLORREF kColBtnPress = RGB(28, 28, 28);
-static const COLORREF kColBtnLine = RGB(76, 76, 76);
-static const COLORREF kColBtnText = RGB(222, 222, 222);
-static const COLORREF kColAccent = RGB(0, 120, 212);
+// Light palette — VS Code "Light Modern" with GitHub-light status semantics.
+static const COLORREF kColPanelBg = RGB(255, 255, 255);  // pane interiors
+static const COLORREF kColText = RGB(59, 59, 59);          // #3B3B3B text
 
 static Rsp* g_rsp;
 static RspRegTable g_tab;
@@ -102,63 +67,21 @@ static int g_nbps;
 static HWND g_wnd, g_host, g_connect, g_detach, g_run, g_step, g_stop, g_status;
 static HWND g_regs, g_memaddr, g_goto, g_follow, g_mem;
 static HWND g_bplabel, g_bpaddr, g_bpadd, g_bpremove, g_bplist, g_hint;
-static HFONT g_ui, g_mono, g_caption;
+static HWND g_cap_regs, g_cap_mem, g_cap_bp;  // pane captions (real controls:
+                                              // parent-drawn chrome + partial
+                                              // child repaints = garbage)
+static HFONT g_ui, g_mono;
 static UINT g_dpi = 96;
-static COLORREF g_status_col = RGB(160, 160, 160);
 
 static void RefreshRegs(void);
 static void RefreshMem(void);
 static void ShowStopReply(const char* pkt);
 
-// ---- dark-mode plumbing -------------------------------------------------------------
-
-// uxtheme's dark-mode helpers are ordinal-only exports (the same entry
-// points Explorer/Notepad use); resolved dynamically so pre-1809 systems
-// simply fall back to the classic light theme.
-static HRESULT (WINAPI *pAllowDark)(HWND, BOOL);
-static void (WINAPI *pFlushThemes)(void);
-static void (WINAPI *pSetAppMode)(int);  // PreferredAppMode: 1 = AllowDark
-// The bare SetWindowTheme is a UNICODE-mapped macro and mingw's import lib
-// carries only the mapped name; resolve the W entry like the ordinals.
-static HRESULT (WINAPI *pSetTheme)(HWND, const wchar_t*, const wchar_t*);
-
-static void DarkModeInit(void) {
-  HMODULE ux = GetModuleHandleA("uxtheme.dll");
-  if (ux) {
-    pAllowDark = (void (WINAPI*)(HWND, BOOL))GetProcAddress(ux, MAKEINTRESOURCEA(133));
-    pFlushThemes = (void (WINAPI*)(void))GetProcAddress(ux, MAKEINTRESOURCEA(136));
-    pSetAppMode = (void (WINAPI*)(int))GetProcAddress(ux, MAKEINTRESOURCEA(137));
-    pSetTheme = (HRESULT (WINAPI*)(HWND, const wchar_t*, const wchar_t*))(void*)GetProcAddress(
-        ux, "SetWindowThemeW");
-    if (pSetAppMode) pSetAppMode(1);  // AllowDark: dark when the app opts in
-    if (pFlushThemes) pFlushThemes();
-  }
-}
-
-#pragma GCC diagnostic pop
-
-#pragma GCC diagnostic pop
-
-static void DarkModeWindow(HWND wnd) {
-  BOOL on = TRUE;
-  // attribute 20 on current builds; 19 on the earliest 1809, so try both —
-  // a failure just leaves the titlebar light.
-  if (DwmSetWindowAttribute(wnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &on, sizeof(on)) != S_OK)
-    DwmSetWindowAttribute(wnd, DWMWA_USE_IMMERSIVE_DARK_MODE - 1, &on, sizeof(on));
-  DWORD pref = 2;  // DWMWCP_ROUND (Win11 rounded corners; ignored before)
-  DwmSetWindowAttribute(wnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
-  if (pAllowDark) pAllowDark(wnd, TRUE);
-  if (pSetTheme) pSetTheme(wnd, L"DarkMode_Explorer", NULL);
-}
-
-static void DarkModeChild(HWND h) {
-  if (pAllowDark) pAllowDark(h, TRUE);
-  if (pSetTheme) pSetTheme(h, L"DarkMode_Explorer", NULL);
-}
-
 // ---- DPI ------------------------------------------------------------------------------
 
 static int S(int v) { return MulDiv(v, (int)g_dpi, 96); }
+
+static int Clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
 // ---- helpers -----------------------------------------------------------------------
 
@@ -168,16 +91,6 @@ static void SetStatus(const char* fmt, ...) {
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-  SetWindowTextA(g_status, buf);
-}
-
-static void SetStatusCol(const char* fmt, COLORREF col, ...) {
-  char buf[256];
-  va_list ap;
-  va_start(ap, col);
-  vsnprintf(buf, sizeof(buf), fmt, ap);
-  va_end(ap);
-  g_status_col = col;
   SetWindowTextA(g_status, buf);
 }
 
@@ -217,14 +130,14 @@ static void LoseConn(const char* why) {
   g_rsp = NULL;
   g_state = ST_DOWN;
   UpdateButtons();
-  SetStatusCol("%s", RGB(230, 120, 110), why);
+  SetStatus("%s", why);
 }
 
 static void ShowStopReply(const char* pkt) {
   if (pkt[0] == 'W' || pkt[0] == 'X') {
     g_state = ST_EXITED;
     UpdateButtons();
-    SetStatusCol("guest exited (code %s)", RGB(230, 120, 110), pkt + 1);
+    SetStatus("guest exited (code %s)", pkt + 1);
     return;
   }
   g_state = ST_STOPPED;
@@ -235,7 +148,7 @@ static void ShowStopReply(const char* pkt) {
   g_mem_addr = g_pc;
   SetEditHex(g_memaddr, g_pc);
   RefreshMem();
-  SetStatusCol("stopped (%s) - %d registers", RGB(231, 196, 113), pkt, g_tab.n);
+  SetStatus("stopped (%s) - %d registers", pkt, g_tab.n);
 }
 
 // ---- views -------------------------------------------------------------------------
@@ -332,7 +245,7 @@ static void DoConnect(void) {
   GetWindowTextA(g_host, hp, (int)sizeof(hp));
   g_rsp = RspConnect(hp);
   if (!g_rsp) {
-    SetStatusCol("connect to %s failed (is cemu running with -s?)", RGB(230, 120, 110), hp);
+    SetStatus("connect to %s failed (is cemu running with -s?)", hp);
     return;
   }
   char pkt[2048];
@@ -375,7 +288,7 @@ static void DoRun(void) {
   }
   g_state = ST_RUNNING;
   UpdateButtons();
-  SetStatusCol("running - interrupt or wait for a breakpoint", RGB(134, 197, 102));
+  SetStatus("running - interrupt or wait for a breakpoint");
 }
 
 static void DoStep(void) {
@@ -399,14 +312,14 @@ static void DoBpAdd(void) {
     return;
   }
   if (strcmp(pkt, "OK") != 0) {
-    SetStatusCol("breakpoint refused (%s)", RGB(230, 120, 110), pkt);
+    SetStatus("breakpoint refused (%s)", pkt);
     return;
   }
   g_bps[g_nbps++] = addr;
   char text[32];
   snprintf(text, sizeof(text), "0x%llx", (unsigned long long)addr);
   SendMessageA(g_bplist, LB_ADDSTRING, 0, (LPARAM)text);
-  SetStatusCol("breakpoint at %llx", RGB(134, 197, 102), (unsigned long long)addr);
+  SetStatus("breakpoint at %llx", (unsigned long long)addr);
 }
 
 static void DoBpRemove(void) {
@@ -424,202 +337,145 @@ static void DoBpRemove(void) {
   SetStatus("breakpoint removed");
 }
 
+// ---- adaptive layout ----------------------------------------------------------------
+// One ComputeLayout() derives every zone from the client rectangle; Relayout
+// positions the controls inside those zones and the pane painter frames the
+// same rects — the two can never disagree. All zone sizes are proportional
+// with sane clamps, so any window size and any DPI scale produce a valid
+// arrangement.
+
+typedef struct {
+  RECT regs, mem, bp;  // pane frames (captions live in the top band)
+  int row_y;           // toolbar baseline
+  int ctl_h, btn_h;
+} Layout;
+
+static void ComputeLayout(int cw, int ch, Layout* L) {
+  const int m = S(10), gap = S(8);
+  L->ctl_h = S(26);
+  L->btn_h = S(28);
+  L->row_y = m;
+
+  int pane_y = m + L->btn_h + S(10);
+  int bottom_h = Clamp((ch - pane_y) * 24 / 100, S(120), S(220));
+  int pane_h = ch - pane_y - bottom_h - m;
+  int left_w = Clamp((cw - 2 * m - gap) * 30 / 100, S(260), S(430));
+  int mem_x = m + left_w + gap;
+  int by = ch - bottom_h;
+  int bp_w = Clamp((cw - 2 * m - gap) * 48 / 100, S(430), S(700));
+
+  L->regs = (RECT){m, pane_y, m + left_w, pane_y + pane_h};
+  L->mem = (RECT){mem_x, pane_y, cw - m, pane_y + pane_h};
+  L->bp = (RECT){m, by, m + bp_w, by + bottom_h - m};
+}
+
+static void Place(HWND h, int x, int y, int w, int h_) {
+  SetWindowPos(h, NULL, x, y, w, h_, SWP_NOZORDER);
+}
+
+static void Relayout(void) {
+  RECT rc;
+  GetClientRect(g_wnd, &rc);
+  int cw = rc.right, ch = rc.bottom;
+  Layout L;
+  ComputeLayout(cw, ch, &L);
+  const int m = S(10), gap = S(8);
+  const int mem_x = L.mem.left;
+  const int by = L.bp.top;
+
+  // toolbar: flow left to right, then give the status label the remainder
+  int x = m;
+  Place(g_host, x, L.row_y, S(150), L.ctl_h); x += S(158);
+  Place(g_connect, x, L.row_y, S(80), L.btn_h); x += S(88);
+  Place(g_detach, x, L.row_y, S(80), L.btn_h); x += S(88) + gap;
+  Place(g_run, x, L.row_y, S(84), L.btn_h); x += S(92);
+  Place(g_step, x, L.row_y, S(84), L.btn_h); x += S(92);
+  Place(g_stop, x, L.row_y, S(96), L.btn_h); x += S(104);
+  Place(g_status, x, L.row_y + S(5), cw - x - m > S(60) ? cw - x - m : S(60), S(20));
+
+  // pane captions sit in each pane's top band
+  Place(g_cap_regs, L.regs.left + S(10), L.regs.top + S(4), S(200), S(18));
+  Place(g_cap_mem, L.mem.left + S(10), L.mem.top + S(4), S(200), S(18));
+  Place(g_cap_bp, L.bp.left + S(10), L.bp.top + S(4), S(200), S(18));
+
+  // registers pane
+  Place(g_regs, L.regs.left + S(10), L.regs.top + S(26), L.regs.right - L.regs.left - S(20),
+        L.regs.bottom - L.regs.top - S(36));
+
+  // memory pane
+  Place(g_memaddr, mem_x + S(10), L.mem.top + S(24), S(160), L.ctl_h);
+  Place(g_goto, mem_x + S(178), L.mem.top + S(23), S(56), L.btn_h);
+  Place(g_follow, mem_x + S(242), L.mem.top + S(23), S(92), L.btn_h);
+  Place(g_mem, mem_x + S(10), L.mem.top + S(58), L.mem.right - mem_x - S(20),
+        L.mem.bottom - L.mem.top - S(68));
+
+  // breakpoints strip + hint
+  Place(g_bplabel, L.bp.left + S(10), by + S(28), S(40), S(20));
+  Place(g_bpaddr, L.bp.left + S(56), by + S(24), S(140), L.ctl_h);
+  Place(g_bpadd, L.bp.left + S(204), by + S(23), S(80), L.btn_h);
+  Place(g_bpremove, L.bp.left + S(292), by + S(23), S(100), L.btn_h);
+  Place(g_bplist, L.bp.left + S(10), by + S(58), L.bp.right - L.bp.left - S(20),
+        L.bp.bottom - by - S(66));
+  // the hint starts right of BOTH bottom-row panes: the breakpoints pane
+  // can be wider than the registers column, so anchoring the hint to the
+  // memory pane's left edge let the two controls overlap and double-paint.
+  int hint_x = (L.bp.right > L.mem.left ? L.bp.right : L.mem.left) + gap;
+  Place(g_hint, hint_x, by + S(12), cw - hint_x - m, S(56));
+}
+
 // ---- window plumbing ---------------------------------------------------------------
 
 static HWND MakeEdit(int id, int x, int y, int w, DWORD style) {
   HWND h = CreateWindowA("EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | style, x, y, w, S(26),
                          g_wnd, (HMENU)(INT_PTR)id, NULL, NULL);
   SendMessageA(h, WM_SETFONT, (WPARAM)g_mono, TRUE);
-  DarkModeChild(h);
+  return h;
+}
+
+static HWND MakeLabelStyle(const char* text, int x, int y, int w, DWORD style) {
+  HWND h = CreateWindowA("STATIC", text, WS_CHILD | WS_VISIBLE | style, x, y, w, S(20), g_wnd,
+                         NULL, NULL, NULL);
+  SendMessageA(h, WM_SETFONT, (WPARAM)g_ui, TRUE);
   return h;
 }
 
 static HWND MakeLabel(const char* text, int x, int y, int w) {
-  HWND h = CreateWindowA("STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, S(20), g_wnd, NULL,
-                         NULL, NULL);
-  SendMessageA(h, WM_SETFONT, (WPARAM)g_ui, TRUE);
-  return h;
-}
-
-// Owner-drawn flat buttons: hover state tracked per control in its
-// GWLP_USERDATA (1 = hot), paint happens in the parent's WM_DRAWITEM.
-static LRESULT CALLBACK BtnProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id,
-                                DWORD_PTR ref) {
-  (void)id;
-  (void)ref;
-  switch (msg) {
-    case WM_MOUSEMOVE: {
-      if (!GetWindowLongPtr(h, GWLP_USERDATA)) {
-        TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0};
-        TrackMouseEvent(&tme);
-        SetWindowLongPtr(h, GWLP_USERDATA, 1);
-        InvalidateRect(h, NULL, FALSE);
-      }
-      break;
-    }
-    case WM_MOUSELEAVE:
-      SetWindowLongPtr(h, GWLP_USERDATA, 0);
-      InvalidateRect(h, NULL, FALSE);
-      break;
-  }
-  return DefSubclassProc(h, msg, wp, lp);
+  return MakeLabelStyle(text, x, y, w, 0);
 }
 
 static HWND MakeBtnBase(const char* text, int id) {
   HWND h = CreateWindowA("BUTTON", text,
-                         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, 0, 0, 0, 0, g_wnd,
+                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, g_wnd,
                          (HMENU)(INT_PTR)id, NULL, NULL);
   SendMessageA(h, WM_SETFONT, (WPARAM)g_ui, TRUE);
-  SetWindowSubclass(h, BtnProc, 0, 0);
   return h;
 }
 
-// ---- layout -------------------------------------------------------------------------
-// Fixed-pixel panes (scaled by the DPI factor): toolbar row on top, registers
-// pane on the left, memory pane filling the rest, breakpoints + hint strip
-// along the bottom. Pane frames and captions are painted by WM_PAINT.
-enum {
-  kMargin = 10,
-  kBottomH = 150,
-  kLeftW = 310,
-};
-
-static void Relayout(void) {
-  RECT rc;
-  GetClientRect(g_wnd, &rc);
-  int cw = rc.right, ch = rc.bottom;
-  const int mem_x = S(kMargin + kLeftW + 8);
-  const int pane_y = S(48);
-  const int pane_h = ch - pane_y - S(kBottomH) - S(8);
-
-  SetWindowPos(g_host, NULL, S(58), S(12), S(160), S(26), SWP_NOZORDER);
-  SetWindowPos(g_connect, NULL, S(228), S(12), S(80), S(28), SWP_NOZORDER);
-  SetWindowPos(g_detach, NULL, S(316), S(12), S(80), S(28), SWP_NOZORDER);
-  SetWindowPos(g_run, NULL, S(428), S(12), S(92), S(28), SWP_NOZORDER);
-  SetWindowPos(g_step, NULL, S(528), S(12), S(92), S(28), SWP_NOZORDER);
-  SetWindowPos(g_stop, NULL, S(628), S(12), S(100), S(28), SWP_NOZORDER);
-  SetWindowPos(g_status, NULL, cw - S(390), S(18), S(380), S(20), SWP_NOZORDER);
-
-  SetWindowPos(g_regs, NULL, kMargin + S(8), pane_y + S(28), S(kLeftW) - S(16), pane_h - S(36),
-               SWP_NOZORDER);
-  SetWindowPos(g_memaddr, NULL, mem_x + S(14), pane_y + S(28), S(170), S(26), SWP_NOZORDER);
-  SetWindowPos(g_goto, NULL, mem_x + S(192), pane_y + S(27), S(62), S(28), SWP_NOZORDER);
-  SetWindowPos(g_follow, NULL, mem_x + S(260), pane_y + S(27), S(98), S(28), SWP_NOZORDER);
-  SetWindowPos(g_mem, NULL, mem_x + S(14), pane_y + S(64), cw - mem_x - kMargin - S(28),
-               pane_h - S(74), SWP_NOZORDER);
-
-  const int by = ch - S(kBottomH);
-  SetWindowPos(g_bplabel, NULL, kMargin + S(12), by + S(28), S(70), S(20), SWP_NOZORDER);
-  SetWindowPos(g_bpaddr, NULL, kMargin + S(86), by + S(24), S(150), S(26), SWP_NOZORDER);
-  SetWindowPos(g_bpadd, NULL, kMargin + S(246), by + S(23), S(88), S(28), SWP_NOZORDER);
-  SetWindowPos(g_bpremove, NULL, kMargin + S(342), by + S(23), S(108), S(28), SWP_NOZORDER);
-  SetWindowPos(g_bplist, NULL, kMargin + S(12), by + S(60), S(540), S(kBottomH) - S(72),
-               SWP_NOZORDER);
-  SetWindowPos(g_hint, NULL, mem_x + S(14), by + S(24), cw - mem_x - S(28), S(60), SWP_NOZORDER);
-}
-
-static void PaintPanes(HDC dc) {
-  // pane frames + captions; the child controls paint over the interiors
-  RECT rc;
-  GetClientRect(g_wnd, &rc);
-  int cw = rc.right, ch = rc.bottom;
-  const int mem_x = S(kMargin + kLeftW + 8);
-  const int pane_y = S(48);
-  const int pane_h = ch - pane_y - S(kBottomH) - S(8);
-  const int by = ch - S(kBottomH);
-  HPEN pen = CreatePen(PS_SOLID, 1, kColPanelLine);
-  HPEN old = (HPEN)SelectObject(dc, pen);
-  HGDIOBJ oldf = SelectObject(dc, g_caption);
-  SetBkMode(dc, TRANSPARENT);
-  SetTextColor(dc, kColCaption);
-  struct {
-    RECT r;
-    const char* cap;
-  } panes[3] = {
-      {{kMargin, pane_y, kMargin + S(kLeftW), pane_y + pane_h}, "REGISTERS"},
-      {{mem_x, pane_y, cw - kMargin, pane_y + pane_h}, "MEMORY"},
-      {{kMargin, by, kMargin + S(568), by + S(kBottomH) - S(8)}, "BREAKPOINTS"},
-  };
-  for (int i = 0; i < 3; i++) {
-    Rectangle(dc, panes[i].r.left, panes[i].r.top, panes[i].r.right, panes[i].r.bottom);
-    TextOutA(dc, panes[i].r.left + S(10), panes[i].r.top + S(7), panes[i].cap,
-             (int)strlen(panes[i].cap));
-  }
-  SelectObject(dc, oldf);
-  SelectObject(dc, old);
-  DeleteObject(pen);
-  (void)cw;
-}
-
-// owner-drawn button paint (hover flag in the control's GWLP_USERDATA)
-static void DrawButton(HDC dc, const DRAWITEMSTRUCT* di) {
-  HWND h = di->hwndItem;
-  int hot = (int)GetWindowLongPtr(h, GWLP_USERDATA);
-  BOOL en = IsWindowEnabled(h);
-  COLORREF bg = di->itemState & ODS_SELECTED ? kColBtnPress : (hot && en) ? kColBtnHover
-                                                                          : kColBtnBg;
-  HBRUSH br = CreateSolidBrush(bg);
-  FillRect(dc, &di->rcItem, br);
-  DeleteObject(br);
-  if (en) {
-    HPEN pen = CreatePen(PS_SOLID, 1, di->CtlID == IDC_CONNECT ? kColAccent : kColBtnLine);
-    HPEN old = (HPEN)SelectObject(dc, pen);
-    HBRUSH oldb = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-    Rectangle(dc, di->rcItem.left, di->rcItem.top, di->rcItem.right, di->rcItem.bottom);
-    SelectObject(dc, oldb);
-    SelectObject(dc, old);
-    DeleteObject(pen);
-  }
-  SetBkMode(dc, TRANSPARENT);
-  SetTextColor(dc, en ? kColBtnText : RGB(110, 110, 110));
-  char text[48];
-  GetWindowTextA(h, text, (int)sizeof(text));
-  RECT tr = di->rcItem;
-  HGDIOBJ oldf = SelectObject(dc, g_ui);
-  DrawTextA(dc, text, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-  SelectObject(dc, oldf);
-}
-
 static void MakeFonts(void) {
-  g_ui = CreateFontA(-S(14), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                     "Segoe UI");
+  g_ui = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
   g_mono = CreateFontA(-S(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS,
                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN,
                        "Consolas");
-  g_caption = CreateFontA(-S(11), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
-                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                          DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
 }
 
 static void ApplyDpi(HWND wnd) {
   UINT (WINAPI *pGetDpi)(HWND) =
-      (UINT (WINAPI*)(HWND))GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForWindow");
+      (UINT (WINAPI*)(HWND))GetProcAddress(GetModuleHandleA("user32.dll"),
+                                           "GetDpiForWindow");
   g_dpi = pGetDpi ? pGetDpi(wnd) : 96;
   if (g_dpi < 96) g_dpi = 96;
-  if (g_ui) {
-    DeleteObject(g_ui);
-    DeleteObject(g_mono);
-    DeleteObject(g_caption);
-  }
+  if (g_mono) DeleteObject(g_mono);
   MakeFonts();
   HWND mono_ctrls[] = {g_regs, g_memaddr, g_mem, g_bpaddr, g_bplist};
   for (size_t i = 0; i < sizeof(mono_ctrls) / sizeof(mono_ctrls[0]); i++)
     SendMessageA(mono_ctrls[i], WM_SETFONT, (WPARAM)g_mono, TRUE);
-  HWND ui_ctrls[] = {g_host, g_connect, g_detach, g_run, g_step, g_stop,
-                     g_status, g_goto, g_follow, g_bpadd, g_bpremove,
-                     g_bplabel, g_hint};
-  for (size_t i = 0; i < sizeof(ui_ctrls) / sizeof(ui_ctrls[0]); i++)
-    SendMessageA(ui_ctrls[i], WM_SETFONT, (WPARAM)g_ui, TRUE);
   Relayout();
-  InvalidateRect(wnd, NULL, TRUE);
 }
 
 static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
     case WM_CREATE: {
       g_wnd = wnd;
-      DarkModeWindow(wnd);
       MakeFonts();
       g_host = MakeEdit(IDC_HOST, 0, 0, 0, ES_AUTOHSCROLL);
       SetWindowTextA(g_host, "127.0.0.1:1234");
@@ -628,18 +484,19 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
       g_run = MakeBtnBase("Run (F5)", IDC_RUN);
       g_step = MakeBtnBase("Step (F10)", IDC_STEP);
       g_stop = MakeBtnBase("Interrupt", IDC_STOP);
-      g_status = MakeLabel("disconnected", 0, 0, 0);
-      SetWindowLongPtr(g_status, GWL_STYLE, GetWindowLongPtr(g_status, GWL_STYLE) | SS_RIGHT);
+      g_cap_regs = MakeLabelStyle("REGISTERS", 0, 0, 0, 0);
+      g_cap_mem = MakeLabelStyle("MEMORY", 0, 0, 0, 0);
+      g_cap_bp = MakeLabelStyle("BREAKPOINTS", 0, 0, 0, 0);
+      g_status = MakeLabelStyle("disconnected", 0, 0, 0, SS_RIGHT);
       g_regs = CreateWindowExA(0, WC_LISTVIEWA, "",
                                WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT |
                                    LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                                0, 0, 0, 0, wnd, (HMENU)(INT_PTR)IDC_REGS, NULL, NULL);
       SendMessageA(g_regs, WM_SETFONT, (WPARAM)g_mono, TRUE);
-      DarkModeChild(g_regs);
       ListView_SetExtendedListViewStyle(g_regs, LVS_EX_FULLROWSELECT);
-      ListView_SetBkColor(g_regs, kColEditBg);
-      ListView_SetTextBkColor(g_regs, kColEditBg);
-      ListView_SetTextColor(g_regs, kColEditText);
+      ListView_SetBkColor(g_regs, kColPanelBg);
+      ListView_SetTextBkColor(g_regs, kColPanelBg);
+      ListView_SetTextColor(g_regs, kColText);
       LVCOLUMNA col;
       memset(&col, 0, sizeof(col));
       col.mask = LVCF_TEXT | LVCF_WIDTH;
@@ -649,8 +506,6 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
       col.pszText = "value";
       col.cx = S(150);
       ListView_InsertColumn(g_regs, 1, &col);
-      HWND hdr = FindWindowExA(g_regs, NULL, "SysHeader32", NULL);
-      if (hdr) DarkModeChild(hdr);
       g_memaddr = MakeEdit(IDC_MEMADDR, 0, 0, 0, ES_AUTOHSCROLL);
       g_goto = MakeBtnBase("Goto", IDC_GOTO);
       g_follow = MakeBtnBase("Follow PC", IDC_FOLLOW);
@@ -665,20 +520,11 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
                                    LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
                                0, 0, 0, 0, wnd, (HMENU)(INT_PTR)IDC_BPLIST, NULL, NULL);
       SendMessageA(g_bplist, WM_SETFONT, (WPARAM)g_mono, TRUE);
-      DarkModeChild(g_bplist);
-      g_hint = MakeLabel("no disassembler by design - decode with external\r\n"
-                         "tools (llvm-objdump, or gdb on the same stub)",
-                         0, 0, 0);
+      g_hint = MakeLabelStyle("no disassembler by design - decode with external\r\n"
+                              "tools (llvm-objdump, or gdb on the same stub)", 0, 0, 0, 0);
       SetTimer(wnd, 1, 100, NULL);
       ApplyDpi(wnd);
       UpdateButtons();
-      return 0;
-    }
-    case WM_PAINT: {
-      PAINTSTRUCT ps;
-      HDC dc = BeginPaint(wnd, &ps);
-      PaintPanes(dc);
-      EndPaint(wnd, &ps);
       return 0;
     }
     case WM_SIZE:
@@ -697,42 +543,6 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
           ShowStopReply(pkt);
       }
       return 0;
-    case WM_DRAWITEM:
-      DrawButton((HDC)wp, (const DRAWITEMSTRUCT*)lp);
-      return TRUE;
-    case WM_CTLCOLORSTATIC: {
-      // read-only edits (the memory view) and labels paint here
-      HDC dc = (HDC)wp;
-      SetBkMode(dc, TRANSPARENT);
-      if (GetDlgCtrlID((HWND)lp) == IDC_MEM) {
-        SetTextColor(dc, kColMemText);
-        static HBRUSH mem_br;
-        if (!mem_br) mem_br = CreateSolidBrush(kColEditBg);
-        return (LRESULT)mem_br;
-      }
-      SetTextColor(dc, GetDlgCtrlID((HWND)lp) == IDC_STATUS ? g_status_col
-                       : !GetDlgCtrlID((HWND)lp)            ? kColCaption  // hint
-                                                            : RGB(200, 200, 200));
-      static HBRUSH bg_br;
-      if (!bg_br) bg_br = CreateSolidBrush(kColBg);
-      return (LRESULT)bg_br;
-    }
-    case WM_CTLCOLOREDIT: {
-      HDC dc = (HDC)wp;
-      SetBkMode(dc, TRANSPARENT);
-      SetTextColor(dc, kColEditText);
-      static HBRUSH edit_br;
-      if (!edit_br) edit_br = CreateSolidBrush(kColEditBg);
-      return (LRESULT)edit_br;
-    }
-    case WM_CTLCOLORLISTBOX: {
-      HDC dc = (HDC)wp;
-      SetBkMode(dc, TRANSPARENT);
-      SetTextColor(dc, kColEditText);
-      static HBRUSH list_br;
-      if (!list_br) list_br = CreateSolidBrush(kColEditBg);
-      return (LRESULT)list_br;
-    }
     case WM_COMMAND: {
       int id = LOWORD(wp);
       if (id == IDC_CONNECT && g_state == ST_DOWN)
@@ -760,8 +570,8 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_GETMINMAXINFO: {
       MINMAXINFO* mmi = (MINMAXINFO*)lp;
-      mmi->ptMinTrackSize.x = S(980);
-      mmi->ptMinTrackSize.y = S(640);
+      mmi->ptMinTrackSize.x = S(900);
+      mmi->ptMinTrackSize.y = S(560);
       return 0;
     }
     case WM_DESTROY:
@@ -786,7 +596,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
       (BOOL (WINAPI*)(void*))GetProcAddress(GetModuleHandleA("user32.dll"),
                                             "SetProcessDpiAwarenessContext");
   if (pSetCtx) pSetCtx((void*)-4);  // PER_MONITOR_AWARE_V2
-  DarkModeInit();
+  // the initial window size must come out DPI-scaled, so learn the primary
+  // monitor's factor before CreateWindow (per-window value confirmed later)
+  HDC screen = GetDC(NULL);
+  g_dpi = (UINT)GetDeviceCaps(screen, LOGPIXELSX);
+  if (g_dpi < 96) g_dpi = 96;
+  ReleaseDC(NULL, screen);
 
   INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES};
   InitCommonControlsEx(&icc);
@@ -796,7 +611,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
   wc.lpfnWndProc = WndProc;
   wc.hInstance = inst;
   wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-  wc.hbrBackground = CreateSolidBrush(kColBg);
+  wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
   wc.lpszClassName = "cemugui";
   RegisterClassA(&wc);
 
@@ -807,7 +622,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
 
   HWND wnd = CreateWindowA(
       "cemugui", "cemugui - cemu debug front (no disassembler: use llvm-objdump / gdb)",
-      WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1160, 720, NULL, NULL, inst, NULL);
+      WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, S(1160), S(720), NULL, NULL, inst,
+      NULL);
   (void)wnd;
   ShowWindow(wnd, show);
   MSG msg;
