@@ -291,17 +291,23 @@ static int StopCb(void* ctx, CpuState* cpu) {
     if (sig && seq != g->last_trap_seq) {
       g->last_trap_seq = seq;
       g->stop_sig = sig;
+      DebugGdbNote("stop: trap during step");
       return 1;
     }
   }
   if (BpHit(g, cpu->pc)) {
     g->stop_sig = 5;
+    DebugGdbNote("stop: breakpoint");
     return 1;
   }
-  if (g->conn && PendingDrain(g)) return 1;
+  if (g->conn && PendingDrain(g)) {
+    DebugGdbNote("stop: async interrupt");
+    return 1;
+  }
   if (g->steps_left) {
     g->steps_left = 0;
     g->stop_sig = 5;
+    DebugGdbNote("stop: step done");
     return 1;
   }
   return 0;
@@ -314,6 +320,7 @@ static int FreeCb(void* ctx, CpuState* cpu) {
     g->conn = HostSockAcceptPoll(g->listen);
     if (g->conn) {
       g->stop_sig = 5;  // fresh attach: generic trap
+      DebugGdbNote("stop: client attached");
       return 1;
     }
     return 0;
@@ -347,9 +354,11 @@ static void DoRun(GdbStub* g, int step) {
 static int Session(GdbStub* g) {
   Board* m = g->board;
   char pkt[kPacketMax];
+  DebugGdbNote("session begin");
   for (;;) {
     int n = PktRead(g, pkt, sizeof pkt);
     if (n <= 0) {  // client went away: drop it and keep running
+      DebugGdbNote("session end: client gone");
       HostSockClose(g->conn);
       g->conn = NULL;
       return 1;
@@ -548,10 +557,23 @@ void GdbStubRun(GdbStub* g, uint64_t max_inst) {
     // breakpoints and Ctrl-C through the per-step callback.
     uint64_t left = max_inst ? max_inst - m->cpu.inst_count : 0;
     g->stop_pending = 0;
-    BoardRunSteps(m, left, FreeCb, g);
-    if (m->cpu.halted) break;
-    if (!g->stop_pending) break;  // the --max-inst limit, logged in the loop
-    if (!g->conn) break;          // defensive: a stop without a client
+    int stopped = BoardRunSteps(m, left, FreeCb, g);
+    if (m->cpu.halted) {
+      DebugGdbNote("run loop: guest halted");
+      break;
+    }
+    if (!stopped) {
+      DebugGdbNote("run loop: instruction limit");
+      break;  // the --max-inst limit, logged in the loop
+    }
+    if (!g->conn) {
+      DebugGdbNote("run loop: stop without a client");
+      break;  // defensive: a stop without a client
+    }
+    // A stop callback fired. The fresh-attach accept carries no stop byte
+    // (stop_pending is only set by the 0x03 path); either way the session
+    // must start now — the client's handshake may already be in the buffer.
+    if (!g->stop_pending) g->stop_sig = g->stop_sig ? g->stop_sig : 5;
     if (!Session(g)) break;
   }
 }

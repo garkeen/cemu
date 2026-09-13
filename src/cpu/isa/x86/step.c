@@ -169,6 +169,12 @@ void x86_step(CpuState* c) {
     return;
   }
 
+  // HLT semantics (SDM vol.2 HLT; vol.3 17-17 "halt state"): instruction
+  // execution stops — nothing after the hlt runs until the wake above
+  // delivers. The step observes the wakeup and retires nothing;
+  // BoardRunSteps keeps stepping (and polling its stop callback) meanwhile.
+  if (cpu->wait) return;
+
   // Single-step is decided at the instruction boundary: the TF value before
   // the instruction ran, not after (POPF/IRET setting TF trap one
   // instruction later, SDM vol.3 17.3.1).

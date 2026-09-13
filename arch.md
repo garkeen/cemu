@@ -39,6 +39,7 @@ cemu/
   progress.md      进度与决策记录
   reference.md     参考项目与用法
   tools/           depcheck.sh  依赖边检查
+  tools/front/     cemugui：gdb RSP 图形调试前端（宿主侧工具，非机器部件）
   src/
     main.c         入口：参数解析 + 装配
     cpu/           处理器

@@ -87,6 +87,8 @@ start:
   jmp .park
 
 irq0_stub:
+  mov al, 0x20                     ; EOI to the PIC — without it the ISR bit
+  out 0x20, al                     ; stays set and IRQ0 never fires again
   iret
 
 text:    db "CGA display channel OK - 80x25 text"

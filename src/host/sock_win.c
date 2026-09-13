@@ -4,6 +4,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "host/host.h"
@@ -50,6 +51,41 @@ HostSock* HostSockListen(int port) {
 static HostSock* AcceptFrom(SOCKET l) {
   SOCKET s = accept(l, NULL, NULL);
   if (s == INVALID_SOCKET) return NULL;
+  HostSock* h = (HostSock*)calloc(1, sizeof(HostSock));
+  if (!h) {
+    closesocket(s);
+    return NULL;
+  }
+  h->s = s;
+  return h;
+}
+
+HostSock* HostSockConnect(const char* host, int port) {
+  if (WsaInit()) return NULL;
+  char port_str[16];
+  snprintf(port_str, sizeof(port_str), "%d", port);
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo* ai = NULL;
+  if (getaddrinfo(host, port_str, &hints, &ai) != 0 || !ai) return NULL;
+  SOCKET s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+  if (s == INVALID_SOCKET) {
+    freeaddrinfo(ai);
+    return NULL;
+  }
+  if (connect(s, ai->ai_addr, (int)ai->ai_addrlen) != 0) {
+    freeaddrinfo(ai);
+    closesocket(s);
+    return NULL;
+  }
+  freeaddrinfo(ai);
+  // The cemugui front-end runs its protocol exchanges on the UI thread: a
+  // silent peer must degrade to a failed request (and a disconnect notice),
+  // never an unbounded block. 3s is far above any local round trip.
+  DWORD rcv_timeout_ms = 3000;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcv_timeout_ms, sizeof(rcv_timeout_ms));
   HostSock* h = (HostSock*)calloc(1, sizeof(HostSock));
   if (!h) {
     closesocket(s);

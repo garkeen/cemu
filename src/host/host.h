@@ -24,6 +24,8 @@ typedef struct HostSock HostSock;
 
 // Listens on 0.0.0.0:port (the QEMU `-gdb tcp::port` contract); NULL on error.
 HostSock* HostSockListen(int port);
+// Connects to host:port (the cemugui front-end is the stub's client); NULL on error.
+HostSock* HostSockConnect(const char* host, int port);
 // Blocks until a client connects; NULL on error.
 HostSock* HostSockAccept(HostSock* l);
 // Non-blocking accept; NULL when no client is waiting.

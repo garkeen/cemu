@@ -27,7 +27,14 @@ int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuStat
       HostSleepMs(1);
     }
     m->isa->step(&m->cpu);
-    if (asleep && m->cpu.wait) continue;  // no instruction retired
+    if (asleep && m->cpu.wait) {
+      // Still asleep (no interrupt yet): no instruction retired. The per-step
+      // observers still get their look — the gdb stub polls for connecting
+      // clients here, the same way the board poll (PitPoll) keeps running
+      // "more often while the CPU sleeps" (i8254.h).
+      if (stop_cb && stop_cb(cb_ctx, &m->cpu)) return 1;
+      continue;
+    }
     m->cpu.inst_count++;
     if (stop_cb && stop_cb(cb_ctx, &m->cpu)) return 1;
     if (max_inst && m->cpu.inst_count >= max_inst) {

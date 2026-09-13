@@ -50,6 +50,10 @@ void DebugBus(struct frame* f, const char* dev_name, uint64_t addr, int size, in
 // gdb stub packet row (stage 3.5): the stub's tx/rx protocol traffic.
 void DebugGdbPkt(int is_tx, const char* pkt);
 
+// gdb stub lifecycle row (same category): accept/detach/session/stop-reason
+// transitions — the state machine around the packets.
+void DebugGdbNote(const char* note);
+
 // True when a watchpoint matches (funnels ask before doing the access so
 // the row prints even when the access itself faults).
 int DebugWatchHit(uint64_t addr, int size, int is_load);

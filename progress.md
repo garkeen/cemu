@@ -3,6 +3,47 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 3.5 片 3：图形调试前端 cemugui（2026-09-13）
+
+`tools/front/{front.c,rsp.c}`（新宿主侧工具，非机器部件；CMake 第二目标
+`cemugui.exe`，链接 ws2_32/user32/gdi32/comctl32，复用 src/host/sock_win.c
+并新增 HostSockConnect）。**纯 RSP 客户端**：qSupported / ? / g / m /
+Z0,z0 / c,s / 0x03 异步中断 / D detach / qXfer target.xml——寄存器表
+（名字/位宽/code_ptr/float 组）从目标描述解析，前端零 ISA 知识，x86 与
+riscv64 同一套 UI。UI（Win32 单线程 + 100ms 定时器轮询，同显示窗口范式）：
+寄存器列表、内存十六进制+ASCII 视图（256B/次，停机自动跟随 eip）、断点
+增删（Z0/z0 pc 匹配表）、Run/Step/Interrupt/Detach（F5/F10 加速键）。
+**不内置反汇编**（2026-09-12 决定）：窗口内注明用 llvm-objdump 或 gdb 看
+同一 stub。
+
+**过程中修复的模拟器侧真 bug**（GUI 联调暴露）：
+
+1. **attach 冻结链**：BoardRunSteps 的 asleep-continue 路径从不调 stop_cb
+   ——客户机 hlt 睡眠期间 stub 的 accept 轮询一次都不跑，前端连接永远躺
+   在 backlog；配合 cga_hello 缺 EOI（PIC ISR 位不清，IRQ0 只发一次，
+   park 空转不退役指令）= 前端阻塞读无限等。修：asleep 路径每轮跑
+   stop_cb（对齐 i8254.h"睡眠期 poll 更勤"的既有约定）；hello 的 IRQ0
+   存根补 EOI；GdbStubRun 的 attach 停止现在正确进入 Session（原代码
+   `!stop_pending` 即 break，attach 到自由运行客户机会直接退出模拟）。
+2. **x86 hlt 睡眠语义**（SDM vol.2 HLT；vol.3 halt state）：睡眠期间
+   step 会投机执行 hlt 的下一条指令（副作用落地，jmp 每毫秒被执行）。
+   修：wait 置位且无中断投递时 step 直接返回，不取指不执行；realmode
+   122 全绿不受影响。GDB 事件：CEMU_DEBUG gdb 类别新增生命周期行
+   （DebugGdbNote：accept/session/stop 原因），本轮全程靠它定位。
+3. **前端健壮性**：socket 3s 收包超时（协议失配降级为断连提示，UI 永不
+   冻结）；qXfer 属性解析限定在本元素内（原 strstr 越界把 fctrl 的
+   group="float" 泄漏给全部寄存器 → 列表全空）；`m` 包无空格（RSP 帧
+   无空格，带空格被 stub 判 E14）；UI 字符串全 ASCII（UTF-8 破折号在
+   ANSI 窗口成乱码）。
+
+**验收**：用户驱动 GUI 全流程（attach→寄存器 16 项→单步→Run/Interrupt
+→断点 7c7b 命中→Remove→Detach）；内存视图对照引导扇区字节（eb fd 跳转
++ EOI 处理程序三指令 + "CGA display channel OK" 字符串逐字节正确）；
+无头 RSP 探针（复用前端 rsp.c）验证握手/g 寄存器映像/m 读回/detach 后
+cemu 存活全链路。**回归**：x86 9 passed / riscv 136 passed / depcheck ok、
+零告警。阶段 3.5 三片全部落地（gdb stub、CGA 显示通道、图形前端），
+arch.md 阶段 3.5 验收条款达成，衔接阶段 4。
+
 ## 阶段 3.5 片 2：CGA 显示通道（2026-09-13）
 
 **设备侧** `device/video/`（新目录类）：`cga.c`——IBM CGA：0xB8000 16KB

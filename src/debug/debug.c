@@ -374,6 +374,15 @@ void DebugGdbPkt(int is_tx, const char* pkt) {
   TableRowEnd(g_tbl);
 }
 
+void DebugGdbNote(const char* note) {
+  if (!DebugOn(kDbgGdb) || !Allow(kDbgGdb)) return;
+  RowBeginBare(g_tbl, 'G');
+  char det[80];
+  snprintf(det, sizeof(det), "~~ %.60s", note);
+  TableRowCell(g_tbl, det);
+  TableRowEnd(g_tbl);
+}
+
 void DebugSessionEnd(const frame* f, const char* stop_reason) {
   if (!g_inited) return;
   // Pure compat-trace mode stays byte-identical to the old interpreter's
