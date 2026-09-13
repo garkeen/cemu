@@ -39,7 +39,7 @@ if(WIN32)
     "src/host/sock_win.c")
   target_include_directories(cemugui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_compile_options(cemugui PRIVATE -Wall -Wextra -D__USE_MINGW_ANSI_STDIO=1)
-  target_link_libraries(cemugui PRIVATE ws2_32 user32 gdi32 comctl32)
+  target_link_libraries(cemugui PRIVATE ws2_32 user32 gdi32 comctl32 dwmapi uxtheme)
 endif()
 
 # --- check target (dependency-edge lint, AGENTS.md 第七节) ----------------

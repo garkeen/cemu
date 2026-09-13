@@ -3,6 +3,19 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## cemugui 暗色主题 + Per-Monitor DPI（2026-09-13，用户"现代一点"要求）
+
+纯系统 API 的现代暗色：DWM 暗色标题栏（DWMWA_USE_IMMERSIVE_DARK_MODE，20/19
+双探）+ Win11 圆角（DWMWA_WINDOW_CORNER_PREFERENCE）；uxtheme 的
+DarkMode_Explorer 控件主题（暗滚动条/边框，序号 133/136/137 + SetWindowThemeW
+全部 GetProcAddress 动态解析，pre-1809 自动回退亮色）；owner-draw 扁平按钮
+（hover/按压态，SetWindowSubclass 跟踪，Connect 带主题蓝描边）；列表/编辑框/
+列表框暗色（WM_CTLCOLOR* + LVM_SETBKCOLOR）；Per-Monitor V2 DPI 感知，
+布局与字号全量随 DPI 缩放（S() 宏），WM_DPICHANGED 实时重排；Segoe UI/
+Consolas 字体；面板框与说明文字由主窗口 WM_PAINT 绘制；状态行按态着色
+（running 绿 / stopped 黄 / 失败红）。CMake 链接增 dwmapi/uxtheme。
+逻辑层（RSP 会话、断点、跟随）零改动。
+
 ## 阶段 3.5 片 3：图形调试前端 cemugui（2026-09-13）
 
 `tools/front/{front.c,rsp.c}`（新宿主侧工具，非机器部件；CMake 第二目标
