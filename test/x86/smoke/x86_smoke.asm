@@ -46,7 +46,7 @@ start:
   jmp .next
 
 .done:
-  mov al, 5              ; exit payload: emulator status = 5 + 1
+  mov al, 5              ; exit payload: emulator status = (5<<1)|1 = 11
   mov dx, 0xf4
   out dx, al
 .hang:

@@ -3,6 +3,37 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 3.5 片 2：CGA 显示通道（2026-09-13）
+
+**设备侧** `device/video/`（新目录类）：`cga.c`——IBM CGA：0xB8000 16KB
+VRAM（kRamOps 直接叠在板 RAM 上，总线小区优先规则接管译码；BusRamRange
+同步改为最小匹配）、MC6845（R0-R17，索引口 0x3D0/2/4 三重镜像 = A2 未译码、
+数据口 0x3D1/3/5 可读，QEMU/dearchap 惯例）、模式锁存 0x3D8 / 颜色锁存
+0x3D9（写实只读，读 0xFF）、状态口 0x3DA（display-enable / vsync 位由宿主
+时钟的帧模型驱动 + 光笔锁存位）、光笔 strobe 0x3DB/DC；端口按 ISA 字节设备
+逐字节分解（`out 0x3D4,ax` 一条周期写 index+data 两通道）。渲染：文本模式
+0-3（80/40 列、CRTC 起址/光标形状/逐属性前景背景、blink 位与背景亮度互斥、
+扫描线垂直加倍、40 列水平加倍），字形 = seabios vgafont8（公有领域
+fntcol16 集合，出处随码），调色板 = IBM CGA RGBI 十六色。复位态 = BIOS
+POST 后的 mode 3 参数块。缺口语义登记 D17（图形模式黑屏、光栅近似、无过
+扫描边框）。
+
+**主机侧** `host/display_win.c`（win32 GDI：StretchDIBits + PeekMessage 泵，
+同线程零锁）+ 接缝 `device/video/display.h` 的 DisplaySourceOps（设备发布
+固定 XRGB 缓冲 + 版本计数，窗口按版本重绘——未来 VGA/ramfb 同缝）。接线：
+Board.display_dev/display_ops（x86 板发布 kCgaDisplayOps）、BoardRunSteps
+每步调 HostDisplayPump（内部 4ms 限频；用户关窗 = 模拟结束，exit 0）、
+main.c `-display win32`（QEMU 惯例单横杠；默认无窗 = 回归全无头）。CMake
+加 gdi32/user32。
+
+**验收**：探针 `test/x86/cga/cga_probe.asm`（VRAM 写读回、MC6845 光标地址
+程序化+读回、0x3DA vsync 边沿有界等待）cemu 与 qemu-system-i386 双绿
+（同 rc=11 + "cga-probe ok"；QEMU 的 VGA 共享 6845 寄存器契约），入 run.sh
+门禁；窗口视觉验收 `cga_hello.bin`（文本行/15 色属性条/闪烁属性/硬件光标
+闪烁开灭两相均目验，截图与放大确认）——点 X 关窗即干净退出。**回归**：
+x86 9 passed（smoke + cga + pm + kvm×5 + realmode）/ riscv 136/136 /
+depcheck ok、零告警。
+
 ## 阶段 3.5 片 1d：D6 销账——Sdtrig 触发器 + x86 DR 断点（2026-09-13）
 
 **riscv 侧（D6）**：新增 `cpu/isa/riscv64/trigger.c`——mcontrol6 匹配（execute

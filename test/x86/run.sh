@@ -20,6 +20,21 @@ else
   echo "FAIL (smoke: rc=$rc)"
 fi
 
+# CGA: the display-card probe (阶段 3.5 片 2). Headless-verified device
+# semantics: VRAM write/readback at 0xB8000, MC6845 cursor-address program +
+# readback through 0x3D4/0x3D5, and a 0x3DA vertical-retrace edge (status
+# bit 3). Calibrated against qemu-system-i386 (same binary, same output,
+# same status — QEMU's VGA shares the 6845 register contract). The rendered
+# window itself is judged by eye via cga_hello.bin + -display win32.
+out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$dir/cga/cga_probe.bin" 2>&1)
+rc=$?
+if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'cga-probe ok'; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL (cga: rc=$rc)"
+fi
+
 # PM: the protected-mode smoke probe (test/x86/pm). Multiboot ELF enters flat
 # PM, rebuilds GDT/IDT/TSS, and walks the stage-3 semantics: descriptor
 # loads, limit #GP, same-priv and cross-ring gate delivery with TSS stack

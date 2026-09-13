@@ -7,6 +7,7 @@
 #include "device/misc/debug_exit.h"
 #include "device/misc/fwcfg.h"
 #include "device/timer/i8254.h"
+#include "device/video/cga.h"
 #include "util/log.h"
 
 // IBM PC machine, the x86 counterpart of spike_min. Real-mode memory is 1MB
@@ -16,8 +17,10 @@
 // (channel 0 -> IRQ0, the periodic timer that wakes hlt), COM1 at
 // 0x3F8-0x3FF, the debug-exit device at 0xF4 and fw_cfg at 0x510/0x511
 // (QEMU contract) — all in a separate x86 I/O space (CpuState.io) — and the
-// Local APIC register page at 0xFEE00000 on the memory bus. Ports and MMIO
-// nobody claims read all-ones and drop writes — x86 I/O decode never faults.
+// Local APIC register page at 0xFEE00000 on the memory bus. The CGA card
+// (阶段 3.5 片 2) puts its 16KB frame buffer at 0xB8000 on the memory bus and
+// its ports at 0x3D0-0x3DF. Ports and MMIO nobody claims read all-ones and
+// drop writes — x86 I/O decode never faults.
 static const uint64_t kRamSize = 32ULL << 20;
 static const uint16_t kPicMasterBase = 0x20;
 static const uint16_t kPicSlaveBase = 0xA0;
@@ -39,6 +42,7 @@ typedef struct X86Board {
   PitDevice pit;
   FwCfgDevice fwcfg;
   LapicDevice lapic;
+  CgaDevice cga;
 } X86Board;
 
 static uint64_t UnclaimedRead(void* dev, uint64_t addr, int size) {
@@ -78,6 +82,7 @@ static void OnPitIrq(void* ctx, int line, int level) {
 static void X86Poll(Board* m) {
   X86Board* xm = (X86Board*)m;
   PitPoll(&xm->pit);
+  CgaPoll(&xm->cga);
 }
 
 Board* X86BoardCreate(const BoardOpts* opts) {
@@ -102,12 +107,14 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   PitDevice* pit = &xm->pit;
   FwCfgDevice* fwcfg = &xm->fwcfg;
   LapicDevice* lapic = &xm->lapic;
+  CgaDevice* cga = &xm->cga;
   Uart16550Init(uart);
   DebugExitBind(dexit, &m->cpu);
   PicInit(pic);
   PitInit(pit);
   FwCfgInit(fwcfg);
   LapicInit(lapic);
+  CgaInit(cga);
   BusAddRegion(&m->io, 0, kPortSpaceSize, &kUnclaimedPortOps, NULL);
   BusAddRegion(&m->io, kCom1Base, kCom1Size, &kUart16550Ops, uart);
   BusAddRegion(&m->io, kDebugExitPort, kDebugExitSize, &kDebugExitOps, dexit);
@@ -115,6 +122,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   PitRegister(&m->io, pit, kPitBase);
   FwCfgRegister(&m->io, fwcfg);
   LapicRegister(&m->bus, lapic);
+  CgaRegister(&m->bus, &m->io, cga);
 
   // Wiring: PIT ch0 -> PIC IRQ0 -> CPU INTR; INTA -> PicAcknowledge. The
   // hooks live on CpuState (like timer_read/timer_dev), so the machine can
@@ -129,5 +137,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   m->cpu.io = &m->io;
   m->bin_base = kBootSectorLoad;
   m->poll = X86Poll;
+  m->display_dev = cga;
+  m->display_ops = &kCgaDisplayOps;
   return m;
 }

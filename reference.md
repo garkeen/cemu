@@ -67,6 +67,7 @@ QEMU 源码不在树中：QEMU 行为经 D:/qemu 的二进制实测校准
 | uart16550 | device/char/uart16550.c | dearchap SerialState 语义（TX-only） |
 | CLINT / PLIC | device/timer/clint.c / device/intc/plic.c | dearchap + DTB |
 | 8259 PIC / 8254 PIT | device/intc/i8259.c / device/timer/i8254.c | QEMU i8259/i8254 语义 |
+| CGA 显示卡 | device/video/cga.c | IBM CGA Technical Reference（寄存器/RGBI 调色板）；dearchap-tinyemu vga.c 的文本渲染形状；字形 seabios vgasrc/vgafonts.c（公有领域 fntcol16 集合） |
 | spike 主板 | board/spike_min.c | spike 契约（tohost 从 ELF 符号表） |
 | 引导扇区契约 | board/x86_min.c（0x7C00、DL=0x80） | QEMU seabios 交接契约实测 |
 | 目录依赖检查 | tools/depcheck.sh（`cmake --build build --target check`） | 自订；规则见 AGENTS.md 第七节 |

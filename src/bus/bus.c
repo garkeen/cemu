@@ -56,12 +56,16 @@ void BusWrite(Bus* bus, uint64_t addr, int size, uint64_t val) {
 }
 
 int BusRamRange(Bus* bus, uint64_t addr, uint64_t len, uint8_t** host) {
+  // Smallest match, like FindRegion: a device RAM window sitting inside
+  // board RAM (e.g. the CGA frame buffer at 0xB8000) owns its bytes.
+  BusRegion* best = NULL;
   for (int i = 0; i < bus->count; i++) {
     BusRegion* r = &bus->regions[i];
     if (r->host && addr >= r->base && addr + len <= r->base + r->size) {
-      *host = r->host + (addr - r->base);
-      return 0;
+      if (!best || r->size < best->size) best = r;
     }
   }
-  return -1;
+  if (!best) return -1;
+  *host = best->host + (addr - best->base);
+  return 0;
 }

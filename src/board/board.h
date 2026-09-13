@@ -5,9 +5,11 @@
 #include "cpu/cpu.h"
 #include "cpu/step.h"
 #include "device/misc/htif.h"
+#include "device/video/display.h"
 #include "mem/ram.h"
 
-struct GdbStub;  // debug/gdbstub.h; the stub owns run control when attached
+struct GdbStub;    // debug/gdbstub.h; the stub owns run control when attached
+struct HostDisplay;  // host/display_win.c; attached by main.c with -display
 
 // A board (motherboard) is a device map plus reset state: it decides which
 // devices sit at which addresses, how their interrupt lines are wired to the
@@ -33,6 +35,12 @@ typedef struct Board {
   // through BoardRunSteps' stop callback — the machine never knows it is
   // being watched.
   struct GdbStub* gdb;
+  // Display channel (阶段 3.5 片 2): a board with a video card publishes its
+  // rendered framebuffer here; main.c attaches a host window (-display) and
+  // the run loop pumps it. display = the attached window, NULL = headless.
+  void* display_dev;
+  const DisplaySourceOps* display_ops;
+  struct HostDisplay* display;
   // Time-driven device refresh (CLINT MTIP, PIT counters); called by the run
   // loop every step and more often while the CPU sleeps.
   void (*poll)(struct Board* b);

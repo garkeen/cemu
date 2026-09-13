@@ -13,6 +13,7 @@ typedef struct Args {
   const char* isa_name;
   const char* machine_name;
   const char* log_file;
+  const char* display_backend;  // -display win32; NULL = headless
   uint64_t mem_size;
   uint64_t mem_base;
   uint64_t bin_base;
@@ -36,6 +37,7 @@ static void Usage(void) {
       "  --max-inst N      stop after N instructions (default unlimited)\n"
       "  --log FILE        also write logs to FILE\n"
       "  --dump-regs       dump registers on any exit\n"
+      "  -display win32    open a window on the machine's display card\n"
       "  -s                gdb stub on tcp::1234 (guest runs until attached)\n"
       "  -gdb tcp::PORT    gdb stub on PORT\n"
       "  -S                with -s: do not start until the client resumes\n";
@@ -74,7 +76,13 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       if (ParseU64(argv[++i], &a->max_inst)) return -1;
     } else if (strcmp(arg, "--dump-regs") == 0)
       a->dump_regs = 1;
-    else if (strcmp(arg, "-s") == 0)
+    else if (strcmp(arg, "-display") == 0) {
+      if (i + 1 >= argc) {
+        LogError("-display expects a backend name");
+        return -1;
+      }
+      a->display_backend = argv[++i];
+    } else if (strcmp(arg, "-s") == 0)
       a->gdb_port = 1234;  // the QEMU -s convention
     else if (strcmp(arg, "-gdb") == 0) {
       // QEMU: -gdb tcp::PORT (the host part is empty = all interfaces).
@@ -134,6 +142,29 @@ int main(int argc, char** argv) {
   LogInfo("loaded %s: entry=%llx isa=%s htif=%d", a.image, (unsigned long long)lr.entry,
           lr.isa->name, lr.has_htif);
 
+  if (a.display_backend) {
+    if (!m->display_ops) {
+      LogError("machine %s has no display card", a.machine_name);
+      BoardDestroy(m);
+      return 1;
+    }
+    if (strcmp(a.display_backend, "win32") != 0) {
+      LogError("unknown display backend %s (win32)", a.display_backend);
+      BoardDestroy(m);
+      return 1;
+    }
+    char title[128];
+    snprintf(title, sizeof(title), "cemu %s - %s", a.machine_name, a.image);
+    m->display =
+        HostDisplayOpen(title, m->display_ops->width, m->display_ops->height,
+                        m->display_ops->Framebuffer(m->display_dev),
+                        m->display_ops->Version, m->display_dev);
+    if (!m->display) {
+      BoardDestroy(m);
+      return 1;
+    }
+  }
+
   if (a.gdb_port) {
     m->gdb = GdbStubStart(m, a.gdb_port, a.gdb_wait);
     if (!m->gdb) {
@@ -150,6 +181,7 @@ int main(int argc, char** argv) {
   if (code != 0 || a.dump_regs) lr.isa->dump_regs(&m->cpu);
 
   GdbStubFree(m->gdb);
+  HostDisplayFree(m->display);
   BoardDestroy(m);
   return code & 0xff;
 }

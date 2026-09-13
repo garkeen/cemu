@@ -36,4 +36,21 @@ int HostSockWrite(HostSock* s, const void* buf, int n);
 int HostSockReadable(HostSock* s);
 void HostSockClose(HostSock* s);
 
+// ---- Display window (display_win.c; GDI, same thread as the run loop) ------
+// Shows a fixed XRGB (0xffRRGGBB) pixel buffer owned by a device; the window
+// repaints whenever version_cb(dev) returns a counter different from the one
+// last shown. The pump (HostDisplayPump) is called from the board run loop —
+// no extra thread, no guest-facing API.
+typedef struct HostDisplay HostDisplay;
+
+HostDisplay* HostDisplayOpen(const char* title, int width, int height,
+                             const uint32_t* fb,
+                             uint32_t (*version_cb)(void* dev), void* dev);
+// Message pump + repaint; cheap enough to call every run-loop step (it
+// rate-limits itself internally).
+void HostDisplayPump(HostDisplay* d);
+// 1 once the user closed the window (the caller ends the emulation).
+int HostDisplayClosed(const HostDisplay* d);
+void HostDisplayFree(HostDisplay* d);
+
 #endif

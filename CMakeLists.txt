@@ -25,7 +25,8 @@ target_include_directories(cemu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set_target_properties(cemu PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build")
 if(WIN32)
-  target_link_libraries(cemu PRIVATE ws2_32)  # host/sock_win.c (gdb stub)
+  # host/sock_win.c (gdb stub) and host/display_win.c (GDI display backend)
+  target_link_libraries(cemu PRIVATE ws2_32 gdi32 user32)
 endif()
 
 # --- check target (dependency-edge lint, AGENTS.md 第七节) ----------------

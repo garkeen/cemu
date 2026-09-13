@@ -10,6 +10,16 @@ int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuStat
                   void* cb_ctx) {
   while (!m->cpu.halted) {
     if (m->poll) m->poll(m);
+    if (m->display) {
+      // Attached display window (-display): pump its message queue and stop
+      // the emulation when the user closes it, like QEMU quitting.
+      HostDisplayPump(m->display);
+      if (HostDisplayClosed(m->display)) {
+        LogInfo("display window closed");
+        m->cpu.halted = kCpuExited;
+        break;
+      }
+    }
     int asleep = m->cpu.wait;
     if (asleep) {
       // Asleep (wfi/hlt): yield the host; Step still runs so the ISA can
