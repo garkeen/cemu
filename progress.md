@@ -633,9 +633,12 @@ gp）；位段类 bug 用 llvm-objdump 对照 cemu trace 的 raw/dnpc 即可裁�
 ## 工具链现状
 
 - nasm：D:/nasm（2.16.03 也在 D:/SSDOWN/tools/nasm-2.16.03/）
-- LLVM 23.1：D:/LLVM（clang/lld/llvm-objcopy，seabios 与 x86 构建用）
-- mingw gcc（D:/mingw64/bin/gcc.exe，版本号以实际为准）：编 cemu 本体
-  （CMake：`cmake --build build`）
+- LLVM 23.1：D:/LLVM（clang/lld/llvm-objcopy）——**cemu 本体编译器**
+  （2026-09-13 起用户决定换 clang：`tools/clang.cmake` 工具链文件，
+  `cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE=tools/clang.cmake`，
+  mingw-w64 目标，lld 链接）
+- mingw64（D:/mingw64）：头文件与 CRT sysroot（不再是编译器）；objcopy/
+  objdump 平二进制工具仍在用
 - qemu-system-i386：D:/qemu
 - **bash 指的是 Git Bash**（`C:\Program Files\Git\bin\bash.exe`；VSCode
   `terminal.integrated.defaultProfile.windows` 已指向它，Cline 创建终端跟随此

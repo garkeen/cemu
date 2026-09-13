@@ -42,8 +42,8 @@ QEMU 源码不在树中：QEMU 行为经 D:/qemu 的二进制实测校准
 
 | 工具 | 位置 | 用途 |
 |---|---|---|
-| clang / lld / llvm-objcopy / llvm-objdump | D:/LLVM/bin（LLVM 23.1） | seabios/x86 多目标交叉构建、ELF 检视（比 GNU objdump 格式友好） |
-| gcc / cmake / objcopy / objdump | D:/mingw64/bin（注意：cemu 本体构建用 D:/mingw64/bin/gcc.exe，路径中无 8.1 版本号，与旧文档"mingw64 gcc 8.1"的描述以实际为准） | 编 cemu 本体（cmake --build build），平二进制 objcopy；objdump 支持裸字节流反汇编 `-D -b binary`（-m i8086 实模式 / -m i386；-M intel，2026-09-12 实测），外部反汇编首选——本机 LLVM 安装无 llvm-mc |
+| clang / lld / llvm-objcopy / llvm-objdump | D:/LLVM/bin（LLVM 23.1） | **cemu 本体编译器（2026-09-13 起，tools/clang.cmake，mingw-w64 目标）**、seabios/x86 多目标交叉构建、ELF 检视（比 GNU objdump 格式友好） |
+| cmake / objcopy / objdump | D:/mingw64/bin | 平二进制 objcopy；objdump 支持裸字节流反汇编 `-D -b binary`（-m i8086 实模式 / -m i386；-M intel，2026-09-12 实测），外部反汇编首选——本机 LLVM 安装无 llvm-mc |
 | ninja | D:/ninja/ninja.exe | seabios 等已带 build.ninja 的构建 |
 | qemu-system-i386 / riscv64 / riscv32 / arm | D:/qemu | 双跑对拍、机器契约实测（dumpdtb、pmemsave、-device help） |
 | nasm | D:/nasm/nasm.exe（2.16.03 亦在 D:/SSDOWN/tools/nasm-2.16.03/） | 16/32 位 x86 测试镜像（-f bin 引导扇区） |

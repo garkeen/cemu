@@ -89,12 +89,17 @@ ISA 头，`virt.c` 仅引 `platform.h`。
 
 - 命名：Google C 风格。文件与变量 snake_case，类型与函数 PascalCase，
   常量与枚举值 k 前缀，宏全大写。include guard 按路径（`CEMU_BUS_BUS_H`）。
-- 构建：CMake（`CMakeLists.txt`）+ Ninja 生成器，MinGW gcc，`-Wall -Wextra`
+- 构建（2026-09-13 起换 LLVM/clang，用户决定）：CMake（`CMakeLists.txt`）+
+  Ninja 生成器，编译器 clang（`tools/clang.cmake` 工具链文件，mingw-w64 目标
+  ——D:/mingw64 只当头文件与运行时 sysroot，不再当编译器），`-Wall -Wextra`
   零告警。源文件用 `file(GLOB_RECURSE src/*.c)`（`CONFIGURE_DEPENDS`，新增/
   删除源文件自动重扫），是旧 Makefile 四级显式通配（`src/*.c` … `src/*/*/*/*.c`）
   的超集，不依赖 glob 尾部斜杠行为。头文件依赖由 CMake/Ninja 自动追踪。
-  流程：`cmake -G Ninja -B build && cmake --build build`（ninja 不在 PATH 时
-  前置 `PATH=/d/ninja:$PATH`）。
+  流程：`cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE=tools/clang.cmake &&
+  cmake --build build`（换编译器或首次配置后从空 build 目录起；ninja 不在
+  PATH 时前置 `PATH=/d/ninja:$PATH`）。clang 与 gcc 的差异注意：
+  -fno-common（暂定定义重复即错，exec.c 的 cpu 共享指针已显式化）、
+  clang 的 mingw 驱动预定义 UNICODE（uxtheme 的 SetWindowTheme 映射 W 版）。
 - 每轮改动结束前限时跑回归：`bash test/run.sh`（分层入口：riscv
   `bash test/riscv64/run.sh`，x86 `bash test/x86/run.sh`）；依赖边用
   `cmake --build build --target check`。
