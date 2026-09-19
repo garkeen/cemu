@@ -163,10 +163,25 @@ static void I8042WriteData(I8042Device* d, uint8_t val) {
       I8042SyncA20(d);
       break;
     default:
-      // A command byte for the keyboard device itself (set-scancode-set,
-      // enable, reset); the model's keyboard needs no configuration, so the
-      // byte is recorded and nothing answers (D20).
+      // A byte for the keyboard device itself. Every one is answered: the
+      // firmware's probe waits for that ACK, and without it SeaBIOS's PS/2
+      // setup times out and leaves the controller with the keyboard disabled —
+      // IRQ1 then never comes up (D20). QEMU's ps2.c queues one ACK per command
+      // and one per parameter byte, which is exactly this; the two
+      // self-identifying commands answer with their extra bytes as well.
       st->last_data = val;
+      if (val == 0xff) {  // reset: ACK, then power-on-reset
+        QueuePush(st, 0xfa);
+        QueuePush(st, 0xaa);
+      } else if (val == 0xf2) {  // identify: ACK, then the device id
+        QueuePush(st, 0xfa);
+        QueuePush(st, 0xab);
+        QueuePush(st, 0x83);
+      } else if (val == 0xee) {  // echo answers itself
+        QueuePush(st, 0xee);
+      } else {  // 0xf0 set-scancode-set, 0xed LEDs, 0xf3 typematic, 0xf4/0xf5, ...
+        QueuePush(st, 0xfa);
+      }
       break;
   }
   st->expecting = kExpectNone;
