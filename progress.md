@@ -3,6 +3,25 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 5：PS/2 键盘通路（i8042 输出队列 + IRQ1 + 宿主窗口按键）（2026-09-19）
+
+- **i8042**（`src/device/input/i8042.c`）：输出队列（16 字节，OBF = 非空，队列即输出
+  缓冲，QEMU pckbd 同深度）、键盘字节入队 `I8042KeyByte`、**IRQ1 电平** = 队列非空
+  && 命令字节允许键盘中断 && 键盘未被禁用（PC/AT Technical Reference；QEMU
+  pckbd.c kbd_update_irq 的同三条条件）。命令应答（0x20/0xD0/0xAA/0xAB）改装进同一
+  队列，不再单用一个 outbuf。
+- **宿主按键**：显示窗口 WM_KEYDOWN/WM_KEYUP（`host/display_win.c`）→
+  `HostDisplaySetKeySink` → 机板 `key_in` 钩子（`board.h`，main.c 在开窗后接）→ PC
+  机板 `OnHostKey` 把 lParam 里的 set-1 扫描码（bit16-23、bit24 = 0xE0 前缀、释放
+  加 0x80）送进 8042 → IRQ1 走既有 ISA 扇出（8259 + IOAPIC pin 1，xv6 用 pin 1）。
+- 登记 **D20**（键盘设备命令集只记录不回答、扫描码固定 set 1、无鼠标、队列满丢
+  字节）。
+- **验证状态**：设备路径完成、构建零告警、xv6 引导到 `$ ` 不受影响；但本会话的工具
+  环境没有可见桌面（`MainWindowHandle=0`），宿主按键注入（SendKeys 与 PostMessage）
+  都进不到窗口 —— 键盘的端到端只能**用户目验**（AGENTS.md 九.8）：启动 cemu 后点
+  一下窗口敲 `ls`。自动化侧已确认：90M 指令 ≈ 27.6 s（3.3 MIPS），到 shell 约 23 s。
+- 顺带发现：**COM1 的 RX 未接线**（`uart16550.c`：RBR 恒读 0），而 xv6 的控制台输入
+  同时接受串口路径，riscv 侧 xv6-riscv 的 shell 也要它 —— 下一片候选。
 ## 阶段 4 片 4：xv6-x86 引导到 shell（验收 1 达成）（2026-09-19）
 
 片 3 遗留的"首个用户态陷阱返回 triple fault"根因找到并修掉：xv6 从盘上引导到

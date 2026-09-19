@@ -14,18 +14,27 @@
 // the same shape as the IRQ sinks of the timers; the rest of the output port
 // (reset, NMI, keyboard data) is stored but not wired.
 //
-// The key path itself (scancode queue, IRQ1) is the PS/2 slice of stage 4;
-// until then a byte written to 0x60 outside a command sequence is recorded as
-// the controller's "last data" exactly as the 8042 does when no device
-// answers.
+// Keys arrive as scancode bytes — make codes, 0x80|make on a release, 0xe0
+// before an extended key — pushed by the host window's keyboard
+// (I8042KeyByte). A byte waiting at 0x60 sets output-buffer-full, and the
+// controller holds its IRQ line up while a byte waits, the command byte
+// enables the keyboard interrupt and the keyboard is clocked (PC/AT Technical
+// Reference; QEMU pckbd's kbd_update_irq spells the same three conditions).
+// That level is how the guest's keyboard driver learns a key is there; the
+// guest drops it by reading the byte.
 typedef struct I8042Device {
   void (*set_a20)(void* ctx, int on);
   void* a20_ctx;
+  void (*set_irq)(void* ctx, int line, int level);
+  void* irq_ctx;
   struct I8042State* st;  // private model state
 } I8042Device;
 
 void I8042Init(I8042Device* d);
 void I8042Register(Bus* io, I8042Device* d);
 void I8042SetA20Sink(I8042Device* d, void (*set_a20)(void* ctx, int on), void* ctx);
+void I8042SetIrqSink(I8042Device* d, void (*set_irq)(void* ctx, int line, int level), void* ctx);
+// One byte from the keyboard device into the controller's output queue.
+void I8042KeyByte(I8042Device* d, uint8_t scancode);
 
 #endif

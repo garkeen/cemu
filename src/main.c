@@ -200,6 +200,8 @@ int main(int argc, char** argv) {
       BoardDestroy(m);
       return 1;
     }
+    // The board's keyboard sink (the PC's 8042): window keys drive it.
+    if (m->key_in) HostDisplaySetKeySink(m->display, m->key_in, m->key_ctx);
   }
 
   if (a.gdb_port) {

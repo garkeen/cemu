@@ -45,6 +45,10 @@ typedef struct Board {
   void* display_dev;
   const DisplaySourceOps* display_ops;
   struct HostDisplay* display;
+  // Keyboard channel: the board's key sink, fed by the host window's keyboard
+  // (on the PC that is the 8042 controller and its IRQ1). NULL = no keyboard.
+  void (*key_in)(void* ctx, uint32_t scan, int extended, int up);
+  void* key_ctx;
   // Time-driven device refresh (CLINT MTIP, PIT counters); called by the run
   // loop every step and more often while the CPU sleeps.
   void (*poll)(struct Board* b);

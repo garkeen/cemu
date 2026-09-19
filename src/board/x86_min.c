@@ -248,6 +248,16 @@ static void OnIsaIrq(void* ctx, int line, int level) {
   IoapicSetPin(b->ioapic, line, level);
 }
 
+// Host keys -> the 8042: the keyboard's byte (0xe0 first for an extended key,
+// bit 7 on a release) lands in the controller's output queue, which raises
+// IRQ1 while a byte waits; the guest's keyboard driver reads it from 0x60.
+static void OnHostKey(void* ctx, uint32_t scan, int extended, int up) {
+  X86Board* xm = (X86Board*)ctx;
+  if (scan == 0 || scan > 0x7f) return;  // Win32 sends no scan code for a few keys
+  if (extended) I8042KeyByte(&xm->kbd, 0xe0);
+  I8042KeyByte(&xm->kbd, (uint8_t)(scan | (up ? 0x80u : 0u)));
+}
+
 // Chipset -> CPU: A20 is one line, driven by the keyboard controller's output
 // port (command 0xd1) and by System Control Port A bit 1.
 static void OnA20(void* ctx, int on) {
@@ -412,9 +422,13 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   LapicSetIrqSink(&xm->lapic, OnLapicIrq, xm);
   LapicSetEoiSink(&xm->lapic, OnLapicEoi, xm);
   PitSetIrqSink(pit, OnIsaIrq, &xm->irqbus);
+  I8042SetIrqSink(kbd, OnIsaIrq, &xm->irqbus);
   IdeSetIrqSink(ide, OnIsaIrq, &xm->irqbus);
   IoapicSetDeliverSink(&xm->ioapic, OnIoapicDeliver, xm);
   I8042SetA20Sink(kbd, OnA20, &m->cpu);
+  // Keys from the host window enter the machine at the 8042 (IRQ1).
+  m->key_in = OnHostKey;
+  m->key_ctx = xm;
   Port92SetA20Sink(p92, OnA20, &m->cpu);
   m->cpu.int_ack = OnIntAck;
   m->cpu.ack_dev = xm;

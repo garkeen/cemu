@@ -22,6 +22,8 @@ struct HostDisplay {
   const uint32_t* fb;
   uint32_t (*version_cb)(void* dev);
   void* dev;
+  void (*key_cb)(void* ctx, uint32_t scan, int extended, int up);
+  void* key_ctx;
   uint32_t shown_version;
   int64_t next_pump_us;
   int closed;
@@ -51,6 +53,19 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
     case WM_ERASEBKGND:
       return 1;  // the blit covers the client area; avoid flicker
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+    case WM_KEYUP:
+    case WM_SYSKEYUP: {
+      if (!d->key_cb) return DefWindowProcA(hwnd, msg, wp, lp);  // Alt+F4 etc. stay
+      // lp bits 16-23 carry the keyboard's own make code — the set-1 byte the
+      // PC/AT sends — and bit 24 marks the 0xe0-prefixed keys (Win32
+      // WM_KEYDOWN). The model adds the break bit from `up`.
+      uint32_t scan = (uint32_t)((lp >> 16) & 0xff);
+      int up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+      d->key_cb(d->key_ctx, scan, (int)((lp >> 24) & 1), up);
+      return 0;
+    }
     case WM_CLOSE:
       DestroyWindow(hwnd);
       return 0;
@@ -104,6 +119,7 @@ HostDisplay* HostDisplayOpen(const char* title, int width, int height,
   }
   SetWindowLongPtr(d->hwnd, GWLP_USERDATA, (LONG_PTR)d);
   ShowWindow(d->hwnd, SW_SHOWNORMAL);
+  SetForegroundWindow(d->hwnd);  // keys land in the focused window
   return d;
 }
 
@@ -124,6 +140,13 @@ void HostDisplayPump(HostDisplay* d) {
 }
 
 int HostDisplayClosed(const HostDisplay* d) { return d && d->closed; }
+
+void HostDisplaySetKeySink(HostDisplay* d,
+                           void (*cb)(void* ctx, uint32_t scan, int extended, int up),
+                           void* ctx) {
+  d->key_cb = cb;
+  d->key_ctx = ctx;
+}
 
 void HostDisplayFree(HostDisplay* d) {
   if (!d) return;

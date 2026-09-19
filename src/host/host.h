@@ -57,6 +57,15 @@ HostDisplay* HostDisplayOpen(const char* title, int width, int height,
 // Message pump + repaint; cheap enough to call every run-loop step (it
 // rate-limits itself internally).
 void HostDisplayPump(HostDisplay* d);
+
+// The keyboard channel: keys the window receives go to the machine's input
+// sink (on the PC that is the 8042 keyboard controller). `scan` is the
+// hardware scan code the host reports — the same set-1 make code the PC/AT
+// keyboard sends — with `extended` set for the 0xe0-prefixed keys and `up`
+// for a release.
+void HostDisplaySetKeySink(HostDisplay* d,
+                           void (*cb)(void* ctx, uint32_t scan, int extended, int up),
+                           void* ctx);
 // 1 once the user closed the window (the caller ends the emulation).
 int HostDisplayClosed(const HostDisplay* d);
 void HostDisplayFree(HostDisplay* d);

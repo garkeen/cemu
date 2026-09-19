@@ -46,15 +46,51 @@ enum { kExpectNone = 0, kExpectCmdByte, kExpectOutPort };
 // Output-port bits (PC/AT Technical Reference).
 enum { kOutPortA20 = 0x02 };
 
+// Output-queue depth. The guest reads one byte per access to 0x60 while the
+// keyboard device can hand over several in a row (a make code plus its break
+// code), so the controller queues them; QEMU's pckbd uses the same 16-byte
+// depth. The queue IS the output buffer: OBF means "not empty".
+enum { kI8042Queue = 16 };
+
 struct I8042State {
+  uint8_t queue[kI8042Queue];
+  int head, tail;
   uint8_t cmd_byte;
   uint8_t outport;
-  uint8_t outbuf;    // the byte waiting at 0x60 while OBF is set
-  uint8_t last_data; // last byte written to 0x60 (echoed when no device answers)
+  uint8_t last_data; // last byte written to 0x60 (echoed when nothing answers)
   uint8_t expecting;
   uint8_t a2;  // address line A2 as of the last access
-  int obf;     // a byte is waiting at 0x60
+  int irq;     // the IRQ line's current level
 };
+
+static int QueueCount(const struct I8042State* st) {
+  return (st->tail - st->head + kI8042Queue) % kI8042Queue;
+}
+
+static void QueuePush(struct I8042State* st, uint8_t v) {
+  if (QueueCount(st) == kI8042Queue - 1) return;  // full: the byte is lost (D20)
+  st->queue[st->tail] = v;
+  st->tail = (st->tail + 1) % kI8042Queue;
+}
+
+static uint8_t QueuePop(struct I8042State* st) {
+  uint8_t v = st->queue[st->head];
+  st->head = (st->head + 1) % kI8042Queue;
+  return v;
+}
+
+// The keyboard interrupt is a level: a byte waiting at 0x60 holds the line up
+// while the command byte enables the interrupt and the keyboard is clocked
+// (PC/AT Technical Reference; QEMU pckbd.c kbd_update_irq). The guest drops it
+// by reading the byte or by masking the mode bit.
+static void I8042SyncIrq(I8042Device* d) {
+  struct I8042State* st = d->st;
+  int level = QueueCount(st) > 0 && (st->cmd_byte & kModeKbdInt) &&
+              !(st->cmd_byte & kModeDisKbd);
+  if (level == st->irq) return;
+  st->irq = level;
+  if (d->set_irq) d->set_irq(d->irq_ctx, 1, level);
+}
 
 static void I8042SyncA20(I8042Device* d) {
   // Output-port bit 1 is the A20 gate; the board decides what the line does.
@@ -63,7 +99,7 @@ static void I8042SyncA20(I8042Device* d) {
 
 static uint8_t I8042Status(const struct I8042State* st) {
   uint8_t v = 0;
-  if (st->obf) v |= kStatObf;
+  if (QueueCount(st) > 0) v |= kStatObf;
   // IBF never sets: the model consumes a written byte within the access.
   if (st->cmd_byte & kModeSys) v |= kStatSysf;
   if (st->a2) v |= kStatA2;
@@ -75,26 +111,22 @@ static void I8042WriteCmd(I8042Device* d, uint8_t val) {
   st->a2 = 1;
   switch (val) {
     case kCmdReadCmdByte:
-      st->outbuf = st->cmd_byte;
-      st->obf = 1;
+      QueuePush(st, st->cmd_byte);
       break;
     case kCmdWriteCmdByte:
       st->expecting = kExpectCmdByte;
       break;
     case kCmdReadOutPort:
-      st->outbuf = st->outport;
-      st->obf = 1;
+      QueuePush(st, st->outport);
       break;
     case kCmdWriteOutPort:
       st->expecting = kExpectOutPort;
       break;
     case kCmdSelfTest:
-      st->outbuf = 0x55;
-      st->obf = 1;
+      QueuePush(st, 0x55);
       break;
     case kCmdInterfaceTest:
-      st->outbuf = 0x00;
-      st->obf = 1;
+      QueuePush(st, 0x00);
       break;
     case kCmdDisableKbd:
       st->cmd_byte |= kModeDisKbd;
@@ -104,7 +136,7 @@ static void I8042WriteCmd(I8042Device* d, uint8_t val) {
       break;
     case kCmdDisableAux:
     case kCmdEnableAux:
-      break;  // no auxiliary device on this controller
+      break;  // no auxiliary device on this controller (D20)
     case kCmdPulseReset:
       break;  // the CPU reset line is not modeled (AGENTS.md D18)
     default:
@@ -116,6 +148,7 @@ static void I8042WriteCmd(I8042Device* d, uint8_t val) {
       }
       break;
   }
+  I8042SyncIrq(d);
 }
 
 static void I8042WriteData(I8042Device* d, uint8_t val) {
@@ -130,24 +163,29 @@ static void I8042WriteData(I8042Device* d, uint8_t val) {
       I8042SyncA20(d);
       break;
     default:
-      // A scancode for the keyboard device; the PS/2 slice owns that path.
+      // A command byte for the keyboard device itself (set-scancode-set,
+      // enable, reset); the model's keyboard needs no configuration, so the
+      // byte is recorded and nothing answers (D20).
       st->last_data = val;
       break;
   }
   st->expecting = kExpectNone;
+  I8042SyncIrq(d);
 }
 
 static uint64_t I8042Read(void* dev, uint64_t addr, int size) {
   (void)size;
-  struct I8042State* st = ((I8042Device*)dev)->st;
+  I8042Device* d = (I8042Device*)dev;
+  struct I8042State* st = d->st;
   if (addr == kI8042CmdPort) {
     st->a2 = 1;
     return I8042Status(st);
   }
   st->a2 = 0;
-  if (st->obf) {
-    st->obf = 0;
-    return st->outbuf;
+  if (QueueCount(st) > 0) {
+    uint8_t v = QueuePop(st);
+    I8042SyncIrq(d);
+    return v;
   }
   return st->last_data;
 }
@@ -173,6 +211,8 @@ void I8042Init(I8042Device* d) {
   d->st = st;
   d->set_a20 = NULL;
   d->a20_ctx = NULL;
+  d->set_irq = NULL;
+  d->irq_ctx = NULL;
 }
 
 void I8042Register(Bus* io, I8042Device* d) {
@@ -183,4 +223,15 @@ void I8042Register(Bus* io, I8042Device* d) {
 void I8042SetA20Sink(I8042Device* d, void (*set_a20)(void* ctx, int on), void* ctx) {
   d->set_a20 = set_a20;
   d->a20_ctx = ctx;
+}
+
+void I8042SetIrqSink(I8042Device* d, void (*set_irq)(void* ctx, int line, int level),
+                     void* ctx) {
+  d->set_irq = set_irq;
+  d->irq_ctx = ctx;
+}
+
+void I8042KeyByte(I8042Device* d, uint8_t scancode) {
+  QueuePush(d->st, scancode);
+  I8042SyncIrq(d);
 }
