@@ -10,6 +10,9 @@ int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuStat
                   void* cb_ctx) {
   while (!m->cpu.halted) {
     if (m->poll) m->poll(m);
+  // Host keys (stdin: the console or a pipe) go to the board's key sink; the
+  // poll self-gates, so calling it every loop costs almost nothing.
+  HostKeyPoll();
     if (m->display) {
       // Attached display window (-display): pump its message queue and stop
       // the emulation when the user closes it, like QEMU quitting.

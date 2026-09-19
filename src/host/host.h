@@ -66,6 +66,13 @@ void HostDisplayPump(HostDisplay* d);
 void HostDisplaySetKeySink(HostDisplay* d,
                            void (*cb)(void* ctx, uint32_t scan, int extended, int up),
                            void* ctx);
+
+// The host's own keyboard source: stdin, read as keys at the same sink (the
+// console the user runs cemu from, or a pipe a script drives). HostKeyOpen
+// attaches, HostKeyPoll is called from the run loop and self-gates to a few
+// milliseconds between OS polls.
+void HostKeyOpen(void (*sink)(void* ctx, uint32_t scan, int extended, int up), void* ctx);
+void HostKeyPoll(void);
 // 1 once the user closed the window (the caller ends the emulation).
 int HostDisplayClosed(const HostDisplay* d);
 void HostDisplayFree(HostDisplay* d);

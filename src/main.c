@@ -202,6 +202,9 @@ int main(int argc, char** argv) {
     }
     // The board's keyboard sink (the PC's 8042): window keys drive it.
     if (m->key_in) HostDisplaySetKeySink(m->display, m->key_in, m->key_ctx);
+    // The same sink also takes the host's stdin (console or pipe): the PC's
+    // only guest input device is the 8042, so both host sources land on IRQ1.
+    if (m->key_in) HostKeyOpen(m->key_in, m->key_ctx);
   }
 
   if (a.gdb_port) {
