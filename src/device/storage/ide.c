@@ -150,17 +150,18 @@ static void Abort(IdeChannel* ch, IdeDrive* dr) {
   RaiseIrq(ch);
 }
 
-// Software reset (SRST): the channel's task files return to their power-on
-// state and any transfer in flight is dropped (§8.3 software reset protocol).
+// Software reset (SRST): the channel's task file returns to its power-on state,
+// the devices report ready again, and any transfer in flight is dropped (§8.3
+// software reset protocol).
 static void ResetChannel(IdeChannel* ch) {
+  ch->count = 0;
+  ch->lba_low = 0;
+  ch->lba_mid = 0;
+  ch->lba_high = 0;
+  ch->head = 0;
   for (int i = 0; i < kIdeDrivesPerChannel; i++) {
     IdeDrive* dr = &ch->drives[i];
     dr->error = 0;
-    dr->count = 0;
-    dr->lba_low = 0;
-    dr->lba_mid = 0;
-    dr->lba_high = 0;
-    dr->head = 0;
     // An empty bay keeps answering zero: that is how firmware and xv6 tell a
     // bay with no drive from one with a drive that has not been selected yet.
     dr->status = dr->image ? kStatusReady : 0;
@@ -225,19 +226,19 @@ static void BuildIdentify(const IdeChannel* ch, int drive, uint16_t* id) {
   id[93] = (uint16_t)(0x4001 | (ch->drives[drive ^ 1].image ? 0x2000 : 0));
 }
 
-// The sector a command addresses: bits 27:0 of the task file when the drive/head
-// register selects LBA (bit 6), else the CHS triple translated through the
-// drive's geometry (§7.10.6 drive/head register; heads/sectors/track from
-// IDENTIFY words 3/6).
-static int64_t CommandLba(const IdeDrive* dr, int* ok) {
+// The sector a command addresses: bits 27:0 of the task file when the
+// drive/head register selects LBA (bit 6), else the CHS triple translated
+// through the drive's geometry (§7.10.6 drive/head register; heads/sectors per
+// track from IDENTIFY words 3/6).
+static int64_t CommandLba(const IdeChannel* ch, const IdeDrive* dr, int* ok) {
   *ok = 1;
-  if (dr->head & 0x40) {
-    return ((int64_t)(dr->head & 0x0f) << 24) | ((int64_t)dr->lba_high << 16) |
-           ((int64_t)dr->lba_mid << 8) | (int64_t)dr->lba_low;
+  if (ch->head & 0x40) {
+    return ((int64_t)(ch->head & 0x0f) << 24) | ((int64_t)ch->lba_high << 16) |
+           ((int64_t)ch->lba_mid << 8) | (int64_t)ch->lba_low;
   }
-  uint32_t cyl = ((uint32_t)dr->lba_high << 8) | dr->lba_mid;
-  uint32_t sector = dr->lba_low;  // one-based
-  uint32_t head = dr->head & 0x0f;
+  uint32_t cyl = ((uint32_t)ch->lba_high << 8) | ch->lba_mid;
+  uint32_t sector = ch->lba_low;  // one-based
+  uint32_t head = ch->head & 0x0f;
   if (sector == 0 || sector > dr->sectors_per_track || head >= dr->heads) {
     *ok = 0;
     return 0;
@@ -299,10 +300,11 @@ static void WriteData(IdeChannel* ch, int size, uint64_t val) {
   FinishSector(ch);
 }
 
-// A command register write starts a command on the selected drive. Commands
-// complete inside the write — no busy window is modelled — which is invisible
-// to the guests this board serves: they poll DRQ and the status register, and
-// both already show the true state of the transfer.
+// A command register write starts a command on the selected drive, using the
+// address registers the host wrote just before it. Commands complete inside the
+// write — no busy window is modelled — which is invisible to the guests this
+// board serves: they poll DRQ and the status register, and both already show
+// the true state of the transfer.
 static void ExecCommand(IdeChannel* ch, uint8_t cmd) {
   IdeDrive* dr = Selected(ch);
   int drive = ch->selected;
@@ -333,8 +335,8 @@ static void ExecCommand(IdeChannel* ch, uint8_t cmd) {
     case kCmdReadSectors:
     case kCmdWriteSectors: {
       int ok = 0;
-      int64_t lba = CommandLba(dr, &ok);
-      int count = dr->count ? dr->count : 256;  // 0 means 256 sectors (§7.10.4)
+      int64_t lba = CommandLba(ch, dr, &ok);
+      int count = ch->count ? ch->count : 256;  // 0 means 256 sectors (§7.10.4)
       if (!ok || lba < 0 || lba + count > dr->sectors) {
         Abort(ch, dr);
         return;
@@ -375,22 +377,21 @@ static uint64_t ReadStatus(IdeChannel* ch) {
 
 static uint64_t CmdRead(void* dev, uint64_t addr, int size) {
   IdeChannel* ch = (IdeChannel*)dev;
-  const IdeDrive* dr = Selected(ch);
   switch (addr - ch->cmd_base) {
     case kRegData:
       return ReadData(ch, size);
     case kRegFeatureError:
-      return dr->error;
+      return Selected(ch)->error;
     case kRegSectorCount:
-      return dr->count;
+      return ch->count;
     case kRegLbaLow:
-      return dr->lba_low;
+      return ch->lba_low;
     case kRegLbaMid:
-      return dr->lba_mid;
+      return ch->lba_mid;
     case kRegLbaHigh:
-      return dr->lba_high;
+      return ch->lba_high;
     case kRegDriveHead:
-      return dr->head;
+      return ch->head;
     default:
       return ReadStatus(ch);
   }
@@ -408,24 +409,24 @@ static void CmdWrite(void* dev, uint64_t addr, int size, uint64_t val) {
       // there is nothing to keep.
       return;
     case kRegSectorCount:
-      Selected(ch)->count = (uint8_t)val;
+      ch->count = (uint8_t)val;
       return;
     case kRegLbaLow:
-      Selected(ch)->lba_low = (uint8_t)val;
+      ch->lba_low = (uint8_t)val;
       return;
     case kRegLbaMid:
-      Selected(ch)->lba_mid = (uint8_t)val;
+      ch->lba_mid = (uint8_t)val;
       return;
     case kRegLbaHigh:
-      Selected(ch)->lba_high = (uint8_t)val;
+      ch->lba_high = (uint8_t)val;
       return;
     case kRegDriveHead:
-      // The register both holds the addressing bits and picks the bay the task
-      // file talks to (bit 4). It lands in the newly selected drive: firmware
-      // validates the controller by writing 0xA0/0xB0 and reading the register
-      // back before it trusts the status register (seabios ata_detect).
+      // The register holds the addressing bits and picks the bay the next
+      // command executes on (bit 4). Firmware validates the controller by
+      // writing 0xA0/0xB0 and reading the register back before it trusts the
+      // status register (seabios ata_detect).
+      ch->head = (uint8_t)val;
       ch->selected = (int)((val >> 4) & 1);
-      Selected(ch)->head = (uint8_t)val;
       return;
     default:
       ExecCommand(ch, (uint8_t)val);

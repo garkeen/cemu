@@ -14,27 +14,33 @@
 // class 0x0101 with programming interface 0x80. Those two bytes are the
 // contract with firmware: SeaBIOS (src/hw/ata.c init_pciata) hands each channel
 // its ISA-mode ports and the fixed IRQ 14/15 exactly when the channel is not
-// switched to native mode, and the device ID routes it through
-// piix_ide_setup, which only pokes the channel-enable bits at 0x40/0x42.
-// QEMU's hw/ide/piix.c carries the same identity (8086:7010, class 0x010180,
-// BAR0..3 = 0x1F1/0x3F5/0x171/0x375).
+// switched to native mode, and the device ID routes it through piix_ide_setup,
+// which only pokes the channel-enable bits at 0x40/0x42. QEMU's hw/ide/piix.c
+// carries the same identity (8086:7010, class 0x010180, BAR0..3 =
+// 0x1F1/0x3F5/0x171/0x375).
+//
+// The task file belongs to the CHANNEL, not to a drive (ATA/ATAPI-7 §7.10: the
+// host interface is one register file, and the drive/head register's bit 4
+// picks which of the two devices executes the next command). Every driver
+// depends on that: xv6's idestart, libata's ata_tf_load and SeaBIOS's send_cmd
+// all write the sector count and the LBA registers *first* and the device/head
+// register last, so a per-drive register file would hand the command the other
+// bay's stale address. Only the status and error registers are per device —
+// they are how a bay reports its own last command, and an empty bay answers
+// status 0 forever, which is how firmware and xv6 tell "no drive" from "drive
+// that has not been selected yet".
 //
 // The drive is the PIO half of ATA-4: IDENTIFY DEVICE (0xEC), READ SECTORS
 // (0x20), WRITE SECTORS (0x30) and FLUSH CACHE (0xE7), in LBA-28 or CHS
 // addressing, one 512-byte sector per DRQ handshake (ATA/ATAPI-7 §6.3 PIO data
-// transfer, §7.10 task file registers). Everything else reports ABRT, which is
-// what a drive that does not implement a command answers — including IDENTIFY
-// PACKET DEVICE (0xA1), the probe SeaBIOS uses to tell an ATAPI drive from an
-// ATA one. Bus-master DMA (the BAR4 engine) is not modelled; see 简化登记 D19.
-//
-// The two bays of a channel are the two drives; an empty bay has no image and
-// reports status 0, which is how firmware and xv6 decide a drive is absent
-// (seabios ata_detect falls through on a zero status; xv6 ide.c probes 0x1F7
-// for a nonzero reading). That is a per-drive answer: the task file registers
-// of an empty bay still store what the host writes, so firmware's controller
-// read-back probe passes before it asks the status register.
+// transfer). Everything else reports ABRT, which is what a drive that does not
+// implement a command answers — including IDENTIFY PACKET DEVICE (0xA1), the
+// probe SeaBIOS uses to tell an ATAPI drive from an ATA one. Bus-master DMA
+// (the BAR4 engine) is not modelled; see 简化登记 D19.
 enum { kIdeDrivesPerChannel = 2 };
 
+// One bay: the medium, its geometry, and the two registers the host reads back
+// from that particular device.
 typedef struct IdeDrive {
   HostFile* image;  // the medium; NULL = empty bay
   int64_t sectors;  // medium size in 512-byte sectors
@@ -44,30 +50,30 @@ typedef struct IdeDrive {
   uint16_t cylinders;
   uint8_t heads;
   uint8_t sectors_per_track;
-  // Task file, as this drive sees it (ATA/ATAPI-7 §7.10.1..§7.10.8): the host
-  // writes these and reads them back; command results come back through
-  // error/status.
-  uint8_t error;
-  uint8_t count;
-  uint8_t lba_low;
-  uint8_t lba_mid;
-  uint8_t lba_high;
-  uint8_t head;
-  uint8_t status;
+  uint8_t error;   // error register (§7.10.2)
+  uint8_t status;  // status register (§7.10.9); zero while the bay is empty
 } IdeDrive;
 
 typedef struct IdeDevice IdeDevice;
 
 typedef struct IdeChannel {
-  IdeDevice* dev;        // for the interrupt sink (the board wires it)
-  uint16_t cmd_base;     // 0x1F0 / 0x170: the eight task file registers
-  uint16_t ctrl_base;    // 0x3F6 / 0x376: alternate status and device control
-  int irq_line;          // 14 / 15, the channel's fixed ISA interrupt
+  IdeDevice* dev;      // for the interrupt sink (the board wires it)
+  uint16_t cmd_base;   // 0x1F0 / 0x170: the eight task file registers
+  uint16_t ctrl_base;  // 0x3F6 / 0x376: alternate status and device control
+  int irq_line;        // 14 / 15, the channel's fixed ISA interrupt
   IdeDrive drives[kIdeDrivesPerChannel];  // [0] = master, [1] = slave
-  int selected;    // the bay the task file addresses (drive/head bit 4)
+  // The channel's task file, as the host wrote it: sector count, address and
+  // the device/head register that selects the bay.
+  uint8_t count;
+  uint8_t lba_low;
+  uint8_t lba_mid;
+  uint8_t lba_high;
+  uint8_t head;
+  int selected;     // the bay the device/head register picked
   uint8_t devctrl;  // control block: nIEN (bit 1), SRST (bit 2), HD15 (bit 3)
   // An in-flight PIO transfer. One command runs per channel at a time; the
-  // active drive is the one that was selected when the command was written.
+  // active drive is the one the device/head register selected when the command
+  // was written.
   int active;     // drive executing, -1 = idle
   int is_write;   // direction of the active transfer
   int64_t lba;    // sector being transferred

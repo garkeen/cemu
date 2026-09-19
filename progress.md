@@ -3,7 +3,48 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 3：IOAPIC + LAPIC 中断路径打通；xv6 卡在首个用户态陷阱（2026-09-19）
+
+片 2 之后 xv6 停在"首次读 fs.img 等完成中断"。本片补齐中断链路，并修掉一个
+IDE 建模错误：
+
+- **LAPIC（重写）**：IRR/ISR/PPR 优先级仲裁、INTA（`LapicAcknowledge`：启用且
+  有可投递请求时返回向量并置 ISR，否则交回机板让 8259 应答）、EOI（清最高 ISR
+  位，并把该向量通知 IOAPIC 退 remote-IRR）、SVR 使能位、TPR、PPR 只读、
+  TCCR/APIC 定时器（LVTT 周期/单次、TICR、TDCR 分频表，按宿主时钟以 100MHz
+  总线时钟推进，`LapicPoll` 进机板 poll 循环）。复位态 = APIC 关闭、SVR=0xFF，
+  所以固件仍跑在 8259 上。
+- **IOAPIC（新）**：`src/device/intc/ioapic.{h,c}`，0xFEC00000（IOREGSEL 0x00 /
+  IOWIN 0x10）、IOAPICID、IOVER（version 0x11，低字节 0x11 = 最大重定向项，
+  xv6 的 `maxintr` 由此而来）、24 项重定向表（vector / delivery / dest mode /
+  polarity / trigger / mask / destination，remote-IRR 由芯片维护）、边沿与电平
+  两种触发（电平走 remote-IRR + EOI 重触发）、fixed 投递（D19 登记）。复位全
+  mask。
+- **机板接线（PC/AT 的真实拓扑）**：每条 ISA IRQ 线**同时**进 8259 与 IOAPIC
+  的针（`IrqBus`），由客户机的编程决定谁投递；INTR 是两者电平的或
+  （`UpdateIntr`）；INTA 先问 LAPIC（启用时），否则问 8259 —— 与 QEMU
+  `cpu_get_pic_interrupt` 的分流一致。
+- **IDE 建模修正（真 bug，被 xv6 逼出来）**：任务文件寄存器是**每通道一套**，
+  不是每盘一套（ATA/ATAPI-7 §7.10：主机接口只有一套寄存器，drive/head 的
+  bit4 只决定哪块盘执行下一条命令）。xv6、libata 的 `ata_tf_load`、SeaBIOS 的
+  `send_cmd` 都是"先写计数与 LBA、最后写 device/head 选盘"，按每盘建模就会把
+  命令交给从盘那份**空**寄存器 → 读到 LBA 0 → 全 0 数据（现象：超级块打印全 0）。
+  改后 cemu 打印的超级块与真 QEMU 逐字节一致。
+- **QEMU 对拍基线**：同一份 `xv6.img`/`fs.img` 在
+  `qemu-system-i386 -m 512 -nographic` 下：`sb: size 1000 nblocks 941 ninodes
+  200 nlog 30 logstart 2 inodestart 32 bmap start 58` → `init: starting sh` → `$ `。
+- **当前遗留（下一轮第一件事）**：xv6 走到**首个用户态陷阱返回**时 triple fault：
+  `trapret` 的 `iret`（0x8010585c）取指到 VA 5/7（initcode 的 `int $T_SYSCALL`
+  及其返回点）→ #PF(14) → 投递再失败。已排除：磁盘（超级块正确）、IOAPIC/LAPIC
+  投递（中断确实到达并唤醒了 iderw）、APIC 定时器（停掉后同样崩）。`pm_iret`
+  的无特权变化路径与帧弹出顺序看了是对的。下一步：先用 `watch` 定位 `allocproc`
+  写入的 `p->kstack` 值，再盯那页内核栈顶 76 字节的 trapframe，看 exec 改写
+  `tf->eip` 与 `iret` 读取的实际值（或把帧内容补进 trap 观测设施后回来登记）。
+- **回归**：`bash test/run.sh` → riscv64 136 passed / 0 failed、x86 9 passed /
+  0 failed；`bash tools/depcheck.sh` → ok。
+- **登记**：D19 增补"IOAPIC 只做 fixed 投递"。
 ## 阶段 4 片 2：IDE 落地，xv6 从盘上被引导、内核起跑到首个进程（2026-09-19）
+
 
 片 1 之后 POST 卡在“没有可引导设备”。本片把机器补到**有盘**，并用用户自己的
 xv6（`D:\xv6img\xv6.img` + `fs.img`，stock xv6-public）当验收件：

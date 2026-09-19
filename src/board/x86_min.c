@@ -6,6 +6,7 @@
 #include "device/input/i8042.h"
 #include "device/intc/i8259.h"
 #include "device/intc/lapic.h"
+#include "device/intc/ioapic.h"
 #include "device/misc/cmos.h"
 #include "device/misc/debug_exit.h"
 #include "device/misc/debugcon.h"
@@ -96,6 +97,14 @@ static const uint8_t kHostBridgeDev = 0;
 static const uint8_t kPiixDev = 1;
 static const uint8_t kPciBus0 = 0;
 
+// Every ISA IRQ wire in a PC/AT reaches two controllers — the 8259 pair and
+// the I/O APIC's pins 0..15 — and the guest's programming decides which one
+// delivers.
+typedef struct IrqBus {
+  PicDevice* pic;
+  IoapicDevice* ioapic;
+} IrqBus;
+
 typedef struct X86Board {
   Board base;
   Uart16550 uart;
@@ -110,8 +119,13 @@ typedef struct X86Board {
   CmosDevice cmos;
   PciBus pci;
   I440fxDevice fx;
+  IoapicDevice ioapic;
   Piix3BridgeDevice piix;
   IdeDevice ide;
+  // INTR is one line and either controller can assert it (UpdateIntr).
+  int pic_irq;
+  int lapic_irq;
+  IrqBus irqbus;  // the ISA IRQ fan-out: the 8259s on one side, the I/O APIC on the other
   uint8_t* rom;  // the -bios image, mapped in the ROM window (NULL = none)
   uint64_t rom_size;
 } X86Board;
@@ -177,23 +191,61 @@ static void RomAliasWrite(void* dev, uint64_t addr, int size, uint64_t val) {
 
 static const DeviceOps kRomAliasOps = {"bios-rom-alias", RomAliasRead, RomAliasWrite};
 
-// PIC -> CPU: the master's highest-priority deliverable IRQ asserts INTR.
-// The board talks to the CpuState hook, not to a CPU-model function, so this
-// board carries no ISA header at all.
-static void OnPicIrq(void* ctx, int line, int level) {
-  CpuState* cpu = (CpuState*)ctx;
-  (void)line;  // one INTR line; the vector is fetched on acknowledge
-  cpu->set_irq(cpu, 0, level);
+// The CPU's INTR line: either controller drives it — the PIC while the machine
+// runs on the 8259s (its firmware), the LAPIC once a guest enables the APIC —
+// and the board owns the combined level, the way a single INTR pin behaves.
+static void UpdateIntr(X86Board* xm) {
+  CpuState* cpu = &xm->base.cpu;
+  cpu->set_irq(cpu, 0, xm->pic_irq || xm->lapic_irq);
 }
 
-// INTA cycle: the CPU asks the PIC for the vector number of the pending IRQ.
-static int OnIntAck(void* ack_dev) { return PicAcknowledge((PicDevice*)ack_dev); }
+static void OnPicIrq(void* ctx, int line, int level) {
+  X86Board* xm = (X86Board*)ctx;
+  (void)line;  // one INTR line; the vector is fetched on acknowledge
+  xm->pic_irq = level;
+  UpdateIntr(xm);
+}
+
+static void OnLapicIrq(void* ctx, int line, int level) {
+  X86Board* xm = (X86Board*)ctx;
+  (void)line;
+  xm->lapic_irq = level;
+  UpdateIntr(xm);
+}
+
+// The I/O APIC hands a redirection entry's vector to the destination APIC: a
+// physical-mode destination names its ID, a logical-mode one names its
+// flat-model mask (SDM vol.3 11.5.3; 82093AA §3.2.4 destination format).
+static void OnIoapicDeliver(void* ctx, int dest, int logical, int vector) {
+  X86Board* xm = (X86Board*)ctx;
+  int match = logical ? (dest & LapicLogicalMask(&xm->lapic)) : (dest == LapicId(&xm->lapic));
+  if (match) LapicDeliver(&xm->lapic, vector);
+}
+
+// An end of interrupt retires the I/O APIC pin whose vector was in service.
+static void OnLapicEoi(void* ctx, int vector) {
+  X86Board* xm = (X86Board*)ctx;
+  IoapicEoi(&xm->ioapic, vector);
+}
+
+// INTA: the processor asks whichever controller asserted INTR. The LAPIC
+// answers first when a guest enabled it, and the 8259 answers otherwise —
+// QEMU's cpu_get_pic_interrupt splits it the same way.
+static int OnIntAck(void* ctx) {
+  X86Board* xm = (X86Board*)ctx;
+  int vec = LapicAcknowledge(&xm->lapic);
+  return vec >= 0 ? vec : PicAcknowledge(&xm->pic);
+}
 
 // An ISA device's interrupt line into the PIC: the PIT on IRQ0, the IDE
 // channels on the fixed IRQ 14/15 (the PIIX3's compatibility-mode wiring).
+// An ISA device's interrupt line: the PIT on IRQ0, the IDE channels on the
+// fixed IRQ 14/15 (the PIIX3's compatibility-mode wiring). The wire reaches
+// both controllers, so each of them can be the one that delivers.
 static void OnIsaIrq(void* ctx, int line, int level) {
-  PicDevice* pic = (PicDevice*)ctx;
-  PicSetIrq(pic, line, level);
+  IrqBus* b = (IrqBus*)ctx;
+  PicSetIrq(b->pic, line, level);
+  IoapicSetPin(b->ioapic, line, level);
 }
 
 // Chipset -> CPU: A20 is one line, driven by the keyboard controller's output
@@ -245,6 +297,9 @@ static void X86Poll(Board* m) {
   X86Board* xm = (X86Board*)m;
   PitPoll(&xm->pit);
   CgaPoll(&xm->cga);
+  // The APIC timer is the machine's clock: xv6 preempts on it, and its count
+  // is derived from the host clock rather than from steps.
+  LapicPoll(&xm->lapic);
 }
 
 Board* X86BoardCreate(const BoardOpts* opts) {
@@ -302,6 +357,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   PitInit(pit);
   FwCfgInit(fwcfg);
   LapicInit(lapic);
+  IoapicInit(&xm->ioapic);
   CgaInit(cga);
   I8042Init(kbd);
   Port92Init(p92);
@@ -337,19 +393,31 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   PciRegister(&m->io, &xm->pci);
   IdeRegister(&m->io, ide);
   LapicRegister(&m->bus, lapic);
+  IoapicRegister(&m->bus, &xm->ioapic);
   CgaRegister(&m->bus, &m->io, cga);
 
   // Wiring: PIT ch0 -> PIC IRQ0 -> CPU INTR; IDE channels -> PIC IRQ14/15;
   // INTA -> PicAcknowledge; the A20 gate comes from the keyboard controller and
   // port 0x92. The hooks live on CpuState (like timer_read/timer_dev), so the
   // machine can install them before the loader picks the ISA.
-  PicSetIrqSink(pic, OnPicIrq, &m->cpu);
-  PitSetIrqSink(pit, OnIsaIrq, pic);
-  IdeSetIrqSink(ide, OnIsaIrq, pic);
+  // Wiring, the way a PC/AT is wired: every ISA IRQ line reaches both
+  // controllers (the 8259 pair and the I/O APIC's pins), the LAPIC is the
+  // processor's own interrupt source, and the A20 gate comes from the keyboard
+  // controller and port 0x92. The hooks live on CpuState (like
+  // timer_read/timer_dev), so the machine installs them before the loader
+  // picks the ISA.
+  xm->irqbus.pic = pic;
+  xm->irqbus.ioapic = &xm->ioapic;
+  PicSetIrqSink(pic, OnPicIrq, xm);
+  LapicSetIrqSink(&xm->lapic, OnLapicIrq, xm);
+  LapicSetEoiSink(&xm->lapic, OnLapicEoi, xm);
+  PitSetIrqSink(pit, OnIsaIrq, &xm->irqbus);
+  IdeSetIrqSink(ide, OnIsaIrq, &xm->irqbus);
+  IoapicSetDeliverSink(&xm->ioapic, OnIoapicDeliver, xm);
   I8042SetA20Sink(kbd, OnA20, &m->cpu);
   Port92SetA20Sink(p92, OnA20, &m->cpu);
   m->cpu.int_ack = OnIntAck;
-  m->cpu.ack_dev = pic;
+  m->cpu.ack_dev = xm;
 
   m->cpu.halted = kCpuRunning;
   m->cpu.bus = &m->bus;
