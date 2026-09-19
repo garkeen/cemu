@@ -3,6 +3,42 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 1：PC 固件路线打通，SeaBIOS POST 完整跑完（2026-09-19）
+
+x86 侧按用户指定走 SeaBIOS 固件路线（riscv 走 opensbi、xv6 用 D:\xv6img 的
+i386 镜像验收），目标是让 xv6 在 cemu 里起来。本片先把 **POST 跑到底**：
+
+- **板级**：`-bios FILE` 引导 —— ROM 窗口 0xC0000 起 256KiB（SeaBIOS 自身
+  布局 BUILD_ROM_START..0xfffff，复位向量 F000:FFF0）+ 高别名 0xFFFC0000
+  （它的 shadow 拷贝源，BIOS_SRC_OFFSET）；镜像可选，无镜像时板子自报
+  `default_isa`。新设备 6 个：debugcon(0x402 POST 日志)、i8042(0x60/0x64 +
+  A20)、port92(0x92)、cmos RTC(0x70/0x71 + 内存量寄存器 0x30/0x31/0x34/0x35)、
+  pci 配置空间(0xcf8/0xcfc)、i440fx(8086:1237 + PAM 0x59-0x5F = ROM/RAM 切换)。
+- **观测设施两处补齐**（§九：缺口要补设施而不是加探针）：x86 端口 I/O 此前
+  不发 bus 事件（文档说 bus 覆盖“MMIO / IO 端口命中”）——补上；**异常在抛出
+  时就发 T 事件**（原先只在投递成功后发，所以 triple fault 时毫无线索；补上后
+  下面几个 bug 都是自己现形的）。
+- **解释器修掉的真 bug**（全部由 SeaBIOS 逼出，不是为跑通加分支）：① 16 位段
+  64K 回绕按“旧”CS 的 D 位判断，远跳进 32 位段被截断（`0xfc9e4`→`0xc9e4`）；
+  ② INS/OUTS(0x6c-0x6f) 整族缺失（fw_cfg 用 `rep insb`）；③ **POP r/m 的内存
+  目标地址必须在 ESP 自增之后计算**（SDM vol.2 POP）——修前 CPUID 检测序列
+  `pushf;pop [esp+0x20];mov eax,[esp+0x20]` 读到栈上残留指针，把垃圾值 popf 进
+  EFLAGS（TF=1）→ 单步 #DB → POST 早期 IDT limit=0 → triple fault；④ PCI 地址
+  寄存器按字节合并（使能位曾被移出 32 位）；⑤ PCI 数据窗口偏移要取地址寄存器
+  低字节（PAM 写曾落到 config[0..7]）；⑥ WBINVD/INVD(0f 08/09) 缺失 → #UD。
+  另登记 D18（复位设施与 RTC 中断缺口）。
+- **实测**（判据通道 = POST 日志/端口 0x402）：`RamSize: 0x02000000`、PMM
+  重定位、`Found 1 PCI devices` + `PCI: init bdf=00:00.0 id=8086:1237`、
+  PIR/MPTABLE/SMBIOS 拷贝、`Turning on vga text mode console`、e820 五项、
+  `enter handle_19` → “No bootable device”（缺 IDE/磁盘，下一片）。
+- **回归**：`bash test/run.sh` → riscv64 136 passed / 0 failed、x86 9 passed /
+  0 failed（上述语义改动没动既有基线）；`bash tools/depcheck.sh` → ok。
+  注：`cmake --build build --target check` 在 cmd/PowerShell 下会调到 PATH 上的
+  WSL bash 而报 127（WSL 不认 `D:/...` 路径，是文档记过的坑），从 Git Bash 跑或
+  直接 `bash tools/depcheck.sh` 即可。
+- **下一片**：IDE(PIIX PATA) + `-hda/-hdb` 挂 xv6.img/fs.img → SeaBIOS int13h 读
+  引导扇区 → xv6 kernel 输出到 CGA；随后 PS/2 键盘供 shell 使用。
+
 ## cemugui 回归最简形态：原生控件 + 自适应布局（2026-09-13，用户裁决）
 
 暗色主题轮（2aa14f7）被用户否决（要白主题；自定义绘制层连出三层
@@ -695,6 +731,8 @@ gp）；位段类 bug 用 llvm-objdump 对照 cemu trace 的 raw/dnpc 即可裁�
   122/122 + kvm taskswitch/taskswitch2/cmpxchg8b/memory/debug；debug 为
   32 位移植件，QEMU 对拍 8/8 见片 1d 节；套件尾部 fninit #UD 死循环由
   D13 登记容纳，run.sh 的 timeout 判据容纳）
+- 回归基线（2026-09-19，阶段 4 片 1 后实测）：riscv64 **136 passed / 0 failed**、
+  x86 **9 passed / 0 failed**；依赖边 `bash tools/depcheck.sh` → ok。
 - debug：`CEMU_DEBUG=...`（见 AGENTS.md 第十节），例
   `CEMU_DEBUG="trace:table,state,mem,budget=200" build/cemu.exe --machine x86 --isa x86 test/x86/realmode/realmode.elf`
 
