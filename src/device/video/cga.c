@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "host/host.h"
+#include "debug/debug.h"
 
 // IBM CGA (阶段 3.5 片 2). Register semantics: IBM CGA Technical Reference
 // and the MC6845 CRTC datasheet; rendering shapes follow the same text-mode
@@ -171,6 +172,35 @@ static void RenderCells(CgaDevice* d, uint64_t now) {
   }
 }
 
+// The guest prints by writing VRAM; a guest whose console never touches the
+// serial port (Linux 0.11) can then only be read back through the screen. The
+// mirror diffs the character plane each render and emits the rows that changed
+// (CEMU_DEBUG item `screen`, AGENTS.md §X) — the 80x25 text mode this machine
+// runs, with the attribute byte skipped.
+static char g_screen_mirror[25][81];
+
+static void ScreenMirror(CgaDevice* d) {
+  if (!DebugOn(kDbgScreen)) return;
+  static int once;
+  if (!once) {
+    once = 1;
+    DebugText("screen-run", "mirror reached");
+    DebugMark("vram", d->vram[0] | (d->vram[1] << 8), d->vram[2] | (d->vram[3] << 8));
+  }
+  for (int row = 0; row < 25; row++) {
+    char line[81];
+    for (int col = 0; col < 80; col++) {
+      uint8_t ch = d->vram[(row * 80 + col) * 2];
+      line[col] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : ' ';
+    }
+    line[80] = 0;
+    int len = 80;
+    while (len > 0 && line[len - 1] == ' ') line[--len] = 0;
+    if (strcmp(g_screen_mirror[row], line) == 0) continue;
+    strcpy(g_screen_mirror[row], line);
+    DebugText("screen", line);
+  }
+}
 static void CgaRender(CgaDevice* d, uint64_t now) {
   // Graphics modes are not rendered yet (AGENTS.md D17) and a disabled video
   // pipeline paints the (unmodeled) overscan black; both show black here.
@@ -180,6 +210,7 @@ static void CgaRender(CgaDevice* d, uint64_t now) {
     RenderCells(d, now);
   }
   d->version++;
+  ScreenMirror(d);
   d->dirty = 0;
 }
 

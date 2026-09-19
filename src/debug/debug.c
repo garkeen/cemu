@@ -130,6 +130,8 @@ void DebugInit(void) {
       g_mask |= kDbgGdb;
     else if (!strcmp(tok, "mark"))
       g_mask |= kDbgMark;
+    else if (!strcmp(tok, "screen"))
+      g_mask |= kDbgScreen;
     else if (!strncmp(tok, "regs=", 5))
       g_regs_period = atoi(tok + 5);
     else if (!strncmp(tok, "watch=", 6))
@@ -143,7 +145,8 @@ void DebugInit(void) {
     else
       LogError("debug: unknown CEMU_DEBUG item '%s'", tok);
   }
-  if (g_mask & (kDbgTraceTable | kDbgMem | kDbgTrap | kDbgBus | kDbgGdb | kDbgMark) ||
+  if (g_mask &
+          (kDbgTraceTable | kDbgMem | kDbgTrap | kDbgBus | kDbgGdb | kDbgMark | kDbgScreen) ||
       g_nwatch) {
     g_tbl = TableOpen(kEventCols, 6, g_ascii, g_header_every);
     TableHeader(g_tbl);
@@ -394,6 +397,18 @@ void DebugMark(const char* what, int a, int b) {
   RowBeginBare(g_tbl, 'K');
   char det[80];
   snprintf(det, sizeof(det), "%s a=%d b=%d", what, a, b);
+  TableRowCell(g_tbl, det);
+  TableRowEnd(g_tbl);
+}
+
+// Frameless text row (kDbgScreen): a guest console line read back from the
+// video device. Linux prints only to VRAM (its `console=` came later), so the
+// text mirror is the only way to read its console without a display window.
+void DebugText(const char* kind, const char* text) {
+  if (!DebugOn(kDbgScreen) || !Allow(kDbgScreen)) return;
+  RowBeginBare(g_tbl, 'V');
+  char det[120];
+  snprintf(det, sizeof(det), "%s %.100s", kind, text);
   TableRowCell(g_tbl, det);
   TableRowEnd(g_tbl);
 }

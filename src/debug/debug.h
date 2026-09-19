@@ -22,7 +22,8 @@ enum {
   kDbgRegs = 1 << 7,        // periodic full register table
   kDbgGdb = 1 << 8,         // gdb stub protocol packets (tx/rx)
   kDbgMark = 1 << 9,        // frameless notes: irq lines, host input
-  kDbgAny = 0x3ff,
+  kDbgScreen = 1 << 10,     // text-screen mirror rows (console with no serial)
+  kDbgAny = 0x7ff,
 };
 
 int DebugOn(uint32_t cat);
@@ -59,6 +60,10 @@ void DebugGdbNote(const char* note);
 // interrupt-line transitions, host input — have no instruction frame to report.
 // a/b are the two numbers the call site wants in the detail cell.
 void DebugMark(const char* what, int a, int b);
+
+// Frameless text row (kDbgScreen): the guest console as read back from the
+// video device, for guests that print only to VRAM.
+void DebugText(const char* kind, const char* text);
 
 // True when a watchpoint matches (funnels ask before doing the access so
 // the row prints even when the access itself faults).

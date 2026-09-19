@@ -3,6 +3,37 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 8：验收 2 起步 —— 取镜像、补 VGA 文本回读设施、定位 Linux 0.11 引导码（2026-09-19）
+
+**镜像**：`build/linux/` 下有两份（用户自取）：`linux.iso`（5.4MB，El Torito 光盘 ✓ 走 ISO
+路线）与 `linux-0.11-devel-040329.zip`（oldlinux 的 0.11 开发套件；`bootimage-0.11-hd` +
+`hdc-0.11.img` 根文件系统 + Bochs 配置 ✓）。
+
+**新观测设施 `screen`**（AGENTS.md §十）：CGA 字符平面逐行 diff，变化的行以 `V` 行打出。
+Linux 0.11 这类客机的控制台只写 VRAM（`console=` 是后来的东西），没有它就只能靠肉眼看
+窗口。实现：`cga.c` 的 `ScreenMirror`（渲染路径上，80×25 字符面 + 属性字节跳过）+ 
+`DebugText`。用它做的 A/B：xv6 全程 VRAM 全 0（一行 V 行都没有 ⇒ 这台机器上没人写过
+VGA 文本；待查是否与用户那版 xv6 的控制台改法有关），而设施本身工作正常（自报
+`screen-run` ✓ + watch 金丝雀命中 BDA ✓）。**结论不变：Linux 0.11 的输出一定能被它读到**
+（0.11 只有 VGA 控制台）。
+
+**Linux 0.11 引导失败的真实原因**（逐步用设施定案，不是推理）：
+1. SeaBIOS 从 hda 引导 ✗ 只提示一次 "Booting from Hard Disk..." 便转去试**软驱**；
+2. 用 `-hdb bootimage-0.11-hd`（补丁 DL=0x81）⇒ SeaBIOS 根本不试第二块盘；
+3. 合成单盘（扇区 0 = 补丁引导码 + 合成分区表指向 LBA1024、LBA1-237 = 内核、
+   LBA1024 起 = 根文件系统）⇒ 引导码**执行了**（watch 0x90000 看到它 `rep movsw` 自我
+   重定位 512 字节到 0x90000）、内核也读进去了，但随后在 **0x78-0x8d 死循环**：
+   它读 `int 13h AH=8` 报的每道扇区数，**只接受 15 或 18**（软盘几何），我这块盘是
+   63 扇区/道 ⇒ 直接 `jmp 0x8d` 自旋。反汇编 `bootimage-0.11`/`-fd`/`-hd` 三个变体
+   全都带这个检查；`bootimage-0.12-hd` 同样把 DL 写死为 0（软驱）。
+4. ⇒ 这套 0.11/0.12 的"hd"名字指**根文件系统在硬盘**，引导码本身是**软盘引导**
+   （Bochs 配置就是 `floppya=bootimage-0.11-hd`）。cemu 无 FDC、无 8237 DMA ⇒ 登记
+   **D21**（软盘与 DMA 通路缺失），Linux 阶梯不走这条路。
+
+**下一步（验收 2 主线）**：走 **ISO 路线** —— 给 PIIX IDE 补 **ATAPI**（0xA1 IDENTIFY、
+0xA0 PACKET + CDB：READ(12)/TEST UNIT READY/REQUEST SENSE/READ CAPACITY/INQUIRY、
+2048 字节块），SeaBIOS 的 El Torito 引导路径即可工作，随后用 `linux.iso` 打第一发；
+Linux 的控制台输出由新的 `screen` 设施读回。这也顺带销掉 D19 里"无 ATAPI"那条。
 ## 阶段 4 片 6/7：宿主输入源 + mark 观测类目；键盘端到端打通（2026-09-19）
 
 **片 6**：`src/host/input_win.c` —— stdin（控制台或管道）→ 美式布局 set-1 扫描码
