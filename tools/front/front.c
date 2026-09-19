@@ -6,9 +6,11 @@
 //
 // Presentation: the simplest form that works — native controls with system
 // colors (nothing custom-painted, so nothing can garble) and an ADAPTIVE
-// layout: every zone is derived from the client rectangle by one
-// ComputeLayout() that Relayout uses; control sizes scale with the monitor
-// DPI and the initial window size scales with it too.
+// layout: ComputeLayout() turns the client rectangle into every control
+// rectangle plus the window's own minimum size, and Relayout() applies that as
+// one atomic reflow (WS_CLIPCHILDREN + SWP_NOCOPYBITS + a single RedrawWindow
+// over parent and children). Metrics scale with the monitor DPI, and
+// WM_DPICHANGED adopts the size Windows hands over.
 //
 // Single-threaded, the same shape as the display window: a 100ms timer polls
 // the socket while the guest runs (stop replies only arrive then); everything
@@ -73,6 +75,23 @@ static HWND g_cap_regs, g_cap_mem, g_cap_bp;  // pane captions (real controls:
 static HFONT g_ui, g_mono;
 static UINT g_dpi = 96;
 
+// ---- geometry slots ----------------------------------------------------------------
+// One slot per control: ComputeLayout() writes a rect per slot and Relayout() applies
+// them in one loop, so no control's rectangle is computed anywhere else.
+enum {
+  ctl_host, ctl_connect, ctl_detach, ctl_run, ctl_step, ctl_stop, ctl_status,
+  ctl_cap_regs, ctl_cap_mem, ctl_cap_bp, ctl_regs,
+  ctl_memaddr, ctl_goto, ctl_follow, ctl_mem,
+  ctl_bplabel, ctl_bpaddr, ctl_bpadd, ctl_bpremove, ctl_bplist, ctl_hint,
+  kCtlCount
+};
+
+static HWND* const g_ctl[kCtlCount] = {  // order must match the enum above
+    &g_host,     &g_connect, &g_detach, &g_run,      &g_step,    &g_stop,     &g_status,
+    &g_cap_regs, &g_cap_mem, &g_cap_bp, &g_regs,     &g_memaddr, &g_goto,     &g_follow,
+    &g_mem,      &g_bplabel, &g_bpaddr, &g_bpadd,    &g_bpremove, &g_bplist,  &g_hint,
+};
+
 static void RefreshRegs(void);
 static void RefreshMem(void);
 static void ShowStopReply(const char* pkt);
@@ -118,10 +137,6 @@ static void UpdateButtons(void) {
   EnableWindow(g_bpaddr, g_state == ST_STOPPED);
   EnableWindow(g_bpadd, g_state == ST_STOPPED);
   EnableWindow(g_bpremove, g_state == ST_STOPPED);
-  // owner-drawn buttons repaint only on demand
-  HWND btns[] = {g_connect, g_detach, g_run, g_step, g_stop, g_goto, g_follow,
-                 g_bpadd, g_bpremove};
-  for (size_t i = 0; i < sizeof(btns) / sizeof(btns[0]); i++) InvalidateRect(btns[i], NULL, FALSE);
 }
 
 // The connection went away (or a request failed on it).
@@ -338,115 +353,184 @@ static void DoBpRemove(void) {
 }
 
 // ---- adaptive layout ----------------------------------------------------------------
-// One ComputeLayout() derives every zone from the client rectangle; Relayout
-// positions the controls inside those zones and the pane painter frames the
-// same rects — the two can never disagree. All zone sizes are proportional
-// with sane clamps, so any window size and any DPI scale produce a valid
-// arrangement.
+// ComputeLayout() is the single source of every control rectangle: the client size goes
+// in, all kCtlCount rects come out, plus the smallest client size this arrangement can
+// be applied to. Relayout() only applies the result, so geometry can never disagree with
+// itself — the old split (three pane rects here, hardcoded pixel advances there) is what
+// let two controls end up drawn over each other. Zone sizes are proportional with
+// clamps, so any size at or above the minimum, at any DPI, produces a valid arrangement.
+
+enum {
+  kMargin = 10,
+  kGap = 8,
+  kRowH = 26,         // edit boxes
+  kBtnH = 28,         // buttons
+  kCapH = 18,         // pane captions
+  kLblH = 20,         // small labels
+  kRegsMinW = 260,    // registers column: floor and ceiling
+  kRegsMaxW = 430,
+  kBpMinW = 430,      // breakpoints pane: floor and ceiling
+  kBpMaxW = 700,
+  kBottomMinH = 120,  // bottom strip: floor and ceiling
+  kBottomMaxH = 220,
+  kMemStripW = 344,   // addr edit + Goto + Follow PC + margins (memory pane's own floor)
+  kHintMinW = 200,
+  kPaneMinH = 206,    // caption band + a usable register/memory list
+  kStatusMinW = 60,
+  kRegsFracPct = 30,  // share of the width before clamping
+  kBpFracPct = 48,
+  kBottomFracPct = 24,
+  kInitW = 1160,      // initial window size, scaled by S() at creation
+  kInitH = 720,
+};
 
 typedef struct {
-  RECT regs, mem, bp;  // pane frames (captions live in the top band)
-  int row_y;           // toolbar baseline
-  int ctl_h, btn_h;
+  int need_cw, need_ch;  // smallest client rect this layout can be applied to
 } Layout;
 
-static void ComputeLayout(int cw, int ch, Layout* L) {
-  const int m = S(10), gap = S(8);
-  L->ctl_h = S(26);
-  L->btn_h = S(28);
-  L->row_y = m;
-
-  int pane_y = m + L->btn_h + S(10);
-  int bottom_h = Clamp((ch - pane_y) * 24 / 100, S(120), S(220));
-  int pane_h = ch - pane_y - bottom_h - m;
-  int left_w = Clamp((cw - 2 * m - gap) * 30 / 100, S(260), S(430));
-  int mem_x = m + left_w + gap;
-  int by = ch - bottom_h;
-  int bp_w = Clamp((cw - 2 * m - gap) * 48 / 100, S(430), S(700));
-
-  L->regs = (RECT){m, pane_y, m + left_w, pane_y + pane_h};
-  L->mem = (RECT){mem_x, pane_y, cw - m, pane_y + pane_h};
-  L->bp = (RECT){m, by, m + bp_w, by + bottom_h - m};
+static void SlotRect(RECT* r, int x, int y, int w, int h) {
+  r->left = x;
+  r->top = y;
+  r->right = x + (w > 0 ? w : 1);
+  r->bottom = y + (h > 0 ? h : 1);
 }
 
-static void Place(HWND h, int x, int y, int w, int h_) {
-  SetWindowPos(h, NULL, x, y, w, h_, SWP_NOZORDER);
+// Toolbar: one left-to-right flow; returns the x where the status label starts.
+static int ToolbarFlow(RECT out[kCtlCount]) {
+  static const int kBox[][3] = {  // ctl, width, height (96-dpi units)
+      {ctl_host, 150, kRowH}, {ctl_connect, 80, kBtnH}, {ctl_detach, 80, kBtnH},
+      {ctl_run, 84, kBtnH},   {ctl_step, 84, kBtnH},    {ctl_stop, 96, kBtnH},
+  };
+  int x = S(kMargin);
+  for (size_t i = 0; i < sizeof(kBox) / sizeof(kBox[0]); i++) {
+    int w = S(kBox[i][1]);
+    if (out) SlotRect(&out[kBox[i][0]], x, S(kMargin), w, S(kBox[i][2]));
+    x += w + S(kGap);
+  }
+  return x;
+}
+
+static void ComputeLayout(int cw, int ch, RECT out[kCtlCount], Layout* meta) {
+  const int m = S(kMargin), gap = S(kGap);
+  const int pane_y = m + S(kBtnH) + S(10);
+
+  // The layout states its own minimum (no separate magic minimum size): toolbar plus a
+  // usable status label, the widest fixed control strip of each pane, and the bottom
+  // strip's floor.
+  int tb_min = ToolbarFlow(NULL) + S(kStatusMinW) + m;
+  int mem_min = m + S(kRegsMinW) + gap + S(kMemStripW) + m;
+  int bp_min = m + S(kBpMinW) + gap + S(kHintMinW) + m;
+  meta->need_cw = tb_min > mem_min ? (tb_min > bp_min ? tb_min : bp_min)
+                                   : (mem_min > bp_min ? mem_min : bp_min);
+  meta->need_ch = pane_y + S(kPaneMinH) + S(kBottomMinH) + m;
+  if (!out) return;
+
+  int x = ToolbarFlow(out);
+  SlotRect(&out[ctl_status], x, m + S(5),
+           cw - x - m > S(kStatusMinW) ? cw - x - m : S(kStatusMinW), S(kLblH));
+
+  int bottom_h = Clamp((ch - pane_y) * kBottomFracPct / 100, S(kBottomMinH), S(kBottomMaxH));
+  int pane_h = ch - pane_y - bottom_h - m;
+  int left_w = Clamp((cw - 2 * m - gap) * kRegsFracPct / 100, S(kRegsMinW), S(kRegsMaxW));
+  RECT regs, mem, bp;
+  SlotRect(&regs, m, pane_y, left_w, pane_h);
+  SlotRect(&mem, m + left_w + gap, pane_y, cw - m - (m + left_w + gap), pane_h);
+  int by = ch - bottom_h;
+  int bp_w = Clamp((cw - 2 * m - gap) * kBpFracPct / 100, S(kBpMinW), S(kBpMaxW));
+  SlotRect(&bp, m, by, bp_w, bottom_h - m);
+
+  // pane interiors; the captions sit in each pane's top band
+  int regs_w = regs.right - regs.left, regs_h = regs.bottom - regs.top;
+  SlotRect(&out[ctl_cap_regs], regs.left + S(10), regs.top + S(4), regs_w - S(20), S(kCapH));
+  SlotRect(&out[ctl_regs], regs.left + S(10), regs.top + S(26), regs_w - S(20), regs_h - S(36));
+
+  int mem_x = mem.left, mem_w = mem.right - mem.left, mem_h = mem.bottom - mem.top;
+  SlotRect(&out[ctl_cap_mem], mem_x + S(10), mem.top + S(4), mem_w - S(20), S(kCapH));
+  SlotRect(&out[ctl_memaddr], mem_x + S(10), mem.top + S(24), S(160), S(kRowH));
+  SlotRect(&out[ctl_goto], mem_x + S(178), mem.top + S(23), S(56), S(kBtnH));
+  SlotRect(&out[ctl_follow], mem_x + S(242), mem.top + S(23), S(92), S(kBtnH));
+  SlotRect(&out[ctl_mem], mem_x + S(10), mem.top + S(58), mem_w - S(20), mem_h - S(68));
+
+  int bp_wide = bp.right - bp.left;
+  SlotRect(&out[ctl_cap_bp], bp.left + S(10), bp.top + S(4), bp_wide - S(20), S(kCapH));
+  SlotRect(&out[ctl_bplabel], bp.left + S(10), by + S(28), S(40), S(kLblH));
+  SlotRect(&out[ctl_bpaddr], bp.left + S(56), by + S(24), S(140), S(kRowH));
+  SlotRect(&out[ctl_bpadd], bp.left + S(204), by + S(23), S(80), S(kBtnH));
+  SlotRect(&out[ctl_bpremove], bp.left + S(292), by + S(23), S(100), S(kBtnH));
+  SlotRect(&out[ctl_bplist], bp.left + S(10), by + S(58), bp_wide - S(20),
+           bp.bottom - by - S(66));
+
+  // The hint starts right of BOTH bottom-row panes: the breakpoints pane can be wider
+  // than the registers column, so anchoring it to the memory pane's left edge let the
+  // two controls overlap and double-paint.
+  int hint_x = (bp.right > mem.left ? bp.right : mem.left) + gap;
+  SlotRect(&out[ctl_hint], hint_x, by + S(12), cw - hint_x - m, S(56));
 }
 
 static void Relayout(void) {
+  if (!g_wnd) return;
   RECT rc;
   GetClientRect(g_wnd, &rc);
-  int cw = rc.right, ch = rc.bottom;
-  Layout L;
-  ComputeLayout(cw, ch, &L);
-  const int m = S(10), gap = S(8);
-  const int mem_x = L.mem.left;
-  const int by = L.bp.top;
+  RECT r[kCtlCount];
+  Layout meta;
+  ComputeLayout(rc.right, rc.bottom, r, &meta);
 
-  // toolbar: flow left to right, then give the status label the remainder
-  int x = m;
-  Place(g_host, x, L.row_y, S(150), L.ctl_h); x += S(158);
-  Place(g_connect, x, L.row_y, S(80), L.btn_h); x += S(88);
-  Place(g_detach, x, L.row_y, S(80), L.btn_h); x += S(88) + gap;
-  Place(g_run, x, L.row_y, S(84), L.btn_h); x += S(92);
-  Place(g_step, x, L.row_y, S(84), L.btn_h); x += S(92);
-  Place(g_stop, x, L.row_y, S(96), L.btn_h); x += S(104);
-  Place(g_status, x, L.row_y + S(5), cw - x - m > S(60) ? cw - x - m : S(60), S(20));
+  // The register columns follow the pane (fixed column widths went stale on DPI change)
+  if (g_regs) {
+    int w = r[ctl_regs].right - r[ctl_regs].left;
+    int c0 = w * 45 / 100;
+    ListView_SetColumnWidth(g_regs, 0, c0);
+    ListView_SetColumnWidth(g_regs, 1, w - c0 - S(4));
+  }
 
-  // pane captions sit in each pane's top band
-  Place(g_cap_regs, L.regs.left + S(10), L.regs.top + S(4), S(200), S(18));
-  Place(g_cap_mem, L.mem.left + S(10), L.mem.top + S(4), S(200), S(18));
-  Place(g_cap_bp, L.bp.left + S(10), L.bp.top + S(4), S(200), S(18));
-
-  // registers pane
-  Place(g_regs, L.regs.left + S(10), L.regs.top + S(26), L.regs.right - L.regs.left - S(20),
-        L.regs.bottom - L.regs.top - S(36));
-
-  // memory pane
-  Place(g_memaddr, mem_x + S(10), L.mem.top + S(24), S(160), L.ctl_h);
-  Place(g_goto, mem_x + S(178), L.mem.top + S(23), S(56), L.btn_h);
-  Place(g_follow, mem_x + S(242), L.mem.top + S(23), S(92), L.btn_h);
-  Place(g_mem, mem_x + S(10), L.mem.top + S(58), L.mem.right - mem_x - S(20),
-        L.mem.bottom - L.mem.top - S(68));
-
-  // breakpoints strip + hint
-  Place(g_bplabel, L.bp.left + S(10), by + S(28), S(40), S(20));
-  Place(g_bpaddr, L.bp.left + S(56), by + S(24), S(140), L.ctl_h);
-  Place(g_bpadd, L.bp.left + S(204), by + S(23), S(80), L.btn_h);
-  Place(g_bpremove, L.bp.left + S(292), by + S(23), S(100), L.btn_h);
-  Place(g_bplist, L.bp.left + S(10), by + S(58), L.bp.right - L.bp.left - S(20),
-        L.bp.bottom - by - S(66));
-  // the hint starts right of BOTH bottom-row panes: the breakpoints pane
-  // can be wider than the registers column, so anchoring the hint to the
-  // memory pane's left edge let the two controls overlap and double-paint.
-  int hint_x = (L.bp.right > L.mem.left ? L.bp.right : L.mem.left) + gap;
-  Place(g_hint, hint_x, by + S(12), cw - hint_x - m, S(56));
+  // One atomic reflow: the batch carries SWP_NOCOPYBITS so the system never shifts stale
+  // pixels around, redraw is frozen across the batch, and a single RedrawWindow restores
+  // parent and children afterwards. A bare SetWindowPos per control — no clip, no
+  // no-copy-bits, no erase — is exactly what smeared shadows around the window.
+  SendMessageA(g_wnd, WM_SETREDRAW, FALSE, 0);
+  HDWP h = BeginDeferWindowPos(kCtlCount);
+  for (int i = 0; i < kCtlCount && h; i++) {
+    HWND c = *g_ctl[i];
+    if (!c) continue;
+    h = DeferWindowPos(h, c, NULL, r[i].left, r[i].top, r[i].right - r[i].left,
+                       r[i].bottom - r[i].top,
+                       SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+  }
+  if (h) EndDeferWindowPos(h);
+  SendMessageA(g_wnd, WM_SETREDRAW, TRUE, 0);
+  RedrawWindow(g_wnd, NULL, NULL,
+               RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 
 // ---- window plumbing ---------------------------------------------------------------
 
-static HWND MakeEdit(int id, int x, int y, int w, DWORD style) {
-  HWND h = CreateWindowA("EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | style, x, y, w, S(26),
+// WS_CLIPCHILDREN is the first half of the reflow contract: the parent's background
+// erase must never touch a child's pixels (that is what left stale patches behind).
+// The second half lives in Relayout(): the deferred batch carries SWP_NOCOPYBITS and
+// the reflow ends with one RedrawWindow covering parent and children.
+static const DWORD kWindowStyle = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+
+// Controls are created at (0,0,0,0) with no geometry of their own; Relayout() is the
+// only thing that ever gives them a rectangle.
+static HWND MakeEdit(int id, DWORD style) {
+  HWND h = CreateWindowA("EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | style, 0, 0, 0, 0,
                          g_wnd, (HMENU)(INT_PTR)id, NULL, NULL);
   SendMessageA(h, WM_SETFONT, (WPARAM)g_mono, TRUE);
   return h;
 }
 
-static HWND MakeLabelStyle(const char* text, int x, int y, int w, DWORD style) {
-  HWND h = CreateWindowA("STATIC", text, WS_CHILD | WS_VISIBLE | style, x, y, w, S(20), g_wnd,
+static HWND MakeLabelStyle(const char* text, DWORD style) {
+  HWND h = CreateWindowA("STATIC", text, WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0, g_wnd,
                          NULL, NULL, NULL);
   SendMessageA(h, WM_SETFONT, (WPARAM)g_ui, TRUE);
   return h;
 }
 
-static HWND MakeLabel(const char* text, int x, int y, int w) {
-  return MakeLabelStyle(text, x, y, w, 0);
-}
+static HWND MakeLabel(const char* text) { return MakeLabelStyle(text, 0); }
 
-static HWND MakeBtnBase(const char* text, int id) {
-  HWND h = CreateWindowA("BUTTON", text,
-                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, g_wnd,
-                         (HMENU)(INT_PTR)id, NULL, NULL);
+static HWND MakeBtn(const char* text, int id) {
+  HWND h = CreateWindowA("BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                         0, 0, 0, 0, g_wnd, (HMENU)(INT_PTR)id, NULL, NULL);
   SendMessageA(h, WM_SETFONT, (WPARAM)g_ui, TRUE);
   return h;
 }
@@ -477,17 +561,17 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
       g_wnd = wnd;
       MakeFonts();
-      g_host = MakeEdit(IDC_HOST, 0, 0, 0, ES_AUTOHSCROLL);
+      g_host = MakeEdit(IDC_HOST, ES_AUTOHSCROLL);
       SetWindowTextA(g_host, "127.0.0.1:1234");
-      g_connect = MakeBtnBase("Connect", IDC_CONNECT);
-      g_detach = MakeBtnBase("Detach", IDC_DETACH);
-      g_run = MakeBtnBase("Run (F5)", IDC_RUN);
-      g_step = MakeBtnBase("Step (F10)", IDC_STEP);
-      g_stop = MakeBtnBase("Interrupt", IDC_STOP);
-      g_cap_regs = MakeLabelStyle("REGISTERS", 0, 0, 0, 0);
-      g_cap_mem = MakeLabelStyle("MEMORY", 0, 0, 0, 0);
-      g_cap_bp = MakeLabelStyle("BREAKPOINTS", 0, 0, 0, 0);
-      g_status = MakeLabelStyle("disconnected", 0, 0, 0, SS_RIGHT);
+      g_connect = MakeBtn("Connect", IDC_CONNECT);
+      g_detach = MakeBtn("Detach", IDC_DETACH);
+      g_run = MakeBtn("Run (F5)", IDC_RUN);
+      g_step = MakeBtn("Step (F10)", IDC_STEP);
+      g_stop = MakeBtn("Interrupt", IDC_STOP);
+      g_cap_regs = MakeLabelStyle("REGISTERS", 0);
+      g_cap_mem = MakeLabelStyle("MEMORY", 0);
+      g_cap_bp = MakeLabelStyle("BREAKPOINTS", 0);
+      g_status = MakeLabelStyle("disconnected", SS_RIGHT);
       g_regs = CreateWindowExA(0, WC_LISTVIEWA, "",
                                WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT |
                                    LVS_SINGLESEL | LVS_SHOWSELALWAYS,
@@ -497,31 +581,31 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
       ListView_SetBkColor(g_regs, kColPanelBg);
       ListView_SetTextBkColor(g_regs, kColPanelBg);
       ListView_SetTextColor(g_regs, kColText);
+      // The column widths are derived from the pane rect on every Relayout(), so they
+      // follow the pane and the DPI instead of being frozen at creation time.
       LVCOLUMNA col;
       memset(&col, 0, sizeof(col));
       col.mask = LVCF_TEXT | LVCF_WIDTH;
       col.pszText = "register";
-      col.cx = S(120);
       ListView_InsertColumn(g_regs, 0, &col);
       col.pszText = "value";
-      col.cx = S(150);
       ListView_InsertColumn(g_regs, 1, &col);
-      g_memaddr = MakeEdit(IDC_MEMADDR, 0, 0, 0, ES_AUTOHSCROLL);
-      g_goto = MakeBtnBase("Goto", IDC_GOTO);
-      g_follow = MakeBtnBase("Follow PC", IDC_FOLLOW);
-      g_mem = MakeEdit(IDC_MEM, 0, 0, 0,
-                       ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL);
-      g_bplabel = MakeLabel("addr:", 0, 0, 0);
-      g_bpaddr = MakeEdit(IDC_BPADDR, 0, 0, 0, ES_AUTOHSCROLL);
-      g_bpadd = MakeBtnBase("Add (Z0)", IDC_BPADD);
-      g_bpremove = MakeBtnBase("Remove (z0)", IDC_BPREMOVE);
+      g_memaddr = MakeEdit(IDC_MEMADDR, ES_AUTOHSCROLL);
+      g_goto = MakeBtn("Goto", IDC_GOTO);
+      g_follow = MakeBtn("Follow PC", IDC_FOLLOW);
+      g_mem = MakeEdit(IDC_MEM, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL);
+      g_bplabel = MakeLabel("addr:");
+      g_bpaddr = MakeEdit(IDC_BPADDR, ES_AUTOHSCROLL);
+      g_bpadd = MakeBtn("Add (Z0)", IDC_BPADD);
+      g_bpremove = MakeBtn("Remove (z0)", IDC_BPREMOVE);
       g_bplist = CreateWindowA("LISTBOX", "",
                                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL |
                                    LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
                                0, 0, 0, 0, wnd, (HMENU)(INT_PTR)IDC_BPLIST, NULL, NULL);
       SendMessageA(g_bplist, WM_SETFONT, (WPARAM)g_mono, TRUE);
       g_hint = MakeLabelStyle("no disassembler by design - decode with external\r\n"
-                              "tools (llvm-objdump, or gdb on the same stub)", 0, 0, 0, 0);
+                              "tools (llvm-objdump, or gdb on the same stub)",
+                              0);
       SetTimer(wnd, 1, 100, NULL);
       ApplyDpi(wnd);
       UpdateButtons();
@@ -530,9 +614,15 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
       Relayout();
       return 0;
-    case WM_DPICHANGED:
-      ApplyDpi(wnd);
+    case WM_DPICHANGED: {
+      // Windows hands over the size this window must have at the new DPI; ignoring it
+      // left the old physical size while S() scaled every metric (controls overflowed).
+      const RECT* sug = (const RECT*)lp;
+      SetWindowPos(wnd, NULL, sug->left, sug->top, sug->right - sug->left,
+                   sug->bottom - sug->top, SWP_NOZORDER | SWP_NOACTIVATE);
+      ApplyDpi(wnd);  // rebuild the fonts for the new DPI, then Relayout()
       return 0;
+    }
     case WM_TIMER:
       if (g_state == ST_RUNNING && g_rsp) {
         char pkt[64];
@@ -569,9 +659,15 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     }
     case WM_GETMINMAXINFO: {
+      // The layout states its own minimum client size (no second magic number), and
+      // ptMinTrackSize counts the frame, so fold it in.
       MINMAXINFO* mmi = (MINMAXINFO*)lp;
-      mmi->ptMinTrackSize.x = S(900);
-      mmi->ptMinTrackSize.y = S(560);
+      Layout meta;
+      ComputeLayout(0, 0, NULL, &meta);
+      RECT rc = {0, 0, meta.need_cw, meta.need_ch};
+      AdjustWindowRect(&rc, kWindowStyle, FALSE);
+      mmi->ptMinTrackSize.x = rc.right - rc.left;
+      mmi->ptMinTrackSize.y = rc.bottom - rc.top;
       return 0;
     }
     case WM_DESTROY:
@@ -622,7 +718,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
 
   HWND wnd = CreateWindowA(
       "cemugui", "cemugui - cemu debug front (no disassembler: use llvm-objdump / gdb)",
-      WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, S(1160), S(720), NULL, NULL, inst,
+      kWindowStyle, CW_USEDEFAULT, CW_USEDEFAULT, S(kInitW), S(kInitH), NULL, NULL, inst,
       NULL);
   (void)wnd;
   ShowWindow(wnd, show);

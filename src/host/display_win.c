@@ -1,8 +1,9 @@
 // Win32 GDI display backend (阶段 3.5 片 2, host/ is the only windows.h user).
-// One window showing a device-owned XRGB buffer: WM_PAINT blits it with
-// StretchDIBits, and HostDisplayPump — called from the board run loop — runs
-// the message queue and invalidates on version changes. Everything lives on
-// the emulator's main thread, so there is no cross-thread state.
+// One fixed-size window showing a device-owned XRGB buffer 1:1: WM_PAINT blits it with
+// StretchDIBits, and HostDisplayPump — called from the board run loop — runs the message
+// queue and invalidates on version changes. The window is deliberately not resizable:
+// the emulated machine's display has exactly one size, the device framebuffer's.
+// Everything lives on the emulator's main thread, so there is no cross-thread state.
 #include <windows.h>
 
 #include <stdlib.h>
@@ -27,15 +28,14 @@ struct HostDisplay {
   BITMAPINFO bi;
 };
 
-static void Blit(HostDisplay* d) {
-  HDC dc = GetDC(d->hwnd);
-  if (!dc) return;
-  RECT rc;
-  GetClientRect(d->hwnd, &rc);
+// The only blit path: 1:1 (the client area is exactly the device framebuffer, because
+// the window is not resizable), and it covers the whole client area — which is why
+// WM_ERASEBKGND below can stay a no-op. The version counter is consumed here so the
+// pump's invalidate loop is quiescent until the device publishes a new frame.
+static void Blit(HostDisplay* d, HDC dc) {
   SetStretchBltMode(dc, COLORONCOLOR);
-  StretchDIBits(dc, 0, 0, rc.right, rc.bottom, 0, 0, d->width, d->height, d->fb,
-                &d->bi, DIB_RGB_COLORS, SRCCOPY);
-  ReleaseDC(d->hwnd, dc);
+  StretchDIBits(dc, 0, 0, d->width, d->height, 0, 0, d->width, d->height, d->fb, &d->bi,
+                DIB_RGB_COLORS, SRCCOPY);
   d->shown_version = d->version_cb(d->dev);
 }
 
@@ -45,19 +45,12 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case WM_PAINT: {
       PAINTSTRUCT ps;
       HDC dc = BeginPaint(hwnd, &ps);
-      RECT rc;
-      GetClientRect(hwnd, &rc);
-      SetStretchBltMode(dc, COLORONCOLOR);
-      StretchDIBits(dc, 0, 0, rc.right, rc.bottom, 0, 0, d->width, d->height,
-                    d->fb, &d->bi, DIB_RGB_COLORS, SRCCOPY);
+      Blit(d, dc);
       EndPaint(hwnd, &ps);
       return 0;
     }
     case WM_ERASEBKGND:
       return 1;  // the blit covers the client area; avoid flicker
-    case WM_SIZE:
-      InvalidateRect(hwnd, NULL, FALSE);
-      return 0;
     case WM_CLOSE:
       DestroyWindow(hwnd);
       return 0;
@@ -95,11 +88,15 @@ HostDisplay* HostDisplayOpen(const char* title, int width, int height,
   wc.lpszClassName = "cemu_display";
   RegisterClassA(&wc);
 
+  // Fixed size on purpose: the emulated machine's display has exactly one size, so the
+  // window drops WS_THICKFRAME/WS_MAXIMIZEBOX and the client area is always the device
+  // framebuffer — which is what keeps the WM_PAINT blit 1:1.
+  static const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
   RECT rc = {0, 0, width, height};
-  AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-  d->hwnd = CreateWindowA("cemu_display", title, WS_OVERLAPPEDWINDOW,
-                          CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left,
-                          rc.bottom - rc.top, NULL, NULL, wc.hInstance, NULL);
+  AdjustWindowRect(&rc, kStyle, FALSE);
+  d->hwnd = CreateWindowA("cemu_display", title, kStyle, CW_USEDEFAULT, CW_USEDEFAULT,
+                          rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, wc.hInstance,
+                          NULL);
   if (!d->hwnd) {
     LogError("display: CreateWindow failed");
     free(d);
@@ -121,10 +118,9 @@ void HostDisplayPump(HostDisplay* d) {
     DispatchMessageA(&msg);
   }
   if (d->closed) return;
-  if (d->version_cb(d->dev) != d->shown_version) {
-    InvalidateRect(d->hwnd, NULL, FALSE);
-    Blit(d);  // paint now; the WM_PAINT that follows is a cheap no-op repaint
-  }
+  // Invalidate only: WM_PAINT is the single blit path, so one published frame costs one
+  // blit instead of the old immediate blit plus the paint that followed it.
+  if (d->version_cb(d->dev) != d->shown_version) InvalidateRect(d->hwnd, NULL, FALSE);
 }
 
 int HostDisplayClosed(const HostDisplay* d) { return d && d->closed; }
