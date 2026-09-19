@@ -2,9 +2,7 @@
 
 违反任何一条即为 bug，发现即修复或登记到本文"简化登记"节，不允许先留着。
 
-本文是原 开发准则.md、重构要求.md、调试方案.md、准则审查.md 四份文档的合并版
-（2026-09-03 重组；准则审查的历史登记项已按当前代码逐条核实销账，仅存活的
-登记项迁入本文第 X 节）。
+本文是原 开发准则.md、重构要求.md、调试方案.md 三份文档的合并版（2026-09-03）。
 
 ## 一、禁止硬编码
 
@@ -229,31 +227,23 @@ CEMU_DEBUG="regs=100000" ./cemu.exe ... img 2> r.txt
   2026-09-12 修订：前端不内置反汇编，反汇编一律走外部工具）。在
   3.5 落地前 CEMU_DEBUG 仍是唯一调试入口（mnemonic 由译码表给出）。
 
-## X、简化登记（原准则审查 D/E 表，2026-09-03 按代码逐条核实后仅存存活项）
+## X、简化登记（在册的规格缺口台账）
 
 规格行为缺失按阶段恢复；销账时在代码落地并在本表勾掉。
 
 | 编号 | 位置 | 缺失 | 参考出处 | 恢复阶段 | 状态 |
 |---|---|---|---|---|---|
-| ~~D6~~ | ~~csr.c tdata1/2/3 WARL 存储无触发匹配~~ | 已销账（2026-09-13 阶段 3.5 片 1d）：trigger.c 按 Sdtrig 实现 mcontrol6 匹配（execute 取指 PC / load/store 访存漏斗按 vaddr、EQ/GE/LT、chain、mode 门控、重入门 = xiangshanNEMU 同款），action=0 走 breakpoint 异常（mtval=匹配地址）、action=1 无 debug mode 触发即 Fatal；tdata1/2/3 按 tselect 每触发器三元组（顺带修正了旧代码 tselect 不索引的错位）；新增 scontext（0x5a8），tdata3 的 mh 字段无 H 强制 WARL-0。配套：riscv 探针 probe_triggers.S（六位全 1） | xiangshanNEMU system/trigger.c + trigger.h；RISC-V debug spec ch.5 | ~~阶段 3.5 gdb stub~~ | 已销账 |
 | D7 | LR/SC 单核预留集 | 无多核冲突语义 | spike 单核同款；规格允许 SC 假失败 | 多核引入时 | 登记中 |
 | D11 | htif.c HTIF syscall（dev0/cmd0）报错退出 | 无 fesvr syscall 设备 | fesvr htif_t::handle_syscall | 阶段 5 cesdk | 登记中 |
-| D13 | x86 RDTSC/x87 FPU 判非法 #UD | 386 子集外指令与 FPU 未实现；CMPXCHG/CMPXCHG8B 已随 A 档销账；**DR 全套已随阶段 3.5 片 1d 销账**（DR0-3 执行/写/读写/I-O 断点、DR6 写清除 B 位+保留位读 1、DR7 GD/LE/GE 与 R/W、LEN 字段、CR4.DE 对 DR4/5 的别名与 #UD、TF 单步、RF 经 iret/popf 装载并在受保护指令完成后清除、icebp(0xF1)、TSS.T 任务切换陷阱）；RDTSC 现为显式 ud()（0F 31） | intel SDM vol.3 ch.17 终裁；DR 存取层有 in-tree 佐证——v86 rust instr_0F21/0F23（CPL→GP、DR4/5+DE→#UD、否则 +2 别名，与 cemu 逐条同）与 gem5 isa.cc（DR4/5 fallthrough、DR6/DR7 BitUnion 位布局）；匹配/投递层（#DB/TF/GD/icebp）三方皆无，以 kvm-unit-tests debug 测试（KVM 硬件语义）+ QEMU TCG 对拍 8/8 双绿锚定 | x87 FPU 在 Linux 用户态（阶段 4+） | 登记中。现实表现：realmode 尾 test_fninit #UD→垃圾 IVT[6]→死循环，run.sh 以 timeout+输出判据容纳 |
-| D14 | x86 iret/popf 载入屏蔽 VM(bit17)（RF 部分已销账） | RF 现按 SDM EFLAGS.RF 由 iret/popf/task-switch 正常装载（kvm debug 测试锚定），本登记只剩 VM86 不进入 | intel SDM vol.3 17.3.1 | DOS/BIOS 兼容路线需要 VM86 时评估（Linux 不需要） | 登记中 |
+| D13 | x86 RDTSC/x87 FPU 判非法 #UD | 386 子集外的指令与 **x87 FPU** 未实现，一律 #UD；RDTSC 现为显式 ud()（0F 31） | intel SDM vol.2/vol.3（指令与 FPU 语义）；QEMU fpu/、spike | x87 FPU 在 Linux 用户态（阶段 4+） | 登记中。现实表现：realmode 尾 test_fninit #UD→垃圾 IVT[6]→死循环，run.sh 以 timeout+输出判据容纳 |
+| D14 | x86 iret/popf 载入屏蔽 VM(bit17) | VM86 位不装载（iret/popf/task-switch 进入 VM86 无实现） | intel SDM vol.3 17.3.1 | DOS/BIOS 兼容路线需要 VM86 时评估（Linux 不需要） | 登记中 |
 | D15 | x86 16 位 TSS 任务切换（类型 1/3）Fatal | 任务切换只支持 32 位 TSS（类型 9/B）；门/任务门对 16 位 TSS 拒绝进入 | v86 do_task_switch（assert 32 位）；tiny386（assert 9/11） | 有验收件需要 286 任务时 | 登记中 |
 | D17 | cga.c 渲染与光栅时序缺口 | CGA 图形模式（0x3D8 bit1）不渲染（黑屏）；过扫描边框不渲染（视频禁止时填黑）；0x3DA 回扫状态为宿主时钟近似（262 行×63.6µs 帧模型，行内只分活跃/消隐两相，非逐像素光栅）；属性/光标闪烁取固定场倍数周期，不跟随场相位 | IBM CGA Technical Reference；FreeVGA；QEMU vga 行为旁证 | 阶段 4 VGA 图形切片（图形模式随 VGA 一起做）；需要精确光栅时序的软件（raster 技巧 demo）出现时再校准 | 登记中 |
 | D18 | PC 芯片组/固件的复位与中断缺口：i8042 命令 0xFE、System Control Port A (0x92) bit 0、0xCF9 复位控制寄存器都不触发复位（无复位设施，SeaBIOS 无引导设备时自行 triple fault 重启）；CMOS RTC 的周期/闹钟中断（IRQ8）不投递，status C 恒读 0 | 复位：QEMU hw/i386/port92.c + i440FX 0xCF9；RTC 中断：MC146818 datasheet + QEMU hw/timer/mc146818rtc.c（IRQ8 经从片 PIC 的线 0） | 需要软/硬复位（ctrl-alt-del、kexec 等）或 RTC 定时（Linux rtc 驱动）时 | 登记中 |
-| ~~D16~~ | ~~x86 LDT/LDTR 机制未实现~~ | 已销账（2026-09-06 阶段 3 项 5）：LDTR 描述符缓存、TI=1 经 LDT 查找、lldt/sldt/verr/verw/lar/lsl/arpl、任务切换 TSS +0x60 装载。null-LDTR 的 TI=1 引用按表限规则抛 GP/SS/TS（tiny386/v86/QEMU 三方一致；SDM 的 TS 读法无文本可查证，若日后有 SDM 文本推翻再修） | v86 lookup_segment_selector/load_ldt；tiny386 read_desc；SDM vol.3 2.4.4/5.3 | ~~阶段 3 项 5~~ | 已销账 |
 | D19 | PIIX3 芯片组、IDE 与 IOAPIC 的简化：IDE 无 bus-master DMA（BAR4 读 0，只有 PIO 的 0x20/0x30/0xEC/0xE7 四条命令，其余按规格 ABRT，无 ATAPI/LBA-48/multi-sector）；0x3F7（AT 老式 drive address 寄存器，非 ATA 寄存器）不解码；IDENTIFY 的时序字 51/52/64-70 与 PIO 模式位留 0；PIIX3 ISA 桥只做身份 + PIRQ 路由字节 0x60-0x63（无 XBCS/PM/DMA 块，ELCR 0x4D0/0x4D1 不落地，PIC 目前只有边沿模式）；IOAPIC 只做 fixed 投递（lowest-priority/NMI/SMI/INIT 交付模式不投递） | PIO/命令集：ATA/ATAPI-7 §6.3/§7.10（未实现命令的应答就是 ABRT）；BAR/身份/QEMU 对照：QEMU hw/ide/piix.c、hw/isa/piix3.c、seabios src/fw/pciinit.c piix_ide_setup/piix_isa_bridge_setup；IOAPIC 交付模式：82093AA datasheet §3.2.4 | BMDMA 在 Linux 里程碑（libata 的 piix 需要 BAR4 才能起盘）；PM/ACPI、PIRQ 路由与 ELCR 电平中断随 Linux 片（需要 PCI INTx 或 RTC/ACPI 时）；其余交付模式按需要用到的客户机补 | 登记中 |
 | D21 | 软盘与 DMA 通路缺失 | 无 Intel 8272 软盘控制器、无 8237 DMA（通道 2 给软盘、通道 0 给内存刷新），CMOS 设备字节也不报软驱；再加上 8042 软驱数据线语义，整条"软盘引导 + PC 兼容传软盘"的路径都不存在。后果：Linux 0.11/0.12 那类把引导码写死成 DL=0（且要求每道 15/18 扇区）的软盘引导镜像无法引导 —— 只能走硬盘/光盘引导的镜像 | PC/AT Technical Reference（FDC 命令集）；Intel 8237A datasheet；QEMU hw/block/fdc.c + hw/dma/i8257.c；SeaBIOS src/hw/floppy.c（INT 13h 路径） | 需要软盘引导的镜像（如 oldlinux 的 0.11/0.12 套件）作为验收件时；Linux 阶梯本身不需要（ISO 路线） | 登记中（2026-09-19 片 8 发现：0.11 引导码 0x78-0x8d 只接受 spt=15/18，否则自旋；0.12-hd 变体同样 DL=0） |
 | D20 | i8042/PS/2 键盘 | 键盘设备只**应答**命令（每条 0xFA；0xFF→ACK+0xAA、0xF2→ACK+0xAB 0x83、0xEE→0xEE），但不真正执行：0xF0/0xED/0xF3 的参数字节只回 ACK、不切换扫描码集/LED/typematic；扫描码一律按 set 1 发（命令字节翻译位只存不译）；无鼠标（AUX）；输出队列满时丢字节（无 overrun 位） | PC/AT Technical Reference；QEMU `ps2.c`/`pckbd.c`（tiny386/i8042.c 同源）：ACK 逐命令、IRQ1 门控 `mode & KBD_INT && !(mode & DISABLE_KBD)` | 需要 set 2 键盘、鼠标或真正走 PS/2 设备命令的客户机时 | 登记中（2026-09-19 片 7：ACK + IRQ1 全链路已端到端实测） |
 | E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中（先加 softfloat 测试向量回归对照） |
-
-已销账（历史存档，无需再管）：D1-D5（S 态机制/sret/wfi/sfence/time 真实
-计时源/PMP 全部随阶段 2 virt+OpenSBI 落地）、D8（中断优先级表 csr.c:77）、
-D9（ELF32，elf.c 已双支持 ei_class 1/2）、D10（HTIF fromhost 应答语义）、
-D12（PIC+PIT+hlt 唤醒，realmode 122 PASS 达成过）、E2/E3（CSR 表驱动化与
-mepc WIRI 随重构落地）。
 
 ## 附：关键行为裁决存档（修复时的先例依据）
 

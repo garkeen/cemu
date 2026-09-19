@@ -363,7 +363,7 @@ main.c `-display win32`（QEMU 惯例单横杠；默认无窗 = 回归全无头�
 x86 9 passed（smoke + cga + pm + kvm×5 + realmode）/ riscv 136/136 /
 depcheck ok、零告警。
 
-## 阶段 3.5 片 1d：D6 销账——Sdtrig 触发器 + x86 DR 断点（2026-09-13）
+## 阶段 3.5 片 1d：Sdtrig 触发器 + x86 DR 断点（2026-09-13）
 
 **riscv 侧（D6）**：新增 `cpu/isa/riscv64/trigger.c`——mcontrol6 匹配（execute
 在 step.c 取指后按 pc、load/store 在 exec.c 漏斗按 vaddr 于访存前；EQ/GE/LT
@@ -612,7 +612,7 @@ asm-offsets.h 靠 kconfig/make 附带产物。本轮收掉：
 - build.ninja 里已无 gcc/mingw/GNU binutils 引用；bash.exe（Git Bash）
   仅作命令壳，与 cemu 回归脚本同一约定。
 
-## 阶段 3 项 5：LDT 机制整体（D16 销账，2026-09-06）
+## 阶段 3 项 5：LDT/LDTR 机制整体（2026-09-06）
 
 exec.c 补齐 LDT/LDTR 全链（对照 v86 lookup_segment_selector/load_ldt、
 tiny386 read_desc、SDM vol.3 2.4.4/3.5/5.3）：
