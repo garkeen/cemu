@@ -53,7 +53,6 @@ extern eflags* fl;
 // selected; `nxt` is the ip after the fully fetched instruction.
 typedef struct dec {
   int w32, a32;  // operand / address size is 32-bit (else 16)
-  int code16;    // CS is a 16-bit segment: EIP wraps at 64K
   int seg;       // segment override, -1 = default
   int rep;       // 0 none, 1 = F3 (repe), 2 = F2 (repne)
   int op2;       // the second byte for 0f opcodes, else 0
@@ -65,6 +64,10 @@ typedef struct dec {
   int mseg;       // the effective segment (override or default)
   uint64_t mlin;  // linear address of the memory operand
   uint32_t moff;  // the segment-relative offset (LEA's answer)
+  // The SIB base was ESP: POP r/m must compute the destination's effective
+  // address after it has incremented ESP (SDM vol.2 POP; the flag is 0 for
+  // 16-bit addressing, where SP can never be a base).
+  int m_esp_base;
 
   // Per-instruction debug bookkeeping: the data/I-O breakpoint hits (DR6.Bn
   // bits, delivered as one post-instruction #DB) and whether the instruction

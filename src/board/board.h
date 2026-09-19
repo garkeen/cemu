@@ -25,6 +25,10 @@ typedef struct Board {
   HtifDevice htif;    // attached only when the loaded image speaks HTIF
   RamDevice* ram;     // main RAM, freed by BoardDestroy
   uint64_t bin_base;  // where the board expects raw images to load
+  // The CPU model this board runs when execution does not come from a loaded
+  // image at all — a PC resetting into its firmware ROM. NULL = the board can
+  // only run an image, which then names its own ISA.
+  const char* default_isa;
   // Reset state, applied after the image loads (QEMU-style boot flow):
   // 0 = enter at the loaded image entry.
   uint64_t reset_pc;
@@ -54,6 +58,9 @@ typedef struct Board {
 typedef struct BoardOpts {
   uint64_t ram_base;
   uint64_t ram_size;
+  // Firmware ROM image (-bios): the PC board maps it over the top of the first
+  // megabyte and resets into it. NULL = no firmware, boot the loaded image.
+  const char* bios_path;
 } BoardOpts;
 
 // Creates a board by name ("spike", "x86", "virt"); returns NULL for unknown

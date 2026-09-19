@@ -59,6 +59,8 @@ static const isa_ops* FindIsaByName(const char* name) {
   return NULL;
 }
 
+const isa_ops* LoaderFindIsa(const char* name) { return FindIsaByName(name); }
+
 // ELF images always self-identify through e_machine; --isa must agree if the
 // user gave it. Raw bins have no header, so --isa (or the default) applies.
 static const isa_ops* PickIsa(const char* isa_name, int is_elf, uint32_t elf_machine) {

@@ -111,6 +111,9 @@ typedef struct x86_state {
   uint32_t dr[8];
   int bt_pending;    // the incoming task's TSS.T: deliver #DB before its
                      // first instruction (SDM vol.3 7.2.1)
+  int a20;           // A20 gate line state: bit 20 of every physical address is
+                     // forced low while it is off (PC/AT); the board drives it
+                     // through CpuState.set_a20
   int intr_pending;  // the machine's INTR line is asserted
   int intr_inhibit;  // SDM window: instruction after STI takes no INTR
   // gdb stub (stage 3.5): bumped on every delivered exception (the INTR

@@ -96,7 +96,8 @@ void x86_step(CpuState* c) {
   // together in a code segment); prefixes then flip either one.
   d.w32 = (s->cr0 & 1) && s->dbit[cs_i];
   d.a32 = d.w32;
-  d.code16 = !((s->cr0 & 1) && s->dbit[cs_i]);  // wrap unless CS is 32-bit
+  // The 64K instruction-pointer wrap is not latched here: it is decided after
+  // the instruction, from the segment it leaves the CPU in (see the commit).
   fr->rec.pc = cpu->pc;
   fr->rec.dnpc = cpu->pc;
   fr->rec.raw_len = 0;
@@ -111,6 +112,11 @@ void x86_step(CpuState* c) {
     // triple fault — shutdown (SDM vol.3 6.9).
     int cause = (int)fr->trap.cause;
     uint32_t tval = (uint32_t)fr->trap.tval;
+    // The trap category reports the exception at the raise point, not after
+    // delivery: a fault whose own delivery faults (the escalation below, up to
+    // the triple fault that ends the run) never reaches a post-delivery
+    // report, and that report is the whole story of what went wrong.
+    DebugTrap(fr);
     int was = delivering_vec;
     delivering_vec = -1;
     if (was >= 0) {
@@ -129,7 +135,6 @@ void x86_step(CpuState* c) {
     // hook). Hardware INTR delivery above intentionally does not count.
     s->trap_seq++;
     s->trap_signal = (uint8_t)GdbTrapSignal(cause);
-    DebugTrap(fr);
     return;
   }
 
@@ -185,7 +190,13 @@ void x86_step(CpuState* c) {
   // EIP is 32 bits — the sum wraps at 2^32 (a negative rel32 rides on the
   // wrap); 16-bit code then wraps the instruction pointer at 64K.
   if (eip == fr->rec.pc) cpu->pc = (uint32_t)(fr->rec.pc + d.nxt);
-  if (d.code16) cpu->pc &= 0xffff;
+  // In a 16-bit code segment the instruction pointer wraps at 64K (SDM vol.1
+  // 3.7.1). The test reads the segment the CPU is in *after* the instruction,
+  // not the one it entered with: a far jump that lands in a 32-bit segment
+  // keeps all 32 bits of its target (SeaBIOS's transition32 makes exactly that
+  // jump — truncating on the old segment's D bit turns 0xfc9e4 into 0xc9e4 and
+  // the CPU walks off into whatever happens to sit at the bottom of RAM).
+  if (!((s->cr0 & kCr0Pe) && s->dbit[cs_i])) cpu->pc &= 0xffff;
   fr->rec.dnpc = cpu->pc;
   // RF clears after the instruction it protected completed successfully —
   // unless this instruction itself loaded an EFLAGS image (iret/popf/task

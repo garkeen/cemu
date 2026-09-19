@@ -44,6 +44,11 @@ typedef struct CpuState {
   // ignored). Boards wire their controllers to this hook instead of calling
   // an ISA function, so a board stays free of CPU-model knowledge.
   void (*set_irq)(struct CpuState* cpu, uint64_t line, int level);
+  // A20 gate (x86 PC/AT): the keyboard controller and the chipset's port 0x92
+  // drive this line, and the CPU model masks bit 20 of every physical address
+  // while it is low. Same shape as set_irq — installed by the CPU model's
+  // init, called by the board. NULL for ISAs without a gate.
+  void (*set_a20)(struct CpuState* cpu, int on);
 } CpuState;
 
 #endif

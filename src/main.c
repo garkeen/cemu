@@ -13,6 +13,7 @@ typedef struct Args {
   const char* isa_name;
   const char* machine_name;
   const char* log_file;
+  const char* bios_path;  // -bios FILE: firmware ROM image (x86 PC board)
   const char* display_backend;  // -display win32; NULL = headless
   uint64_t mem_size;
   uint64_t mem_base;
@@ -37,6 +38,7 @@ static void Usage(void) {
       "  --max-inst N      stop after N instructions (default unlimited)\n"
       "  --log FILE        also write logs to FILE\n"
       "  --dump-regs       dump registers on any exit\n"
+      "  -bios FILE        x86: map a firmware ROM image and reset into it\n"
       "  -display win32    open a window on the machine's display card\n"
       "  -s                gdb stub on tcp::1234 (guest runs until attached)\n"
       "  -gdb tcp::PORT    gdb stub on PORT\n"
@@ -99,12 +101,16 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       }
     } else if (strcmp(arg, "-S") == 0)
       a->gdb_wait = 1;
+    else if (strcmp(arg, "-bios") == 0)
+      a->bios_path = argv[++i];
     else if (arg[0] == '-' && arg[1] == '-')
       return -1;
     else
       a->image = arg;
   }
-  if (!a->image) return -1;
+  // An image file is the normal way in; -bios boots the machine from its
+  // firmware ROM instead, and main() rejects boards that cannot do that.
+  if (!a->image && !a->bios_path) return -1;
   if (a->gdb_wait && !a->gdb_port) {
     LogError("-S needs -s or -gdb");
     return -1;
@@ -120,16 +126,32 @@ int main(int argc, char** argv) {
   }
   if (a.log_file) LogInitFile(a.log_file);
 
-  BoardOpts opts = {a.mem_base, a.mem_size};
+  BoardOpts opts = {a.mem_base, a.mem_size, a.bios_path};
   Board* m = BoardCreate(a.machine_name, &opts);
   if (!m) return 1;
 
   uint64_t bin_base = a.bin_base ? a.bin_base : m->bin_base;
   LoadResult lr;
-  if (LoaderLoadImage(&m->bus, a.image, a.isa_name, bin_base, a.bin_tohost, m->bin_htif, &lr) !=
-      0) {
-    BoardDestroy(m);
-    return 1;
+  memset(&lr, 0, sizeof(lr));
+  if (a.image) {
+    if (LoaderLoadImage(&m->bus, a.image, a.isa_name, bin_base, a.bin_tohost, m->bin_htif, &lr) !=
+        0) {
+      BoardDestroy(m);
+      return 1;
+    }
+  } else {
+    // Firmware boot (-bios): nothing is loaded, so the machine names its own
+    // CPU model and the board brings its own reset state (the PC's reset
+    // vector inside the BIOS ROM window). Boards without a default ISA need
+    // an image file, which then names the ISA itself.
+    const char* isa_name = a.isa_name ? a.isa_name : m->default_isa;
+    lr.isa = isa_name ? LoaderFindIsa(isa_name) : NULL;
+    if (!lr.isa) {
+      LogError("machine %s has no default isa: give it an image file", a.machine_name);
+      BoardDestroy(m);
+      return 1;
+    }
+    lr.entry = m->reset_pc;
   }
   if (lr.has_htif) {
     HtifBind(&m->htif, &m->cpu);
@@ -139,8 +161,11 @@ int main(int argc, char** argv) {
   m->cpu.pc = m->reset_pc ? m->reset_pc : lr.entry;
   m->cpu.image_base = lr.image_base;
   lr.isa->init(&m->cpu);
-  LogInfo("loaded %s: entry=%llx isa=%s htif=%d", a.image, (unsigned long long)lr.entry,
-          lr.isa->name, lr.has_htif);
+  if (a.image)
+    LogInfo("loaded %s: entry=%llx isa=%s htif=%d", a.image, (unsigned long long)lr.entry,
+            lr.isa->name, lr.has_htif);
+  else
+    LogInfo("firmware boot: reset=%llx isa=%s", (unsigned long long)m->cpu.pc, lr.isa->name);
 
   if (a.display_backend) {
     if (!m->display_ops) {
@@ -154,7 +179,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     char title[128];
-    snprintf(title, sizeof(title), "cemu %s - %s", a.machine_name, a.image);
+    snprintf(title, sizeof(title), "cemu %s - %s", a.machine_name, a.image ? a.image : "firmware");
     m->display =
         HostDisplayOpen(title, m->display_ops->width, m->display_ops->height,
                         m->display_ops->Framebuffer(m->display_dev),

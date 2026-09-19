@@ -24,5 +24,9 @@ typedef struct LoadResult {
 // HTIF placement is reported, not wired; the caller attaches the device.
 int LoaderLoadImage(Bus* bus, const char* path, const char* isa_name, uint64_t bin_base,
                     uint64_t bin_tohost, int bin_uses_htif, LoadResult* out);
+// Picks an ISA by name without loading anything: a board that resets into its
+// firmware ROM instead of a loaded image still needs a CPU model. NULL = the
+// name is not registered.
+const isa_ops* LoaderFindIsa(const char* name);
 
 #endif

@@ -39,8 +39,18 @@ eflags* fl;
 // funnel through bus_load/bus_store (the debug hub's observation points),
 // which walk the page tables first when CR0.PG=1; the debug events report
 // the PHYSICAL address — what the bus and the devices actually see.
+// A20 gate (PC/AT): while the chipset holds the line low, bit 20 of the
+// physical address is forced to 0, so accesses above 1 MiB alias into the
+// first megabyte — the state firmware runs in until it opens the gate. The
+// board drives the line through CpuState.set_a20 (keyboard controller output
+// port bit 1, or port 0x92 bit 1).
+static uint64_t a20_gate(uint64_t addr) {
+  return s->a20 ? addr : (addr & ~(1ULL << 20));
+}
+
 static uint64_t phys_load(uint64_t addr, int size) {
   BusRegion* r;
+  addr = a20_gate(addr);
   if (BusProbe(cpu->bus, addr, size, &r) != 0) return size == 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
   uint64_t v = BusRead(cpu->bus, addr, size);
   if (DebugOn(kDbgBus) && !r->host) DebugBus(fr, r->ops->name, addr, size, 1, v);
@@ -50,6 +60,7 @@ static uint64_t phys_load(uint64_t addr, int size) {
 
 static void phys_store(uint64_t addr, int size, uint64_t v) {
   BusRegion* r;
+  addr = a20_gate(addr);
   if (BusProbe(cpu->bus, addr, size, &r) != 0) return;
   if (DebugOn(kDbgBus) && !r->host) {
     DebugBus(fr, r->ops->name, addr, size, 0, v);
@@ -117,13 +128,21 @@ static void IoBpHit(uint16_t port) {
 }
 
 // The port-I/O funnel: every IN/OUT runs the I/O breakpoint check after the
-// access.
+// access, and — like the memory funnel — reports the device hit to the debug
+// hub's bus category (the winning region's name; the unclaimed region has one
+// too, so an accidental touch of a port nobody implements is visible).
 static uint32_t io_in(uint16_t port, int size) {
+  BusRegion* r;
   uint32_t v = (uint32_t)BusRead(cpu->io, port, size);
+  if (DebugOn(kDbgBus) && BusProbe(cpu->io, port, size, &r) == 0)
+    DebugBus(fr, r->ops->name, port, size, 1, v);
   IoBpHit(port);
   return v;
 }
 static void io_out(uint16_t port, int size, uint32_t v) {
+  BusRegion* r;
+  if (DebugOn(kDbgBus) && BusProbe(cpu->io, port, size, &r) == 0)
+    DebugBus(fr, r->ops->name, port, size, 0, v);
   BusWrite(cpu->io, port, size, v);
   IoBpHit(port);
 }
@@ -283,6 +302,7 @@ static void modrm(void) {
     return;
   }
   d.is_mem = 1;
+  d.m_esp_base = 0;
   uint32_t off = 0;
   if (!d.a32) {
     // 16-bit addressing (table 2-1): base [+index] [+disp], [disp16].
@@ -305,6 +325,12 @@ static void modrm(void) {
     int scale = 1 << (sib >> 6);
     int idx = (sib >> 3) & 7;
     int base = sib & 7;
+    // A base of ESP is always a real base (the no-base form is base 5 with mod
+    // 0), and ESP can never be an index — so this flag marks exactly the
+    // operands whose effective address POP must recompute after the pop
+    // (SDM vol.2 POP: a memory destination's address is computed *after* ESP
+    // is incremented).
+    if (base == 4) d.m_esp_base = 1;
     if (base == 5 && d.mod == 0) {
       off = fetch32();
     } else {
@@ -1634,14 +1660,20 @@ static void grp3(int size) {
   }
 }
 
-// ---- string operations (SDM MOVS..SCAS with REP/REPE/REPNE) -----------------
+// ---- string operations (SDM MOVS..SCAS, INS/OUTS, with REP/REPE/REPNE) -------
 // SI uses DS (overridable); DI always ES. SI/DI advance by the address size,
-// CX counts by the operand size. One iteration per step: a REP that wants
-// another re-executes the instruction (interruptible, like hardware).
-static int str_uses_si(int op) { return (op >= 0xa4 && op <= 0xa7) || op == 0xac || op == 0xad; }
+// CX counts by the operand size. INS/OUTS swap the memory side for port DX and
+// share the whole loop. One iteration per step: a REP that wants another
+// re-executes the instruction (interruptible, like hardware).
+static int str_uses_si(int op) {
+  // SI uses DS (overridable). OUTS reads DS:[SI]; INS reads no memory at all.
+  return (op >= 0xa4 && op <= 0xa7) || op == 0xac || op == 0xad || op == 0x6e || op == 0x6f;
+}
 static int str_uses_di(int op) {
   // MOVS/CMPS (a4-a7) and STOS/SCAS (aa-ab, ae-af); LODS (ac/ad) is SI only.
-  return (op >= 0xa4 && op <= 0xa7) || op == 0xaa || op == 0xab || op == 0xae || op == 0xaf;
+  // INS (6c/6d) writes ES:[DI]: the destination segment is always ES.
+  return (op >= 0xa4 && op <= 0xa7) || op == 0xaa || op == 0xab || op == 0xae || op == 0xaf ||
+         op == 0x6c || op == 0x6d;
 }
 
 static void string_op(uint8_t op) {
@@ -1654,7 +1686,8 @@ static void string_op(uint8_t op) {
   // LODS read DS:SI; MOVS/STOS write ES:DI; CMPS/SCAS read ES:DI.
   if (str_uses_si(op)) seg_use(sseg, sio, size, 0);
   if (str_uses_di(op))
-    seg_use(es_i, dio, size, op == 0xa4 || op == 0xa5 || op == 0xaa || op == 0xab);
+    seg_use(es_i, dio, size,
+            op == 0xa4 || op == 0xa5 || op == 0xaa || op == 0xab || op == 0x6c || op == 0x6d);
   uint64_t slin = s->base[sseg] + sio;
   uint64_t dlin = s->base[es_i] + dio;
   switch (op) {
@@ -1704,6 +1737,27 @@ static void string_op(uint8_t op) {
         ax = rd16(slin);
       else
         eax = rd32(slin);
+      break;
+    }
+    case 0x6c:
+    case 0x6d: {  // ins: port DX -> ES:[DI] (SDM vol.2 INS)
+      fr->rec.mnemonic = size == 1 ? "insb" : size == 2 ? "insw" : "insd";
+      WatchData(dlin, size, 1);
+      uint32_t v = io_in(dx, size);
+      if (size == 1)
+        wr8(dlin, (uint8_t)v);
+      else if (size == 2)
+        wr16(dlin, (uint16_t)v);
+      else
+        wr32(dlin, v);
+      break;
+    }
+    case 0x6e:
+    case 0x6f: {  // outs: DS:[SI] -> port DX (SDM vol.2 OUTS)
+      fr->rec.mnemonic = size == 1 ? "outsb" : size == 2 ? "outsw" : "outsd";
+      WatchData(slin, size, 0);
+      uint32_t v = size == 1 ? rd8(slin) : size == 2 ? rd16(slin) : rd32(slin);
+      io_out(dx, size, v);
       break;
     }
     default: {  // 0xae/0xaf scas: eAX - [di]
@@ -2001,6 +2055,15 @@ static void run_op2(uint8_t op2) {
       }
       break;
     }
+    case 0x08:  // invd, wbinvd: cache-control (privileged, SDM vol.2). The
+    case 0x09:  // interpreter keeps no cache, so there is nothing to flush or
+                // invalidate and both retire as no-ops — the same reading QEMU
+                // gives them. Firmware uses wbinvd to order writes before it
+                // write-protects the BIOS area (seabios src/fw/shadow.c
+                // make_bios_readonly_intel).
+      fr->rec.mnemonic = d.op2 == 0x08 ? "invd" : "wbinvd";
+      if (cpl() != 0) gp_fault(0);
+      break;
     case 0x06:  // clts: clear CR0.TS (privileged: SDM vol.2)
       fr->rec.mnemonic = "clts";
       if (cpl() != 0) gp_fault(0);
@@ -3195,6 +3258,12 @@ void run_op(uint8_t op) {
       }
       break;
     }
+  case 0x6c:
+  case 0x6d:
+  case 0x6e:
+  case 0x6f:
+    string_op(op);  // ins/outs: the string family's port-I/O pair
+    break;
     case 0x68:
       fr->rec.mnemonic = "push";
       push_w(d.w32 ? imm32() : imm16());
@@ -3371,10 +3440,22 @@ void run_op(uint8_t op) {
       }
       break;
     }  // mov sreg, rm16
-    case 0x8f: {
+    case 0x8f: {  // pop r/m: a memory destination's effective address is
+                  // computed *after* ESP is incremented (SDM vol.2 POP), so an
+                  // ESP-based operand must be re-addressed here — otherwise the
+                  // popped value lands four bytes below where the next
+                  // instruction looks for it (seabios's CPUID test does
+                  // pushf; pop [esp+0x20]; mov eax,[esp+0x20] and then loads
+                  // EFLAGS from what it read).
       fr->rec.mnemonic = "pop";
       modrm();
+      int esp_base = d.is_mem && d.m_esp_base;
+      int width = d.w32 ? 4 : 2;
       uint32_t v = pop_w();
+      if (esp_base) {
+        d.moff += (uint32_t)width;
+        d.mlin = s->base[d.mseg] + d.moff;
+      }
       if (d.w32)
         SET_RM32(v);
       else
@@ -4011,8 +4092,10 @@ void x86_set_intr(CpuState* c, int level) {
 // ---- reset / boot ----------------------------------------------------------------
 
 // Multiboot header magic the loader scans for (Multiboot 0.6.96 §3.1.1);
-// the loader magic the kernel expects in EAX (§3.2).
-enum { k_mb_hdr_magic = 0x1badb002, k_mb_load_magic = 0x2badb002 };
+// the loader magic the kernel expects in EAX (§3.2). The same enum carries the
+// reset vector a board hands the CPU when it boots firmware instead of an
+// image: on a 16-bit PC board that is the linear address of F000:FFF0.
+enum { k_mb_hdr_magic = 0x1badb002, k_mb_load_magic = 0x2badb002, k_bios_reset_vector = 0xffff0 };
 
 // How boards drive our interrupt lines: x86 has one shared INTR line, so the
 // line id is ignored (the PIC supplies the vector on the INTA acknowledge).
@@ -4020,6 +4103,13 @@ enum { k_mb_hdr_magic = 0x1badb002, k_mb_load_magic = 0x2badb002 };
 static void x86_set_irq_line(CpuState* cpu, uint64_t line, int level) {
   (void)line;
   x86_set_intr(cpu, level);
+}
+
+// The A20 line, driven by the board's keyboard controller output port or by
+// port 0x92 (both funnel into CpuState.set_a20).
+static void x86_set_a20_line(CpuState* c, int on) {
+  x86_state* st = (x86_state*)c->priv;
+  st->a20 = on ? 1 : 0;
 }
 
 void x86_init(CpuState* c) {
@@ -4041,6 +4131,10 @@ void x86_init(CpuState* c) {
   // enabled, BSP.
   st->msr_apic_base = 0xFEE00000ULL | 0x800ULL | 0x100ULL;
   c->set_irq = x86_set_irq_line;
+  c->set_a20 = x86_set_a20_line;
+  // The gate starts open (the reasoning lives in port92.h): every image cemu
+  // accepts is handed flat memory above 1 MiB and never expects the alias.
+  st->a20 = 1;
 
   // Multiboot images (header in the first 8 KiB, 4-aligned) enter in flat
   // protected mode, CS=0x08/data=0x10 with built-in descriptors (QEMU
@@ -4075,6 +4169,19 @@ void x86_init(CpuState* c) {
     }
     st->r[eax_i].e = k_mb_load_magic;
     st->r[ebx_i].e = 0x7000;  // multiboot info scratch
+  } else if (c->pc == k_bios_reset_vector) {
+    // Firmware reset: the first instruction is fetched at the reset vector,
+    // which on a 16-bit PC board is CS:IP = F000:FFF0 (SDM vol.3 9.1.4) — the
+    // board maps its BIOS ROM over the top of the first megabyte and hands the
+    // CPU the linear address. SeaBIOS enters at exactly the same place QEMU
+    // puts it.
+    st->sreg[cs_i] = 0xf000;
+    st->base[cs_i] = 0xf0000;
+    st->limit[cs_i] = 0xffff;
+    st->ar[cs_i] = 0x9b;
+    c->pc = 0xfff0;  // the offset within CS: 0xf0000 + 0xfff0 = 0xffff0
+    st->idtr = 0;
+    st->idtr_limit = 0xffff;  // SDM reset state: no IDT until POST builds one
   } else {
     // BIOS boot-sector handoff: DL = 0x80 (boot drive), IVT at linear 0.
     st->r[edx_i].e = 0x80;
