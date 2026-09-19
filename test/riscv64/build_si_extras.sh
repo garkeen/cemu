@@ -12,14 +12,21 @@
 #      declaration (env/p/riscv_test.h) to global — GNU ld tolerates the
 #      binding change, lld does not. The .S copies rewrite the lines to
 #      `.weak` (same effective binding: the handler is defined in the test).
+#   3. Names follow the upstream Makefrags (<suite> <test> -> rv64<suite>-p-<test>).
+#      Note that rv64ssvnapot/napot.S carries two `.align 20` (2^20 = 1 MiB) directives
+#      inside .data: that image is ~1 MiB of zero padding around 8-byte variables with
+#      ~900 bytes of text — the size belongs to the test, not to the build.
 set -eu
-R=${RISCV_TESTS:-D:/code/c/TinyEMU}
+# Reference checkouts sit next to this repo — the tree was renamed TinyEMU -> EMU,
+# so point RISCV_TESTS at the directory that holds riscv-tests/ and riscv-test-env/.
+R=${RISCV_TESTS:-D:/code/c/EMU}
 OUT=$(cd "$(dirname "$0")" && pwd)
 TMP=$(mktemp -d)
 sed 's/FLAGS(SHF_ALLOC | SHF_EXECINSTR)/FLAGS(0x7)/' \
   "$R/riscv-test-env/p/link.ld" > "$TMP/link.ld"
-build() { # build <suite> <name> <march>
-  local src="$R/riscv-tests/isa/$1/$2.S"
+build() { # build <suite> <test> <march> — names follow the upstream Makefrags, so the
+  # source is isa/rv64<suite>/<test>.S and the image comes out as rv64<suite>-p-<test>.elf
+  local src="$R/riscv-tests/isa/rv64$1/$2.S"
   sed 's/^  .global stvec_handler/  .weak stvec_handler/;
        s/^  .global mtvec_handler/  .weak mtvec_handler/' "$src" > "$TMP/$2.S"
   clang --target=riscv64-unknown-elf -march="$3" -mabi=lp64d \
