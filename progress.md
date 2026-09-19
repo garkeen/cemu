@@ -3,6 +3,42 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 4：xv6-x86 引导到 shell（验收 1 达成）（2026-09-19）
+
+片 3 遗留的"首个用户态陷阱返回 triple fault"根因找到并修掉：xv6 从盘上引导到
+`init: starting sh` + `$ ` 提示符，输出与 QEMU 基线逐字一致。
+
+**根因：处理器内部访问被当成用户程序访问去查 U/S 权限。**
+
+- 现场（`CEMU_DEBUG=trap`）：三行陷阱全落在 iret 自己（PC=0x8010585c），
+  `cause=14 tval=7 → 5 → 5`。`tval` 对 #PF 是**错误码**（线性地址在 CR2，
+  见 `pf_fault`）：7 = present + 写 + 用户，5 = present + 读 + 用户。
+- 用 gdb 挂 RSP stub 在第 8 次 `iret` 处停下（判据：帧里 cs=0x1b 是用户段，
+  前 7 次都是内核内的返回），读出完整合法的陷阱帧（eip=0 cs=001b efl=200
+  esp=1000 ss=0023；内核 esp=0x8dffffec = 内核栈顶-20 = 帧的 5 个字）：
+  帧没问题，问题在 iret 执行期间。
+- 机制：`pm_iret` 先 `seg_commit(cs_i, 0x1b, …)`（`cpl()` 由缓存 AR 得到，
+  此刻已是 3），而 `seg_commit` 里紧接着要把该描述符的 A 位写回 GDT ——
+  那个写走 `bus_store`（页表翻译 + 按 CPL 做 U/S 检查），GDT 在 U=0 的内核页
+  → **#PF 错误码 7**（第一行）。异常投递读 IDT（`bus_load(s->idtr+…)`）时
+  CPL 仍是 3，IDT 页 U=0 → **#PF 错误码 5**（第二、三行）→ #DF → triple
+  fault。三次陷阱都报在 iret 上，是因为 CPU 状态在 `seg_commit` 里已经改过
+  （CS 已提交、eip 还没写）。
+- 修复（`src/cpu/isa/x86/exec.c`）：访问层分两类 —— 程序访问
+  `bus_load/bus_store`（U/S 按 CPL 检查）与**处理器访问**
+  `kbus_load/kbus_store/krd*/kwr*/kpush*`（忽略 U/S，恒为超级权限）。裁决
+  依据：SDM vol.3 4.6 的 U/S 检查对象是**程序**的 CPL；描述符表、TSS、换栈
+  后压的投递帧都是处理器自己的状态 —— 硬性判据是任何 OS 都必须成立：ring 3
+  的段加载要能读 U=0 的 GDT，ring 3 的中断要能写 U=0 的内核栈。
+- 站点：`desc_parse`（GDT/LDT 描述符读）、`seg_commit`（A 位写回）、
+  `tss_stack` 与 `do_task_switch`（TSS 全字段读写 + GDT 忙位写回）、
+  `pm_far` 的 LDT/GDT 描述符读、`do_int` 的 IDT 门读与投递帧、`call_gate`
+  的换栈入栈、任务切换的错误码入栈。`page_translate` 拆为
+  `page_translate_as(lin, write, user)`，访问类由调用者给出。
+- 实测：`init: starting sh` + `$ `（QEMU 同镜像基线一致）；回归 riscv64
+  136/0、x86 9/0、depcheck ok。
+- 遗留（验收 1 的可用性）：PS/2 键盘输入未接（i8042 只有 POST 骨架，无按键
+  注入与 IRQ1 投递），所以 shell 起得来但还不能敲命令 —— 下一片。
 ## 阶段 4 片 3：IOAPIC + LAPIC 中断路径打通；xv6 卡在首个用户态陷阱（2026-09-19）
 
 片 2 之后 xv6 停在"首次读 fs.img 等完成中断"。本片补齐中断链路，并修掉一个

@@ -284,3 +284,14 @@ mepc WIRI 随重构落地）。
   `lea (%%rip)` 改 call/pop 锚点 +3），语义全部模式无关（SDM ch.17 单处
   定义），QEMU TCG 32 位与 cemu 双绿 8/8——用户 2026-09-13 批准作为 A 档
   验收件。
+
+- **x86 处理器内部访问 = 超级权限（2026-09-19，片 4）**：描述符表（GDT/IDT/
+  LDT）、TSS，以及换栈后压入的投递帧，都是**处理器自己的访问**，忽略 U/S 位；
+  只有程序自己的访问才按 CPL 检查（SDM vol.3 4.6）。硬性判据：ring 3 的段加载
+  要能读 U=0 的 GDT，ring 3 的中断要能写 U=0 的内核栈 —— 任何 OS 都依赖这条。
+  先例：xv6 首个用户态 iret 里 `seg_commit(cs)` 已把 CPL 切成 3，紧接着的描述符
+  A 位写回被当成"用户写 GDT"（U=0）→ #PF 错误码 7；随后 #PF 的投递读 IDT 又被
+  当成"用户读" → #PF 错误码 5 → #DF → triple fault（三次陷阱都报在 iret 上，
+  因为 CS 已提交而 eip 还没写）。实现：程序类 `bus_load/bus_store` 对处理器类
+  `kbus_load/kbus_store/krd*/kwr*/kpush*`，由
+  `page_translate_as(lin, write, user)` 的 user 参数分派。

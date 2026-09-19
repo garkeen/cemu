@@ -70,14 +70,35 @@ static void phys_store(uint64_t addr, int size, uint64_t v) {
   BusWrite(cpu->bus, addr, size, v);
 }
 
-// The page walk lives with the segment machinery below (it faults through
-// the raise channel and reads the current CPL).
+// The page walk lives with the segment machinery below (it faults through the
+// raise channel); the access class decides whether the U/S bits are checked.
+static uint64_t page_translate_as(uint64_t lin, int write, int user);
 static uint64_t page_translate(uint64_t lin, int write);
 
 static uint64_t bus_load(uint64_t lin, int size) { return phys_load(page_translate(lin, 0), size); }
 static void bus_store(uint64_t lin, int size, uint64_t v) {
   phys_store(page_translate(lin, 1), size, v);
 }
+
+// Processor-internal accesses — the GDT/LDT/IDT/TSS, and the frames the
+// delivery and gate paths push after an outward switch — are SUPERVISOR
+// accesses whatever the live CPL is: a ring-3 segment load reads a U=0 GDT,
+// `int n` from ring 3 reads a U=0 IDT, and an interrupt taken in ring 3 writes
+// the U=0 kernel stack. None of those may fault on U/S (SDM vol.3 4.6: the
+// check is on the CPL the *program* runs at; the tables and the switched stack
+// are the processor's own state), and every OS depends on it — its GDT/IDT/TSS
+// live in supervisor pages.
+static uint64_t kbus_load(uint64_t lin, int size) {
+  return phys_load(page_translate_as(lin, 0, 0), size);
+}
+static void kbus_store(uint64_t lin, int size, uint64_t v) {
+  phys_store(page_translate_as(lin, 1, 0), size, v);
+}
+static uint8_t krd8(uint64_t lin) { return (uint8_t)kbus_load(lin, 1); }
+static uint16_t krd16(uint64_t lin) { return (uint16_t)kbus_load(lin, 2); }
+static uint32_t krd32(uint64_t lin) { return (uint32_t)kbus_load(lin, 4); }
+static void kwr16(uint64_t lin, uint16_t v) { kbus_store(lin, 2, v); }
+static void kwr32(uint64_t lin, uint32_t v) { kbus_store(lin, 4, v); }
 
 static uint8_t rd8(uint64_t lin) { return (uint8_t)bus_load(lin, 1); }
 static uint16_t rd16(uint64_t lin) { return (uint16_t)bus_load(lin, 2); }
@@ -472,6 +493,23 @@ static void push16(uint16_t v) { stack_push(2, v); }
 static void push32(uint32_t v) { stack_push(4, v); }
 static uint16_t pop16(void) { return (uint16_t)stack_pop(2); }
 static uint32_t pop32(void) { return stack_pop(4); }
+
+// The frames a delivery writes are the processor's own writes too: after an
+// outward switch the stack is the new supervisor one while CS still names the
+// old ring-3 segment, so the store may not take the U/S check.
+static void kstack_push(int size, uint32_t v) {
+  uint32_t sp16 = (uint16_t)(esp - size);
+  uint32_t off = s->dbit[ss_i] ? esp - (uint32_t)size : sp16;
+  seg_use(ss_i, off, size, 1);
+  WatchData(s->base[ss_i] + off, size, 1);
+  if (size == 4)
+    kwr32(s->base[ss_i] + off, v);
+  else
+    kwr16(s->base[ss_i] + off, (uint16_t)v);
+  esp = s->dbit[ss_i] ? off : (esp & 0xffff0000u) | sp16;
+}
+static void kpush16(uint16_t v) { kstack_push(2, v); }
+static void kpush32(uint32_t v) { kstack_push(4, v); }
 // A stack read that does not move ESP, at a byte offset above ESP. The
 // far-control paths (IRET/RETF/gate entry) peek their whole frame and
 // validate it before a single pop commits: raise_ unwinds without rolling
@@ -518,9 +556,11 @@ static void desc_parse(uint16_t sel, seg_view* v) {
   }
   // The GDT and LDT bases are linear addresses (SDM vol.3 3.5.1), so an entry
   // comes through the paging unit: a kernel whose tables sit above the identity
-  // map (xv6's GDT and IDT live at 0x8011xxxx) has no other way to reach them.
+  // map (xv6's GDT and IDT live at 0x8011xxxx) has no other way to reach them —
+  // and the read is the processor's own, so it is a supervisor access (kbus_load)
+  // however small the guest's CPL is.
   uint64_t table = sel & 4 ? s->ldtr_base : s->gdtr;
-  uint64_t desc = bus_load(table + (uint64_t)(sel >> 3) * 8, 8);
+  uint64_t desc = kbus_load(table + (uint64_t)(sel >> 3) * 8, 8);
   v->hi = (uint32_t)(desc >> 32);
   v->base = ((desc >> 16) & 0xffffff) | (((desc >> 56) & 0xff) << 24);
   uint32_t lim = (uint32_t)(desc & 0xffff) | (uint32_t)((desc >> 32) & 0xf0000);
@@ -534,7 +574,10 @@ static uint32_t table_limit(uint16_t sel) { return sel & 4 ? s->ldtr_limit : s->
 
 // Commits a validated load: fills the cache and marks the descriptor
 // accessed (SDM vol.3 5.3: the CPU sets the A bit when a segment register
-// is loaded from it) — in whichever table the selector names.
+// is loaded from it) — in whichever table the selector names. Both halves
+// are processor accesses: IRET commits the ring-3 CS first and writes that
+// descriptor's A bit back afterwards, which is only legal because the write
+// is a supervisor access to a U=0 GDT page.
 static void seg_commit(int seg, uint16_t sel, const seg_view* v) {
   s->sreg[seg] = sel;
   s->base[seg] = v->base;
@@ -542,8 +585,8 @@ static void seg_commit(int seg, uint16_t sel, const seg_view* v) {
   s->ar[seg] = v->ar;
   s->dbit[seg] = v->dbit;
   if ((s->cr0 & 1) && (sel & 0xfffc) && !(v->ar & 1))
-    bus_store((sel & 4 ? s->ldtr_base : s->gdtr) + (uint64_t)(sel >> 3) * 8 + 5, 1,
-              (uint8_t)(v->ar | 1));
+    kbus_store((sel & 4 ? s->ldtr_base : s->gdtr) + (uint64_t)(sel >> 3) * 8 + 5, 1,
+               (uint8_t)(v->ar | 1));
 }
 
 // CPL is the CS descriptor's DPL (SDM vol.1 3.4.5); the cache is the source.
@@ -552,17 +595,26 @@ static int cpl(void) { return (s->ar[cs_i] >> 5) & 3; }
 // The two-level 4KB page walk (SDM vol.3 4.3, 4.6, 4.7). CR3 names the page
 // directory; each level's R/W and U/S combine with the next (a page is
 // writable / user-accessible only where BOTH entries allow), then one
-// permission check against CPL: user mode needs U on both levels, a write
-// needs W unless it is a supervisor access with CR0.WP=0 (vol.3 4.6; WP is
+// permission check against the access class: a user-mode program access needs
+// U on both levels, a write
 // 486+ but SDM defines the flag). A missing entry at either level faults as
 // not-present (error code P=0); every other violation faults with P=1. A
 // goes into PDE and PTE on each successful translation and D into the PTE on
 // a write (vol.3 4.7) — the RMW lands in RAM below this layer. The walk's
 // own reads are physical and bypass translation plus the debug mem/bus
 // events: page tables are machine state, not program accesses.
+// The program's own access: the U/S check runs against CPL (SDM vol.3 4.6).
 static uint64_t page_translate(uint64_t lin, int write) {
+  return page_translate_as(lin, write, cpl() == 3);
+}
+
+// `user` is the access class: 1 for the program's own accesses, 0 for the
+// processor's (see kbus_* above) — the descriptor tables, the TSS and the
+// frames a delivery pushes are the processor's own state, which every OS keeps
+// in supervisor pages whatever the live CPL is.
+static uint64_t page_translate_as(uint64_t lin, int write, int user) {
   if (!(s->cr0 & kCr0Pg)) return lin;
-  uint32_t code = (write ? 2u : 0u) | (cpl() == 3 ? 4u : 0u);
+  uint32_t code = (write ? 2u : 0u) | (user ? 4u : 0u);
   uint32_t pde_addr = (uint32_t)(s->cr3 & ~0xfffu) | ((uint32_t)(lin >> 20) & 0xffc);
   uint32_t pde = phys_load(pde_addr, 4);
   if (!(pde & kPdeP)) pf_fault(lin, code);
@@ -572,7 +624,6 @@ static uint64_t page_translate(uint64_t lin, int write) {
     // update in the PDE. (Bits 21:13 are reserved-0 in the SDM layout; the
     // 386-class #PF error code carries no RSVD flag, so a set reserved bit
     // surfaces as an ordinary fault.)
-    int user = cpl() == 3;
     if (user ? !(pde & kPdeUs) : (write && (s->cr0 & kCr0Wp) && !(pde & kPdeRw)))
       pf_fault(lin, code | 1);
     uint32_t new_pde = pde | kPdeA | (write ? kPdeD : 0u);
@@ -582,7 +633,6 @@ static uint64_t page_translate(uint64_t lin, int write) {
   uint32_t pte_addr = (pde & ~0xfffu) | ((uint32_t)(lin >> 10) & 0xffc);
   uint32_t pte = phys_load(pte_addr, 4);
   if (!(pte & kPteP)) pf_fault(lin, code);
-  int user = cpl() == 3;
   int writable = (pde & kPdeRw) != 0 && (pte & kPteRw) != 0;
   if (user ? (!(pde & kPdeUs) || !(pte & kPteUs))
            : (write && (s->cr0 & kCr0Wp) && !writable))
@@ -707,8 +757,8 @@ static void tss_stack(int newpl, uint16_t* ss0, uint32_t* esp0, seg_view* sv) {
   if (!(s->tr_ar & 0x80) || (ty != 1 && ty != 3 && ty != 9 && ty != 0xb))
     ts_fault(0);  // TR holds no TSS
   int tss32 = ty & 8;
-  *esp0 = tss32 ? rd32(s->tr_base + 4 + 8 * newpl) : rd16(s->tr_base + 2 + 4 * newpl);
-  *ss0 = tss32 ? rd16(s->tr_base + 8 + 8 * newpl) : rd16(s->tr_base + 4 + 4 * newpl);
+  *esp0 = tss32 ? krd32(s->tr_base + 4 + 8 * newpl) : krd16(s->tr_base + 2 + 4 * newpl);
+  *ss0 = tss32 ? krd16(s->tr_base + 8 + 8 * newpl) : krd16(s->tr_base + 4 + 4 * newpl);
   if ((*ss0 & 0xfffc) == 0) ts_fault(0);
   if ((uint32_t)(*ss0 >> 3) * 8 + 7 > table_limit(*ss0)) ts_fault(*ss0 & ~3u);
   desc_parse(*ss0, sv);
@@ -781,28 +831,29 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   // Save the outgoing task (SDM fig 7-4 dynamic fields): EIP, EFLAGS, the
   // GPRs and the six segment selectors. The saved EFLAGS drops NT on an IRET
   // switch — the outgoing task is being retired, not suspended (tiny386
-  // TS_IRET, v86's busy-target rule).
-  wr32(s->tr_base + 0x20, next_eip);
-  wr32(s->tr_base + 0x24, source == kTaskIret ? fl->word & ~0x4000u : fl->word);
-  for (int i = 0; i < 8; i++) wr32(s->tr_base + 0x28 + 4 * i, s->r[i].e);
+  // TS_IRET, v86's busy-target rule). The TSS is the processor's own
+  // structure, so every access to it below is a supervisor access.
+  kwr32(s->tr_base + 0x20, next_eip);
+  kwr32(s->tr_base + 0x24, source == kTaskIret ? fl->word & ~0x4000u : fl->word);
+  for (int i = 0; i < 8; i++) kwr32(s->tr_base + 0x28 + 4 * i, s->r[i].e);
   static const int seg_order[6] = {es_i, cs_i, ss_i, ds_i, fs_i, gs_i};
   // The segment selectors sit on 4-byte strides in the TSS (SDM fig 7-4:
   // ES 0x48, CS 0x4c, SS 0x50, DS 0x54, FS 0x58, GS 0x5c), each field two
   // bytes wide with two reserved bytes after it.
-  for (int i = 0; i < 6; i++) wr16(s->tr_base + 0x48 + 4 * i, s->sreg[seg_order[i]]);
+  for (int i = 0; i < 6; i++) kwr16(s->tr_base + 0x48 + 4 * i, s->sreg[seg_order[i]]);
 
   // Busy bits (SDM 7.2.3): JMP/IRET clear the outgoing descriptor's,
   // JMP/CALL/INT set the incoming one's; IRET leaves the target busy (it
   // never stopped being the suspended task).
   if (source != kTaskCall)
-    bus_store(s->gdtr + (uint64_t)(s->tr >> 3) * 8 + 5, 1, (uint8_t)(s->tr_ar & ~2u));
+    kbus_store(s->gdtr + (uint64_t)(s->tr >> 3) * 8 + 5, 1, (uint8_t)(s->tr_ar & ~2u));
   if (source != kTaskIret)
-    bus_store(s->gdtr + (uint64_t)(sel >> 3) * 8 + 5, 1, (uint8_t)(v.ar | 2));
+    kbus_store(s->gdtr + (uint64_t)(sel >> 3) * 8 + 5, 1, (uint8_t)(v.ar | 2));
   // The incoming task's T flag (SDM vol.3 7.2.1, fig 7-4 byte 0 bit 0): a
   // task-switch debug trap fires before the new task's first instruction.
   // Read before the back-link write below lands on the same word.
-  s->bt_pending = rd8(v.base) & 1;
-  if (source == kTaskCall) wr16(v.base, s->tr);  // the back-link (fig 7-4)
+  s->bt_pending = krd8(v.base) & 1;
+  if (source == kTaskCall) kwr16(v.base, s->tr);  // the back-link (fig 7-4)
 
   // TR commits before the new state loads: a faulting load leaves the
   // machine in the new task's context (tiny386 follows the SDM order; v86
@@ -812,13 +863,13 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   s->tr_limit = v.limit;
   s->tr_ar = (uint8_t)(v.ar | 2);
 
-  s->cr3 = rd32(v.base + 0x1c);  // carried along (SDM 7.2.1); the walk uses bits 31:12
+  s->cr3 = krd32(v.base + 0x1c);  // carried along (SDM 7.2.1); the walk uses bits 31:12
   // The incoming LDT (TSS +0x60) loads BEFORE the segment selectors: their
   // TI=1 lookups go through the new task's own LDT (SDM 7.2.1 step order).
   // It is not written back to the outgoing TSS (tiny386 and v86 agree).
-  load_ldtr(rd16(v.base + 0x60), 1);
+  load_ldtr(krd16(v.base + 0x60), 1);
 
-  uint32_t nf = rd32(v.base + 0x24);
+  uint32_t nf = krd32(v.base + 0x24);
   if (nf & 0x20000) Fatal("x86: VM86 not implemented (D14)");
   d.rf_load = 1;  // the TSS image's RF is the authoritative one (SDM 7.2.1)
   fl->word = (fl->word & ~(0x7fd7u | 0x30000u)) | (nf & 0x7fd7u) | 2;
@@ -827,7 +878,7 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   // The incoming CS: every defect faults #TS, not-present #NP (v86
   // do_task_switch; this is the one segment load the switch treats
   // specially). The new CPL is the CS RPL.
-  uint16_t new_cs = rd16(v.base + 0x4c);
+  uint16_t new_cs = krd16(v.base + 0x4c);
   if ((new_cs & 0xfffc) == 0) ts_fault(0);
   if ((uint32_t)(new_cs >> 3) * 8 + 7 > table_limit(new_cs)) ts_fault(new_cs & ~3u);
   seg_view cv;
@@ -841,16 +892,16 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   if (conf) cv.ar = (uint8_t)((cv.ar & ~0x60u) | (nrpl << 5));
   seg_commit(cs_i, new_cs, &cv);
 
-  for (int i = 0; i < 8; i++) s->r[i].e = rd32(v.base + 0x28 + 4 * i);
-  load_data(es_i, rd16(v.base + 0x48));
-  load_ss(rd16(v.base + 0x50));
-  load_data(ds_i, rd16(v.base + 0x54));
-  load_data(fs_i, rd16(v.base + 0x58));
-  load_data(gs_i, rd16(v.base + 0x5c));
+  for (int i = 0; i < 8; i++) s->r[i].e = krd32(v.base + 0x28 + 4 * i);
+  load_data(es_i, krd16(v.base + 0x48));
+  load_ss(krd16(v.base + 0x50));
+  load_data(ds_i, krd16(v.base + 0x54));
+  load_data(fs_i, krd16(v.base + 0x58));
+  load_data(gs_i, krd16(v.base + 0x5c));
 
   s->cr0 |= 0x8;  // CR0.TS: the FPU state is per-task (SDM 7.2.1)
-  if (has_ec) push32(ec);  // an exception's error code lands on the new stack
-  eip = rd32(v.base + 0x20);
+  if (has_ec) kpush32(ec);  // an exception's error code lands on the new stack
+  eip = krd32(v.base + 0x20);
 }
 
 // Protected-mode IRET (SDM vol.2 IRET Operation): a same-privilege return
@@ -864,7 +915,7 @@ static void pm_iret(void) {
     uint8_t ty = s->tr_ar & 0xf;
     if (!(s->tr_ar & 0x80) || (ty != 1 && ty != 3 && ty != 9 && ty != 0xb))
       ts_fault(0);  // TR holds no TSS to read the link from
-    uint16_t back = rd16(s->tr_base + 0);
+  uint16_t back = krd16(s->tr_base + 0);
     if ((back & 0xfffc) == 0) ts_fault(0);
     do_task_switch(back, kTaskIret, (uint32_t)(fr->rec.pc + d.nxt), 0, 0);
     return;
@@ -969,25 +1020,25 @@ static void call_gate(uint16_t sel, uint64_t desc, int is_call, uint32_t ret_eip
   if (is_call) {
     if (switched) {
       if (gate16) {
-        push16(old_ss);
-        push16((uint16_t)old_esp);
+        kpush16(old_ss);
+        kpush16((uint16_t)old_esp);
       } else {
-        push32(old_ss);
-        push32(old_esp);
+        kpush32(old_ss);
+        kpush32(old_esp);
       }
       for (int i = count - 1; i >= 0; i--) {
         if (gate16)
-          push16((uint16_t)params[i]);
+          kpush16((uint16_t)params[i]);
         else
-          push32(params[i]);
+          kpush32(params[i]);
       }
     }
     if (gate16) {
-      push16(old_cs);
-      push16((uint16_t)ret_eip);
+      kpush16(old_cs);
+      kpush16((uint16_t)ret_eip);
     } else {
-      push32(old_cs);
-      push32(ret_eip);
+      kpush32(old_cs);
+      kpush32(ret_eip);
     }
   }
   if (conf) cv.ar = (uint8_t)((cv.ar & ~0x60u) | (newpl << 5));
@@ -1015,7 +1066,7 @@ static void pm_far(uint16_t sel, uint32_t off, int is_call, uint32_t ret_eip) {
   if ((uint32_t)(sel >> 3) * 8 + 7 > table_limit(sel)) gp_fault(sel & ~3u);
   // Call gates may live in the LDT (SDM vol.3 3.5); task gates and TSSes
   // are GDT-only, so the TI=1 system paths below reject first.
-  uint64_t desc = bus_load((sel & 4 ? s->ldtr_base : s->gdtr) + (uint64_t)(sel >> 3) * 8, 8);
+  uint64_t desc = kbus_load((sel & 4 ? s->ldtr_base : s->gdtr) + (uint64_t)(sel >> 3) * 8, 8);
   if (!((desc >> 44) & 1)) {  // S=0: a system descriptor
     uint8_t ty = (uint8_t)((desc >> 40) & 0xf);
     int gdpl = (int)((desc >> 45) & 3);
@@ -1095,11 +1146,11 @@ void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
   int ext = !soft;
   if (!(s->cr0 & 1)) {
     uint64_t tbl = s->idtr + (uint64_t)vec * 4;
-    uint32_t off = rd16(tbl);
-    uint32_t seg = rd16(tbl + 2);
-    push16(fl->word | 2);
-    push16(s->sreg[cs_i]);
-    push16((uint16_t)ret_eip);
+    uint32_t off = krd16(tbl);
+    uint32_t seg = krd16(tbl + 2);
+    kpush16(fl->word | 2);
+    kpush16(s->sreg[cs_i]);
+    kpush16((uint16_t)ret_eip);
     fl->if_ = 0;
     fl->tf = 0;
     seg_view v;
@@ -1114,7 +1165,7 @@ void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
   if (gate_idx + 7 > s->idtr_limit) gp_fault(gate_idx | 2 | ext);
   // The IDT base is a linear address (SDM vol.3 3.5.1), so the gate comes
   // through the paging unit like any other access.
-  uint64_t gate = bus_load(s->idtr + gate_idx, 8);
+  uint64_t gate = kbus_load(s->idtr + gate_idx, 8);
   uint8_t gt = (uint8_t)((gate >> 40) & 0xf);
   if (soft && ((gate >> 45) & 3) < (uint32_t)cpl()) gp_fault(gate_idx | 2);
   if (gt != 6 && gt != 7 && gt != 0xe && gt != 0xf && gt != 5)
@@ -1166,24 +1217,24 @@ void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
 
   if (gate16) {
     if (switched) {
-      push16((uint16_t)old_ss);
-      push16((uint16_t)old_esp);
+      kpush16((uint16_t)old_ss);
+      kpush16((uint16_t)old_esp);
     }
-    push16(fl->word | 2);
-    push16((uint16_t)old_cs);
-    push16((uint16_t)ret_eip);
+    kpush16(fl->word | 2);
+    kpush16((uint16_t)old_cs);
+    kpush16((uint16_t)ret_eip);
     // Software INT n never carries an error code — only the exceptions do
     // (SDM vol.2 INT Operation; v86 passes None for software ints).
-    if (vec_has_ec(vec) && !soft) push16((uint16_t)ec);
+    if (vec_has_ec(vec) && !soft) kpush16((uint16_t)ec);
   } else {
     if (switched) {
-      push32(old_ss);
-      push32(old_esp);
+      kpush32(old_ss);
+      kpush32(old_esp);
     }
-    push32(fl->word | 2);
-    push32(old_cs);
-    push32(ret_eip);
-    if (vec_has_ec(vec) && !soft) push32(ec);
+    kpush32(fl->word | 2);
+    kpush32(old_cs);
+    kpush32(ret_eip);
+    if (vec_has_ec(vec) && !soft) kpush32(ec);
   }
   fl->tf = 0;
   fl->nt = 0;
