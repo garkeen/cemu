@@ -61,6 +61,10 @@ typedef struct BoardOpts {
   // Firmware ROM image (-bios): the PC board maps it over the top of the first
   // megabyte and resets into it. NULL = no firmware, boot the loaded image.
   const char* bios_path;
+  // Disk images for the PC's primary IDE channel (-hda = master, -hdb = slave);
+  // NULL = empty bay. Machines without an IDE controller ignore them.
+  const char* hda;
+  const char* hdb;
 } BoardOpts;
 
 // Creates a board by name ("spike", "x86", "virt"); returns NULL for unknown

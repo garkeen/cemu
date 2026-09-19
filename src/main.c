@@ -14,6 +14,8 @@ typedef struct Args {
   const char* machine_name;
   const char* log_file;
   const char* bios_path;  // -bios FILE: firmware ROM image (x86 PC board)
+  const char* hda;        // -hda FILE: primary IDE master image (x86 PC board)
+  const char* hdb;        // -hdb FILE: primary IDE slave image
   const char* display_backend;  // -display win32; NULL = headless
   uint64_t mem_size;
   uint64_t mem_base;
@@ -39,6 +41,8 @@ static void Usage(void) {
       "  --log FILE        also write logs to FILE\n"
       "  --dump-regs       dump registers on any exit\n"
       "  -bios FILE        x86: map a firmware ROM image and reset into it\n"
+      "  -hda FILE         x86: primary IDE master disk image\n"
+      "  -hdb FILE         x86: primary IDE slave disk image\n"
       "  -display win32    open a window on the machine's display card\n"
       "  -s                gdb stub on tcp::1234 (guest runs until attached)\n"
       "  -gdb tcp::PORT    gdb stub on PORT\n"
@@ -103,6 +107,10 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       a->gdb_wait = 1;
     else if (strcmp(arg, "-bios") == 0)
       a->bios_path = argv[++i];
+    else if (strcmp(arg, "-hda") == 0)
+      a->hda = argv[++i];
+    else if (strcmp(arg, "-hdb") == 0)
+      a->hdb = argv[++i];
     else if (arg[0] == '-' && arg[1] == '-')
       return -1;
     else
@@ -126,7 +134,11 @@ int main(int argc, char** argv) {
   }
   if (a.log_file) LogInitFile(a.log_file);
 
-  BoardOpts opts = {a.mem_base, a.mem_size, a.bios_path};
+  BoardOpts opts = {.ram_base = a.mem_base,
+                    .ram_size = a.mem_size,
+                    .bios_path = a.bios_path,
+                    .hda = a.hda,
+                    .hdb = a.hdb};
   Board* m = BoardCreate(a.machine_name, &opts);
   if (!m) return 1;
 

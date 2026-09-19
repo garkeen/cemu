@@ -3,6 +3,61 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 2：IDE 落地，xv6 从盘上被引导、内核起跑到首个进程（2026-09-19）
+
+片 1 之后 POST 卡在“没有可引导设备”。本片把机器补到**有盘**，并用用户自己的
+xv6（`D:\xv6img\xv6.img` + `fs.img`，stock xv6-public）当验收件：
+
+- **IDE(PIIX PATA)**：新增 `src/device/storage/ide.{h,c}`（新目录 `storage/`，
+  外设按类分的第二类）。PIO 半套 ATA-4：IDENTIFY DEVICE(0xEC)、READ SECTORS
+  (0x20)、WRITE SECTORS(0x30)、FLUSH CACHE(0xE7)，LBA-28 与 CHS 两种寻址，
+  DRQ 逐扇区握手；其余命令（含 ATAPI 的 0xA1 与 LBA-48/multi-sector）按规格
+  回 ABRT。中断线 IRQ14/15 走机板 sink 到 PIC（兼容模式，`intr pin = 0`）。
+  BAR 做了尺寸解码（写全 1 读回给窗口大小，PCI §6.2.5.1），BAR4 读 0 = 无
+  BMDMA（D19 登记）。
+- **PIIX3 ISA 桥**：新增 `src/device/misc/piix3.{h,c}`（8086:7000，class 0x0601，
+  header type bit7 = 多功能）。**它是 IDE 能不能被看见的前提**：固件按
+  “function 0 不开多功能就跳下一个设备”遍历（seabios src/hw/pci.c pci_next），
+  没有它 00:01.1 永远不会被探测。
+- **机板**：`-hda/-hdb` 挂主通道主/从盘（`BoardOpts` 加两个字段），`--mem`
+  在 x86 上也生效（xv6 的 PHYSTOP 是 224MB，必须给够；CMOS 内存量跟着走，
+  e820 自然正确）。另加**全 4GiB open-bus 区**（未被任何译码器认领的地址读全 1、
+  写丢弃）——xv6 的 `ioapicinit` 写 0xFEC00000，此前会 `[fatal] read of
+  unmapped address`，而真实 PC 该处是 open bus。
+- **解释器里抠出的两个真 bug（都由 xv6 逼出来，不是为跑通加分支）**：
+  ① **GDT/LDT/IDT 表项是线性地址，必须过分页**（SDM vol.3 3.5.1）：原实现用
+  `BusRead` 直读物理地址，xv6 的内核表在 0x8011xxxx（高于恒等映射），读到的是
+  open bus 的全 1 → IDT 门选择子 0xFFFF → `#GP(0xfffc)` → 双重投递失败 →
+  triple fault（`cpu0: starting 0` 之后立刻崩）。改为走 `bus_load/bus_store`
+  （7 处：desc_parse、段装载的 A 位回写、LTR/LLDT/任务切换的忙位回写、CALL/JMP
+  门的描述符读、IDT 门读）。
+  ② **INTR 是电平，不是锁存**（SDM vol.3 6.3.2）：PIC 的 `PicUpdateIrq` 只置位
+  从不清零、x86 的 `x86_set_intr` 忽略 level=0——POST 期间 IRQ0 置起的 INTR
+  一直挂着，xv6 `picinit` 屏蔽全部线之后开 IF 仍会“收到”一个 PIC 已经没了的
+  中断。现在两侧都按电平语义：PIC 每次重算可投递请求并相应拉高/拉低，
+  CPU 只在线上有电平时置 `intr_pending`。
+- **设备模型一修**：**空盘位的命令不产生任何应答**。原先对空盘也回 ABRT，
+  于是状态寄存器变 0x41 非零，xv6 的 `havedisk1` 探测就以为 1 号盘存在
+  （SeaBIOS 的 `ata_detect` 也是靠“状态为 0”判定空位）。现在空位状态恒 0、
+  命令写忽略，只有任务文件寄存器照存（固件回读探针要过）。
+- **实测证据**（`-bios bios.bin -hda xv6.img -hdb fs.img --mem 512`）：
+  SeaBIOS 认盘 `ata0-0: CEMU VIRTUAL DISK ATA-3 Hard-Disk (4 MiBytes)` /
+  `ata0-1: ... (0 MiBytes)`（从盘也认到了 → word 93 的 CBLID 位按 0 报，
+  否则 SeaBIOS 会认定“device 0 在替 device 1 应答”而跳过从盘），
+  `Booting from Hard Disk... Booting from 0000:7c00` → xv6 引导块自己从 0x1F0
+  读内核（bootmain.c 的 PIO 路径）→ `xv6...` → `cpu0: starting 0`（内核 main
+  全跑完 + mpmain）→ 进 scheduler 自旋、**0 个异常**，卡在 init 进程第一次读
+  fs.img 等中断上。反证：去掉 `-hdb` 立刻得到 xv6 自己的
+  `lapicid 0: panic: iderw: ide disk 1 not present`——说明它确实走到了那次读盘；
+  装上 fs.img 就是等 IRQ14 的完成中断，而 xv6 把 IDE 中断交给 **IOAPIC**
+  （0xFEC00000，本片还没有）投递 → 下一片。
+- **回归**：`bash test/run.sh` → riscv64 136 passed / 0 failed、x86 9 passed /
+  0 failed（门表寻址与 INTR 电平两处核心改动没有动摇任何基线）；
+  `bash tools/depcheck.sh` → ok。
+- **登记**：AGENTS.md 加 **D19**（PIIX3/IDE 简化清单：无 BMDMA、0x3F7 不解码、
+  IDENTIFY 时序字留 0、ISA 桥只有身份 + PIRQ）。
+- **下一片**：IOAPIC（+ LAPIC 定时器复核）→ xv6 起 shell；随后 PS/2 键盘
+  (IRQ1) 让 shell 能输入。
 ## 阶段 4 片 1：PC 固件路线打通，SeaBIOS POST 完整跑完（2026-09-19）
 
 x86 侧按用户指定走 SeaBIOS 固件路线（riscv 走 opensbi、xv6 用 D:\xv6img 的

@@ -12,23 +12,28 @@
 #include "device/misc/fwcfg.h"
 #include "device/misc/i440fx.h"
 #include "device/misc/pci.h"
+#include "device/misc/piix3.h"
 #include "device/misc/port92.h"
+#include "device/storage/ide.h"
 #include "device/timer/i8254.h"
 #include "device/video/cga.h"
 #include "host/host.h"
 #include "util/log.h"
 
 // IBM PC machine (x86_min), the x86 counterpart of spike_min. Real-mode
-// memory is 1MB at linear 0; the machine carries 32MB of RAM total
-// (kvm-unit-tests images link at 4MB and identity-map through the 4MB-page
-// directory). Platform devices: 8259 PIC pair at 0x20/0xA0 (IRQ0..15), 8254
-// PIT at 0x40-0x43 (channel 0 -> IRQ0, the periodic timer that wakes hlt),
-// COM1 at 0x3F8-0x3FF, the debug-exit device at 0xF4 and fw_cfg at 0x510/0x511
-// (QEMU contract) — all in a separate x86 I/O space (CpuState.io) — and the
-// Local APIC register page at 0xFEE00000 on the memory bus. The CGA card
+// memory is 1MB at linear 0; the machine carries 32MB of RAM by default
+// (kDefaultRamSize, overridable with --mem; kvm-unit-tests images link at 4MB
+// and identity-map through the 4MB-page directory, xv6's kernel assumes at
+// least its own 224MB PHYSTOP). Platform devices: 8259 PIC pair at 0x20/0xA0
+// (IRQ0..15), 8254 PIT at 0x40-0x43 (channel 0 -> IRQ0, the periodic timer that
+// wakes hlt), COM1 at 0x3F8-0x3FF, the debug-exit device at 0xF4 and fw_cfg at
+// 0x510/0x511 (QEMU contract) — all in a separate x86 I/O space (CpuState.io) —
+// and the Local APIC register page at 0xFEE00000 on the memory bus. The CGA card
 // (阶段 3.5 片 2) puts its 16KB frame buffer at 0xB8000 on the memory bus and
 // its ports at 0x3D0-0x3DF. Ports and MMIO nobody claims read all-ones and
-// drop writes — x86 I/O decode never faults.
+// drop writes — x86 I/O decode never faults — and an address no memory region
+// covers answers the same way, the open-bus value of a PC whose decoders all
+// decline the cycle.
 //
 // Firmware boot (-bios): the top of the first megabyte carries a ROM window
 // where the image is mapped, and the CPU resets at the x86 reset vector inside
@@ -40,14 +45,25 @@
 // alias at the end of the 4GiB space that firmware copies itself from (seabios
 // src/fw/shadow.c BIOS_SRC_OFFSET; the e820 entry POST reserves for it).
 //
-// The chipset is the i440FX host bridge (device/misc/i440fx.c): firmware asks
-// it — through PCI configuration space — to turn the ROM window into writable
-// RAM before it can store its own variables, which is why POST cannot get
-// anywhere without it. The keyboard controller (0x60/0x64), System Control
-// Port A (0x92) and the RTC/CMOS (0x70/0x71) are here because firmware touches
-// them before anything else — A20 is the line the first two drive, and the
-// CMOS memory-size registers are how POST learns how much RAM it has.
-static const uint64_t kRamSize = 32ULL << 20;
+// The chipset is the i440FX host bridge (device/misc/i440fx.c) plus the PIIX3
+// PCI-to-ISA bridge and its IDE function (device/misc/piix3.c,
+// device/storage/ide.h). Firmware asks the host bridge — through PCI
+// configuration space — to turn the ROM window into writable RAM before it can
+// store its own variables, which is why POST cannot get anywhere without it.
+// The keyboard controller (0x60/0x64), System Control Port A (0x92) and the
+// RTC/CMOS (0x70/0x71) are here because firmware touches them before anything
+// else — A20 is the line the first two drive, and the CMOS memory-size
+// registers are how POST learns how much RAM it has. The IDE controller is how
+// the machine has a disk at all: firmware reads the boot sector off it with
+// int13h, and an operating system reads the rest of its medium through the same
+// task file.
+static const uint64_t kDefaultRamSize = 32ULL << 20;
+// The chipset's MMIO windows start at the Local APIC page
+// (device/intc/lapic.c) and continue up through the PCI/BIOS holes at the top
+// of the 4GiB space, so RAM can only live below them.
+static const uint64_t kRamLimit = 0xFEE00000ULL;
+static const uint64_t kMinRamSize = 1ULL << 20;
+static const uint64_t kAddressSpace = 1ULL << 32;
 static const uint16_t kPicMasterBase = 0x20;
 static const uint16_t kPicSlaveBase = 0xA0;
 static const uint16_t kPitBase = 0x40;
@@ -73,8 +89,12 @@ static const uint64_t kResetVector = kRomBase + kRomSize - 0x10;
 // Boot-sector handoff (QEMU seabios): BIOS loads the image at 0x7C00 and
 // enters it with CS:IP = 0000:7C00, DL = 0x80 (drive number).
 static const uint64_t kBootSectorLoad = 0x7C00;
-// The host bridge sits at PCI bus 0, device 0, function 0 (QEMU i440fx).
+// The host bridge sits at PCI bus 0, device 0, function 0, and the PIIX3 at
+// device 1: function 0 the ISA bridge, function 1 the IDE controller (i440FX
+// and PIIX3 datasheets; QEMU hw/pci-host/i440fx.c and hw/isa/piix3.c).
 static const uint8_t kHostBridgeDev = 0;
+static const uint8_t kPiixDev = 1;
+static const uint8_t kPciBus0 = 0;
 
 typedef struct X86Board {
   Board base;
@@ -90,6 +110,8 @@ typedef struct X86Board {
   CmosDevice cmos;
   PciBus pci;
   I440fxDevice fx;
+  Piix3BridgeDevice piix;
+  IdeDevice ide;
   uint8_t* rom;  // the -bios image, mapped in the ROM window (NULL = none)
   uint64_t rom_size;
 } X86Board;
@@ -108,6 +130,7 @@ static void UnclaimedWrite(void* dev, uint64_t addr, int size, uint64_t val) {
 }
 
 static const DeviceOps kUnclaimedPortOps = {"unclaimed-ports", UnclaimedRead, UnclaimedWrite};
+static const DeviceOps kUnclaimedMemOps = {"unclaimed-mem", UnclaimedRead, UnclaimedWrite};
 
 // The ROM window. Reads always answer with the image — the chipset's RAM there
 // was initialized from the same bytes, so one buffer serves both states of the
@@ -166,9 +189,9 @@ static void OnPicIrq(void* ctx, int line, int level) {
 // INTA cycle: the CPU asks the PIC for the vector number of the pending IRQ.
 static int OnIntAck(void* ack_dev) { return PicAcknowledge((PicDevice*)ack_dev); }
 
-// PIT -> PIC: channel edges set/clear IRQ lines (level edges from the PIT
-// become edge-triggered IRR bits in the PIC).
-static void OnPitIrq(void* ctx, int line, int level) {
+// An ISA device's interrupt line into the PIC: the PIT on IRQ0, the IDE
+// channels on the fixed IRQ 14/15 (the PIIX3's compatibility-mode wiring).
+static void OnIsaIrq(void* ctx, int line, int level) {
   PicDevice* pic = (PicDevice*)ctx;
   PicSetIrq(pic, line, level);
 }
@@ -215,6 +238,7 @@ static int LoadRom(X86Board* xm, const char* path) {
 static void X86Destroy(Board* m) {
   X86Board* xm = (X86Board*)m;
   free(xm->rom);
+  IdeDestroy(&xm->ide);
 }
 
 static void X86Poll(Board* m) {
@@ -224,20 +248,30 @@ static void X86Poll(Board* m) {
 }
 
 Board* X86BoardCreate(const BoardOpts* opts) {
-  if (opts->ram_base || opts->ram_size) {
-    LogError("x86 machine has a fixed 1MB real-mode layout");
+  if (opts->ram_base) {
+    LogError("x86 machine places RAM at linear 0");
+    return NULL;
+  }
+  uint64_t ram_size = opts->ram_size ? opts->ram_size : kDefaultRamSize;
+  if (ram_size < kMinRamSize || ram_size > kRamLimit) {
+    LogError("x86 machine takes between %lluMB and %lluMB of RAM",
+             (unsigned long long)(kMinRamSize >> 20), (unsigned long long)(kRamLimit >> 20));
     return NULL;
   }
   X86Board* xm = (X86Board*)calloc(1, sizeof(X86Board));
   if (!xm) return NULL;
   Board* m = &xm->base;
   m->name = "x86";
-  m->ram = RamCreate(0, kRamSize);
+  m->ram = RamCreate(0, ram_size);
   if (!m->ram) {
     free(xm);
     return NULL;
   }
-  BusAddRamRegion(&m->bus, 0, kRamSize, &kRamOps, m->ram, m->ram->mem);
+  // The open bus first: every address the chipset's decoders do not claim
+  // answers with all ones and swallows writes (the RAM region below is smaller,
+  // so it wins wherever it applies).
+  BusAddRegion(&m->bus, 0, kAddressSpace, &kUnclaimedMemOps, NULL);
+  BusAddRamRegion(&m->bus, 0, ram_size, &kRamOps, m->ram, m->ram->mem);
   if (opts->bios_path) {
     if (LoadRom(xm, opts->bios_path) != 0) {
       BoardDestroy(m);
@@ -261,6 +295,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   I8042Device* kbd = &xm->kbd;
   Port92Device* p92 = &xm->port92;
   CmosDevice* cmos = &xm->cmos;
+  IdeDevice* ide = &xm->ide;
   Uart16550Init(uart);
   DebugExitBind(dexit, &m->cpu);
   PicInit(pic);
@@ -272,8 +307,22 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   Port92Init(p92);
   CmosInit(cmos);
   PciInit(&xm->pci);
-  I440fxInit(&xm->fx, 0, kHostBridgeDev);
+  I440fxInit(&xm->fx, kPciBus0, kHostBridgeDev);
+  Piix3BridgeInit(&xm->piix, kPciBus0, kPiixDev);
+  IdeInit(ide, kPciBus0, kPiixDev);
+  if (opts->hda && IdeAttach(ide, 0, 0, opts->hda) != 0) {
+    LogError("cannot attach -hda image '%s'", opts->hda);
+    BoardDestroy(m);
+    return NULL;
+  }
+  if (opts->hdb && IdeAttach(ide, 0, 1, opts->hdb) != 0) {
+    LogError("cannot attach -hdb image '%s'", opts->hdb);
+    BoardDestroy(m);
+    return NULL;
+  }
   PciAddDevice(&xm->pci, &xm->fx.pci);
+  PciAddDevice(&xm->pci, &xm->piix.pci);
+  PciAddDevice(&xm->pci, &ide->pci);
   BusAddRegion(&m->io, 0, kPortSpaceSize, &kUnclaimedPortOps, NULL);
   BusAddRegion(&m->io, kCom1Base, kCom1Size, &kUart16550Ops, uart);
   BusAddRegion(&m->io, kDebugExitPort, kDebugExitSize, &kDebugExitOps, dexit);
@@ -284,17 +333,19 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   I8042Register(&m->io, kbd);
   Port92Register(&m->io, p92);
   CmosRegister(&m->io, cmos);
-  CmosSetMemory(cmos, kRamSize);
+  CmosSetMemory(cmos, ram_size);
   PciRegister(&m->io, &xm->pci);
+  IdeRegister(&m->io, ide);
   LapicRegister(&m->bus, lapic);
   CgaRegister(&m->bus, &m->io, cga);
 
-  // Wiring: PIT ch0 -> PIC IRQ0 -> CPU INTR; INTA -> PicAcknowledge; the A20
-  // gate comes from the keyboard controller and port 0x92. The hooks live on
-  // CpuState (like timer_read/timer_dev), so the machine can install them
-  // before the loader picks the ISA.
+  // Wiring: PIT ch0 -> PIC IRQ0 -> CPU INTR; IDE channels -> PIC IRQ14/15;
+  // INTA -> PicAcknowledge; the A20 gate comes from the keyboard controller and
+  // port 0x92. The hooks live on CpuState (like timer_read/timer_dev), so the
+  // machine can install them before the loader picks the ISA.
   PicSetIrqSink(pic, OnPicIrq, &m->cpu);
-  PitSetIrqSink(pit, OnPitIrq, pic);
+  PitSetIrqSink(pit, OnIsaIrq, pic);
+  IdeSetIrqSink(ide, OnIsaIrq, pic);
   I8042SetA20Sink(kbd, OnA20, &m->cpu);
   Port92SetA20Sink(p92, OnA20, &m->cpu);
   m->cpu.int_ack = OnIntAck;

@@ -516,8 +516,11 @@ static void desc_parse(uint16_t sel, seg_view* v) {
     v->dbit = 0;
     return;
   }
+  // The GDT and LDT bases are linear addresses (SDM vol.3 3.5.1), so an entry
+  // comes through the paging unit: a kernel whose tables sit above the identity
+  // map (xv6's GDT and IDT live at 0x8011xxxx) has no other way to reach them.
   uint64_t table = sel & 4 ? s->ldtr_base : s->gdtr;
-  uint64_t desc = BusRead(cpu->bus, table + (uint64_t)(sel >> 3) * 8, 8);
+  uint64_t desc = bus_load(table + (uint64_t)(sel >> 3) * 8, 8);
   v->hi = (uint32_t)(desc >> 32);
   v->base = ((desc >> 16) & 0xffffff) | (((desc >> 56) & 0xff) << 24);
   uint32_t lim = (uint32_t)(desc & 0xffff) | (uint32_t)((desc >> 32) & 0xf0000);
@@ -539,8 +542,8 @@ static void seg_commit(int seg, uint16_t sel, const seg_view* v) {
   s->ar[seg] = v->ar;
   s->dbit[seg] = v->dbit;
   if ((s->cr0 & 1) && (sel & 0xfffc) && !(v->ar & 1))
-    BusWrite(cpu->bus, (sel & 4 ? s->ldtr_base : s->gdtr) + (uint64_t)(sel >> 3) * 8 + 5, 1,
-             (uint8_t)(v->ar | 1));
+    bus_store((sel & 4 ? s->ldtr_base : s->gdtr) + (uint64_t)(sel >> 3) * 8 + 5, 1,
+              (uint8_t)(v->ar | 1));
 }
 
 // CPL is the CS descriptor's DPL (SDM vol.1 3.4.5); the cache is the source.
@@ -792,10 +795,9 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   // JMP/CALL/INT set the incoming one's; IRET leaves the target busy (it
   // never stopped being the suspended task).
   if (source != kTaskCall)
-    BusWrite(cpu->bus, s->gdtr + (uint64_t)(s->tr >> 3) * 8 + 5, 1,
-             (uint8_t)(s->tr_ar & ~2u));
+    bus_store(s->gdtr + (uint64_t)(s->tr >> 3) * 8 + 5, 1, (uint8_t)(s->tr_ar & ~2u));
   if (source != kTaskIret)
-    BusWrite(cpu->bus, s->gdtr + (uint64_t)(sel >> 3) * 8 + 5, 1, (uint8_t)(v.ar | 2));
+    bus_store(s->gdtr + (uint64_t)(sel >> 3) * 8 + 5, 1, (uint8_t)(v.ar | 2));
   // The incoming task's T flag (SDM vol.3 7.2.1, fig 7-4 byte 0 bit 0): a
   // task-switch debug trap fires before the new task's first instruction.
   // Read before the back-link write below lands on the same word.
@@ -1013,8 +1015,7 @@ static void pm_far(uint16_t sel, uint32_t off, int is_call, uint32_t ret_eip) {
   if ((uint32_t)(sel >> 3) * 8 + 7 > table_limit(sel)) gp_fault(sel & ~3u);
   // Call gates may live in the LDT (SDM vol.3 3.5); task gates and TSSes
   // are GDT-only, so the TI=1 system paths below reject first.
-  uint64_t desc =
-      BusRead(cpu->bus, (sel & 4 ? s->ldtr_base : s->gdtr) + (uint64_t)(sel >> 3) * 8, 8);
+  uint64_t desc = bus_load((sel & 4 ? s->ldtr_base : s->gdtr) + (uint64_t)(sel >> 3) * 8, 8);
   if (!((desc >> 44) & 1)) {  // S=0: a system descriptor
     uint8_t ty = (uint8_t)((desc >> 40) & 0xf);
     int gdpl = (int)((desc >> 45) & 3);
@@ -1111,7 +1112,9 @@ void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
 
   uint32_t gate_idx = (uint32_t)vec * 8;
   if (gate_idx + 7 > s->idtr_limit) gp_fault(gate_idx | 2 | ext);
-  uint64_t gate = BusRead(cpu->bus, s->idtr + gate_idx, 8);
+  // The IDT base is a linear address (SDM vol.3 3.5.1), so the gate comes
+  // through the paging unit like any other access.
+  uint64_t gate = bus_load(s->idtr + gate_idx, 8);
   uint8_t gt = (uint8_t)((gate >> 40) & 0xf);
   if (soft && ((gate >> 45) & 3) < (uint32_t)cpl()) gp_fault(gate_idx | 2);
   if (gt != 6 && gt != 7 && gt != 0xe && gt != 0xf && gt != 5)
@@ -1922,8 +1925,7 @@ static void run_op2(uint8_t op2) {
           s->tr_base = v.base;
           s->tr_limit = v.limit;
           s->tr_ar = (uint8_t)(v.ar | 2);
-          BusWrite(cpu->bus, s->gdtr + (uint64_t)(sel >> 3) * 8 + 5, 1,
-                   (uint8_t)(v.ar | 2));
+          bus_store(s->gdtr + (uint64_t)(sel >> 3) * 8 + 5, 1, (uint8_t)(v.ar | 2));
           break;
         }
         case 4:
@@ -4083,10 +4085,12 @@ void run_op(uint8_t op) {
 
 void x86_set_intr(CpuState* c, int level) {
   x86_state* st = (x86_state*)c->priv;
-  if (level) {
-    st->intr_pending = 1;
-    c->wait = 0;
-  }
+  // INTR is a level line (SDM vol.3 6.3.2: it is sampled, not latched by the
+  // CPU), so the request stands only while the machine asserts it. The PIC
+  // keeps its own pending bits in the IRR and drops the line the moment the
+  // request is masked or acknowledged.
+  st->intr_pending = level ? 1 : 0;
+  if (level) c->wait = 0;
 }
 
 // ---- reset / boot ----------------------------------------------------------------

@@ -71,7 +71,12 @@ static void PicUpdateIrq(PicDevice* pic) {
     pic->pics[0].last_irr &= ~(1 << 2);
   }
   int irq = PicGetIrq(&pic->pics[0]);
-  if (pic->set_irq && irq >= 0) pic->set_irq(pic->irq_ctx, irq, 1);
+  // The CPU-facing line is a level (SDM vol.3 6.3.2: INTR is sampled while it
+  // is asserted), so a request that stops being deliverable — masked, or
+  // acknowledged and gone — must drop it. Holding it latched instead hands a
+  // kernel an interrupt the PIC no longer has: xv6 masks every PIC line during
+  // its init and would still see one pending the moment it enables IF.
+  if (pic->set_irq) pic->set_irq(pic->irq_ctx, irq >= 0 ? irq : 0, irq >= 0);
 }
 
 static void PicSetIrq1(PicState* s, int irq, int level) {

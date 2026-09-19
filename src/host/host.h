@@ -7,8 +7,14 @@
 typedef struct HostFile HostFile;
 
 HostFile* HostFileOpenRead(const char* path);
+// Read-write image file: a disk image has sectors the guest writes back.
+HostFile* HostFileOpenReadWrite(const char* path);
 int64_t HostFileSize(HostFile* f);
 size_t HostFileRead(HostFile* f, void* buf, size_t n);
+// Positioned access. A disk is addressed by sector number, not by a stream
+// cursor, so a transfer carries its own offset.
+size_t HostFileReadAt(HostFile* f, int64_t off, void* buf, size_t n);
+size_t HostFileWriteAt(HostFile* f, int64_t off, const void* buf, size_t n);
 void HostFileClose(HostFile* f);
 
 void HostWriteOut(const char* buf, size_t n);
