@@ -1,6 +1,8 @@
 // Host keyboard source (階段 4 片 6): whatever the process's stdin is — the
 // console the user runs cemu from, or a pipe a script drives — becomes
 // make/break scan code pairs at the machine's key sink. The PC's guest input
+
+#include "debug/debug.h"
 // device is the 8042 keyboard, so both the display window and stdin end up on
 // the same wire (IRQ1); typing in the terminal is the fallback when the window
 // does not hold the keyboard focus.
@@ -96,9 +98,19 @@ void HostKeyOpen(void (*sink)(void* ctx, uint32_t scan, int extended, int up), v
   g_in_is_console = g_in && g_in != INVALID_HANDLE_VALUE && GetConsoleMode(g_in, &mode);
   if (!g_in_is_console && (g_in == NULL || g_in == INVALID_HANDLE_VALUE)) g_sink = NULL;
   g_saw_cr = 0;
+  if (DebugOn(kDbgMark)) DebugMark("keyopen", g_sink ? 1 : 0, g_in_is_console);
 }
 
 void HostKeyPoll(void) {
+  static int announced;
+  if (!announced) {
+    announced = 1;
+    // Self-report at the first poll: this runs after DebugInit, so the note
+    // actually prints (an attach-time note would be swallowed), and it fires
+    // even when no sink is attached — which is what the keyboard hunt needed.
+    if (DebugOn(kDbgMark))
+      DebugMark("keypoll", (g_sink != NULL) * 10 + (int)(uintptr_t)g_in, g_in_is_console);
+  }
   if (!g_sink) return;
   // A 2 ms gate: the run loop steps millions of times a second and each poll
   // that reaches the OS costs a syscall.
@@ -109,6 +121,7 @@ void HostKeyPoll(void) {
   for (;;) {
     int c = NextByte();
     if (c < 0) return;
+    if (DebugOn(kDbgMark)) DebugMark("hostbyte", c, 0);
     if (g_saw_cr && c == '\n') {  // the LF of a "\r\n" is not a second Enter
       g_saw_cr = 0;
       continue;

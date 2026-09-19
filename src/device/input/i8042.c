@@ -2,6 +2,8 @@
 
 #include <stdlib.h>
 
+#include "debug/debug.h"
+
 // The controller's two ports (IBM PC/AT Technical Reference).
 enum { kI8042DataPort = 0x60, kI8042CmdPort = 0x64 };
 
@@ -90,6 +92,7 @@ static void I8042SyncIrq(I8042Device* d) {
   if (level == st->irq) return;
   st->irq = level;
   if (d->set_irq) d->set_irq(d->irq_ctx, 1, level);
+  if (DebugOn(kDbgMark)) DebugMark("kbd-irq", 1, level);
 }
 
 static void I8042SyncA20(I8042Device* d) {
@@ -247,6 +250,7 @@ void I8042SetIrqSink(I8042Device* d, void (*set_irq)(void* ctx, int line, int le
 }
 
 void I8042KeyByte(I8042Device* d, uint8_t scancode) {
+  if (DebugOn(kDbgMark)) DebugMark("kbd-byte", (int)scancode, 0);
   QueuePush(d->st, scancode);
   I8042SyncIrq(d);
 }

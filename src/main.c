@@ -179,6 +179,12 @@ int main(int argc, char** argv) {
   else
     LogInfo("firmware boot: reset=%llx isa=%s", (unsigned long long)m->cpu.pc, lr.isa->name);
 
+  // Host keys: stdin always feeds the machine's key sink (the console cemu was
+  // started from, or a pipe a script drives). This is deliberately outside the
+  // display branch: a run without a window has stdin as its only input path,
+  // and the window path is attached separately below.
+  if (m->key_in) HostKeyOpen(m->key_in, m->key_ctx);
+
   if (a.display_backend) {
     if (!m->display_ops) {
       LogError("machine %s has no display card", a.machine_name);
@@ -202,9 +208,6 @@ int main(int argc, char** argv) {
     }
     // The board's keyboard sink (the PC's 8042): window keys drive it.
     if (m->key_in) HostDisplaySetKeySink(m->display, m->key_in, m->key_ctx);
-    // The same sink also takes the host's stdin (console or pipe): the PC's
-    // only guest input device is the 8042, so both host sources land on IRQ1.
-    if (m->key_in) HostKeyOpen(m->key_in, m->key_ctx);
   }
 
   if (a.gdb_port) {

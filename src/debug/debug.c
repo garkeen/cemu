@@ -128,6 +128,8 @@ void DebugInit(void) {
       g_mask |= kDbgBus;
     else if (!strcmp(tok, "gdb"))
       g_mask |= kDbgGdb;
+    else if (!strcmp(tok, "mark"))
+      g_mask |= kDbgMark;
     else if (!strncmp(tok, "regs=", 5))
       g_regs_period = atoi(tok + 5);
     else if (!strncmp(tok, "watch=", 6))
@@ -141,7 +143,8 @@ void DebugInit(void) {
     else
       LogError("debug: unknown CEMU_DEBUG item '%s'", tok);
   }
-  if (g_mask & (kDbgTraceTable | kDbgMem | kDbgTrap | kDbgBus | kDbgGdb) || g_nwatch) {
+  if (g_mask & (kDbgTraceTable | kDbgMem | kDbgTrap | kDbgBus | kDbgGdb | kDbgMark) ||
+      g_nwatch) {
     g_tbl = TableOpen(kEventCols, 6, g_ascii, g_header_every);
     TableHeader(g_tbl);
   }
@@ -379,6 +382,18 @@ void DebugGdbNote(const char* note) {
   RowBeginBare(g_tbl, 'G');
   char det[80];
   snprintf(det, sizeof(det), "~~ %.60s", note);
+  TableRowCell(g_tbl, det);
+  TableRowEnd(g_tbl);
+}
+
+// Frameless note rows: the board's interrupt lines and the host input path live
+// outside the guest's step stream, and that gap is what made the keyboard path
+// invisible (AGENTS.md §IX.1: fix the facility instead of guessing).
+void DebugMark(const char* what, int a, int b) {
+  if (!DebugOn(kDbgMark) || !Allow(kDbgMark)) return;
+  RowBeginBare(g_tbl, 'K');
+  char det[80];
+  snprintf(det, sizeof(det), "%s a=%d b=%d", what, a, b);
   TableRowCell(g_tbl, det);
   TableRowEnd(g_tbl);
 }

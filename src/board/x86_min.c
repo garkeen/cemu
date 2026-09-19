@@ -7,6 +7,7 @@
 #include "device/intc/i8259.h"
 #include "device/intc/lapic.h"
 #include "device/intc/ioapic.h"
+#include "debug/debug.h"
 #include "device/misc/cmos.h"
 #include "device/misc/debug_exit.h"
 #include "device/misc/debugcon.h"
@@ -246,6 +247,9 @@ static void OnIsaIrq(void* ctx, int line, int level) {
   IrqBus* b = (IrqBus*)ctx;
   PicSetIrq(b->pic, line, level);
   IoapicSetPin(b->ioapic, line, level);
+  // Line transitions into the controllers (and from there to the CPU): the ISA
+  // fan-out is otherwise invisible from outside (kDbgMark).
+  if (DebugOn(kDbgMark)) DebugMark("isa", line, level);
 }
 
 // Host keys -> the 8042: the keyboard's byte (0xe0 first for an extended key,
@@ -255,6 +259,7 @@ static void OnHostKey(void* ctx, uint32_t scan, int extended, int up) {
   X86Board* xm = (X86Board*)ctx;
   if (scan == 0 || scan > 0x7f) return;  // Win32 sends no scan code for a few keys
   if (extended) I8042KeyByte(&xm->kbd, 0xe0);
+  if (DebugOn(kDbgMark)) DebugMark("hostkey", (int)scan, up);
   I8042KeyByte(&xm->kbd, (uint8_t)(scan | (up ? 0x80u : 0u)));
 }
 

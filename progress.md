@@ -3,6 +3,34 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 6/7：宿主输入源 + mark 观测类目；键盘端到端打通（2026-09-19）
+
+**片 6**：`src/host/input_win.c` —— stdin（控制台或管道）→ 美式布局 set-1 扫描码
+（大写走 shift 组合）→ 机板 `key_in` 钩子；`HostKeyOpen`/`HostKeyPoll`，run.c 的步进
+循环轮询（自带 2 ms 门限）。管道里的 `\r\n` 只当一次 Enter。
+
+**片 7 观测设施**：新增 `mark` 类目（无帧事件行 `DebugMark()`，K 行，AGENTS.md §十），
+打点：`I8042KeyByte`（kbd-byte）、`I8042SyncIrq` 的线跳变（kbd-irq）、机板 ISA 扇出
+`OnIsaIrq`（isa）、`OnHostKey`（hostkey），外加输入源自报 keypoll/hostbyte。
+§IX.1：这次卡住的就是"中断线与宿主输入完全看不见"，补设施而非继续推理。
+
+**根因（数据定案，不是推理）**：
+1. `mark` 下**一条 hostkey/kbd-byte 都没有** ⇒ 键没进 8042；
+2. 自报移到 `HostKeyPoll` 顶部（原先被 `if (!g_sink) return` 挡住）⇒ 仍无 keypoll
+   ⇒ `HostKeyPoll()` 根本没跑起来；
+3. 读 main.c：**`HostKeyOpen` 被写在 `if (a.display_backend)` 块里**，而未传 `-display`
+   的运行（你和我的都是）⇒ 既没有窗口、stdin 也没挂上 ⇒ 敲什么都没反应。
+   此前"工具会话没有可见桌面、自己测不了"的判断是错的：那个进程根本没有窗口。
+
+**修复**：`HostKeyOpen` 移出显示分支（stdin 恒接）；窗口按键仍由
+`HostDisplaySetKeySink` 单独接。
+
+**实测（无头、管道，可重复）**：启动 32 s 后写 `ls\r` ⇒ xv6 打出完整目录表
+（kill / ln / ls / mkdir / rm / sh / stressfs / usertests / wc / zombie / console）
+⇒ 宿主输入 → set-1 扫描码 → 8042 队列 → IRQ1 → xv6 kbd → 控制台，全链路通。
+
+**用法**：`-display win32` 出窗口（点窗口敲键）；不传 `-display` 即无头，直接在启动
+cemu 的终端里敲键（xv6 控制台同时写串口，回显就在同一终端）。
 ## 阶段 4 片 5：PS/2 键盘通路（i8042 输出队列 + IRQ1 + 宿主窗口按键）（2026-09-19）
 
 - **i8042**（`src/device/input/i8042.c`）：输出队列（16 字节，OBF = 非空，队列即输出

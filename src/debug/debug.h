@@ -21,7 +21,8 @@ enum {
   kDbgBus = 1 << 6,         // MMIO/IO port hits
   kDbgRegs = 1 << 7,        // periodic full register table
   kDbgGdb = 1 << 8,         // gdb stub protocol packets (tx/rx)
-  kDbgAny = 0x1ff,
+  kDbgMark = 1 << 9,        // frameless notes: irq lines, host input
+  kDbgAny = 0x3ff,
 };
 
 int DebugOn(uint32_t cat);
@@ -53,6 +54,11 @@ void DebugGdbPkt(int is_tx, const char* pkt);
 // gdb stub lifecycle row (same category): accept/detach/session/stop-reason
 // transitions — the state machine around the packets.
 void DebugGdbNote(const char* note);
+
+// Frameless note row (kDbgMark): board-level wiring and device-side events —
+// interrupt-line transitions, host input — have no instruction frame to report.
+// a/b are the two numbers the call site wants in the detail cell.
+void DebugMark(const char* what, int a, int b);
 
 // True when a watchpoint matches (funnels ask before doing the access so
 // the row prints even when the access itself faults).
