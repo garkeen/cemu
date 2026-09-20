@@ -1147,14 +1147,19 @@ static void pm_ret(uint32_t n) {
 }
 
 // Delivers a vector. Real mode: the IVT at IDTR (SDM vol.3 16.3). Protected
-// mode: the IDT gate — interrupt/trap gates push flags/CS/IP (plus the error
-// code when the vector carries one), switching to the TSS SS0:ESP0 stack on
-// a privilege change (SDM vol.2 INT Operation; behavior cross-checked
-// against v86 call_interrupt_vector; task gates and NT returns are task
-// switching, stage 3 item 3). `soft` marks INT n/INT3/INTO: only those check
-// the gate DPL, and external events stamp EXT into gate-fault error codes.
-void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
-  int ext = !soft;
+// mode: the IDT gate — interrupt/trap gates push flags/CS/IP, switching to the
+// TSS SS0:ESP0 stack on a privilege change (SDM vol.2 INT Operation; behavior
+// cross-checked against v86 call_interrupt_vector; task gates and NT returns
+// are task switching, stage 3 item 3).
+//
+// `origin` says where the vector came from, and the three sources differ in the
+// SDM: only a CPU-raised exception pushes the vector's error code (vol.2 INT
+// Operation, vol.3 table 6-1 — a software INT n and the external interrupt pin
+// push a bare flags/CS/IP frame); the EXT bit of gate-fault error codes is set
+// for external events only; and only INT n/INT3/INTO check the gate DPL.
+void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
+  int soft = origin == kIntSoft;
+  int ext = origin == kIntExternal;
   if (!(s->cr0 & 1)) {
     uint64_t tbl = s->idtr + (uint64_t)vec * 4;
     uint32_t off = krd16(tbl);
@@ -1185,7 +1190,8 @@ void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
   if (gt == 5) {
     // Task gate: the switch replaces the whole context, and an exception's
     // error code lands on the new task's stack (v86 do_task_switch).
-    do_task_switch((uint16_t)(gate >> 16), kTaskCall, ret_eip, vec_has_ec(vec), ec);
+    int gate_ec = vec_has_ec(vec) && origin == kIntException;
+    do_task_switch((uint16_t)(gate >> 16), kTaskCall, ret_eip, gate_ec, ec);
     d.delivered = 1;  // the exception went through a task gate
     return;
   }
@@ -1234,9 +1240,10 @@ void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
     kpush16(fl->word | 2);
     kpush16((uint16_t)old_cs);
     kpush16((uint16_t)ret_eip);
-    // Software INT n never carries an error code — only the exceptions do
-    // (SDM vol.2 INT Operation; v86 passes None for software ints).
-    if (vec_has_ec(vec) && !soft) kpush16((uint16_t)ec);
+    // Only a CPU-raised exception carries the vector's error code: a software
+    // INT n pushes a bare frame, and so does the external interrupt pin (SDM
+    // vol.2 INT Operation, vol.3 table 6-1; v86 passes None for software ints).
+    if (vec_has_ec(vec) && origin == kIntException) kpush16((uint16_t)ec);
   } else {
     if (switched) {
       kpush32(old_ss);
@@ -1245,7 +1252,7 @@ void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec) {
     kpush32(fl->word | 2);
     kpush32(old_cs);
     kpush32(ret_eip);
-    if (vec_has_ec(vec) && !soft) kpush32(ec);
+    if (vec_has_ec(vec) && origin == kIntException) kpush32(ec);
   }
   fl->tf = 0;
   fl->nt = 0;
@@ -3818,20 +3825,20 @@ void run_op(uint8_t op) {
       break;  // retf
     case 0xcc:
       fr->rec.mnemonic = "int3";
-      do_int(3, (uint32_t)(fr->rec.pc + d.nxt), 1, 0);
+      do_int(3, (uint32_t)(fr->rec.pc + d.nxt), kIntSoft, 0);
       return;  // int3
     case 0xcd: {
       fr->rec.mnemonic = "int";
       int v = imm8();  // evaluate the immediate first: d.nxt must count it
                        // before the return address is formed (arg order in C
                        // is unspecified)
-      do_int(v, (uint32_t)(fr->rec.pc + d.nxt), 1, 0);
+      do_int(v, (uint32_t)(fr->rec.pc + d.nxt), kIntSoft, 0);
       return;
     }  // int imm8
     case 0xce:
       fr->rec.mnemonic = "into";
       if (fl->of) {
-        do_int(4, (uint32_t)(fr->rec.pc + d.nxt), 1, 0);
+        do_int(4, (uint32_t)(fr->rec.pc + d.nxt), kIntSoft, 0);
         return;
       }
       break;      // into
@@ -4013,7 +4020,7 @@ void run_op(uint8_t op) {
     case 0xf1: {  // icebp/int1: #DB as a trap, rip after the byte (kvm debug:
                   // dr6 unchanged — no Bn/BS bits come from icebp itself)
       fr->rec.mnemonic = "icebp";
-      do_int(vec_db, (uint32_t)(fr->rec.pc + d.nxt), 0, 0);
+    do_int(vec_db, (uint32_t)(fr->rec.pc + d.nxt), kIntException, 0);
       return;
     }  // icebp
     case 0xf4: {  // hlt: sleeps until an unmasked external interrupt (SDM)

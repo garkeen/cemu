@@ -125,7 +125,7 @@ void x86_step(CpuState* c) {
       tval = 0;  // #DF pushes error code 0 (SDM vol.3 table 6-1)
     }
     delivering_vec = cause;
-    do_int(cause, (uint32_t)cpu->pc, 0, tval);
+    do_int(cause, (uint32_t)cpu->pc, kIntException, tval);
     delivering_vec = -1;
     // Live RF clears on exception entry; the pushed image kept whatever the
     // interrupted context held (an instruction-breakpoint #DB forces RF=1 in
@@ -168,7 +168,7 @@ void x86_step(CpuState* c) {
     fr->rec.raw_len = 0;
     fr->rec.mnemonic = "intr";
     delivering_vec = vec;
-    do_int(vec, (uint32_t)cpu->pc, 0, 0);
+    do_int(vec, (uint32_t)cpu->pc, kIntExternal, 0);
     delivering_vec = -1;
     DebugInsn(fr);
     return;
@@ -216,7 +216,7 @@ void x86_step(CpuState* c) {
     s->bt_pending = 0;
     cpu->wait = 0;  // a #DB after hlt wakes the processor
     DebugInsn(fr);
-    do_int(vec_db, (uint32_t)cpu->pc, 0, 0);
+    do_int(vec_db, (uint32_t)cpu->pc, kIntException, 0);
     s->trap_seq++;
     s->trap_signal = (uint8_t)GdbTrapSignal(vec_db);
     DebugTrap(fr);

@@ -3,6 +3,46 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 10：x86 中断投递多压错误码（IRQ 被当成异常）——isolinux 的 iret #GP 根因（2026-09-19）
+
+片 9 的卡点（El Torito 引导镜像跳转后，isolinux 的 32 位 PM 代码在 guest 0x8ccc 的
+`iret` 上反复 #GP → triple fault）在这一片定案并修掉。
+
+**症状回顾**：`trap` 行 cause=13、错误码是被弹入的伪选择子（随运行变化）；PC 恒为
+0x8ccc（isolinux.bin 文件偏移 0x10cc = `popa; add esp,4; iret`）。
+
+**定位（用调试设施，不是推理）**：
+1. 同一地址在 cemu 与 QEMU 两边下断点（stub）：两边的指令流到 0x873c/0x8cc2 逐条
+   一致、每条指令的 ESP 增量也一致，但 **ESP 绝对值差 4 字节** ⇒ 漂移发生在更早处；
+2. 两侧栈镜像对齐后可见：ceme 的返回帧比 QEMU 的高一个双字，且那个槽里是 **0**
+   ⇒ 有一次压栈多写了 4 字节的零；
+3. `CEMU_DEBUG=watch=0x31ff80:0x80:w` 的 W 行（带 PC/RAW/助记符）直接给出写者：
+   `| W | 0000000000008dd7 | intr | w 31ffb0:4 <- 0 |` —— **一次中断投递把错误码
+   0 压进了栈**（帧 = [EC=0][EIP][CS][FLAGS]）。
+
+**根因（真 bug，不是特判需求）**：`do_int` 用 `!soft` 判断"这个向量要不要压错误码"。
+软件 `INT n` 已经排除（`!soft`），但 **step.c 的硬件 INTR 投递也传 `soft=0`**，于是被
+当成异常：标准 PC 映射下 IRQ0..7 = 向量 8..15，其中 8/10/11/12/13/14/17 在我的
+`vec_has_ec` 表里 ⇒ **每一次定时器中断都多压 4 字节** ⇒ 客人的 IRQ 处理程序按
+"无错误码"的布局收尾（`popa; add esp,4; iret`）⇒ 栈漂移 ⇒ `iret` 弹出伪选择子。
+
+**修复（按 SDM vol.2 INT Operation / vol.3 table 6-1 分三类来源）**：`x86.h` 新增
+`kIntException / kIntExternal / kIntSoft`；`do_int(vec, ret_eip, origin, ec)` 只在
+`kIntException` 时压该向量的错误码，门故障错误码的 EXT 位只对 `kIntExternal` 置，
+门 DPL 检查仍只对 `kIntSoft` 生效。调用点按语境传参：step.c 的三处（异常桥
+`kIntException`、INTR 投递 `kIntExternal`、单步 #DB `kIntException`），exec.c 四处
+（INT3/INT n/INTO = `kIntSoft`，单步 #DB = `kIntException`）。
+
+**实测**：triple fault 消失（150M 条指令干净跑完、`trap` 类目 25M 条内零异常）；
+引导停在 isolinux 自举阶段（无控制台输出、无异常）——**下一片**：查 isolinux 经
+INT 13h 读自身文件（多块 CDB / SeaBIOS 的 CD 映射）为何没有进展。
+
+**回归**：riscv64 136/0、x86 9/0、depcheck ok（CPU 语义改动没动摇既有基线）。
+
+**设施记要（本轮踩到的两个坑，已顺手补一个）**：`watch=` 的地址/长度要写 `0x`
+前缀，写成 `31ff80:80:w` 会被当十进制解析失败而**静默丢弃**（现已补错误日志）；
+`bus`/`mem` 的 5MB 会话上限会被 BIOS 的 ROM 影子拷贝（每字节两次事件）吃满，
+要定位引导期的设备流量得用 `skip=` 把窗口挪过去。
 ## 阶段 4 片 9：ATAPI 落地 —— SeaBIOS 从光盘引导 isolinux（2026-09-19）
 
 验收 2 主线的第一半：给 PIIX IDE 补上 packet（ATAPI）设备，让 SeaBIOS 的

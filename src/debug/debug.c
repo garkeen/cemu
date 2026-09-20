@@ -74,16 +74,25 @@ static int ParseUint(const char* s, uint64_t* out) {
 
 static void AddWatch(const char* spec) {
   // watch=ADDR:SIZE[:r|w|rw]
-  if (g_nwatch >= kMaxWatches) return;
+  if (g_nwatch >= kMaxWatches) {
+    LogError("debug: too many watches, dropping '%s'", spec);
+    return;
+  }
   uint64_t addr, size;
   const char* colon = strchr(spec, ':');
-  if (!colon) return;
+  if (!colon) {
+    LogError("debug: watch expects ADDR:SIZE[:r|w|rw] ('%s')", spec);
+    return;
+  }
   char head[32];
   size_t hl = (size_t)(colon - spec);
   if (hl >= sizeof(head)) return;
   memcpy(head, spec, hl);
   head[hl] = 0;
-  if (!ParseUint(head, &addr)) return;
+  if (!ParseUint(head, &addr)) {
+    LogError("debug: watch address must be a number, 0x-prefixed for hex ('%s')", head);
+    return;
+  }
   const char* rest = colon + 1;
   const char* colon2 = strchr(rest, ':');
   char szs[32];
@@ -91,7 +100,10 @@ static void AddWatch(const char* spec) {
   if (sl >= sizeof(szs)) return;
   memcpy(szs, rest, sl);
   szs[sl] = 0;
-  if (!ParseUint(szs, &size)) return;
+  if (!ParseUint(szs, &size)) {
+    LogError("debug: watch size must be a number ('%s')", szs);
+    return;
+  }
   int rw = 3;
   if (colon2) {
     if (!strcmp(colon2 + 1, "r"))

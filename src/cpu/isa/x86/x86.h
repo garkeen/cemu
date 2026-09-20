@@ -23,6 +23,10 @@ enum {
   vec_de = 0, vec_db = 1, vec_bp = 3, vec_ud = 6, vec_df = 8, vec_ts = 10,
   vec_np = 11, vec_ss = 12, vec_gp = 13, vec_pf = 14, vec_ac = 17
 };
+// Where a delivered vector came from (SDM vol.2 INT Operation / vol.3 table
+// 6-1): only a CPU-raised exception pushes the vector's error code — a software
+// INT n and the external interrupt pin push a bare flags/CS/IP frame.
+enum { kIntException = 0, kIntExternal = 1, kIntSoft = 2 };
 
 // Debug registers (SDM vol.3 ch.17). DR6's reserved bits read 1 (reset
 // 0xffff0ff0) and its B bits clear on any write; DR7 bit 10 reads 1 (reset
