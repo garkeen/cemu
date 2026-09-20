@@ -82,7 +82,10 @@ uint64_t riscv_mem_load(frame* fr, uint64_t vaddr, int size, int acc) {
       BusProbe(cpu->bus, paddr, size, &r) != 0)
     raise_(fr, fault_cause(acc), vaddr);
   uint64_t v = BusRead(cpu->bus, paddr, size);
-  if (DebugOn(kDbgBus) && !r->host) DebugBus(fr, r->ops->name, paddr, size, 1, v);
+  // The bus category reports device accesses (MMIO and port hits); an
+  // instruction fetch is not one — see the x86 funnel's is_fetch.
+  if (DebugOn(kDbgBus) && !r->host && acc != acc_ifetch)
+    DebugBus(fr, r->ops->name, paddr, size, 1, v);
   if (DebugOn(kDbgMem)) DebugMem(fr, vaddr, size, acc, v, 1);
   return v;
 }

@@ -48,12 +48,16 @@ static uint64_t a20_gate(uint64_t addr) {
   return s->a20 ? addr : (addr & ~(1ULL << 20));
 }
 
-static uint64_t phys_load(uint64_t addr, int size) {
+// is_fetch marks the instruction stream: the bus category reports device
+// accesses (MMIO and port hits), and a fetch is not one. Firmware executes from
+// its ROM window for most of a boot, and those fetch rows would otherwise fill
+// the session's output cap before any real device access happens.
+static uint64_t phys_load(uint64_t addr, int size, int is_fetch) {
   BusRegion* r;
   addr = a20_gate(addr);
   if (BusProbe(cpu->bus, addr, size, &r) != 0) return size == 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
   uint64_t v = BusRead(cpu->bus, addr, size);
-  if (DebugOn(kDbgBus) && !r->host) DebugBus(fr, r->ops->name, addr, size, 1, v);
+  if (DebugOn(kDbgBus) && !r->host && !is_fetch) DebugBus(fr, r->ops->name, addr, size, 1, v);
   if (DebugOn(kDbgMem)) DebugMem(fr, addr, size, acc_read, v, 1);
   return v;
 }
@@ -75,7 +79,14 @@ static void phys_store(uint64_t addr, int size, uint64_t v) {
 static uint64_t page_translate_as(uint64_t lin, int write, int user);
 static uint64_t page_translate(uint64_t lin, int write);
 
-static uint64_t bus_load(uint64_t lin, int size) { return phys_load(page_translate(lin, 0), size); }
+static uint64_t bus_load(uint64_t lin, int size) {
+  return phys_load(page_translate(lin, 0), size, 0);
+}
+// The instruction stream reads through the same funnel (code in ROM or RAM is
+// observed identically) but is not a device access — see phys_load.
+static uint64_t bus_fetch(uint64_t lin, int size) {
+  return phys_load(page_translate(lin, 0), size, 1);
+}
 static void bus_store(uint64_t lin, int size, uint64_t v) {
   phys_store(page_translate(lin, 1), size, v);
 }
@@ -89,7 +100,7 @@ static void bus_store(uint64_t lin, int size, uint64_t v) {
 // are the processor's own state), and every OS depends on it — its GDT/IDT/TSS
 // live in supervisor pages.
 static uint64_t kbus_load(uint64_t lin, int size) {
-  return phys_load(page_translate_as(lin, 0, 0), size);
+  return phys_load(page_translate_as(lin, 0, 0), size, 0);
 }
 static void kbus_store(uint64_t lin, int size, uint64_t v) {
   phys_store(page_translate_as(lin, 1, 0), size, v);
@@ -293,7 +304,7 @@ uint8_t fetch8(void) {
   uint32_t off = (uint32_t)(eip + d.nxt);
   // CS limit (SDM vol.3 5.3): every fetched byte lies inside the segment.
   if ((s->cr0 & 1) && off > s->limit[cs_i]) gp_fault(0);
-  uint8_t v = rd8(s->base[cs_i] + eip + d.nxt);
+  uint8_t v = (uint8_t)bus_fetch(s->base[cs_i] + eip + d.nxt, 1);
   if (fr->rec.raw_len < sizeof(fr->rec.raw)) fr->rec.raw[fr->rec.raw_len++] = v;
   d.nxt++;
   return v;
@@ -616,7 +627,7 @@ static uint64_t page_translate_as(uint64_t lin, int write, int user) {
   if (!(s->cr0 & kCr0Pg)) return lin;
   uint32_t code = (write ? 2u : 0u) | (user ? 4u : 0u);
   uint32_t pde_addr = (uint32_t)(s->cr3 & ~0xfffu) | ((uint32_t)(lin >> 20) & 0xffc);
-  uint32_t pde = phys_load(pde_addr, 4);
+  uint32_t pde = phys_load(pde_addr, 4, 0);
   if (!(pde & kPdeP)) pf_fault(lin, code);
   if ((pde & kPdePs) && (s->cr4 & kCr4Pse)) {
     // 4MB page (SDM vol.3 4.3): the PDE is the leaf — frame = bits 31:22,
@@ -631,7 +642,7 @@ static uint64_t page_translate_as(uint64_t lin, int write, int user) {
     return ((uint64_t)(pde & 0xffc00000u)) | (lin & 0x3fffff);
   }
   uint32_t pte_addr = (pde & ~0xfffu) | ((uint32_t)(lin >> 10) & 0xffc);
-  uint32_t pte = phys_load(pte_addr, 4);
+  uint32_t pte = phys_load(pte_addr, 4, 0);
   if (!(pte & kPteP)) pf_fault(lin, code);
   int writable = (pde & kPdeRw) != 0 && (pte & kPteRw) != 0;
   if (user ? (!(pde & kPdeUs) || !(pte & kPteUs))

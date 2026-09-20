@@ -69,6 +69,9 @@ typedef struct BoardOpts {
   // NULL = empty bay. Machines without an IDE controller ignore them.
   const char* hda;
   const char* hdb;
+  // CD-ROM image for the PC's secondary IDE master (-cdrom): a packet (ATAPI)
+  // device with 2048-byte blocks. NULL = empty bay.
+  const char* cdrom;
 } BoardOpts;
 
 // Creates a board by name ("spike", "x86", "virt"); returns NULL for unknown

@@ -3,6 +3,52 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 9：ATAPI 落地 —— SeaBIOS 从光盘引导 isolinux（2026-09-19）
+
+验收 2 主线的第一半：给 PIIX IDE 补上 packet（ATAPI）设备，让 SeaBIOS 的
+El Torito 路径能读光盘。
+
+**设备侧**（`device/storage/ide.{h,c}`）：新增介质种类（`kIdeMediaDisk` /
+`kIdeMediaCd`）与 packet 设备的完整状态——复位后呈现 ATAPI 签名（SC=SN=1、
+CL/CH=0x14/0xEB；选择该盘位时重新呈现，这是驱动在没读 IDENTIFY 前认出它的
+唯一途径）、IDENTIFY PACKET DEVICE（0xA1，word 0 = 0x8580 = packet 设备 +
+设备类型 5 = CD-ROM + 可换介质）、PACKET（0xA0）经数据口收 12 字节 CDB 并按
+§9.6 解释。CDB 覆盖 TUR(0x00)/REQUEST SENSE(0x03，18 字节定长 sense)/
+INQUIRY(0x12，36 字节)/START STOP UNIT(0x1B)/READ CAPACITY(0x25)/
+READ(10)(0x28)/READ(12)(0xA8)；其余回 ILLEGAL REQUEST + ASC（错误寄存器
+高位 nibble = sense key）。逻辑块 2048 字节。
+**传输核心统一成"DRQ 轮次"**（round/used/left/limit/refill/packet 六个字段）：
+ATA 仍是每轮 512 字节、只在命令末尾中断；ATAPI 每轮 2048 字节（受字节数上限
+CL/CH 与块边界约束）、每轮中断、结束置"命令完成"中断理由。ATA 语义逐字保留
+（回归 riscv64 136/0、x86 9/0 全绿，depcheck ok）。
+
+**板级**：`-cdrom FILE`（QEMU 惯例；落在次通道主盘）——main.c / board.h /
+x86_min.c。
+
+**关键 bug（新探针逮住，不是推理）**：数据相没有把 `block_size` 从 CDB 阶段的
+12 改回 2048 ⇒ 每轮只搬 12 字节、且按 `lba × 12` 读介质 ⇒ 引导记录卷描述符
+（LBA 0x11）读出全零 ⇒ SeaBIOS 报 `Could not read from CDROM (code 0005)`。
+先用 QEMU `-trace 'ide_*'` 取客人下发的 CDB 真值（`28 00 00 00 00 11 00 00 01
+00 00 00`，字节数上限 0x0800），排除译码嫌疑后定位到数据面。
+
+**观测设施补缺（§九.1）**：`bus` 类目此前把**指令取指**也记为设备命中——固件
+在 ROM 窗口执行时，取指行会吃满会话 5MB 输出上限，IDE 端口流量完全看不见
+（本轮为此白跑数轮）。现在取指不进 `bus`：x86 走 `phys_load(..., is_fetch)`
+与 `bus_fetch`，riscv 用既有的 `acc_ifetch` 访问类；`mem` 类目不受影响。
+
+**新增 smoke 探针** `test/x86/probe/cd_atapi.asm`（.bin 已 ignore）：直接驱动
+次通道 ATAPI，打印签名 / IDENTIFY / READ(10) 块字节与结束状态，**cemu 与 QEMU
+双跑对拍**。实测两侧转录逐字一致，且 `blk=` 与 ISO 第 17 扇区逐字节相同。
+
+**验收进展**：SeaBIOS `Booting from DVD/CD...` → `Booting from 0000:7c00`
+（El Torito 无仿真引导镜像被加载并跳转，与 QEMU 转录一致）✓。
+
+**当前卡点（下一轮第一件事）**：isolinux 的 32 位保护模式代码在 guest 0x8ccc
+的 `iret` 上反复 #GP（`trap` 行 cause=13，首个错误码是被弹入的伪选择子且随运行
+变化）→ triple fault。已定位指令区间（6.0M 条时 PC=0x8c98，紧邻故障点）。
+下一步查 cemu 的 PM iret 帧宽度与选择子校验（SDM vol.3 6.13/6.14）。
+
+**登记**：D19 的 ATAPI 条目销账；未实现的 CDB 与 ATAPI DMA 立 D27。
 ## 阶段 4 片 8：验收 2 起步 —— 取镜像、补 VGA 文本回读设施、定位 Linux 0.11 引导码（2026-09-19）
 
 **镜像**：`build/linux/` 下有两份（用户自取）：`linux.iso`（5.4MB，El Torito 光盘 ✓ 走 ISO

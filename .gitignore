@@ -23,3 +23,6 @@ build/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Smoke-probe products (the source stays; test/x86/probe/*.asm builds them)
+/test/x86/probe/*.bin

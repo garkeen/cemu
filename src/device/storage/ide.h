@@ -23,35 +23,67 @@
 // host interface is one register file, and the drive/head register's bit 4
 // picks which of the two devices executes the next command). Every driver
 // depends on that: xv6's idestart, libata's ata_tf_load and SeaBIOS's send_cmd
-// all write the sector count and the LBA registers *first* and the device/head
-// register last, so a per-drive register file would hand the command the other
-// bay's stale address. Only the status and error registers are per device —
-// they are how a bay reports its own last command, and an empty bay answers
-// status 0 forever, which is how firmware and xv6 tell "no drive" from "drive
-// that has not been selected yet".
+// all write the sector count and the LBA registers and only then the device/head
+// register, so a per-drive register file would hand the command the other bay's
+// stale address. Only the status and error registers are per device — they are
+// how a bay reports its own last command, and an empty bay answers status 0
+// forever, which is how firmware and xv6 tell "no drive" from "drive that has
+// not been selected yet".
 //
-// The drive is the PIO half of ATA-4: IDENTIFY DEVICE (0xEC), READ SECTORS
-// (0x20), WRITE SECTORS (0x30) and FLUSH CACHE (0xE7), in LBA-28 or CHS
-// addressing, one 512-byte sector per DRQ handshake (ATA/ATAPI-7 §6.3 PIO data
-// transfer). Everything else reports ABRT, which is what a drive that does not
-// implement a command answers — including IDENTIFY PACKET DEVICE (0xA1), the
-// probe SeaBIOS uses to tell an ATAPI drive from an ATA one. Bus-master DMA
-// (the BAR4 engine) is not modelled; see 简化登记 D19.
+// Two media kinds share the controller:
+//
+//  - A disk answers the PIO half of ATA-4: IDENTIFY DEVICE (0xEC), READ SECTORS
+//    (0x20), WRITE SECTORS (0x30) and FLUSH CACHE (0xE7), in LBA-28 or CHS
+//    addressing, one 512-byte sector per DRQ handshake (ATA/ATAPI-7 §6.3 PIO
+//    data transfer).
+//  - A CD-ROM answers the packet (ATAPI) command set: IDENTIFY PACKET DEVICE
+//    (0xA1) and PACKET (0xA0), whose 12-byte command descriptor block arrives
+//    through the data port and carries a SCSI-style command (§9.5/§9.6). Its
+//    logical blocks are 2048 bytes. After a reset a packet device presents the
+//    ATAPI signature (sector count 1, sector number 1, cylinder low 0x14,
+//    cylinder high 0xEB) — that is how a driver recognises the bay before it
+//    has read IDENTIFY PACKET DEVICE.
+//
+// Buses and drivers do not implement a command by answering nothing: an
+// unimplemented ATA command is aborted (ABRT), an unimplemented CDB reports a
+// sense key. Bus-master DMA (the BAR4 engine) is not modelled; see 简化登记
+// D19.
 enum { kIdeDrivesPerChannel = 2 };
+
+// Logical block sizes. The ATA register command set moves 512-byte sectors; the
+// packet command set moves the CD-ROM's 2048-byte blocks (§9.6, MMC).
+enum {
+  kAtaBlockSize = 512,
+  kAtapiBlockSize = 2048,
+  kMaxBlockSize = kAtapiBlockSize,
+  kAtapiCdbSize = 12,  // 12-byte packets (IDENTIFY PACKET DEVICE word 0 bit 5 = 0)
+};
+
+// Media kinds for IdeAttach.
+enum { kIdeMediaDisk = 0, kIdeMediaCd = 1 };
 
 // One bay: the medium, its geometry, and the two registers the host reads back
 // from that particular device.
 typedef struct IdeDrive {
   HostFile* image;  // the medium; NULL = empty bay
-  int64_t sectors;  // medium size in 512-byte sectors
+  int atapi;        // packet device: 2048-byte blocks and the CDB command set
+  // Medium size in logical blocks (512-byte for a disk, 2048-byte for a CD):
+  // what IDENTIFY words 60/61 and the READ CAPACITY reply report.
+  int64_t blocks;
   // CHS geometry, reported by IDENTIFY words 1/3/6 and used to translate CHS
   // commands. 16 heads / 63 sectors per track is the LBA-assist translation
-  // firmware and QEMU's hd_geometry_guess use for a drive without a real one.
+  // firmware and QEMU's hd_geometry_guess use for a drive without a real one. A
+  // CD has no geometry to report (CHS addressing is LBA on a packet device).
   uint16_t cylinders;
   uint8_t heads;
   uint8_t sectors_per_track;
-  uint8_t error;   // error register (§7.10.2)
+  uint8_t error;   // error register (§7.10.2); for a packet device the sense
+                   // key sits in its high nibble
   uint8_t status;  // status register (§7.10.9); zero while the bay is empty
+  // The sense key and additional sense code of the last failed packet command,
+  // which REQUEST SENSE hands back (§10.3.2).
+  uint8_t sense_key;
+  uint8_t asc;
 } IdeDrive;
 
 typedef struct IdeDevice IdeDevice;
@@ -73,14 +105,23 @@ typedef struct IdeChannel {
   uint8_t devctrl;  // control block: nIEN (bit 1), SRST (bit 2), HD15 (bit 3)
   // An in-flight PIO transfer. One command runs per channel at a time; the
   // active drive is the one the device/head register selected when the command
-  // was written.
-  int active;     // drive executing, -1 = idle
-  int is_write;   // direction of the active transfer
-  int64_t lba;    // sector being transferred
-  int remaining;  // sectors left in the command
-  int done;       // bytes of the current sector already moved
+  // was written. Data moves in DRQ rounds: a round hands over as much as one
+  // logical block holds, the ATAPI byte count limit, and the bytes the command
+  // has left, whichever is smallest (§6.3, §9.6).
+  int active;      // drive executing, -1 = idle
+  int is_write;    // direction of the active transfer
+  int packet;      // what is moving is the CDB itself, not data
+  int64_t lba;     // logical block being transferred
+  int64_t left;    // bytes left in the command's data phase
+  int round;       // bytes of the current DRQ round not yet moved
+  int used;        // bytes of the current block already moved
+  int block_size;  // bytes per logical block for the active command
+  int limit;       // per-round byte limit: one block for ATA, the packet
+                   // device's byte count limit register value for ATAPI
+  int refill;      // the buffer is reloaded at every block boundary — a medium
+                   // transfer, as opposed to a reply that already sits in it
   int irq_pending;  // a completion to report (masked by devctrl nIEN)
-  uint8_t buf[512];
+  uint8_t buf[kMaxBlockSize];
 } IdeChannel;
 
 struct IdeDevice {
@@ -91,9 +132,10 @@ struct IdeDevice {
 };
 
 void IdeInit(IdeDevice* d, uint8_t bus, uint8_t dev);
-// Attaches a disk image to one bay: channel 0/1, drive 0 (master) / 1 (slave).
-// Returns 0 on success; the image must be a whole number of sectors.
-int IdeAttach(IdeDevice* d, int channel, int drive, const char* path);
+// Attaches a medium to one bay: channel 0/1, drive 0 (master) / 1 (slave).
+// Returns 0 on success; the image must be a whole number of logical blocks
+// (512 bytes for kIdeMediaDisk, 2048 for kIdeMediaCd).
+int IdeAttach(IdeDevice* d, int channel, int drive, const char* path, int media);
 // The four legacy port windows on the I/O bus.
 void IdeRegister(Bus* io, IdeDevice* d);
 void IdeSetIrqSink(IdeDevice* d, void (*set_irq)(void* ctx, int line, int level), void* ctx);

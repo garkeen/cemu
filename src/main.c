@@ -16,6 +16,7 @@ typedef struct Args {
   const char* bios_path;  // -bios FILE: firmware ROM image (x86 PC board)
   const char* hda;        // -hda FILE: primary IDE master image (x86 PC board)
   const char* hdb;        // -hdb FILE: primary IDE slave image
+  const char* cdrom;      // -cdrom FILE: secondary IDE master CD-ROM image
   const char* display_backend;  // -display win32; NULL = headless
   uint64_t mem_size;
   uint64_t mem_base;
@@ -43,6 +44,7 @@ static void Usage(void) {
       "  -bios FILE        x86: map a firmware ROM image and reset into it\n"
       "  -hda FILE         x86: primary IDE master disk image\n"
       "  -hdb FILE         x86: primary IDE slave disk image\n"
+      "  -cdrom FILE       x86: secondary IDE master CD-ROM image\n"
       "  -display win32    open a window on the machine's display card\n"
       "  -s                gdb stub on tcp::1234 (guest runs until attached)\n"
       "  -gdb tcp::PORT    gdb stub on PORT\n"
@@ -111,6 +113,8 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       a->hda = argv[++i];
     else if (strcmp(arg, "-hdb") == 0)
       a->hdb = argv[++i];
+    else if (strcmp(arg, "-cdrom") == 0)
+      a->cdrom = argv[++i];
     else if (arg[0] == '-' && arg[1] == '-')
       return -1;
     else
@@ -138,7 +142,8 @@ int main(int argc, char** argv) {
                     .ram_size = a.mem_size,
                     .bios_path = a.bios_path,
                     .hda = a.hda,
-                    .hdb = a.hdb};
+                    .hdb = a.hdb,
+                    .cdrom = a.cdrom};
   Board* m = BoardCreate(a.machine_name, &opts);
   if (!m) return 1;
 

@@ -381,13 +381,20 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   I440fxInit(&xm->fx, kPciBus0, kHostBridgeDev);
   Piix3BridgeInit(&xm->piix, kPciBus0, kPiixDev);
   IdeInit(ide, kPciBus0, kPiixDev);
-  if (opts->hda && IdeAttach(ide, 0, 0, opts->hda) != 0) {
+  if (opts->hda && IdeAttach(ide, 0, 0, opts->hda, kIdeMediaDisk) != 0) {
     LogError("cannot attach -hda image '%s'", opts->hda);
     BoardDestroy(m);
     return NULL;
   }
-  if (opts->hdb && IdeAttach(ide, 0, 1, opts->hdb) != 0) {
+  if (opts->hdb && IdeAttach(ide, 0, 1, opts->hdb, kIdeMediaDisk) != 0) {
     LogError("cannot attach -hdb image '%s'", opts->hdb);
+    BoardDestroy(m);
+    return NULL;
+  }
+  // The CD-ROM sits on the secondary master, which is where a PC puts it (and
+  // where QEMU's -cdrom lands by default).
+  if (opts->cdrom && IdeAttach(ide, 1, 0, opts->cdrom, kIdeMediaCd) != 0) {
+    LogError("cannot attach -cdrom image '%s'", opts->cdrom);
     BoardDestroy(m);
     return NULL;
   }
