@@ -1,6 +1,6 @@
 # cemu 参考资料索引（reference.md）
 
-调研全文在 TinyEMU/项目调研.md（各项目逐个分析：执行模型、译码结构、
+调研全文在 EMU/项目调研.md（各项目逐个分析：执行模型、译码结构、
 覆盖面、POSIX 依赖、许可证、参考建议）。本文是**工作索引**：修 bug、
 写设备、加指令时按此表直达文件，并守住两条纪律——
 
@@ -11,7 +11,7 @@
    已有答案（先例：DAS 的 SDM/实机 18 处分歧按 QEMU/v86 真值表修复）。
    定位不了时先读参考同位置代码，再回 CEMU_DEBUG 验证假设。
 
-## 一、参考代码树（D:/code/c/TinyEMU/，cemu 的邻居）
+## 一、参考代码树（D:/code/c/EMU/，cemu 的邻居）
 
 | 项目 | 位置 | 拿什么 | 许可 |
 |---|---|---|---|
@@ -26,6 +26,9 @@
 | opensbi | opensbi/ | 阶段 2 验收固件源码（fw_dynamic.h 等结构定义） | BSD-2 |
 | riscv-tests / riscv-test-env | riscv-tests/ riscv-test-env/ | riscv 验收套件；env/p/riscv_test.h 是 tohost/fromhost 退出契约 | MIT/BSD 系 |
 | seabios | seabios/ | 阶段 4 SeaBIOS 路线：bios.bin 已从源码构建成功（256KiB，复位向量逐字节验证） | LGPL 等 |
+| xv6-public | xv6-public/ | 阶段 4 x86 验收件源码（用户镜像即它构建的 i386 版）：ide.c/lapic.c/ioapic.c 是设备语义的现成判据 | MIT |
+| pintos | pintos/ | 阶段 5 及之后的 OS 候选验收件（线程/文件系统/驱动契约），当前尚未使用 | 见树内 LICENSE |
+| UcoreOS | UcoreOS/ | 同上：阶段 5+ 候选验收件，当前尚未使用 | 见树内 LICENSE |
 
 QEMU 源码不在树中：QEMU 行为经 D:/qemu 的二进制实测校准
 （dumpdtb/pmemsave/-device help/双跑对拍），cemu 的 virt 机器即由此而来。
@@ -52,6 +55,10 @@ QEMU 源码不在树中：QEMU 行为经 D:/qemu 的二进制实测校准
   exit status = (value<<1)|1（实测校准，非 value+1）。
 - riscv 交叉 gcc（xpack）不在当前工具清单内：阶段 1 时曾用，现状可用
   LLVM/clang 按目标三元组补位，缺什么再登记。
+- 裁决仪器还有两支（2026-09-19 片 10 补记）：QEMU 侧 `-gdb tcp::N -S`（与 cemu 的 RSP
+  stub 同协议，可在同一地址下断点、把两边的寄存器与栈逐项对齐）、`-d cpu`（逐指令
+  状态流）与 `-trace 'ide_*'`（设备事件真值）；cemu 侧自身的 `-gdb` stub 是唯一能
+  "让客人停下来看状态"的入口（AGENTS.md 第九、十节）。
 
 ## 四、cemu 内已有资产的对照表（别重造）
 
@@ -71,5 +78,8 @@ QEMU 源码不在树中：QEMU 行为经 D:/qemu 的二进制实测校准
 | spike 主板 | board/spike_min.c | spike 契约（tohost 从 ELF 符号表） |
 | 引导扇区契约 | board/x86_min.c（0x7C00、DL=0x80） | QEMU seabios 交接契约实测 |
 | 目录依赖检查 | tools/depcheck.sh（`cmake --build build --target check`） | 自订；规则见 AGENTS.md 第七节 |
+| PC 芯片组与固件接口 | device/misc/{i440fx,piix3,pci,cmos,port92,fwcfg,debugcon}.c | QEMU hw/i386/*、seabios src/fw/pciinit.c（progress 片 1 逐项记录） |
+| PIIX IDE 与 ATAPI | device/storage/ide.c | ATA/ATAPI-7 §6.3/§7.10/§9.6（PIO 与 PACKET）；QEMU hw/ide/core.c（经 tiny386/ide.c 转述）+ SeaBIOS src/hw/ata.c 的实际用法（片 9） |
+| PS/2 键盘（i8042） | device/input/i8042.c | PC/AT Technical Reference；QEMU ps2.c/pckbd.c（片 5-7） |
 
 新设备/新机器动手前，先按"当初照谁写的"列找到参考原型读一遍。

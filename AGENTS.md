@@ -188,8 +188,12 @@ CEMU_DEBUG = item[,item...]
   bus                       MMIO / IO 端口命中（**不含指令取指**：固件在 ROM 窗口
                            执行时取指行会淹没一切，见片 9）
   regs=N                    每 N 条指令打一次全寄存器表；halt/exit 必打
-  watch=ADDR:SIZE[:r|w|rw]  地址观测（可重复逗号分隔）
+  watch=ADDR:SIZE[:r|w|rw]  地址观测（可重复逗号分隔；数字按 C 字面量解析，
+                            **十六进制必须写 0x**，否则静默丢弃——现已改为报错）
   budget=N                  单类别事件上限，超出抑制并计数，退出时汇总
+                           （会话另有 5MB 输出硬顶：固件 ROM 影子拷贝这类"每字
+                            节两次事件"的热点会把它吃满；定位引导期设备流量要用
+                            skip= 把窗口挪过去——2026-09-19 片 10 实测）
   mark                      无帧事件行（中断线跳变、宿主输入等板级/设备级观测）
   utf8                      UTF-8 边框（默认 ASCII，Windows 代码页安全）
 ```
@@ -246,7 +250,6 @@ CEMU_DEBUG="regs=100000" ./cemu.exe ... img 2> r.txt
 | D20 | i8042/PS/2 键盘 | 键盘设备只**应答**命令（每条 0xFA；0xFF→ACK+0xAA、0xF2→ACK+0xAB 0x83、0xEE→0xEE），但不真正执行：0xF0/0xED/0xF3 的参数字节只回 ACK、不切换扫描码集/LED/typematic；扫描码一律按 set 1 发（命令字节翻译位只存不译）；无鼠标（AUX）；输出队列满时丢字节（无 overrun 位） | PC/AT Technical Reference；QEMU `ps2.c`/`pckbd.c`（tiny386/i8042.c 同源）：ACK 逐命令、IRQ1 门控 `mode & KBD_INT && !(mode & DISABLE_KBD)` | 需要 set 2 键盘、鼠标或真正走 PS/2 设备命令的客户机时 | 登记中（2026-09-19 片 7：ACK + IRQ1 全链路已端到端实测） |
 | D22 | `device/char/uart16550.c` | **COM1 的 RX 没接线**：RBR 恒读 0，无接收 FIFO、无 IRQ4、无宿主输入源，整条串口输入路径不存在。后果：xv6 的控制台只能靠 8042 键盘输入，Linux 的 `console=ttyS0` 只能看不能敲，xv6-riscv 的 shell 更是完全没有输入通道 | 16550D datasheet（RBR/LSR/IIR 与接收中断）；QEMU hw/char/serial.c（FIFO 深度与 IIR 优先级） | 做 xv6-riscv 串口控制台（验收 3 的 shell）或 Linux 串口登录时；顺带给出无头输入通道 |
 | D23 | 构建/检查入口 | `cmake --build build --target check`（tools/depcheck.sh）与 `test/*/run.sh` 只按 bash 写：cmd/PowerShell 下会去调 WSL bash 而失败，必须用 Git Bash 跑 —— AGENTS.md §七 写的流程在 cmd 下不成立。非规格缺口，是工具链入口缺口 | 现成脚本 tools/depcheck.sh、test/{riscv64,x86}/run.sh；Git for Windows 的 bash | 有非 Git Bash 环境要跑检查时；或把入口改成 CMake 目标里显式调用 bash |
-| D24 | `reference.md` | 两处陈旧路径仍指 `D:/code/c/TinyEMU/`；§一 参考清单缺 `xv6-public`、`pintos`、`UcoreOS` 三行（树都在本地） | 本地实际树：`D:\code\c\EMU\{xv6-public,pintos,UcoreOS}` | 文档修正，无代码依赖，顺手可做 |
 | D25 | `test/x86/realmode/probe_ah.elf`（15016 B，已入 git） | **中间产物入库 + 配方缺失**：§七 规定 test/ 只入库源与脚本，这份 kvm-harness 探针的 ELF 产品却在库里；更要紧的是生成它的命令从未入库 —— `test/x86/realmode/build.sh` 只构建 realmode.elf，probe_ah.c / probe_harness.c 那轮手工编译（2026-09-05 AH/DAS 排查）没有配方，同目录 .o / .exe / .gen.s / .flat.s 都被 .gitignore 覆盖且已清出，只有这份 ELF 例外 ⇒ 删掉即不可再生 | 配方可照抄：test/x86/realmode/build.sh（realmode.elf 的 gcc -m32 管线）、test/x86/build_kut.sh（clang i386 管线）；探针源 probe_ah.c、probe_harness.c 已在库 | 想清理 test/ 里的中间产物时：先在 build.sh 补 probe_ah 目标，再 `git rm --cached` 该 ELF 并让它走 ignore | 登记中（2026-09-19 盘点发现） |
 | D26 | `test/riscv64/rv64ssvnapot-p-napot.elf`（3 147 616 B，全库最大跟踪文件） | **体积构成的 99.95％ 是填充**：全文件只有 1517 个非零字节。上游 napot.S 的两个 `.align 20` 把 .data 顶成 1 MiB 对齐 ⇒ 该 PT_LOAD 的 p_align = 2**20，lld 为满足 file offset ≡ vaddr (mod 2^20) 把段放在文件偏移 0x100000，于是 1 MiB 空洞 + filesz 0x200010 的段内容。非规格缺口，也不违反 §七 的 5 MB 落盘上限（3.0 MB < 5 MB）—— git 实存仅 ≈ 4.5 KB（zlib 实测），成本只在工作树与拷贝 | riscv-tests rv64ssvnapot 上游的 `.align 20`（test/riscv64/build_si_extras.sh 头注释已记）；实测：llvm-objdump -p（p_align 2**20、off 0x100000）、非零字节计数、deflate 估计 | 仓库瘦身提上日程时；或所有跑回归的机器都有 clang riscv64 交叉工具链后，改为测前由 build_si_extras.sh 现生成、镜像不入库（93aee5b 当初入库镜像正是为了免这个依赖）。单纯 `--max-page-size` 未必压得下来（节对齐会把 p_align 顶回去，未实测） | 登记中（2026-09-19 盘点发现） |
 | D27 | `device/storage/ide.c` 的 ATAPI 未实现项 | PACKET 只答 TUR / REQUEST SENSE / INQUIRY / START STOP UNIT / READ CAPACITY / READ(10) / READ(12)：MODE SENSE(0x5A)、GET CONFIGURATION(0x46)、READ TOC(0x43)、READ CD(0xBE)、SEEK(0x2B)、PREVENT/ALLOW MEDIUM REMOVAL(0x1E) 等一律 ILLEGAL REQUEST + ASC 0x24；只有 LUN 0；无 ATAPI DMA（BAR4 读 0，PIO 每轮 2048 字节）；无介质更换事件（UNIT ATTENTION 从不置位） | MMC-3（READ TOC / GET CONFIGURATION / READ CD）、SPC（MODE SENSE）；QEMU hw/ide/core.c 的 ide_atapi_cmd 分发 | Linux 的 sr 驱动探测与挂载（它先问 GET CONFIGURATION / MODE SENSE）或音频 CD 需要时；ATAPI DMA 随 D19 的 BMDMA | 登记中（2026-09-19 片 9：SeaBIOS El Torito 引导已实测通过） |

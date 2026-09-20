@@ -34,8 +34,15 @@
 （INT3/INT n/INTO = `kIntSoft`，单步 #DB = `kIntException`）。
 
 **实测**：triple fault 消失（150M 条指令干净跑完、`trap` 类目 25M 条内零异常）；
-引导停在 isolinux 自举阶段（无控制台输出、无异常）——**下一片**：查 isolinux 经
-INT 13h 读自身文件（多块 CDB / SeaBIOS 的 CD 映射）为何没有进展。
+引导越过 isolinux 自举：SeaBIOS 的 El Torito 交接完成后，isolinux 经 INT 13h 把 /bzImage
+读进内存并跳入其早期引导。**下一片的卡点（本轮已做到地址级定位，不再动手）**：PC 恒在
+guest 0x103906（一段 `rep movsd` 拷贝例程）被反复重入；调用方 0x102604（`jz` /
+`mov ecx,edi` / `call 0x1038e0` 进 memcpy 风格例程），表基 0x106ba0、12 字节表项、
+`[ebp]!=0` 时回跳 0x1024af。三次采样（10M / 30M / 60M 条指令）寄存器完全相同
+（cs=0x20 ss=0x28 esp=0x31ffb8 eip=0x103906 eax=0x0032000a ebx=edi=0x00320010 ecx=2
+edx=0x000c8004 ebp=0x00106ba0 esi=0x00106fda eflags=0x203）⇒ 整段装载被从头重来
+（不是原地死循环，是外层循环重入），而无异常、无控制台输出；该字节序列在 ISO 里找不到
+⇒ 由运行时生成/解压，即已经在内核早期引导里。
 
 **回归**：riscv64 136/0、x86 9/0、depcheck ok（CPU 语义改动没动摇既有基线）。
 
@@ -43,6 +50,15 @@ INT 13h 读自身文件（多块 CDB / SeaBIOS 的 CD 映射）为何没有进�
 前缀，写成 `31ff80:80:w` 会被当十进制解析失败而**静默丢弃**（现已补错误日志）；
 `bus`/`mem` 的 5MB 会话上限会被 BIOS 的 ROM 影子拷贝（每字节两次事件）吃满，
 要定位引导期的设备流量得用 `skip=` 把窗口挪过去。
+
+**文档收尾（本轮）**：reference.md 销账 D24 —— 两处陈旧路径修正（`TinyEMU/项目调研.md`
+→ `EMU/项目调研.md`、参考树根 `D:/code/c/TinyEMU/` → `D:/code/c/EMU/`）、§一 参考清单补
+`xv6-public`/`pintos`/`UcoreOS` 三行、§三 补 QEMU 侧裁决仪器（`-gdb tcp::N -S`、`-d cpu`、
+`-trace 'ide_*'`，与 cemu 自身的 `-gdb` stub 同协议）、§四 补 PC 芯片组与固件接口/PIIX IDE
+与 ATAPI/PS/2 键盘三行；AGENTS.md 销 D24 行、§十 补两条设施注记（`watch=` 的 `0x` 前缀、
+会话 5MB 硬顶与 `skip=`）；arch.md 目录树按现状补全（device 增 input/storage/video，intc 增
+lapic/ioapic，misc 增 i440fx/piix3/pci/cmos/port92/fwcfg/debugcon；debug 增 gdbstub；host 增
+display/input/sock），阶段 3 与 3.5 补 ✅、阶段 4 标注"进行中"并写入当前验收状态。
 ## 阶段 4 片 9：ATAPI 落地 —— SeaBIOS 从光盘引导 isolinux（2026-09-19）
 
 验收 2 主线的第一半：给 PIIX IDE 补上 packet（ATAPI）设备，让 SeaBIOS 的

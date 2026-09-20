@@ -49,23 +49,28 @@ cemu/
         isa.h        ISA 侧汇聚头
         registry.c   k_isa_table：有哪些型号
         riscv64/     riscv.h  exec.h  platform.h  exec.c  step.c
-                     csr.c  mmu.c  fp.c  isa_riscv64.c
+                     csr.c  mmu.c  fp.c  trigger.c  isa_riscv64.c
         x86/         x86.h  exec.h  exec.c  step.c  isa_x86.c
     bus/           bus.h/.c     地址空间与译码
     mem/           ram.h/.c     内存
     device/        外设，按类分
       char/         uart16550
       timer/        i8254  clint
-      intc/         i8259  plic
-      misc/         htif  sifive_test  debug_exit
+      intc/         i8259  lapic  ioapic  plic
+      input/        i8042（PS/2 键盘控制器）
+      storage/      ide（PIIX ATA/ATAPI）
+      video/        cga  cga_font（+ display.h 显示后端契约）
+      misc/         htif  sifive_test  debug_exit  i440fx  piix3  pci
+                    cmos  port92  fwcfg  debugcon
     board/         主板：设备布局 + 复位态 + 接线 + 装载 + 运行循环
       board.h/.c    Board 契约 + 工厂
       run.c         运行循环 + 销毁
       loader.h/.c   装载（按 e_machine 选 ISA）
       elf.h/.c      ELF 解析
       spike_min.c  virt.c(+virt_dtb.h)  x86_min.c
-    debug/         debug.h/.c   CEMU_DEBUG 观测中枢
-    host/          console_win.c  file_win.c  time_win.c
+    debug/         debug.h/.c  CEMU_DEBUG 观测中枢；gdbstub.h/.c  RSP 服务端
+    host/          host.h  console_win.c  file_win.c  time_win.c
+                   display_win.c  input_win.c  sock_win.c
     util/          log.c  table.c  type.h
   test/            run.sh  riscv64/  x86/
 ```
@@ -150,7 +155,7 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - x86 侧：PC 平台（i8259 + i8254，hlt 由 IRQ0 唤醒），realmode 全绿过。
 - M 态完整化：misa/medeleg/mideleg/PMP/Sv39（mmu.c）全落地。
 
-### 阶段 3：x86 保护模式与分页（2026-09-05 提前，原阶段 4 的语义核心）
+### 阶段 3：x86 保护模式与分页 ✅（2026-09-05 提前，原阶段 4 的语义核心）
 最后一大块指令集语义，收掉之后进入纯设备/IO 阶段。固件已备：x86 SeaBIOS
 （bios.bin 阶段 0 已构建）、riscv OpenSBI（fw_jump 阶段 2 已引导）。
 - 32 位保护模式：GDT/LDT/IDT 装载、描述符缓存、特权级检查
@@ -164,7 +169,7 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - 验收：kvm-unit-tests 32 位保护模式用例 + multiboot 平段内核开分页冒烟。
 - riscv 侧无新增语义（S 态/Sv39 阶段 2 已落地）。
 
-### 阶段 3.5：调试器与 GUI（2026-09-05 立项）
+### 阶段 3.5：调试器与 GUI ✅（2026-09-05 立项；VGA 图形模式与 ramfb 按 D17 挪入阶段 4）
 三片独立可交付，顺序可调；显示通道是阶段 4 图形 OS 的硬前置。
 - 前置任务：exec.c 逐 case 填 insn_rec.mnemonic（名字级，SDM/手册指令名；
   语法级不做）。CEMU_DEBUG 事件表的 MNEMONIC 列在 case 入口即有值，
@@ -182,7 +187,7 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - 验收：真 gdb attach 设断点/单步/看现场；CGA 窗口点亮 realmode hello；
   图形 OS 显示前置就绪，衔接阶段 4。
 
-### 阶段 4：设备全集与真实 OS（此后为纯设备/IO 阶段）
+### 阶段 4：设备全集与真实 OS（此后为纯设备/IO 阶段；进行中）
 - PC 设备模型全集（CGA、PS/2、PIC、PIT、UART、IDE、LAPIC、IOAPIC）。
 - bin 路线：multiboot 等价的入口契约，xv6 去掉 bootasm.S/bootmain.c
   编为 .bin；SeaBIOS 路线：官方 bios.bin 映射内存顶端，复位 F000:FFF0
@@ -191,6 +196,12 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   xv6-riscv（OpenSBI fw_jump 引导）并行验收。
 - D13 剩余（x87 FPU）在 Linux 用户态销账；D14（VM86）在 DOS/BIOS 兼容
   路线需要时评估（Linux 不需要）。
+- **现状（2026-09-19）**：验收 1（xv6-x86）✅ —— SeaBIOS → IDE 盘 → xv6 到 shell，
+  与 QEMU 基线逐项一致；验收 2（Linux）进行中 —— ATAPI（PACKET）与 El Torito
+  引导已通（SeaBIOS 认 CD、跳 0x7C00），isolinux 已加载 /bzImage 并跳入内核早期
+  引导，当前卡在内核早期的装载循环（guest 0x102xxx / 0x103906 反复重入，无异常、
+  无控制台输出；地址级定位见 progress.md 片 10）；验收 3（xv6-riscv）未开始
+  （依赖 D22 的 COM1 接收路径）。
 
 ### 阶段 5：cesdk（放后：真实 OS 跑通后再做 SDK）
 - 交付：crun 运行时（_start、putch→UART、halt→sifive_test）、klib、
