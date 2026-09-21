@@ -3,6 +3,55 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 11：验收 2 推进到内核 —— 五处 x86 语义缺口（rep 计数 0、BSR、x87 ESC、CMPXCHG、xadd 顺序）（2026-09-21）
+
+片 10 之后的卡点（ldlinux 的 do_sysappend 在 guest 0x103906 的 `rep movsd` 上
+打转）在本片定案，并一路推到 **cemu 进入内核**。
+
+**方法（全部 ≤2 分钟的有界命令）**：QEMU 侧 `-gdb` 与 cemu 侧 `-gdb` 同协议，
+同一地址逐次命中对拍寄存器；必要时用 `-monitor pmemsave` 取运行镜像、用
+`llvm-objdump/objdump -m i8086` 离线反汇编；GNU/QEMU 的内存镜像互校以定基址。
+
+**五处语义缺口（逐个修掉，均为真 bug 不是特判）**：
+1. **`string_op()` 的 REP 计数为 0**：原实现"先执行一次再减 1"，`(E)CX = 0` 时
+   算出 0xffffffff 并判定继续 ⇒ 40 亿次拷贝。SDM vol.2 REP 前缀的循环体在计数
+   判断之后，(E)CX = 0 是**完全空操作**。触发点是 ldlinux memcpy 的
+   `shr ecx,2; rep movsd`（尾长 2–3 字节时 ECX 恰为 0）。现场：cemu 逐次命中
+   0x103906 为 `ecx=2→1→0→0xffffffff`，QEMU 为 `2→1→0→下一条指令`；用户看到的
+   `ecx≈0xff6c40a4` = 0xffffffff 已减 9,686,363 次。
+2. **BSR/BSF（0F BC/BD）未实现**：#UD ⇒ 内核 setup 的磁盘几何计算（`bsr eax,eax`）
+   反复陷入（2 亿条指令 205 万次陷阱，零设备 I/O、零推进）。按 SDM 补实现。
+3. **x87 ESC 一律 #UD**：内核启动期 FPU 探测（arch/x86/boot/setup.S：先把栈上两字
+   填 0xffff，再 fninit/fnstsw/fnstcw，靠"内存未被写回"判定无 FPU）因此陷入
+   3460 万次陷阱。改为**无 FPU 处理器语义**：CR0.TS/EM 置位先 #NM，否则解码
+   modrm 当 NOP（tiny386 `ESC()` 同款；本机 CPUID 本就报 EDX.FPU=0）。
+4. **CMPXCHG（0F B0/B1）未实现**：内核 0xc0105df2 处 #UD。按 SDM 补实现
+   （ZF 与算术标志取自与累加器的比较）。
+5. **XADD 的写回顺序**：SDM 是 `SRC ← DEST` 再 `DEST ← TEMP`，原实现反了；当
+   目的与源同寄存器（realmode 的 `xaddl %eax,%eax`）结果错。
+
+**验收进展（有界证据）**：isolinux → 内核 setup → `Decompressing Linux... Parsing
+ELF... Booting the kernel.`（screen 读到）→ 内核以 **cs=0x60**、cr0=0x8005002f
+（分页开）运行，PC 采样已过用户给的判据点 0xc0106130（150M 条时 eip=0xc0116b30，
+280M 条时 0xc02ef716）✓。
+
+**当前卡点（下一片第一件事）**：内核卡在 `calibrate_delay_converge()`
+（0xc02ef710–0xc02ef718 自旋等 `jiffies`，初值 0xffff8ad0 = -30000 = INITIAL_JIFFIES
+@HZ=100）。证据链：`watch=0x2cb818:4:w` 在 2.5 亿条指令内**一次写入都没有** ⇒ 定时器
+ISR 从未运行；`bus` 日志显示内核已解除 IRQ0 屏蔽（master IMR = 0xb8，bit0=0）且
+PIT 通道 0 有边沿（`mark` 的 `isa a=0 b=1/0`）；而**新探针 test/x86/probe/pit_irq.asm
+（自建 IDT/PIC、编 100Hz、sti 后自旋不 hlt）在 cemu 与 QEMU 上都能收到 10 个 tick**
+⇒ PIT/PIC/CPU 通路本身可用，问题在内核这一侧的投递配置（IOAPIC/PIRQ 或内核的
+request_irq 路径，D19 的 PIRQ/ELCR 缺口是首要嫌疑）。
+
+**回归**：x86 套件 11 格全绿（smoke / cga / rep-zero / pit-irq / pm 24 ok / kvm×5 /
+realmode 126 PASS + 1 FAIL(fninit，无 FPU 模型的必然，判据已注释)）；riscv 侧未动。
+
+**设施**：新增两个常驻探针 `test/x86/probe/rep_zero.asm`（REP 计数 0）与
+`pit_irq.asm`（自旋下的 IRQ0 投递），均双跑校准并接入 run.sh；登记两个观测缺口
+**D28**（gdb stub 在内核虚拟地址上的断点不触发）与 **D29**（`trace` 的 `skip=`
+不是"跳过前 N 条指令"）。
+
 ## 阶段 4 片 10：x86 中断投递多压错误码（IRQ 被当成异常）——isolinux 的 iret #GP 根因（2026-09-19）
 
 片 9 的卡点（El Torito 引导镜像跳转后，isolinux 的 32 位 PM 代码在 guest 0x8ccc 的

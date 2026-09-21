@@ -20,7 +20,7 @@ enum { eax_i, ecx_i, edx_i, ebx_i, esp_i, ebp_i, esi_i, edi_i };
 enum { es_i, cs_i, ss_i, ds_i, fs_i, gs_i };
 // Exception vectors (SDM vol.3 table 6-1).
 enum {
-  vec_de = 0, vec_db = 1, vec_bp = 3, vec_ud = 6, vec_df = 8, vec_ts = 10,
+  vec_de = 0, vec_db = 1, vec_bp = 3, vec_ud = 6, vec_nm = 7, vec_df = 8, vec_ts = 10,
   vec_np = 11, vec_ss = 12, vec_gp = 13, vec_pf = 14, vec_ac = 17
 };
 // Where a delivered vector came from (SDM vol.2 INT Operation / vol.3 table

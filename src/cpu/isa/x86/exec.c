@@ -1263,6 +1263,10 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
 
 _Noreturn static void ud(void) { raise_(fr, vec_ud, (uint64_t)eip); }
 
+// Device not available (SDM vol.3 2.5): an x87 escape reached with CR0.TS or
+// CR0.EM set. Raised before the opcode is decoded.
+_Noreturn static void nm(void) { raise_(fr, vec_nm, (uint64_t)eip); }
+
 // Divide errors (SDM DIV/IDIV): quotient overflow or zero divisor.
 _Noreturn static void de(void) { raise_(fr, 0, (uint64_t)eip); }
 
@@ -1749,7 +1753,17 @@ static int str_uses_di(int op) {
 }
 
 static void string_op(uint8_t op) {
-  int size = (op & 1) && op != 0xa6 && op != 0xa7 && op != 0xae && op != 0xaf ? (d.w32 ? 4 : 2) : 1;
+  // SDM vol.2 REP/REPE/REPZ/REPNE/REPNZ: with (E)CX = 0 the instruction
+  // performs no operation at all -- no memory access, no counter or pointer
+  // update. The guard has to stand before the single iteration below: entering
+  // it with a zero counter and decrementing afterwards wraps (E)CX to
+  // 0xffffffff and turns a no-op into a 2^32-iteration loop.
+  if (d.rep && (d.w32 ? ecx : cx) == 0) return;
+  // Odd opcodes are the word/dword forms for every member of the family
+  // (A4/A5 MOVS, A6/A7 CMPS, AA/AB STOS, AC/AD LODS, AE/AF SCAS, 6C/6D INS,
+  // 6E/6F OUTS): the operand size picks 4 or 2 bytes (SDM vol.2 per-opcode
+  // "OperandSize" column), never a byte.
+  int size = (op & 1) ? (d.w32 ? 4 : 2) : 1;
   int step = fl->df ? -size : size;
   uint32_t sio = d.a32 ? esi : (uint32_t)si;
   uint32_t dio = d.a32 ? edi : (uint32_t)di;
@@ -2523,29 +2537,70 @@ static void run_op2(uint8_t op2) {
       modrm();
       set_reg32((uint32_t)(int32_t)(int16_t)rm16());
       break;
+    case 0xb0:
+    case 0xb1: {  // cmpxchg rm, reg (SDM vol.2 CMPXCHG: compare the accumulator
+                  // with DEST -- equal sets ZF and stores SRC into DEST, else
+                  // ZF clears and the accumulator takes DEST's old value. The
+                  // arithmetic flags describe that comparison, so they come
+                  // from the same helper CMP uses; the 8-bit form pairs with
+                  // AL, the 16/32-bit forms with AX/EAX.)
+      fr->rec.mnemonic = "cmpxchg";
+      modrm();
+      if (op2 & 1) {
+        if (d.w32) {
+          uint32_t dst = RM32();
+          uint32_t r = dst - eax;
+          flags_sub(eax, dst, r, 4, 0);
+          if (r == 0)
+            SET_RM32(reg32());
+          else
+            eax = dst;
+        } else {
+          uint16_t dst = RM16();
+          uint16_t r = (uint16_t)(dst - (uint16_t)ax);
+          flags_sub(ax, dst, r, 2, 0);
+          if (r == 0)
+            SET_RM16((uint16_t)reg16());
+          else
+            ax = dst;
+        }
+      } else {
+        uint8_t dst = (uint8_t)RM8();
+        uint8_t r = (uint8_t)(dst - al);
+        flags_sub(al, dst, r, 1, 0);
+        if (r == 0)
+          SET_RM8((uint8_t)reg8());
+        else
+          al = dst;
+      }
+      break;
+    }
     case 0xc0:
-    case 0xc1: {  // xadd rm, reg
+    case 0xc1: {  // xadd rm, reg (SDM vol.2 XADD: TEMP = SRC + DEST; SRC = DEST;
+                  // DEST = TEMP). The source register must be written before
+                  // the destination: with the two aliasing (xaddl %eax,%eax)
+                  // the other order leaves the register holding the old value.
       fr->rec.mnemonic = "xadd";
       modrm();
       if (op2 & 1) {
         if (d.w32) {
           uint32_t dst = RM32(), src = reg32();
           uint32_t r = dst + src;
-          SET_RM32(r);
           set_reg32(dst);
+          SET_RM32(r);
           flags_add(dst, src, r, 4, 0);
         } else {
           uint16_t dst = RM16(), src = reg16();
           uint16_t r = (uint16_t)(dst + src);
-          SET_RM16(r);
           set_reg16(dst);
+          SET_RM16(r);
           flags_add(dst, src, r, 2, 0);
         }
       } else {
         uint8_t dst = RM8(), src = reg8();
         uint8_t r = (uint8_t)(dst + src);
-        SET_RM8(r);
         set_reg8(dst);
+        SET_RM8(r);
         flags_add(dst, src, r, 1, 0);
       }
       break;
@@ -2584,6 +2639,39 @@ static void run_op2(uint8_t op2) {
       fr->rec.mnemonic = "bswap";
       uint32_t v = s->r[op2 & 7].e;
       s->r[op2 & 7].e = ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >> 8) & 0xff00) | (v >> 24);
+      break;
+    }
+    case 0xbc:
+    case 0xbd: {  // bsf/bsr r, r/m (SDM vol.2 BSF/BSR: a zero source sets ZF
+                  // and leaves DEST undefined -- hardware and QEMU leave it
+                  // untouched; otherwise DEST is the bit index found from the
+                  // low end for BSF and from the high end for BSR. CF/OF/SF/
+                  // AF/PF are undefined, so only ZF is written here.)
+      fr->rec.mnemonic = op2 == 0xbc ? "bsf" : "bsr";
+      modrm();
+      uint32_t v = d.w32 ? RM32() : RM16();  // 16-bit source is zero-extended
+      if (v == 0) {
+        fl->zf = 1;
+        break;
+      }
+      fl->zf = 0;
+      int idx = 0;
+      if (op2 == 0xbc) {
+        while (!(v & 1)) {
+          v >>= 1;
+          idx++;
+        }
+      } else {
+        idx = 31;
+        while (!(v & 0x80000000u)) {
+          v <<= 1;
+          idx--;
+        }
+      }
+      if (d.w32)
+        set_reg32((uint32_t)idx);
+      else
+        set_reg16((uint16_t)idx);
       break;
     }
     default:
@@ -3922,10 +4010,17 @@ void run_op(uint8_t op) {
     case 0xde:
     case 0xdf: {  // x87 escape
       fr->rec.mnemonic = "x87";
+      // This machine has no x87 FPU and says so in CPUID (EDX.FPU = 0, D13).
+      // With CR0.TS or CR0.EM set the escape raises #NM before any decode
+      // (SDM vol.3 2.5); otherwise the opcode is decoded and executed as a
+      // NOP -- tiny386's ESC() macro (i386.c) does exactly that when cpu->fpu
+      // is NULL, and the Linux boot FPU probe depends on it: arch/x86/boot/
+      // setup.S pre-fills two stack words with 0xffff, runs fninit, fnstsw and
+      // fnstcw, and reads "no FPU" out of the untouched words (which is how a
+      // 386SX/486SX boots Linux). Faulting here instead put the probe into a
+      // #UD storm: 34.6M traps per 100M instructions, no progress.
+      if (s->cr0 & 0xc) nm();
       modrm();
-      // Only FNINIT (DB /3) is accepted; this machine has no FPU (D13).
-      if (!(op == 0xdb && d.mod == 3 && d.reg == 3)) ud();
-      fr->rec.mnemonic = "fninit";
       break;
     }
     case 0xe0:
