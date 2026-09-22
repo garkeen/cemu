@@ -2,7 +2,7 @@
 
 违反任何一条即为 bug，发现即修复或登记到本文"简化登记"节，不允许先留着。
 
-本文是原 开发准则.md、重构要求.md、调试方案.md 三份文档的合并版（2026-09-03）。
+本文是原 开发准则.md、重构要求.md、调试方案.md 三份文档的合并版。
 
 ## 一、禁止硬编码
 
@@ -87,7 +87,7 @@ ISA 头，`virt.c` 仅引 `platform.h`。
 
 - 命名：Google C 风格。文件与变量 snake_case，类型与函数 PascalCase，
   常量与枚举值 k 前缀，宏全大写。include guard 按路径（`CEMU_BUS_BUS_H`）。
-- 构建（2026-09-13 起换 LLVM/clang，用户决定）：CMake（`CMakeLists.txt`）+
+- 构建（LLVM/clang）：CMake（`CMakeLists.txt`）+
   Ninja 生成器，编译器 clang（`tools/clang.cmake` 工具链文件，mingw-w64 目标
   ——D:/mingw64 只当头文件与运行时 sysroot，不再当编译器），`-Wall -Wextra`
   零告警。源文件用 `file(GLOB_RECURSE src/*.c)`（`CONFIGURE_DEPENDS`，新增/
@@ -100,7 +100,10 @@ ISA 头，`virt.c` 仅引 `platform.h`。
   clang 的 mingw 驱动预定义 UNICODE（uxtheme 的 SetWindowTheme 映射 W 版）。
 - 每轮改动结束前限时跑回归：`bash test/run.sh`（分层入口：riscv
   `bash test/riscv64/run.sh`，x86 `bash test/x86/run.sh`）；依赖边用
-  `cmake --build build --target check`。
+  `cmake --build build --target check`。脚本是 bash，调用方不必是：CMake 在配置时
+  解析出 Git 的 bash（打印 `shell for check targets:`），`check` / `check-x86` /
+  `check-riscv64` 三个目标用登录 shell 跑脚本，cmd/PowerShell 下入口一致；直跑脚本
+  要用 Git Bash（非登录 shell 的 PATH 无 /usr/bin）。
 - 运行限时：**所有**运行一律限时——run.sh 用 `timeout` 包裹 cemu 调用；
   会话内的临时手跑（调试观测、state 对拍、探针复现）同样必须前置
   `timeout <秒>`，防止被测程序死循环导致不退出的挂起（realmode 套件
@@ -166,7 +169,7 @@ step 是纯函数式的状态转移（给定当前 CPU 状态，产出下一状�
 6. **对拍流程**：改动前 `CEMU_DEBUG=state ... 2> base.state`，改后
    `2> new.state`，diff 第一个分叉行即第一语义偏差。
 7. **不要求全部通过**：把最基础的过了就行，剩下的按登记排期。
-8. **子代理纪律（2026-09-13 用户指令）**：任何 subagent **硬上限 3 分钟**，超时
+8. **子代理纪律**：任何 subagent **硬上限 3 分钟**，超时
    即停（TaskStop），要它**直接输出报告**，不许自己一路翻拍文档、不许扩大阅读
    范围；只读式"代码审查"没有产出价值，别为它花时间。GUI 类改动的验证是
    **构建 + 启动 + 用户目验**，不是脑内推理，也不是子代理评审。
@@ -186,14 +189,13 @@ CEMU_DEBUG = item[,item...]
   mem[:ld|:st][=N]          访存事件
   trap                      异常/中断/陷入事件
   bus                       MMIO / IO 端口命中（**不含指令取指**：固件在 ROM 窗口
-                           执行时取指行会淹没一切，见片 9）
+                           执行时取指行会淹没一切）
   regs=N                    每 N 条指令打一次全寄存器表；halt/exit 必打
   watch=ADDR:SIZE[:r|w|rw]  地址观测（可重复逗号分隔；数字按 C 字面量解析，
                             **十六进制必须写 0x**，否则静默丢弃——现已改为报错）。
                             **地址按物理地址匹配**：x86 开分页后要看内核某个符号
                             必须先减去映射偏移（内核 .data 的 0xc02c0180 是物理
-                            0x2c0180），写线性地址会一行都不出——2026-09-21 片 12
-                            实测踩坑
+                            0x2c0180），写线性地址会一行都不出
   dump=ADDR:SIZE:FILE       会话结束时按**物理地址**取回一段客机内存并落盘
                             （可重复，上限 4 段、单段 5MB）。watch= 只说某地址
                             被碰过，说不了客机留在"没人再读的结构"里的东西——
@@ -204,12 +206,16 @@ CEMU_DEBUG = item[,item...]
   budget=N                  单类别事件上限，超出抑制并计数，退出时汇总
                            （会话另有 5MB 输出硬顶：固件 ROM 影子拷贝这类"每字
                             节两次事件"的热点会把它吃满；定位引导期设备流量要用
-                            skip= 把窗口挪过去——2026-09-19 片 10 实测）
+                            skip= 把窗口挪过去）
+  skip=N                    类别静默窗口：该类别的前 N 个单位不打印。**trace 类目按
+                            指令计**，其余类目按自己的事件计（trace 不为每条退休指令
+                            都发射事件，按事件计会在没人要的指令号上开窗）
   mark                      无帧事件行：板级/设备级/解释器级观测，`a` 十进制、
                             `b` 十六进制（位掩码与地址要能直接读）。现有 name：
                             isa(中断线) intr(CPU INTR 线) inta(INTA 向量)
                             pic0/pic1-imr|eoi|base ioapic lapic-irr|ack|eoi
-                            lidt/lgdt gate(门描述符) hostkey
+                            lidt/lgdt gate(门描述符) hostkey reset-req(设备请求
+                            机器复位)
   screen                    无帧文本行：客机控制台镜像，**整行输出**（控制台一行
                             80 列，事件表 DETAIL 只有 41，截断后读不了 call trace）
   utf8                      UTF-8 边框（默认 ASCII，Windows 代码页安全）
@@ -246,7 +252,7 @@ CEMU_DEBUG="regs=100000" ./cemu.exe ... img 2> r.txt
 
 # 中断"送不到"：先看线（isa=设备侧到控制器，intr=控制器到 CPU），再看 ack/eoi
 # （三者都不出 = 控制器没present；intr 有而 inta 无 = CPU 没取；inta 有而无 eoi
-#  = 处理程序没跑完，多半交付落到了错的桩）——2026-09-21 片 12
+#  = 处理程序没跑完，多半交付落到了错的桩）
 CEMU_DEBUG="mark" ./cemu.exe ... img 2> m.txt
 
 # 交付到了哪个桩：gate 给出该向量门描述符里的 handler 偏移（无帧标记，十六进制）
@@ -258,35 +264,30 @@ CEMU_DEBUG="watch=0x2c0000:0x800:w" ./cemu.exe ... img 2> idt.txt
 CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 ```
 
-- 交互式调试器/REPL、反汇编器、GUI 输出已立项为阶段 3.5（2026-09-05，见
-  arch.md 阶段计划：gdb RSP stub / Win32 显示通道 / 图形调试前端；
-  2026-09-12 修订：前端不内置反汇编，反汇编一律走外部工具）。在
-  3.5 落地前 CEMU_DEBUG 仍是唯一调试入口（mnemonic 由译码表给出）。
+- 交互式调试器/REPL、反汇编器、GUI 输出立项为阶段 3.5（见 arch.md 阶段计划：
+  gdb RSP stub / Win32 显示通道 / 图形调试前端；前端不内置反汇编，反汇编一律
+  走外部工具）。在 3.5 落地前 CEMU_DEBUG 仍是唯一调试入口（mnemonic 由译码表给出）。
 
 ## X、简化登记（在册的规格缺口台账）
 
-规格行为缺失按阶段恢复；销账时在代码落地并在本表勾掉。
+规格行为缺失按阶段恢复。**销账 = 整行删除**：不写"已完成 / 已销账"，不留日期、片号、
+过程或解释（过程只进 progress.md）；行内只写还缺什么。只有新功能才加行。
 
 | 编号 | 位置 | 缺失 | 参考出处 | 恢复阶段 | 状态 |
 |---|---|---|---|---|---|
 | D7 | LR/SC 单核预留集 | 无多核冲突语义 | spike 单核同款；规格允许 SC 假失败 | 多核引入时 | 登记中 |
 | D11 | htif.c HTIF syscall（dev0/cmd0）报错退出 | 无 fesvr syscall 设备 | fesvr htif_t::handle_syscall | 阶段 5 cesdk | 登记中 |
-| D13 | x86 x87 FPU 与 RDTSC | **x87 FPU 未实现**：本机 CPUID 报 EDX.FPU = 0（无 FPU），因此 ESC 指令（D8-DF）按"无 FPU 处理器"语义执行——CR0.TS/EM 置位时先 #NM，否则解码 modrm 后当 NOP（tiny386 ESC() 同款；386SX/486SX 上 Linux 就是这么引导的）。**RDTSC 仍为显式 ud()**（0F 31） | intel SDM vol.2/vol.3（ESC 与 CR0.EM/TS 语义）；tiny386 i386.c 的 ESC() 宏；Linux arch/x86/boot/setup.S 的 FPU 探测（靠 ESC 为 NOP 判定"无 FPU"） | 真 FPU（含 RDTSC 与 CPUID 特性位）在需要 x87 算术的客户机出现时（Linux 用户态/浮点程序） | 登记中（2026-09-21：ESC 从 #UD 改为无 FPU 语义后，linux.iso 的内核才越过启动期 FPU 探测；realmode 的 test_fninit 因此从"卡死"变为"运行并失败"，见 test/x86/run.sh 的判据注释） |
-| D28 | gdb stub 断点 | **内核虚拟地址上的断点不触发**：在 0xc0106130 / 0xc02ef6ea / 0xc02ef710 下 `Z0` 后 `c` 永不停下（三次实测，超时后连接被对端关闭），而同一 stub 在实模式/低地址（0x103906、0x8702 等）断点工作正常。分页打开后 stub 的断点比对对象（线性 vs 物理）需要查 | QEMU gdbstub 的同协议行为（`Z0,addr,4` 断在虚拟地址）；cemu src/debug/gdbstub.c 的 pc-match 列表 | 需要在内核地址上下断点时（验收 2 之后的定位几乎都要） | 登记中（2026-09-21 发现，定位内核卡点时绕道用 `watch=`/内存读代替） |
-| D29 | CEMU_DEBUG trace 的 skip | `trace:line,skip=N,budget=M` 在 N 接近指令数时**一行都不输出**（N=1e8、运行到 1.0000006e8 条指令），而小 N（100）正常。说明 trace 类目的事件计数与指令计数不同源（REP 迭代/取指路径大概不发射事件），`skip=` 对 trace 不是"跳过前 N 条指令" | cemu src/debug/debug.c 的 Allow()/g_emitted 与各发射点 | 需要抓"引导后段"的指令流时（本轮改用断点序列 + regs= 采样代替） | 登记中（2026-09-21 发现） |
+| D13 | x86 x87 FPU 与 RDTSC | **x87 FPU 未实现**：本机 CPUID 报 EDX.FPU = 0（无 FPU），因此 ESC 指令（D8-DF）按"无 FPU 处理器"语义执行——CR0.TS/EM 置位时先 #NM，否则解码 modrm 后当 NOP（tiny386 ESC() 同款；386SX/486SX 上 Linux 就是这么引导的）。**RDTSC 仍为显式 ud()**（0F 31） | intel SDM vol.2/vol.3（ESC 与 CR0.EM/TS 语义）；tiny386 i386.c 的 ESC() 宏；Linux arch/x86/boot/setup.S 的 FPU 探测（靠 ESC 为 NOP 判定"无 FPU"） | 真 FPU（含 RDTSC 与 CPUID 特性位）在需要 x87 算术的客户机出现时（Linux 用户态/浮点程序） | 登记中 |
 | D14 | x86 iret/popf 载入屏蔽 VM(bit17) | VM86 位不装载（iret/popf/task-switch 进入 VM86 无实现） | intel SDM vol.3 17.3.1 | DOS/BIOS 兼容路线需要 VM86 时评估（Linux 不需要） | 登记中 |
 | D15 | x86 16 位 TSS 任务切换（类型 1/3）Fatal | 任务切换只支持 32 位 TSS（类型 9/B）；门/任务门对 16 位 TSS 拒绝进入 | v86 do_task_switch（assert 32 位）；tiny386（assert 9/11） | 有验收件需要 286 任务时 | 登记中 |
 | D17 | cga.c 渲染与光栅时序缺口 | CGA 图形模式（0x3D8 bit1）不渲染（黑屏）；过扫描边框不渲染（视频禁止时填黑）；0x3DA 回扫状态为宿主时钟近似（262 行×63.6µs 帧模型，行内只分活跃/消隐两相，非逐像素光栅）；属性/光标闪烁取固定场倍数周期，不跟随场相位 | IBM CGA Technical Reference；FreeVGA；QEMU vga 行为旁证 | 阶段 4 VGA 图形切片（图形模式随 VGA 一起做）；需要精确光栅时序的软件（raster 技巧 demo）出现时再校准 | 登记中 |
-| D18 | PC 芯片组/固件的复位与中断缺口：i8042 命令 0xFE、System Control Port A (0x92) bit 0、0xCF9 复位控制寄存器都不触发复位（无复位设施，SeaBIOS 无引导设备时自行 triple fault 重启）；CMOS RTC 的周期/闹钟中断（IRQ8）不投递，status C 恒读 0 | 复位：QEMU hw/i386/port92.c + i440FX 0xCF9；RTC 中断：MC146818 datasheet + QEMU hw/timer/mc146818rtc.c（IRQ8 经从片 PIC 的线 0） | 需要软/硬复位（ctrl-alt-del、kexec 等）或 RTC 定时（Linux rtc 驱动）时 | 登记中 |
-| D19 | PIIX3 芯片组、IDE 与 IOAPIC 的简化：IDE 无 bus-master DMA（BAR4 读 0）；ATA 侧只有 PIO 的 0x20/0x30/0xEC/0xE7 四条命令（其余按规格 ABRT，无 LBA-48/multi-sector），ATAPI 侧实现了 packet 子集（未实现项见 D27）；0x3F7（AT 老式 drive address 寄存器，非 ATA 寄存器）不解码；IDENTIFY 的时序字 51/52/64-70 与 PIO 模式位留 0；PIIX3 ISA 桥只做身份 + PIRQ 路由字节 0x60-0x63（无 XBCS/PM/DMA 块，ELCR 0x4D0/0x4D1 不落地，PIC 目前只有边沿模式）；IOAPIC 只做 fixed 投递（lowest-priority/NMI/SMI/INIT 交付模式不投递） | PIO/命令集：ATA/ATAPI-7 §6.3/§7.10/§9.6（未实现命令的应答就是 ABRT / ILLEGAL REQUEST）；BAR/身份/QEMU 对照：QEMU hw/ide/piix.c、hw/isa/piix3.c、seabios src/fw/pciinit.c piix_ide_setup/piix_isa_bridge_setup；IOAPIC 交付模式：82093AA datasheet §3.2.4 | BMDMA 在 Linux 里程碑（libata 的 piix 需要 BAR4 才能起盘）；PM/ACPI、PIRQ 路由与 ELCR 电平中断随 Linux 片（需要 PCI INTx 或 RTC/ACPI 时）；其余交付模式按需要用到的客户机补 | 登记中（2026-09-19 片 9：ATAPI 的 PACKET 子集已落地，El Torito 引导实测通过） |
-| D21 | 软盘与 DMA 通路缺失 | 无 Intel 8272 软盘控制器、无 8237 DMA（通道 2 给软盘、通道 0 给内存刷新），CMOS 设备字节也不报软驱；再加上 8042 软驱数据线语义，整条"软盘引导 + PC 兼容传软盘"的路径都不存在。后果：Linux 0.11/0.12 那类把引导码写死成 DL=0（且要求每道 15/18 扇区）的软盘引导镜像无法引导 —— 只能走硬盘/光盘引导的镜像 | PC/AT Technical Reference（FDC 命令集）；Intel 8237A datasheet；QEMU hw/block/fdc.c + hw/dma/i8257.c；SeaBIOS src/hw/floppy.c（INT 13h 路径） | 需要软盘引导的镜像（如 oldlinux 的 0.11/0.12 套件）作为验收件时；Linux 阶梯本身不需要（ISO 路线） | 登记中（2026-09-19 片 8 发现：0.11 引导码 0x78-0x8d 只接受 spt=15/18，否则自旋；0.12-hd 变体同样 DL=0） |
-| D20 | i8042/PS/2 键盘 | 键盘设备只**应答**命令（每条 0xFA；0xFF→ACK+0xAA、0xF2→ACK+0xAB 0x83、0xEE→0xEE），但不真正执行：0xF0/0xED/0xF3 的参数字节只回 ACK、不切换扫描码集/LED/typematic；扫描码一律按 set 1 发（命令字节翻译位只存不译）；无鼠标（AUX）；输出队列满时丢字节（无 overrun 位） | PC/AT Technical Reference；QEMU `ps2.c`/`pckbd.c`（tiny386/i8042.c 同源）：ACK 逐命令、IRQ1 门控 `mode & KBD_INT && !(mode & DISABLE_KBD)` | 需要 set 2 键盘、鼠标或真正走 PS/2 设备命令的客户机时 | 登记中（2026-09-19 片 7：ACK + IRQ1 全链路已端到端实测） |
-| D22 | `device/char/uart16550.c` | **COM1 的 RX 没接线**：RBR 恒读 0，无接收 FIFO、无 IRQ4、无宿主输入源，整条串口输入路径不存在。后果：xv6 的控制台只能靠 8042 键盘输入，Linux 的 `console=ttyS0` 只能看不能敲，xv6-riscv 的 shell 更是完全没有输入通道 | 16550D datasheet（RBR/LSR/IIR 与接收中断）；QEMU hw/char/serial.c（FIFO 深度与 IIR 优先级） | 做 xv6-riscv 串口控制台（验收 3 的 shell）或 Linux 串口登录时；顺带给出无头输入通道 |
-| D23 | 构建/检查入口 | `cmake --build build --target check`（tools/depcheck.sh）与 `test/*/run.sh` 只按 bash 写：cmd/PowerShell 下会去调 WSL bash 而失败，必须用 Git Bash 跑 —— AGENTS.md §七 写的流程在 cmd 下不成立。非规格缺口，是工具链入口缺口 | 现成脚本 tools/depcheck.sh、test/{riscv64,x86}/run.sh；Git for Windows 的 bash | 有非 Git Bash 环境要跑检查时；或把入口改成 CMake 目标里显式调用 bash |
-| D25 | `test/x86/realmode/probe_ah.elf`（15016 B，已入 git） | **中间产物入库 + 配方缺失**：§七 规定 test/ 只入库源与脚本，这份 kvm-harness 探针的 ELF 产品却在库里；更要紧的是生成它的命令从未入库 —— `test/x86/realmode/build.sh` 只构建 realmode.elf，probe_ah.c / probe_harness.c 那轮手工编译（2026-09-05 AH/DAS 排查）没有配方，同目录 .o / .exe / .gen.s / .flat.s 都被 .gitignore 覆盖且已清出，只有这份 ELF 例外 ⇒ 删掉即不可再生 | 配方可照抄：test/x86/realmode/build.sh（realmode.elf 的 gcc -m32 管线）、test/x86/build_kut.sh（clang i386 管线）；探针源 probe_ah.c、probe_harness.c 已在库 | 想清理 test/ 里的中间产物时：先在 build.sh 补 probe_ah 目标，再 `git rm --cached` 该 ELF 并让它走 ignore | 登记中（2026-09-19 盘点发现） |
-| D26 | `test/riscv64/rv64ssvnapot-p-napot.elf`（3 147 616 B，全库最大跟踪文件） | **体积构成的 99.95％ 是填充**：全文件只有 1517 个非零字节。上游 napot.S 的两个 `.align 20` 把 .data 顶成 1 MiB 对齐 ⇒ 该 PT_LOAD 的 p_align = 2**20，lld 为满足 file offset ≡ vaddr (mod 2^20) 把段放在文件偏移 0x100000，于是 1 MiB 空洞 + filesz 0x200010 的段内容。非规格缺口，也不违反 §七 的 5 MB 落盘上限（3.0 MB < 5 MB）—— git 实存仅 ≈ 4.5 KB（zlib 实测），成本只在工作树与拷贝 | riscv-tests rv64ssvnapot 上游的 `.align 20`（test/riscv64/build_si_extras.sh 头注释已记）；实测：llvm-objdump -p（p_align 2**20、off 0x100000）、非零字节计数、deflate 估计 | 仓库瘦身提上日程时；或所有跑回归的机器都有 clang riscv64 交叉工具链后，改为测前由 build_si_extras.sh 现生成、镜像不入库（93aee5b 当初入库镜像正是为了免这个依赖）。单纯 `--max-page-size` 未必压得下来（节对齐会把 p_align 顶回去，未实测） | 登记中（2026-09-19 盘点发现） |
-| D27 | `device/storage/ide.c` 的 ATAPI 未实现项 | PACKET 只答 TUR / REQUEST SENSE / INQUIRY / START STOP UNIT / READ CAPACITY / READ(10) / READ(12)：MODE SENSE(0x5A)、GET CONFIGURATION(0x46)、READ TOC(0x43)、READ CD(0xBE)、SEEK(0x2B)、PREVENT/ALLOW MEDIUM REMOVAL(0x1E) 等一律 ILLEGAL REQUEST + ASC 0x24；只有 LUN 0；无 ATAPI DMA（BAR4 读 0，PIO 每轮 2048 字节）；无介质更换事件（UNIT ATTENTION 从不置位） | MMC-3（READ TOC / GET CONFIGURATION / READ CD）、SPC（MODE SENSE）；QEMU hw/ide/core.c 的 ide_atapi_cmd 分发 | Linux 的 sr 驱动探测与挂载（它先问 GET CONFIGURATION / MODE SENSE）或音频 CD 需要时；ATAPI DMA 随 D19 的 BMDMA | 登记中（2026-09-19 片 9：SeaBIOS El Torito 引导已实测通过） |
-| E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中（先加 softfloat 测试向量回归对照） |
+| D18 | CMOS RTC 的周期/闹钟中断 | RTC 的周期中断与闹钟中断（IRQ8，经从片 PIC 的线 0）不投递，status C 恒读 0 —— 读日期时间够用，按周期取中断的驱动（Linux rtc 驱动、周期性 timekeeping）不够 | MC146818 datasheet；QEMU hw/timer/mc146818rtc.c | 有客户机按周期用 RTC 中断时（现在 Linux 用 PIT 走时） | 登记中 |
+| D19 | PIIX3 芯片组、IDE 与 IOAPIC | IOAPIC 只投递 fixed 与 lowest-priority，**NMI/SMI/INIT/ExtINT 四种交付模式不投递**；PIIX3 ISA 桥的 PIRQ 路由字节 0x60-0x63 无消费者（IDE 跑兼容模式，没有 PCI 设备拉 INTx）；XBCS/PM/DMA 块未做；ATA 侧无 LBA-48 与 multi-sector（未实现的命令按规格 ABRT） | ATA/ATAPI-7 §6.3（未实现命令的应答就是 ABRT）；QEMU hw/isa/piix3.c、seabios src/fw/pciinit.c piix_isa_bridge_setup；IOAPIC 交付模式：82093AA datasheet §3.2.4；NMI 输入：SDM vol.3 §6.7 | NMI/SMI 交付模式要先给 CPU 加 NMI 输入（本机无 SMM、单 APIC、无 PIC→IOAPIC 通路）；PIRQ 需要真拉 INTx 的 PCI 设备；PM/ACPI 在需要挂起/电源管理时；LBA-48 在需要 >128 GiB 或客户机强制时 | 登记中 |
+| D21 | 软盘与 DMA 通路缺失 | 无 Intel 8272 软盘控制器、无 8237 DMA（通道 2 给软盘、通道 0 给内存刷新），CMOS 设备字节也不报软驱；再加上 8042 软驱数据线语义，整条"软盘引导 + PC 兼容传软盘"的路径都不存在。后果：Linux 0.11/0.12 那类把引导码写死成 DL=0（且要求每道 15/18 扇区）的软盘引导镜像无法引导 —— 只能走硬盘/光盘引导的镜像 | PC/AT Technical Reference（FDC 命令集）；Intel 8237A datasheet；QEMU hw/block/fdc.c + hw/dma/i8257.c；SeaBIOS src/hw/floppy.c（INT 13h 路径） | 需要软盘引导的镜像（如 oldlinux 的 0.11/0.12 套件）作为验收件时；Linux 阶梯本身不需要（ISO 路线） | 登记中 |
+| D20 | i8042/PS/2 键盘 | 键盘设备只**应答**命令（每条 0xFA；0xFF→ACK+0xAA、0xF2→ACK+0xAB 0x83、0xEE→0xEE），但不真正执行：0xF0/0xED/0xF3 的参数字节只回 ACK、不切换扫描码集/LED/typematic；扫描码一律按 set 1 发（命令字节翻译位只存不译）；无鼠标（AUX）；输出队列满时丢字节（无 overrun 位） | PC/AT Technical Reference；QEMU `ps2.c`/`pckbd.c`（tiny386/i8042.c 同源）：ACK 逐命令、IRQ1 门控 `mode & KBD_INT && !(mode & DISABLE_KBD)` | 需要 set 2 键盘、鼠标或真正走 PS/2 设备命令的客户机时 | 登记中 |
+| D25 | `test/x86/realmode/probe_ah.elf`（15016 B，已入 git） | **中间产物入库 + 配方缺失**：§七 规定 test/ 只入库源与脚本，这份 kvm-harness 探针的 ELF 产品却在库里；更要紧的是生成它的命令从未入库 —— `test/x86/realmode/build.sh` 只构建 realmode.elf，probe_ah.c / probe_harness.c 的手工编译没有配方，同目录 .o / .exe / .gen.s / .flat.s 都被 .gitignore 覆盖且已清出，只有这份 ELF 例外 ⇒ 删掉即不可再生 | 配方可照抄：test/x86/realmode/build.sh（realmode.elf 的 gcc -m32 管线）、test/x86/build_kut.sh（clang i386 管线）；探针源 probe_ah.c、probe_harness.c 已在库 | 想清理 test/ 里的中间产物时：先在 build.sh 补 probe_ah 目标，再 `git rm --cached` 该 ELF 并让它走 ignore | 登记中 |
+| D26 | `test/riscv64/rv64ssvnapot-p-napot.elf`（3 147 616 B，全库最大跟踪文件） | **体积构成的 99.95％ 是填充**：全文件只有 1517 个非零字节。上游 napot.S 的两个 `.align 20` 把 .data 顶成 1 MiB 对齐 ⇒ 该 PT_LOAD 的 p_align = 2**20，lld 为满足 file offset ≡ vaddr (mod 2^20) 把段放在文件偏移 0x100000，于是 1 MiB 空洞 + filesz 0x200010 的段内容。非规格缺口，也不违反 §七 的 5 MB 落盘上限（3.0 MB < 5 MB）—— git 实存仅 ≈ 4.5 KB（zlib 实测），成本只在工作树与拷贝 | riscv-tests rv64ssvnapot 上游的 `.align 20`（test/riscv64/build_si_extras.sh 头注释已记）；实测：llvm-objdump -p（p_align 2**20、off 0x100000）、非零字节计数、deflate 估计 | 仓库瘦身提上日程时；或所有跑回归的机器都有 clang riscv64 交叉工具链后，改为测前由 build_si_extras.sh 现生成、镜像不入库（93aee5b 当初入库镜像正是为了免这个依赖）。单纯 `--max-page-size` 未必压得下来（节对齐会把 p_align 顶回去，未实测） | 登记中 |
+| E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中 |
 
 ## 附：关键行为裁决存档（修复时的先例依据）
 
@@ -309,7 +310,7 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
   歧（gem5 从不发射 B 位、断点使能即 panic，该路径无实机对拍）——按
   规则"参考分歧以手册/实机裁决"，从实机。v86 则原样存（同样无投递层，
   写 0 会丢保留位 1，不可对拍）。
-- **x86 DR 存取层三方佐证（2026-09-13 补查）**：复位值 DR6=0xffff0ff0、
+- **x86 DR 存取层三方佐证**：复位值 DR6=0xffff0ff0、
   DR7=0x400 三方一致（gem5 isa.cc:136、v86 cpu.rs:4610、SDM）；DR4/5 在
   CR4.DE=0 时别名 DR6/7、DE=1 时 #UD 三方一致（v86 `dreg_index += 2`、
   gem5 fallthrough、cemu 同款）；DR7 BitUnion 位布局（gem5
@@ -318,10 +319,10 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
   asm 用 %rax/%rip）。32 位移植件 test/x86/kut_debug.c 的期望地址按 clang
   实际编码重推导（AND 累加器格式 5 字节 vs 原版 81/4 假设 6 字节；
   `lea (%%rip)` 改 call/pop 锚点 +3），语义全部模式无关（SDM ch.17 单处
-  定义），QEMU TCG 32 位与 cemu 双绿 8/8——用户 2026-09-13 批准作为 A 档
+  定义），QEMU TCG 32 位与 cemu 双绿 8/8——批准作为 A 档
   验收件。
 
-- **x86 处理器内部访问 = 超级权限（2026-09-19，片 4）**：描述符表（GDT/IDT/
+- **x86 处理器内部访问 = 超级权限**：描述符表（GDT/IDT/
   LDT）、TSS，以及换栈后压入的投递帧，都是**处理器自己的访问**，忽略 U/S 位；
   只有程序自己的访问才按 CPL 检查（SDM vol.3 4.6）。硬性判据：ring 3 的段加载
   要能读 U=0 的 GDT，ring 3 的中断要能写 U=0 的内核栈 —— 任何 OS 都依赖这条。

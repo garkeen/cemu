@@ -370,6 +370,81 @@ static int64_t X86NextEventUs(Board* m) {
   return pit < apic ? pit : apic;
 }
 
+// A device asked for a machine reset (D18). The request is recorded, not acted
+// on here: it arrives from inside the step that wrote the register, and the
+// reset happens at the next instruction boundary (run.c), where no instruction
+// is still using the state it would tear down.
+static void RequestReset(void* ctx) {
+  X86Board* xm = (X86Board*)ctx;
+  xm->base.reset_pending = 1;
+  if (DebugOn(kDbgMark)) DebugMark("reset-req", 0, 0);
+}
+
+// The machine's wiring: which sink each device's line reaches, and which
+// devices may ask for a reset. Every Init below clears its own sinks, so this
+// runs again after a reset — it is the state of the connections, not their
+// layout (the bus registration in X86BoardCreate happens once).
+static void WireDevices(X86Board* xm) {
+  Board* m = &xm->base;
+  xm->irqbus.pic = &xm->pic;
+  xm->irqbus.ioapic = &xm->ioapic;
+  PicSetIrqSink(&xm->pic, OnPicIrq, xm);
+  LapicSetIrqSink(&xm->lapic, OnLapicIrq, xm);
+  LapicSetEoiSink(&xm->lapic, OnLapicEoi, xm);
+  PitSetIrqSink(&xm->pit, OnIsaIrq, &xm->irqbus);
+  I8042SetIrqSink(&xm->kbd, OnIsaIrq, &xm->irqbus);
+  IdeSetIrqSink(&xm->ide, OnIsaIrq, &xm->irqbus);
+  Uart16550SetIrqSink(&xm->uart, OnCom1Irq, &xm->irqbus);
+  IoapicSetDeliverSink(&xm->ioapic, OnIoapicDeliver, xm);
+  I8042SetA20Sink(&xm->kbd, OnA20, &m->cpu);
+  Port92SetA20Sink(&xm->port92, OnA20, &m->cpu);
+  // The three ways a guest can reboot the machine on a PC (D18): port 0x92's
+  // INIT_NOW line, the PIIX3 reset control register at 0xCF9, and the keyboard
+  // controller's 0xFE command.
+  Port92SetResetSink(&xm->port92, RequestReset, xm);
+  Piix3SetResetSink(&xm->piix, RequestReset, xm);
+  I8042SetResetSink(&xm->kbd, RequestReset, xm);
+  m->cpu.int_ack = OnIntAck;
+  m->cpu.ack_dev = xm;
+}
+
+// The machine's reset. Devices first, so the firmware that starts at the reset
+// vector finds a power-on machine, and the CPU last, because its reset state
+// decides where the first fetch goes. The Inits are the ones the board came up
+// with — they are written to be re-runnable — with two exceptions, because a
+// reset is not a power cycle: CMOS keeps its battery-backed contents, and the
+// IDE controller keeps its media and the configuration the chipset was
+// programmed with. The layout (bus registration, port windows, the images) is
+// never touched.
+static void X86Reset(Board* m) {
+  X86Board* xm = (X86Board*)m;
+  Uart16550Init(&xm->uart);
+  PicInit(&xm->pic);
+  PitInit(&xm->pit);
+  FwCfgInit(&xm->fwcfg);
+  LapicInit(&xm->lapic);
+  IoapicInit(&xm->ioapic);
+  CgaInit(&xm->cga);
+  I8042Init(&xm->kbd);
+  Port92Init(&xm->port92);
+  CmosReset(&xm->cmos);
+  // The PCI bus forgets its device list on reset (the devices keep their
+  // configuration), so the three functions are re-enumerated here.
+  PciInit(&xm->pci);
+  PciAddDevice(&xm->pci, &xm->fx.pci);
+  PciAddDevice(&xm->pci, &xm->piix.pci);
+  PciAddDevice(&xm->pci, &xm->ide.pci);
+  IdeReset(&xm->ide);
+  DebugExitBind(&xm->dexit, &m->cpu);
+  WireDevices(xm);
+  m->cpu.pc = m->entry;
+  m->cpu.halted = kCpuRunning;
+  m->cpu.wait = 0;
+  m->cpu.exit_code = 0;
+  m->isa->init(&m->cpu);
+  LogInfo("machine reset: entry=%llx", (unsigned long long)m->entry);
+}
+
 Board* X86BoardCreate(const BoardOpts* opts) {
   if (opts->ram_base) {
     LogError("x86 machine places RAM at linear 0");
@@ -467,6 +542,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   CmosRegister(&m->io, cmos);
   CmosSetMemory(cmos, ram_size);
   PciRegister(&m->io, &xm->pci);
+  Piix3Register(&m->io, &xm->piix);
   IdeRegister(&m->io, ide);
   // The bus-master engine moves a transfer through system memory (the PRD table
   // and the host's buffers), so the controller needs the address space the task
@@ -482,26 +558,13 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   // controller and port 0x92. The hooks live on CpuState (like
   // timer_read/timer_dev), so the machine installs them before the loader
   // picks the ISA.
-  xm->irqbus.pic = pic;
-  xm->irqbus.ioapic = &xm->ioapic;
-  PicSetIrqSink(pic, OnPicIrq, xm);
-  LapicSetIrqSink(&xm->lapic, OnLapicIrq, xm);
-  LapicSetEoiSink(&xm->lapic, OnLapicEoi, xm);
-  PitSetIrqSink(pit, OnIsaIrq, &xm->irqbus);
-  I8042SetIrqSink(kbd, OnIsaIrq, &xm->irqbus);
-  IdeSetIrqSink(ide, OnIsaIrq, &xm->irqbus);
-  Uart16550SetIrqSink(uart, OnCom1Irq, &xm->irqbus);
-  IoapicSetDeliverSink(&xm->ioapic, OnIoapicDeliver, xm);
-  I8042SetA20Sink(kbd, OnA20, &m->cpu);
+  WireDevices(xm);
   // Keys from the host window enter the machine at the 8042 (IRQ1); stdin
   // enters it at COM1's receiver, which is where a terminal belongs on a PC.
   m->key_in = OnHostKey;
   m->key_ctx = xm;
   m->serial_in = OnHostSerial;
   m->serial_ctx = xm;
-  Port92SetA20Sink(p92, OnA20, &m->cpu);
-  m->cpu.int_ack = OnIntAck;
-  m->cpu.ack_dev = xm;
 
   m->cpu.halted = kCpuRunning;
   m->cpu.bus = &m->bus;
@@ -511,6 +574,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   m->poll = X86Poll;
   m->next_event_us = X86NextEventUs;
   m->skip_idle = opts->skip_idle;
+  m->reset = X86Reset;  // port 0x92 bit 0 / RCR 0xCF9 / i8042 0xFE (D18)
   m->destroy = X86Destroy;
   m->display_dev = cga;
   m->display_ops = &kCgaDisplayOps;

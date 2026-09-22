@@ -5,6 +5,15 @@
 # mem/, device/, board/, debug/). The include rules below keep the module
 # boundaries from eroding; this script fails the build when one is violated.
 set -u
+# A shell without the usual tools would report every rule clean and print "ok":
+# started non-interactively, Git's bash inherits a PATH with no /usr/bin, so the
+# checks must refuse to run rather than pass vacuously (D23).
+for tool in dirname grep sed; do
+  command -v "$tool" > /dev/null 2>&1 || {
+    echo "dep: $tool not on PATH — run this through a login shell (bash -l)" >&2
+    exit 1
+  }
+done
 cd "$(dirname "$0")/.." || exit 1
 
 fail=0

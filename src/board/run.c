@@ -56,6 +56,14 @@ int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuStat
       continue;
     }
     m->cpu.inst_count++;
+    if (m->reset_pending) {
+      // A device asked for a machine reset (port 0x92 bit 0, RCR 0xCF9, the
+      // keyboard controller's 0xFE): the guest restarts at the reset vector,
+      // so the instruction that requested it is the last one of this life.
+      m->reset_pending = 0;
+      if (m->reset) m->reset(m);
+      continue;
+    }
     if (stop_cb && stop_cb(cb_ctx, &m->cpu)) return 1;
     if (max_inst && m->cpu.inst_count >= max_inst) {
       LogError("instruction limit %llu reached at pc=%llx", (unsigned long long)max_inst,

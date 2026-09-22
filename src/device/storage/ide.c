@@ -1726,6 +1726,26 @@ int IdeAttach(IdeDevice* d, int channel, int drive, const char* path, int media)
   return 0;
 }
 
+void IdeReset(IdeDevice* d) {
+  // A machine reset (D18) takes the controller's own reset further: both
+  // channels go back to power-on — the task file, any transfer in flight, the
+  // bus-master engine, the per-drive status — while the machine's layout (the
+  // port windows, the IRQ wiring, the PCI configuration firmware programmed)
+  // and its media stay: a reset neither rewires the board nor ejects the
+  // medium, and POST re-programs the configuration it cares about.
+  for (int i = 0; i < 2; i++) {
+    IdeChannel* ch = &d->channels[i];
+    ResetChannel(ch);
+    ch->feature = 0;
+    ch->devctrl = 0;
+    ch->lba = 0;
+    // The bus-master descriptor pointer is a register like the rest: a machine
+    // reset clears it (SRST, by contrast, leaves the host's table in place).
+    ch->bmdma_prd = 0;
+    memset(ch->buf, 0, sizeof(ch->buf));
+  }
+}
+
 void IdeSetIrqSink(IdeDevice* d, void (*set_irq)(void* ctx, int line, int level), void* ctx) {
   d->set_irq = set_irq;
   d->irq_ctx = ctx;

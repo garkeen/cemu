@@ -3,6 +3,38 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 14：复位设施 + 观测/入口缺口（D28/D29/D23 销账，D18 收窄）（2026-09-22）
+
+**D28 是误登记：断点在客户机虚拟地址上是好的。** xv6（分页开、cs base=0）实测：
+`Z0,801046c2,4` 后 `c`，客机跑到该地址时 5.9 秒停下，`g` 读回 eip=0x801046c2；对照组
+`Z0,80109999,4`（不在执行路径上）跑满 20 秒不停。片 11 那三个地址里 `0xc02ef6ea` 根本
+不是指令边界，另两个只在启动的特定阶段执行，而那一轮跑到 `--max-inst` 就结束了——stub
+关掉连接是运行结束，不是断点失效。台账删行。
+
+**D29：trace 类目的 `skip=` 改按指令计**（新增 `AllowTrace(cat, inst)`，用
+`cpu->inst_count` 判窗口；其余类目仍按自身事件计，`skip=0` 时输出逐字节同旧）。实测
+`trace:line,skip=10000000,budget=5`：配 `--max-inst 10000000` → 0 行，`12000000` → 4 行。删行。
+
+**回归脚本不再丢证据**：`test/x86/run.sh` 每个失败分支改为 `report_fail`（FAIL 行 + 客机
+输出尾部，`FAIL_TAIL` 默认 12 行），kvm 用例的输出不再进 /dev/null；`test/riscv64/run.sh`
+同样捕获输出并补 `timeout 60`。
+
+**D23**：CMake 配置时解析 Git 的 bash，`check` / `check-x86` / `check-riscv64` 三个目标以
+登录 shell 跑脚本（非登录 shell 的 PATH 里没有 /usr/bin，那样跑 depcheck 会零命中报 ok）；
+`tools/depcheck.sh` 先检查 dirname/grep/sed 在位。PowerShell 下实测通过。删行。
+
+**D18 复位设施**：`Board` 加 `entry` / `reset_pending` / `reset`，`BoardRunSteps` 在**指令
+边界**执行复位（请求来自写寄存器那条指令内部，就地拆机会抽掉它正在用的状态）；三个触发源
+接 sink——port 0x92 bit 0、PIIX3 复位控制寄存器 **0xCF9**（bit1 类型 / bit2 请求，SeaBIOS
+`pci_reboot` 写 |2 再写 |6）、i8042 命令 **0xFE**；`X86Reset` 重置设备 + CPU 回 `entry`
+（CMOS 保留电池内容、IDE 保留介质与芯片组配置）。四个自带堆状态的设备 Init 改为可重入。
+新探针 `test/x86/probe/reset.asm`（生命计数记在 CMOS——低端 RAM 不行，两次复位之间有固件
+在跑；三源各占一条命，第四条命打印 `reset ok`；`-DTRIGGER=1|2|3` 变体打印 `no reset` 用于
+单独对拍）：**cemu 与 qemu-system-i386 双跑都是 rc=11 + `reset ok`**。D18 收窄到剩下的一半
+（RTC 周期/闹钟中断 IRQ8 不投递）。
+
+**未做**：x86 回归套件本轮没跑（等许可）；linux.iso 卡点未动。
+
 ## 阶段 4 片 13：内存取证设施 + D30/D22/D27/D19 落地（2026-09-22）
 
 **新增常驻设施（AGENTS.md §十）**：`CEMU_DEBUG` 的 `dump=ADDR:SIZE:FILE` —— 会话结束时按

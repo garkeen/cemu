@@ -18,10 +18,15 @@ typedef struct Port92Device {
   uint8_t outport;
   void (*set_a20)(void* ctx, int on);
   void* a20_ctx;
+  // A write with bit 0 set asks the machine to reset (D18). The board records
+  // the request and acts on it at the next instruction boundary.
+  void (*request_reset)(void* ctx);
+  void* reset_ctx;
 } Port92Device;
 
 void Port92Init(Port92Device* d);
 void Port92Register(Bus* io, Port92Device* d);
 void Port92SetA20Sink(Port92Device* d, void (*set_a20)(void* ctx, int on), void* ctx);
+void Port92SetResetSink(Port92Device* d, void (*request_reset)(void* ctx), void* ctx);
 
 #endif

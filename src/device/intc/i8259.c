@@ -327,7 +327,12 @@ void PicRegisterElcr(Bus* io, PicDevice* pic) {
 }
 
 void PicInit(PicDevice* pic) {
-  pic->pics = (PicState*)calloc(2, sizeof(PicState));
+  if (!pic->pics) {
+    pic->pics = (PicState*)calloc(2, sizeof(PicState));
+    if (!pic->pics) return;
+  }
+  // Re-initialising a live controller is the machine's reset path (D18): both
+  // chips return to their power-on state without a second allocation.
   pic->pics[0].pic = pic;
   pic->pics[1].pic = pic;
   PicReset(&pic->pics[0]);

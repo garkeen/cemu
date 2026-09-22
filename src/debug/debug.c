@@ -283,19 +283,40 @@ static int CatIdx(uint32_t cat) {
   return 7;
 }
 
-// Budget gate: 1 = emit, 0 = suppress (counted for the summary).
-static int Allow(uint32_t cat) {
+// The window is closed; the budget counts from here.
+static int AllowAfterWindow(uint32_t cat) {
   int i = CatIdx(cat);
-  if (g_emitted[i] < g_skip) {  // skip window: count, don't print
-    g_emitted[i]++;
-    return 0;
-  }
   if (g_emitted[i] - g_skip < (uint64_t)g_budget) {
     g_emitted[i]++;
     return 1;
   }
   g_suppressed[i]++;
   return 0;
+}
+
+// Budget gate: 1 = emit, 0 = suppress (counted for the summary). The skip
+// window here is counted in this category's own events.
+static int Allow(uint32_t cat) {
+  int i = CatIdx(cat);
+  if (g_emitted[i] < g_skip) {  // skip window: count, don't print
+    g_emitted[i]++;
+    return 0;
+  }
+  return AllowAfterWindow(cat);
+}
+
+// Trace gate. A trace `skip=N` reads as "say nothing before instruction N",
+// and its unit is instructions rather than events: the trace stream has no
+// event for a step that retires nothing (a REP iteration, a hlt wakeup), so an
+// event counter closes the window at an instruction number nobody asked for —
+// and when N sits near the run's length it never closes at all, which looks
+// like a silent trace (D29). The retired-instruction counter is the unit the
+// caller means.
+static int AllowTrace(uint32_t cat, uint64_t inst) {
+  if (inst < g_skip) return 0;
+  int i = CatIdx(cat);
+  if (g_emitted[i] < g_skip) g_emitted[i] = g_skip;  // the budget starts at the window's edge
+  return AllowAfterWindow(cat);
 }
 
 // Session output cap. Returns 1 if n bytes may still be written (and accounts
@@ -401,8 +422,8 @@ void DebugInsn(frame* f) {
   if (!g_inited) return;
   if (g_mask & kDbgTraceLine) {
     // Compact one-line form: pc, raw bytes, mnemonic, next pc. Greppable,
-    // no table chrome.
-    if (Allow(kDbgTraceLine)) {
+    // no table chrome. The skip window is in instructions (AllowTrace).
+    if (AllowTrace(kDbgTraceLine, f->cpu->inst_count)) {
       char line[160];
       int n = snprintf(line, sizeof(line), "pc=%016llx", (unsigned long long)f->rec.pc);
       for (int i = 0; i < f->rec.raw_len && i < 8; i++)
@@ -413,7 +434,7 @@ void DebugInsn(frame* f) {
     }
   }
   if (g_mask & kDbgTraceTable) {
-    if (Allow(kDbgTraceTable)) {
+    if (AllowTrace(kDbgTraceTable, f->cpu->inst_count)) {
       RowBegin(g_tbl, 'I', f);
       char det[48];
       snprintf(det, sizeof(det), "-> %016llx", (unsigned long long)f->rec.dnpc);

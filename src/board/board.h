@@ -32,6 +32,20 @@ typedef struct Board {
   // Reset state, applied after the image loads (QEMU-style boot flow):
   // 0 = enter at the loaded image entry.
   uint64_t reset_pc;
+  // Where the CPU starts after a *machine* reset (port 0x92 bit 0, the reset
+  // control register at 0xCF9, the keyboard controller's 0xFE command): the
+  // firmware's reset vector on a board with a ROM, otherwise the loaded
+  // image's entry, which is still in RAM — a reset restarts the machine, not
+  // the process. main.c fills this in next to cpu.pc.
+  uint64_t entry;
+  // A device's reset request is recorded here and acted on at the next
+  // instruction boundary: the request arrives from inside a step (the store
+  // that wrote the register), and resetting there would pull state out from
+  // under the instruction that is still using it.
+  int reset_pending;
+  // Performs that reset: every device back to its power-on state and the CPU
+  // to `entry`. NULL = the machine has no reset facility.
+  void (*reset)(struct Board* b);
   // Whether raw binaries of this board speak HTIF (spike does; the QEMU virt
   // and PC contracts do not). ELFs always declare HTIF by symbols.
   int bin_htif;

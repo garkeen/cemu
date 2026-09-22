@@ -15,8 +15,11 @@ static void Port92Write(void* dev, uint64_t addr, int size, uint64_t val) {
   Port92Device* d = (Port92Device*)dev;
   uint8_t prev = d->outport;
   d->outport = (uint8_t)val;
-  // Bit 0 is the "fast reset" line (INIT_RC); the CPU reset facility is not
-  // modeled yet (AGENTS.md D18), so it is stored and ignored.
+  // Bit 0 is INIT_NOW: the fast-reset line, which the machine answers with a
+  // reset (QEMU hw/i386/port92.c does the same on a write with bit 0 set). The
+  // request is recorded by the board and taken at the next instruction
+  // boundary — this write is still inside the instruction that issued it.
+  if ((d->outport & kPort92Reset) && d->request_reset) d->request_reset(d->reset_ctx);
   if ((prev ^ d->outport) & kPort92A20 && d->set_a20)
     d->set_a20(d->a20_ctx, (d->outport & kPort92A20) ? 1 : 0);
 }
@@ -27,6 +30,8 @@ void Port92Init(Port92Device* d) {
   d->outport = kPort92A20;
   d->set_a20 = NULL;
   d->a20_ctx = NULL;
+  d->request_reset = NULL;
+  d->reset_ctx = NULL;
 }
 
 void Port92Register(Bus* io, Port92Device* d) { BusAddRegion(io, 0x92, 1, &kPort92Ops, d); }
@@ -34,4 +39,9 @@ void Port92Register(Bus* io, Port92Device* d) { BusAddRegion(io, 0x92, 1, &kPort
 void Port92SetA20Sink(Port92Device* d, void (*set_a20)(void* ctx, int on), void* ctx) {
   d->set_a20 = set_a20;
   d->a20_ctx = ctx;
+}
+
+void Port92SetResetSink(Port92Device* d, void (*request_reset)(void* ctx), void* ctx) {
+  d->request_reset = request_reset;
+  d->reset_ctx = ctx;
 }

@@ -22,10 +22,19 @@
 // them yet: the IDE function stays in compatibility mode, so the board's
 // devices use the fixed ISA IRQs. The remaining PIIX3 registers (the XBCS BIOS
 // control byte, the DMA and PM blocks) are not modelled — see 简化登记 D19.
+//
+// The one I/O port the bridge owns is the reset control register at 0xCF9.
 typedef struct Piix3BridgeDevice {
   PciDevice pci;
+  uint8_t rcr;  // reset control register: the reset type bit, once written
+  // A write that requests a reset asks the machine for one (D18); the board
+  // records it and acts at the next instruction boundary.
+  void (*request_reset)(void* ctx);
+  void* reset_ctx;
 } Piix3BridgeDevice;
 
 void Piix3BridgeInit(Piix3BridgeDevice* d, uint8_t bus, uint8_t dev);
+void Piix3Register(Bus* io, Piix3BridgeDevice* d);
+void Piix3SetResetSink(Piix3BridgeDevice* d, void (*request_reset)(void* ctx), void* ctx);
 
 #endif

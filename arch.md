@@ -10,7 +10,7 @@
    运行真实软件。
 2. **cesdk**：AM 式构建系统，C 源码 → 自含 .bin/.elf/.img，产物在真 QEMU 上
    可运行。
-3. 顺序（2026-09-05 重排）：cemu 先行；x86 保护模式与分页是最后一大块
+3. 顺序：cemu 先行；x86 保护模式与分页是最后一大块
    指令集语义，提前收掉，其后进入纯设备/IO 与真实 OS（xv6 → Linux）；
    cesdk 放后——真实软件跑通之后其 API 才有设计依据，cemu 的测试阶梯
    也不依赖 cesdk。
@@ -155,7 +155,7 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - x86 侧：PC 平台（i8259 + i8254，hlt 由 IRQ0 唤醒），realmode 全绿过。
 - M 态完整化：misa/medeleg/mideleg/PMP/Sv39（mmu.c）全落地。
 
-### 阶段 3：x86 保护模式与分页 ✅（2026-09-05 提前，原阶段 4 的语义核心）
+### 阶段 3：x86 保护模式与分页 ✅（原阶段 4 的语义核心）
 最后一大块指令集语义，收掉之后进入纯设备/IO 阶段。固件已备：x86 SeaBIOS
 （bios.bin 阶段 0 已构建）、riscv OpenSBI（fw_jump 阶段 2 已引导）。
 - 32 位保护模式：GDT/LDT/IDT 装载、描述符缓存、特权级检查
@@ -169,7 +169,7 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - 验收：kvm-unit-tests 32 位保护模式用例 + multiboot 平段内核开分页冒烟。
 - riscv 侧无新增语义（S 态/Sv39 阶段 2 已落地）。
 
-### 阶段 3.5：调试器与 GUI ✅（2026-09-05 立项；VGA 图形模式与 ramfb 按 D17 挪入阶段 4）
+### 阶段 3.5：调试器与 GUI ✅（VGA 图形模式与 ramfb 按 D17 挪入阶段 4）
 三片独立可交付，顺序可调；显示通道是阶段 4 图形 OS 的硬前置。
 - 前置任务：exec.c 逐 case 填 insn_rec.mnemonic（名字级，SDM/手册指令名；
   语法级不做）。CEMU_DEBUG 事件表的 MNEMONIC 列在 case 入口即有值，
@@ -181,7 +181,7 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   断点/单步/读写现场复用 raise 通道与 CEMU_DEBUG 基建。软件断点不依赖
   D6；硬件断点（hbreak/watch → trigger 匹配语义）在此销账 D6。
 - 图形调试前端：依赖前两片，纯 RSP 客户端（寄存器/内存/断点/单步控制），
-  不内置反汇编（2026-09-12 用户决定：反汇编一律外部工具——gdb/lldb
+  不内置反汇编（反汇编一律外部工具——gdb/lldb
   attach 同一 stub 客户端侧反汇编，或 llvm-objdump 离线看镜像）。cemu
   本体保持纯 C 零新依赖。
 - 验收：真 gdb attach 设断点/单步/看现场；CGA 窗口点亮 realmode hello；
@@ -195,22 +195,16 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - 验收阶梯：xv6-x86 → Linux（参照 v86/tests/full 清单）；riscv 侧
   xv6-riscv（OpenSBI fw_jump 引导）并行验收。
 - D13 剩余（x87 FPU）在 Linux 用户态销账；D14（VM86）在 DOS/BIOS 兼容
-  路线需要时评估（Linux 不需要）。**（2026-09-21 更新）**：x87 ESC 已按"无 FPU
-  处理器"语义落地（CR0.TS/EM 先 #NM，否则解码 modrm 当 NOP），内核启动期的 FPU
-  探测因此通过；仍缺的是 x87 算术与 **RDTSC（0F 31 仍为显式 #UD）**——二者的
-  前提是 CPUID 特性位如实为 0（EDX=0，无 FPU/TSC/APIC/MSR），实现与报位必须
-  始终自洽，否则内核会走到 RDTSC / LAPIC 上。
-- **现状（2026-09-21 片 12）**：验收 1（xv6-x86）✅ —— SeaBIOS → IDE 盘 → xv6 到 shell，
-  与 QEMU 基线逐项一致；验收 2（Linux）进行中 —— ATAPI（PACKET）/El Torito 引导已通，
-  片 11 补掉五处 x86 语义缺口（REP 计数 0、BSR/BSF、x87 ESC 的无 FPU 语义、CMPXCHG、
-  XADD 写回顺序）后内核进入保护模式运行；片 12 定案了片 11 的卡点：**`BT/BTS/BTR/BTC`
-  的内存操作数是位串**（SDM vol.2 Operation `BitBase ← BitOffset DIV OperandSize`），
-  原实现不按位偏移推进有效地址 ⇒ 内核 `init_IRQ()` 的 IRQ 门安装循环把 0x20–0xff 全
-  判成"系统向量" ⇒ 224 个 IRQ 门一个都没装 ⇒ 唯一一次 IRQ0 交付落到 `ignore_int`
-  （不算 tick、不发 EOI）⇒ PIC ISR 卡住 ⇒ 定时器死掉、`calibrate_delay_converge` 自旋。
-  修掉后 linux.iso 单跑通过定时器校准并走到 `VFS: Mounted root (ext2 filesystem)`
-  （RTC/8250/IDE-ATAPI/i8042/RAMDISK 全部就位）；验收 3（xv6-riscv）未开始
-  （依赖 D22 的 COM1 接收路径）。
+  路线需要时评估（Linux 不需要）。x87 ESC 已按"无 FPU
+  处理器"语义落地（CR0.TS/EM 先 #NM，否则当 NOP），内核启动期 FPU 探测因此通过；
+  仍缺 x87 算术与 RDTSC（0F 31 仍 #UD），前提是 CPUID 特性位如实为 0（EDX=0）。
+- **现状（2026-09-22）**：验收 1（xv6-x86）✅ SeaBIOS → IDE 盘 → xv6 到 shell，
+  与 QEMU 基线逐项一致。验收 2（Linux）进行中：引导链已通（ATAPI/El Torito → 内核保护
+  模式 → `VFS: Mounted root (ext2 filesystem)`），**卡在 `mount_root()` 之后、
+  `free_initmem()` 之前那一段**（`devtmpfs_mount` / MS_MOVE / chroot /
+  `async_synchronize_full`）——内核日志在 `VFS: Mounted root` 之后零输出、零告警，
+  未定案；设备侧（COM1 接收、ATAPI 命令集、IDE DMA、ELCR/电平 PIC、机器复位）已补齐。
+  验收 3（xv6-riscv）未开始（串口输入通道已就绪）。过程与证据见 progress.md。
 
 ### 阶段 5：cesdk（放后：真实 OS 跑通后再做 SDK）
 - 交付：crun 运行时（_start、putch→UART、halt→sifive_test）、klib、

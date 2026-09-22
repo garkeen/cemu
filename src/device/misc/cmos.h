@@ -22,6 +22,9 @@ typedef struct CmosDevice {
 } CmosDevice;
 
 void CmosInit(CmosDevice* d);
+// A machine reset (D18): the battery-backed contents survive it, the access
+// state does not.
+void CmosReset(CmosDevice* d);
 void CmosRegister(Bus* io, CmosDevice* d);
 // Tells the RTC how much RAM the machine carries; the extended-memory
 // registers answer from it.

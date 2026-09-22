@@ -1,6 +1,7 @@
 #include "device/misc/cmos.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 #include "host/host.h"
 
@@ -219,9 +220,24 @@ static void CmosWrite(void* dev, uint64_t addr, int size, uint64_t val) {
 
 static const DeviceOps kCmosOps = {"cmos", CmosRead, CmosWrite};
 
+void CmosReset(CmosDevice* d) {
+  // A machine reset leaves the battery-backed contents alone — the clock keeps
+  // running across it, and the guest re-reads the same date and time after the
+  // reboot. Only the chip's access state (the address pointer and the
+  // NMI-disable latch) returns to its reset value.
+  if (!d->st) return;
+  d->st->index = 0;
+  d->st->nmi_off = 0;
+}
+
 void CmosInit(CmosDevice* d) {
-  struct CmosState* st = (struct CmosState*)calloc(1, sizeof(struct CmosState));
-  if (!st) return;
+  if (!d->st) {
+    d->st = (struct CmosState*)calloc(1, sizeof(struct CmosState));
+    if (!d->st) return;
+  } else {
+    memset(d->st, 0, sizeof(*d->st));
+  }
+  struct CmosState* st = d->st;
   // Power-on contents: 32.768kHz source with a 1024Hz periodic rate in status
   // A, 24-hour mode, status D reporting valid RAM, a century register so the
   // two-digit year has a century, and a stored date of 2000-01-01 so a guest
@@ -233,7 +249,6 @@ void CmosInit(CmosDevice* d) {
   st->regs[kRegDayOfMonth] = (uint8_t)ToBcd(1);
   st->regs[kRegMonth] = (uint8_t)ToBcd(1);
   st->bias_sec = 0;
-  d->st = st;
 }
 
 void CmosRegister(Bus* io, CmosDevice* d) {

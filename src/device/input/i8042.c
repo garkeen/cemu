@@ -1,6 +1,7 @@
 #include "device/input/i8042.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 #include "debug/debug.h"
 
@@ -141,7 +142,11 @@ static void I8042WriteCmd(I8042Device* d, uint8_t val) {
     case kCmdEnableAux:
       break;  // no auxiliary device on this controller (D20)
     case kCmdPulseReset:
-      break;  // the CPU reset line is not modeled (AGENTS.md D18)
+      // 0xFE pulses the CPU reset line (PC/AT Technical Reference; QEMU
+      // pckbd.c KBD_CCMD_RESET): the machine resets, so the guest's reboot
+      // lands back in firmware instead of spinning on a dead controller.
+      if (d->request_reset) d->request_reset(d->reset_ctx);
+      break;
     default:
       // 0xf0..0xfd pulse output-port bits 0..3 (PC/AT Technical Reference);
       // QEMU pckbd.c keeps bits 2..3 and folds the low nibble in.
@@ -219,18 +224,26 @@ static void I8042Write(void* dev, uint64_t addr, int size, uint64_t val) {
 static const DeviceOps kI8042Ops = {"i8042", I8042Read, I8042Write};
 
 void I8042Init(I8042Device* d) {
-  struct I8042State* st = (struct I8042State*)calloc(1, sizeof(struct I8042State));
-  if (!st) return;
+  if (!d->st) {
+    d->st = (struct I8042State*)calloc(1, sizeof(struct I8042State));
+    if (!d->st) return;
+  } else {
+    // Re-initialising an existing controller is the machine's reset path: the
+    // model state goes back to power-on without a second allocation.
+    memset(d->st, 0, sizeof(*d->st));
+  }
+  struct I8042State* st = d->st;
   // Reset state: the command byte the firmware expects to find (keyboard
   // interrupt and translation enabled, system flag up) and the output port
   // with A20 open — see port92.h for why the gate starts open.
   st->cmd_byte = kModeKbdInt | kModeSys | kModeKcc;
   st->outport = kOutPortA20;
-  d->st = st;
   d->set_a20 = NULL;
   d->a20_ctx = NULL;
   d->set_irq = NULL;
   d->irq_ctx = NULL;
+  d->request_reset = NULL;
+  d->reset_ctx = NULL;
 }
 
 void I8042Register(Bus* io, I8042Device* d) {
@@ -241,6 +254,11 @@ void I8042Register(Bus* io, I8042Device* d) {
 void I8042SetA20Sink(I8042Device* d, void (*set_a20)(void* ctx, int on), void* ctx) {
   d->set_a20 = set_a20;
   d->a20_ctx = ctx;
+}
+
+void I8042SetResetSink(I8042Device* d, void (*request_reset)(void* ctx), void* ctx) {
+  d->request_reset = request_reset;
+  d->reset_ctx = ctx;
 }
 
 void I8042SetIrqSink(I8042Device* d, void (*set_irq)(void* ctx, int line, int level),

@@ -43,7 +43,39 @@ if(WIN32)
 endif()
 
 # --- check target (dependency-edge lint, AGENTS.md 第七节) ----------------
+# The checks are bash scripts. On Windows a bare `bash` on PATH is WSL's, which
+# cannot run a D:/ path and fails under cmd/PowerShell (D23), so resolve the
+# shell once at configure time — Git's bash first — and run it as a *login*
+# shell: started non-interactively it inherits the caller's PATH, which has no
+# /usr/bin, and then dirname/grep/sed are all missing (the checks would pass
+# vacuously). Every entry point below therefore runs from cmd, PowerShell and a
+# POSIX shell alike.
+if(WIN32)
+  find_program(CEMU_BASH NAMES bash.exe
+    PATHS "$ENV{ProgramFiles}/Git/bin" "$ENV{ProgramFiles}/Git/usr/bin"
+          "$ENV{ProgramW6432}/Git/bin" "$ENV{LOCALAPPDATA}/Programs/Git/bin"
+          "C:/Program Files/Git/bin" "C:/Program Files/Git/usr/bin"
+    NO_DEFAULT_PATH)
+endif()
+if(NOT CEMU_BASH)
+  find_program(CEMU_BASH NAMES bash)
+endif()
+if(NOT CEMU_BASH)
+  message(WARNING "no bash found: the check targets cannot run (see D23)")
+else()
+  message(STATUS "shell for check targets: ${CEMU_BASH}")
+endif()
+
 add_custom_target(check
-  COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/depcheck.sh"
+  COMMAND "${CEMU_BASH}" -l "${CMAKE_CURRENT_SOURCE_DIR}/tools/depcheck.sh"
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
   COMMENT "Running dependency-edge check (tools/depcheck.sh)")
+
+# The machine suites: the same scripts the developer runs by hand, behind a
+# target so the entry point does not depend on which shell the caller is in.
+foreach(suite x86 riscv64)
+  add_custom_target(check-${suite}
+    COMMAND "${CEMU_BASH}" -l "${CMAKE_CURRENT_SOURCE_DIR}/test/${suite}/run.sh"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Running the ${suite} suite (test/${suite}/run.sh)")
+endforeach()

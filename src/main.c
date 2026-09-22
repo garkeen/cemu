@@ -182,6 +182,7 @@ int main(int argc, char** argv) {
   }
   m->isa = lr.isa;
   m->cpu.pc = m->reset_pc ? m->reset_pc : lr.entry;
+  m->entry = m->cpu.pc;  // where a machine reset restarts (board.h)
   m->cpu.image_base = lr.image_base;
   lr.isa->init(&m->cpu);
   if (a.image)

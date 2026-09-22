@@ -27,6 +27,11 @@ typedef struct I8042Device {
   void* a20_ctx;
   void (*set_irq)(void* ctx, int line, int level);
   void* irq_ctx;
+  // Command 0xFE pulses the CPU's reset line: on a PC that is a machine reset,
+  // and it is how SeaBIOS's i8042_reboot() asks for one (D18). The board
+  // records the request and acts on it at the next instruction boundary.
+  void (*request_reset)(void* ctx);
+  void* reset_ctx;
   struct I8042State* st;  // private model state
 } I8042Device;
 
@@ -34,6 +39,7 @@ void I8042Init(I8042Device* d);
 void I8042Register(Bus* io, I8042Device* d);
 void I8042SetA20Sink(I8042Device* d, void (*set_a20)(void* ctx, int on), void* ctx);
 void I8042SetIrqSink(I8042Device* d, void (*set_irq)(void* ctx, int line, int level), void* ctx);
+void I8042SetResetSink(I8042Device* d, void (*request_reset)(void* ctx), void* ctx);
 // One byte from the keyboard device into the controller's output queue.
 void I8042KeyByte(I8042Device* d, uint8_t scancode);
 

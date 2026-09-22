@@ -9,6 +9,16 @@ CEMU=${CEMU:-$dir/../../build/cemu.exe}
 pass=0
 fail=0
 
+# A failure reported by exit status alone is not diagnosable: rc cannot tell
+# "the image would not open" from "the guest ran and disagreed", and the one
+# run that came back all-rc=1 (stage 4 片 12) left no evidence at all. Print
+# the tail of the guest's own output with every FAIL; FAIL_TAIL caps it (the
+# realmode suite prints 126 PASS lines).
+report_fail() {
+  echo "FAIL ($1)"
+  echo "$out" | tail -n "${FAIL_TAIL:-12}" | sed 's/^/    | /'
+}
+
 # Smoke: boot sector prints "cemu-x86-smoke" on COM1 (the QEMU dual-run golden
 # output) and exits via debug-exit with value 5 -> status 11.
 out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$dir/smoke/x86_smoke.bin" 2>&1)
@@ -17,7 +27,7 @@ if [ "$rc" -eq 11 ] && echo "$out" | grep -q cemu-x86-smoke; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL (smoke: rc=$rc)"
+  report_fail "smoke: rc=$rc"
 fi
 
 # CGA: the display-card probe (阶段 3.5 片 2). Headless-verified device
@@ -32,7 +42,7 @@ if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'cga-probe ok'; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL (cga: rc=$rc)"
+  report_fail "cga: rc=$rc"
 fi
 
 # REP-prefixed string ops with (E)CX = 0 (test/x86/probe/rep_zero.asm): the
@@ -54,7 +64,7 @@ if [ -f "$repbin" ]; then
     pass=$((pass + 1))
   else
     fail=$((fail + 1))
-    echo "FAIL (rep-zero: rc=$rc)"
+    report_fail "rep-zero: rc=$rc"
   fi
 else
   echo "SKIP (rep-zero: no nasm and no prebuilt probe bin)"
@@ -78,10 +88,38 @@ if [ -f "$pitbin" ]; then
     pass=$((pass + 1))
   else
     fail=$((fail + 1))
-    echo "FAIL (pit-irq: rc=$rc)"
+    report_fail "pit-irq: rc=$rc"
   fi
 else
   echo "SKIP (pit-irq: no nasm and no prebuilt probe bin)"
+fi
+
+# Machine reset (test/x86/probe/reset.asm, AGENTS.md D18): a boot sector that
+# pulls the three ways a PC guest reboots the machine — port 0xCF9's reset
+# control register (SeaBIOS pci_reboot), port 0x92 bit 0 (INIT_NOW) and the
+# keyboard controller's 0xFE command (SeaBIOS i8042_reboot) — one per life,
+# counting lives in CMOS, which survives a reset where low RAM does not (the
+# firmware runs again in between). Only a machine that really restarted reaches
+# the fourth life, which prints "reset ok" and exits 11.
+# Dual run against qemu-system-i386: same transcript, same status 11. Measured
+# one trigger at a time with -DTRIGGER=1|2|3 (each variant prints "no reset" if
+# its trigger did nothing): QEMU's pc machine implements all three, so the
+# three-life sequence completes there too.
+resetbin="$dir/probe/reset.bin"
+if [ ! -f "$resetbin" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f bin -o "$resetbin" "$dir/probe/reset.asm"
+fi
+if [ -f "$resetbin" ]; then
+  out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$resetbin" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'reset ok'; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "reset: rc=$rc"
+  fi
+else
+  echo "SKIP (reset: no nasm and no prebuilt probe bin)"
 fi
 
 # PM: the protected-mode smoke probe (test/x86/pm). Multiboot ELF enters flat
@@ -119,7 +157,7 @@ if [ "$rc" -eq 11 ] && [ "$n_ok" -eq "$expected_pm" ] && [ "$n_bad" -eq 0 ] &&
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL (pm: rc=$rc, $n_ok ok, $n_bad bad)"
+  report_fail "pm: rc=$rc, $n_ok ok, $n_bad bad"
 fi
 
 # kvm-unit-tests 32-bit flat images (built from the v86 checkout by
@@ -131,13 +169,13 @@ fi
 # AGENTS.md D6). The kvm exit convention: report_summary
 # failures call exit(failures) — payload 0 only when every test passed.
 for t in taskswitch taskswitch2 cmpxchg8b memory debug; do
-  timeout 60 "$CEMU" --machine x86 --isa x86 "$dir/$t.elf" > /dev/null 2>&1
+  out=$(timeout 60 "$CEMU" --machine x86 --isa x86 "$dir/$t.elf" 2>&1)
   rc=$?
   if [ "$rc" -eq 1 ]; then
     pass=$((pass + 1))
   else
     fail=$((fail + 1))
-    echo "FAIL (kvm-$t: rc=$rc)"
+    report_fail "kvm-$t: rc=$rc"
   fi
 done
 
@@ -168,7 +206,7 @@ if [ "$n_pass" -eq "$expected_pass" ] && [ "$n_fail" -eq 1 ] &&
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL (realmode: $n_pass pass, $n_fail fail)"
+  report_fail "realmode: $n_pass pass, $n_fail fail"
 fi
 
 echo "$pass passed, $fail failed"

@@ -161,6 +161,9 @@ struct IdeDevice {
 };
 
 void IdeInit(IdeDevice* d, uint8_t bus, uint8_t dev);
+// A machine reset (D18): both channels back to their power-on state, keeping
+// the machine's layout and the attached media.
+void IdeReset(IdeDevice* d);
 // Attaches a medium to one bay: channel 0/1, drive 0 (master) / 1 (slave).
 // Returns 0 on success; the image must be a whole number of logical blocks
 // (512 bytes for kIdeMediaDisk, 2048 for kIdeMediaCd).

@@ -265,7 +265,12 @@ static void PitWrite(void* dev, uint64_t addr, int size, uint64_t val) {
 static const DeviceOps kPitOps = {"8254", PitRead, PitWrite};
 
 void PitInit(PitDevice* pit) {
-  pit->channels = (PitChannel*)calloc(3, sizeof(PitChannel));
+  if (!pit->channels) {
+    pit->channels = (PitChannel*)calloc(3, sizeof(PitChannel));
+    if (!pit->channels) return;
+  }
+  // Re-initialising a live timer is the machine's reset path (D18): the three
+  // channels go back to power-on without a second allocation.
   PitReset(pit);
   pit->channels[0].irq = 0;  // IRQ0
   pit->set_irq = NULL;
