@@ -46,8 +46,13 @@
 //
 // Buses and drivers do not implement a command by answering nothing: an
 // unimplemented ATA command is aborted (ABRT), an unimplemented CDB reports a
-// sense key. Bus-master DMA (the BAR4 engine) is not modelled; see 简化登记
-// D19.
+// sense key.
+//
+// Data can move two ways. PIO is the DRQ handshake through the data port; the
+// bus-master engine (BAR4, PIIX3 "Bus Master IDE") instead walks a physical
+// region descriptor table in system memory, which is how every modern driver
+// moves a disk's data. Both are modelled, and a driver that asks for DMA in
+// IDENTIFY gets a working engine.
 enum { kIdeDrivesPerChannel = 2 };
 
 // Logical block sizes. The ATA register command set moves 512-byte sectors; the
@@ -84,6 +89,17 @@ typedef struct IdeDrive {
   // which REQUEST SENSE hands back (§10.3.2).
   uint8_t sense_key;
   uint8_t asc;
+  // Tray state (MMC-3 START STOP UNIT, PREVENT/ALLOW MEDIUM REMOVAL). The image
+  // attached at boot *is* the medium; a tray cycle is the one event that makes
+  // the medium come and go, and it is what raises the unit attention a driver
+  // has to collect with REQUEST SENSE.
+  int tray_open;
+  int tray_locked;
+  // Power management (§8.9): the state CHECK POWER MODE reports, and whether the
+  // drive has been put to sleep — a sleeping drive answers nothing until a
+  // reset wakes it (§8.12).
+  uint8_t power;
+  int sleeping;
 } IdeDrive;
 
 typedef struct IdeDevice IdeDevice;
@@ -101,6 +117,7 @@ typedef struct IdeChannel {
   uint8_t lba_mid;
   uint8_t lba_high;
   uint8_t head;
+  uint8_t feature;  // the feature register: the argument SET FEATURES reads
   int selected;     // the bay the device/head register picked
   uint8_t devctrl;  // control block: nIEN (bit 1), SRST (bit 2), HD15 (bit 3)
   // An in-flight PIO transfer. One command runs per channel at a time; the
@@ -111,6 +128,7 @@ typedef struct IdeChannel {
   int active;      // drive executing, -1 = idle
   int is_write;    // direction of the active transfer
   int packet;      // what is moving is the CDB itself, not data
+  int dma;         // the active transfer moves through the bus-master engine
   int64_t lba;     // logical block being transferred
   int64_t left;    // bytes left in the command's data phase
   int round;       // bytes of the current DRQ round not yet moved
@@ -121,12 +139,23 @@ typedef struct IdeChannel {
   int refill;      // the buffer is reloaded at every block boundary — a medium
                    // transfer, as opposed to a reply that already sits in it
   int irq_pending;  // a completion to report (masked by devctrl nIEN)
+  // Bus-master DMA (PIIX3 "Bus Master IDE"): the two registers the host
+  // programs, the descriptor table it points at, and the engine's own start
+  // bit. One register block per channel inside the 16-port window at BAR4.
+  uint8_t bmdma_cmd;
+  uint8_t bmdma_status;
+  uint32_t bmdma_prd;
   uint8_t buf[kMaxBlockSize];
 } IdeChannel;
 
 struct IdeDevice {
   PciDevice pci;
   IdeChannel channels[2];  // [0] = primary (IRQ14), [1] = secondary (IRQ15)
+  // System memory. The bus-master engine moves the data through the PRD table
+  // and the host's buffers, both of which live in guest RAM, so the controller
+  // needs the address space the task file itself never touches. NULL = no DMA
+  // (a board that never attaches one leaves the engine unable to run).
+  Bus* mem;
   void (*set_irq)(void* ctx, int line, int level);
   void* irq_ctx;
 };
@@ -136,8 +165,10 @@ void IdeInit(IdeDevice* d, uint8_t bus, uint8_t dev);
 // Returns 0 on success; the image must be a whole number of logical blocks
 // (512 bytes for kIdeMediaDisk, 2048 for kIdeMediaCd).
 int IdeAttach(IdeDevice* d, int channel, int drive, const char* path, int media);
-// The four legacy port windows on the I/O bus.
+// The four legacy port windows on the I/O bus, plus the bus-master window.
 void IdeRegister(Bus* io, IdeDevice* d);
+// The address space the bus-master engine moves data through.
+void IdeSetDmaBus(IdeDevice* d, Bus* mem);
 void IdeSetIrqSink(IdeDevice* d, void (*set_irq)(void* ctx, int line, int level), void* ctx);
 // Closes the attached images.
 void IdeDestroy(IdeDevice* d);

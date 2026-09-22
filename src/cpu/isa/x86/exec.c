@@ -1202,6 +1202,10 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
   // 16-31. Type/DPL/P decode from byte 5 (bits 40-47).
   uint16_t code_sel = (uint16_t)(gate >> 16);
   uint32_t off = (uint32_t)(gate & 0xffff) | (uint32_t)((gate >> 48) & 0xffff) << 16;
+  // The gate actually read decides where a vector lands; when a guest's
+  // handler never runs, the difference between "delivered to the right stub"
+  // and "delivered to the early default handler" is this one number (kDbgMark).
+  if (DebugOn(kDbgMark)) DebugMark("gate", vec, (int)off);
 
   // The gate's code segment (SDM vol.2 INT: table limits, executable,
   // DPL <= CPL, present — a faulting gate is never entered; the target may
@@ -2106,6 +2110,10 @@ static void run_op2(uint8_t op2) {
             s->idtr = base;
             s->idtr_limit = limit;
           }
+          // The descriptor-table bases decide every later gate/descriptor read;
+          // a stale one is invisible until something is delivered (kDbgMark).
+          if (DebugOn(kDbgMark))
+            DebugMark(d.reg == 2 ? "lgdt" : "lidt", (int)base, (int)limit);
           break;
         }
         case 4:  // smsw: CR0 at the rm width
@@ -2367,14 +2375,21 @@ static void run_op2(uint8_t op2) {
     case 0xbb: {  // bt/bts/btr/btc rm, reg
       fr->rec.mnemonic = op2 == 0xa3 ? "bt" : op2 == 0xab ? "bts" : op2 == 0xb3 ? "btr" : "btc";
       modrm();
+      // SDM vol.2 BT/BTS/BTR/BTC, Operation: the memory operand is a bit
+      // string — "BitBase ← BitOffset DIV OperandSize", so an offset past one
+      // operand walks the base on by a whole operand (4 bytes per 32 bits for
+      // a 32-bit operand, 2 bytes per 16). A register operand instead takes
+      // the offset modulo its size and never moves.
       uint32_t v, bit, pos;
       if (d.w32) {
-        v = RM32();
         bit = reg32();
+        if (d.is_mem) d.mlin += 4 * (bit >> 5);
+        v = RM32();
         pos = bit & 31;
       } else {
-        v = RM16();
         bit = reg16();
+        if (d.is_mem) d.mlin += 2 * (bit >> 4);
+        v = RM16();
         pos = bit & 15;
       }
       fl->cf = (v >> pos) & 1;

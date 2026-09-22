@@ -13,9 +13,11 @@
 
 #include "device/intc/i8259.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "debug/debug.h"
 #include "util/log.h"
 
 typedef struct PicState {
@@ -34,11 +36,32 @@ typedef struct PicState {
   uint8_t special_fully_nested_mode;
   uint8_t init4;  // ICW4 expected
   uint8_t single_mode;
+  // Trigger mode. ICW1's LTIM bit asks for level-sensitive lines for the whole
+  // chip, and on a PC the PIIX3's edge/level control register (ELCR, ports
+  // 0x4D0/0x4D1) overrides it line by line — which is how a machine whose PIC
+  // is initialised edge-triggered still delivers level-triggered PCI and RTC
+  // interrupts (QEMU i8259 pic_set_irq1 reads the same pair).
+  uint8_t ltim;
+  uint8_t elcr;
+  uint8_t elcr_mask;  // the lines the ELCR may select, per the PIIX3 wiring
   PicDevice* pic;  // back-pointer for EOI callbacks
 } PicState;
 
 // I/O port offsets inside each chip's 16-byte window: only 0 and 1 are real.
 enum { kPortCmd = 0, kPortData = 1 };
+
+// Controller state transitions that decide whether a request ever reaches the
+// processor: the mask register, the EOI commands, and the vector base. They
+// are invisible from the board's side (it only sees the INTR pin), so a guest
+// whose timer stops arriving cannot be told apart from a controller that
+// stopped presenting it (kDbgMark). `b` always carries (irr << 8) | isr so one
+// row shows the whole decision.
+static void PicMark(const PicState* s, const char* what, int a) {
+  if (!DebugOn(kDbgMark)) return;
+  char tag[24];
+  snprintf(tag, sizeof(tag), "pic%d-%s", s == &s->pic->pics[0] ? 0 : 1, what);
+  DebugMark(tag, a, (int)((s->irr << 8) | s->isr));
+}
 
 static int GetPriority(const PicState* s, int mask) {
   if (mask == 0) return 8;
@@ -81,11 +104,23 @@ static void PicUpdateIrq(PicDevice* pic) {
 
 static void PicSetIrq1(PicState* s, int irq, int level) {
   int mask = 1 << irq;
+  int level_mode = ((s->elcr & s->elcr_mask) | (s->ltim ? 0xff : 0)) & mask;
+  if (level_mode) {
+    // Level-sensitive: the request follows the wire, so a line that is still
+    // asserted asks again after the handler's EOI and one that drops takes its
+    // request back (8259A level mode; QEMU pic_set_irq1).
+    if (level)
+      s->irr |= mask;
+    else
+      s->irr &= (uint8_t)~mask;
+    s->last_irr = (uint8_t)((s->last_irr & ~mask) | (level ? mask : 0));
+    return;
+  }
   if (level) {
     if ((s->last_irr & mask) == 0) s->irr |= mask;  // rising edge sets IRR
     s->last_irr |= mask;
   } else {
-    s->last_irr &= ~mask;
+    s->last_irr &= (uint8_t)~mask;
   }
 }
 
@@ -147,6 +182,8 @@ static void PicReset(PicState* s) {
   s->special_fully_nested_mode = 0;
   s->init4 = 0;
   s->single_mode = 0;
+  s->ltim = 0;
+  s->elcr = 0;  // a hardware reset clears the trigger selection
 }
 
 // Per-chip I/O write; `addr` is 0 or 1 (already masked to the chip window).
@@ -158,7 +195,7 @@ static void PicIoWrite(PicDevice* pic, PicState* s, uint16_t addr, uint8_t val) 
       s->init_state = 1;
       s->init4 = val & 1;
       s->single_mode = val & 2;
-      if (val & 0x08) LogError("i8259: level-sensitive mode not supported");
+      s->ltim = (val >> 3) & 1;  // level-sensitive lines for the whole chip
     } else if (val & 0x08) {
       // OCW3.
       if (val & 0x04) s->poll = 1;
@@ -181,10 +218,12 @@ static void PicIoWrite(PicDevice* pic, PicState* s, uint16_t addr, uint8_t val) 
             s->isr &= ~(1 << irq);
             if (cmd == 5) s->priority_add = (irq + 1) & 7;
           }
+          PicMark(s, "eoi", val);
           break;
         }
         case 3:  // specific EOI
           s->isr &= ~(1 << (val & 7));
+          PicMark(s, "eoi", val);
           break;
         case 6:  // set priority
           s->priority_add = (val + 1) & 7;
@@ -194,6 +233,7 @@ static void PicIoWrite(PicDevice* pic, PicState* s, uint16_t addr, uint8_t val) 
           int irq = val & 7;
           s->isr &= ~(1 << irq);
           s->priority_add = (irq + 1) & 7;
+          PicMark(s, "eoi", val);
           break;
         }
       }
@@ -204,10 +244,12 @@ static void PicIoWrite(PicDevice* pic, PicState* s, uint16_t addr, uint8_t val) 
     switch (s->init_state) {
       case 0:
         s->imr = val;
+        PicMark(s, "imr", val);
         PicUpdateIrq(pic);
         break;
       case 1:  // ICW2: vector base
         s->irq_base = val & 0xf8;
+        PicMark(s, "base", val & 0xf8);
         s->init_state = s->single_mode ? (s->init4 ? 3 : 0) : 2;
         break;
       case 2:  // ICW3
@@ -259,12 +301,43 @@ static void PicSlaveWrite(void* dev, uint64_t addr, int size, uint64_t val) {
 static const DeviceOps kPicMasterOps = {"8259-master", PicMasterRead, PicMasterWrite};
 static const DeviceOps kPicSlaveOps = {"8259-slave", PicSlaveRead, PicSlaveWrite};
 
+// The PIIX3's edge/level control register: one bit per IRQ line, 1 = level
+// triggered. The ISA bridge owns the address (0x4D0 selects the master's lines,
+// 0x4D1 the slave's) and the PIC owns the mode, which is the split QEMU makes
+// too (hw/isa/piix3.c registers these two ports against the i8259).
+static const uint16_t kElcrBase = 0x4d0;
+
+static uint64_t ElcrRead(void* dev, uint64_t addr, int size) {
+  (void)size;
+  PicDevice* pic = (PicDevice*)dev;
+  return pic->pics[(addr - kElcrBase) & 1].elcr;
+}
+
+static void ElcrWrite(void* dev, uint64_t addr, int size, uint64_t val) {
+  (void)size;
+  PicDevice* pic = (PicDevice*)dev;
+  PicState* s = &pic->pics[(addr - kElcrBase) & 1];
+  s->elcr = (uint8_t)(val & s->elcr_mask);
+}
+
+static const DeviceOps kElcrOps = {"piix3-elcr", ElcrRead, ElcrWrite};
+
+void PicRegisterElcr(Bus* io, PicDevice* pic) {
+  BusAddRegion(io, kElcrBase, 2, &kElcrOps, pic);
+}
+
 void PicInit(PicDevice* pic) {
   pic->pics = (PicState*)calloc(2, sizeof(PicState));
   pic->pics[0].pic = pic;
   pic->pics[1].pic = pic;
   PicReset(&pic->pics[0]);
   PicReset(&pic->pics[1]);
+  // Which lines the ELCR may switch to level. On a PC the timer, keyboard and
+  // cascade lines (master IRQ0..2) and the RTC (slave IRQ0) are edge-only, and
+  // slave IRQ5 is not routed at all — the masks the PIIX3 exposes and the ones
+  // the QEMU model carries.
+  pic->pics[0].elcr_mask = 0xf8;
+  pic->pics[1].elcr_mask = 0xde;
   pic->set_irq = NULL;
   pic->irq_ctx = NULL;
 }

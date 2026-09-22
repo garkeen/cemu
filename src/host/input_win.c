@@ -1,21 +1,30 @@
-// Host keyboard source (階段 4 片 6): whatever the process's stdin is — the
-// console the user runs cemu from, or a pipe a script drives — becomes
-// make/break scan code pairs at the machine's key sink. The PC's guest input
-
-#include "debug/debug.h"
-// device is the 8042 keyboard, so both the display window and stdin end up on
-// the same wire (IRQ1); typing in the terminal is the fallback when the window
-// does not hold the keyboard focus.
+// Host input source: whatever the process's stdin is — the console the user
+// runs cemu from, or a pipe a script drives — becomes guest input. There is one
+// reader and two shapes of the same bytes:
 //
-// ASCII in, set 1 out: the table is the US layout's make codes, and an
-// upper-case letter rides on the shift key (shift make, key make, key break,
-// shift break) so the guest's own decoder sees a normal shifted keypress.
+//   * the serial receiver, which takes the byte itself (a terminal on COM1 or
+//     on the virt machine's ns16550a), and
+//   * the keyboard controller, which takes set-1 scan codes (the PC's 8042).
+//
+// A board that has a serial port takes stdin there and leaves the window's
+// keyboard on the PS/2 wire — the QEMU `-serial stdio` model, where the two
+// sources stay separate. A board with no serial port takes stdin at the
+// keyboard, which is how the PC's console was driven before COM1 had a
+// receiver.
+//
+// ASCII in, set 1 out for the keyboard path: the table is the US layout's make
+// codes, and an upper-case letter rides on the shift key (shift make, key make,
+// key break, shift break) so the guest's own decoder sees a normal shifted
+// keypress.
+
+#include "host/host.h"
+
 #include <windows.h>
 
 #include <conio.h>
 #include <stdio.h>
 
-#include "host/host.h"
+#include "debug/debug.h"
 
 typedef struct KeyMap {
   char ch;
@@ -41,15 +50,17 @@ static const KeyMap kAsciiMap[] = {
 
 enum { kScanShiftMake = 0x2a, kScanShiftBreak = 0xaa, kScanBreakBit = 0x80 };
 
-static void (*g_sink)(void* ctx, uint32_t scan, int extended, int up);
-static void* g_ctx;
+static void (*g_serial)(void* ctx, int ch);
+static void* g_serial_ctx;
+static void (*g_key)(void* ctx, uint32_t scan, int extended, int up);
+static void* g_key_ctx;
 static HANDLE g_in;
 static int g_in_is_console;
 static int g_saw_cr;  // a pipe sends "\r\n": the LF after a CR is not a key
 
 static void Emit(uint8_t scan) {
-  g_sink(g_ctx, scan, 0, 0);
-  g_sink(g_ctx, (uint32_t)(scan | kScanBreakBit), 0, 1);
+  g_key(g_key_ctx, scan, 0, 0);
+  g_key(g_key_ctx, (uint32_t)(scan | kScanBreakBit), 0, 1);
 }
 
 static void SendChar(unsigned char ch) {
@@ -66,9 +77,9 @@ static void SendChar(unsigned char ch) {
     }
   }
   if (scan == 0) return;  // no scan code for this byte: dropped
-  if (shift) g_sink(g_ctx, kScanShiftMake, 0, 0);
+  if (shift) g_key(g_key_ctx, kScanShiftMake, 0, 0);
   Emit(scan);
-  if (shift) g_sink(g_ctx, kScanShiftBreak, 0, 1);
+  if (shift) g_key(g_key_ctx, kScanShiftBreak, 0, 1);
 }
 
 // Returns the next byte, or -1 when nothing is waiting.
@@ -90,18 +101,27 @@ static int NextByte(void) {
   return (unsigned char)c;
 }
 
-void HostKeyOpen(void (*sink)(void* ctx, uint32_t scan, int extended, int up), void* ctx) {
-  g_sink = sink;
-  g_ctx = ctx;
+void HostInputOpen(void (*serial)(void* ctx, int ch), void* serial_ctx,
+                   void (*key)(void* ctx, uint32_t scan, int extended, int up), void* key_ctx) {
+  // A board with a serial port takes stdin at the receiver; the window keeps
+  // driving the keyboard sink (HostDisplaySetKeySink). The keyboard path from
+  // stdin stays available only where there is no serial port to feed.
+  g_serial = serial;
+  g_serial_ctx = serial_ctx;
+  g_key = serial ? NULL : key;
+  g_key_ctx = key_ctx;
   g_in = GetStdHandle(STD_INPUT_HANDLE);
   DWORD mode = 0;
   g_in_is_console = g_in && g_in != INVALID_HANDLE_VALUE && GetConsoleMode(g_in, &mode);
-  if (!g_in_is_console && (g_in == NULL || g_in == INVALID_HANDLE_VALUE)) g_sink = NULL;
+  if (!g_in_is_console && (g_in == NULL || g_in == INVALID_HANDLE_VALUE)) {
+    g_serial = NULL;
+    g_key = NULL;
+  }
   g_saw_cr = 0;
-  if (DebugOn(kDbgMark)) DebugMark("keyopen", g_sink ? 1 : 0, g_in_is_console);
+  if (DebugOn(kDbgMark)) DebugMark("inputopen", g_serial ? 1 : (g_key ? 2 : 0), g_in_is_console);
 }
 
-void HostKeyPoll(void) {
+void HostInputPoll(void) {
   static int announced;
   if (!announced) {
     announced = 1;
@@ -109,9 +129,9 @@ void HostKeyPoll(void) {
     // actually prints (an attach-time note would be swallowed), and it fires
     // even when no sink is attached — which is what the keyboard hunt needed.
     if (DebugOn(kDbgMark))
-      DebugMark("keypoll", (g_sink != NULL) * 10 + (int)(uintptr_t)g_in, g_in_is_console);
+      DebugMark("inputpoll", (g_serial ? 1 : 0) * 10 + (g_key ? 1 : 0), g_in_is_console);
   }
-  if (!g_sink) return;
+  if (!g_serial && !g_key) return;
   // A 2 ms gate: the run loop steps millions of times a second and each poll
   // that reaches the OS costs a syscall.
   static int64_t next_us;
@@ -127,6 +147,9 @@ void HostKeyPoll(void) {
       continue;
     }
     g_saw_cr = c == '\r';
-    SendChar((unsigned char)c);
+    if (g_serial)
+      g_serial(g_serial_ctx, c);
+    else
+      SendChar((unsigned char)c);
   }
 }

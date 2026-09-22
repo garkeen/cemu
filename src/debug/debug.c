@@ -64,6 +64,111 @@ int DebugWatchHit(uint64_t addr, int size, int is_load) {
   return 0;
 }
 
+// ---- guest-memory dumps -----------------------------------------------------
+//
+// watch= reports that an address was touched; it cannot report what a guest
+// left in a structure nothing reads again (a stopped kernel's log buffer, its
+// page tables, its task structs). Those need the address space, which this hub
+// does not own — bus/ stays outside debug/ — so the board installs a reader
+// (DebugSetMemReader) and dump items are written when the session ends.
+enum { kMaxDumps = 4 };
+static int ParseUint(const char* s, uint64_t* out);  // defined with the watch parser below
+static struct {
+  uint64_t addr;
+  uint64_t size;
+  char file[128];
+} g_dump[kMaxDumps];
+static int g_ndump;
+static DebugMemReadFn g_mem_read;
+static void* g_mem_ctx;
+// AGENTS.md §七 caps every file this repo writes at 5MB; a dump is a file this
+// repo writes, so an oversized region is refused rather than truncated.
+static const uint64_t kDumpLimit = 5ULL * 1024 * 1024;
+
+void DebugSetMemReader(DebugMemReadFn read, void* ctx) {
+  g_mem_read = read;
+  g_mem_ctx = ctx;
+}
+
+// dump=ADDR:SIZE:FILE — the address is physical, exactly as in watch=.
+static void AddDump(const char* spec) {
+  if (g_ndump >= kMaxDumps) {
+    LogError("debug: too many dumps, dropping '%s'", spec);
+    return;
+  }
+  const char* c1 = strchr(spec, ':');
+  if (!c1) {
+    LogError("debug: dump expects ADDR:SIZE:FILE ('%s')", spec);
+    return;
+  }
+  const char* c2 = strchr(c1 + 1, ':');
+  if (!c2) {
+    LogError("debug: dump expects ADDR:SIZE:FILE, and the file is not optional ('%s')", spec);
+    return;
+  }
+  char head[32], szs[32];
+  size_t hl = (size_t)(c1 - spec), sl = (size_t)(c2 - c1 - 1);
+  if (hl >= sizeof(head) || sl >= sizeof(szs) || strlen(c2 + 1) >= sizeof(g_dump[0].file)) {
+    LogError("debug: dump field too long ('%s')", spec);
+    return;
+  }
+  memcpy(head, spec, hl);
+  head[hl] = 0;
+  memcpy(szs, c1 + 1, sl);
+  szs[sl] = 0;
+  uint64_t addr, size;
+  if (!ParseUint(head, &addr) || !ParseUint(szs, &size) || size == 0) {
+    LogError("debug: dump address/size must be numbers, 0x-prefixed for hex ('%s')", spec);
+    return;
+  }
+  g_dump[g_ndump].addr = addr;
+  g_dump[g_ndump].size = size;
+  snprintf(g_dump[g_ndump].file, sizeof(g_dump[0].file), "%s", c2 + 1);
+  g_ndump++;
+}
+
+// Writes one region out at session end. A short read is a failed dump, not a
+// partial file: the guest's memory is the whole point, so a region that does
+// not resolve is reported and skipped.
+static void WriteDump(const int idx) {
+  const uint64_t addr = g_dump[idx].addr, size = g_dump[idx].size;
+  const char* path = g_dump[idx].file;
+  char line[192];
+  if (!g_mem_read) {
+    LogError("debug: dump %s: no memory reader (the board installed none)", path);
+    return;
+  }
+  if (size > kDumpLimit) {
+    LogError("debug: dump %s: %llu bytes exceeds the 5MB session file cap", path,
+             (unsigned long long)size);
+    return;
+  }
+  uint8_t* buf = (uint8_t*)malloc((size_t)size);
+  if (!buf) {
+    LogError("debug: dump %s: out of memory", path);
+    return;
+  }
+  if (!g_mem_read(g_mem_ctx, addr, buf, (int)size)) {
+    LogError("debug: dump %s: no memory at %llx for %llu bytes", path, (unsigned long long)addr,
+             (unsigned long long)size);
+    free(buf);
+    return;
+  }
+  HostFile* f = HostFileCreate(path);
+  if (!f) {
+    LogError("debug: dump %s: cannot create the file", path);
+    free(buf);
+    return;
+  }
+  size_t wrote = HostFileWriteAt(f, 0, buf, (size_t)size);
+  HostFileClose(f);
+  free(buf);
+  int n = snprintf(line, sizeof(line), "== dump: %llx:%llu -> %s (%llu bytes)\n",
+                   (unsigned long long)addr, (unsigned long long)size, path,
+                   (unsigned long long)wrote);
+  if (n > 0 && DebugAccountOut((size_t)n)) HostWriteErr(line, (size_t)n);
+}
+
 // ---- init -------------------------------------------------------------------
 
 static int ParseUint(const char* s, uint64_t* out) {
@@ -148,6 +253,8 @@ void DebugInit(void) {
       g_regs_period = atoi(tok + 5);
     else if (!strncmp(tok, "watch=", 6))
       AddWatch(tok + 6);
+    else if (!strncmp(tok, "dump=", 5))
+      AddDump(tok + 5);
     else if (!strncmp(tok, "budget=", 7))
       g_budget = atoi(tok + 7);
     else if (!strncmp(tok, "skip=", 5))
@@ -404,11 +511,14 @@ void DebugGdbNote(const char* note) {
 // Frameless note rows: the board's interrupt lines and the host input path live
 // outside the guest's step stream, and that gap is what made the keyboard path
 // invisible (AGENTS.md §IX.1: fix the facility instead of guessing).
+// `a` prints decimal (vectors, line numbers, IRQ ids) and `b` hex (bitmasks,
+// addresses, controller state) — the two forms a mark's two numbers actually
+// need, since one cell cannot hold both.
 void DebugMark(const char* what, int a, int b) {
   if (!DebugOn(kDbgMark) || !Allow(kDbgMark)) return;
   RowBeginBare(g_tbl, 'K');
   char det[80];
-  snprintf(det, sizeof(det), "%s a=%d b=%d", what, a, b);
+  snprintf(det, sizeof(det), "%s a=%d b=0x%x", what, a, (unsigned)b);
   TableRowCell(g_tbl, det);
   TableRowEnd(g_tbl);
 }
@@ -416,21 +526,23 @@ void DebugMark(const char* what, int a, int b) {
 // Frameless text row (kDbgScreen): a guest console line read back from the
 // video device. Linux prints only to VRAM (its `console=` came later), so the
 // text mirror is the only way to read its console without a display window.
+// A console line is up to 80 columns and the event table's DETAIL cell is 41
+// wide — a truncated mirror cannot carry a call trace or a panic — so this one
+// category prints whole lines instead of a table row.
 void DebugText(const char* kind, const char* text) {
   if (!DebugOn(kDbgScreen) || !Allow(kDbgScreen)) return;
-  RowBeginBare(g_tbl, 'V');
-  char det[120];
-  snprintf(det, sizeof(det), "%s %.100s", kind, text);
-  TableRowCell(g_tbl, det);
-  TableRowEnd(g_tbl);
+  char line[160];
+  int n = snprintf(line, sizeof(line), "%s %s\n", kind, text);
+  if (n < 0) return;
+  if (DebugAccountOut((size_t)n)) HostWriteErr(line, (size_t)n);
 }
 
 void DebugSessionEnd(const frame* f, const char* stop_reason) {
   if (!g_inited) return;
   // Pure compat-trace mode stays byte-identical to the old interpreter's
   // output; the summary is a new-format feature.
-  if (g_mask == kDbgTraceLine) return;
-  if (!(g_mask || g_nwatch)) return;
+  if (g_mask == kDbgTraceLine && !g_ndump) return;
+  if (!(g_mask || g_nwatch || g_ndump)) return;
   if (g_mask & kDbgRegs) f->isa->dump_regs(f->cpu);
   char line[160];
   int n = snprintf(line, sizeof(line), "== session: inst=%llu traps=%llu",
@@ -441,4 +553,5 @@ void DebugSessionEnd(const frame* f, const char* stop_reason) {
                     (unsigned long long)g_suppressed[i]);
   snprintf(line + n, sizeof(line) - (size_t)n, " stop=%s\n", stop_reason);
   if (DebugAccountOut(strlen(line))) HostWriteErr(line, strlen(line));
+  for (int i = 0; i < g_ndump; i++) WriteDump(i);
 }

@@ -6,13 +6,23 @@
 #include "host/host.h"
 #include "util/log.h"
 
+// Physical-memory reader for the debug hub's dump= items (debug/debug.h): the
+// hub owns no address space, the board layer does. A region the bus does not
+// fully claim is a failed read, not open-bus noise, so a mistyped address
+// reports instead of producing a plausible-looking file.
+static int DebugReadPhys(void* ctx, uint64_t addr, uint8_t* buf, int len) {
+  Bus* bus = (Bus*)ctx;
+  if (len <= 0 || BusProbe(bus, addr, len, NULL) != 0) return 0;
+  for (int i = 0; i < len; i++) buf[i] = (uint8_t)BusRead(bus, addr + (uint64_t)i, 1);
+  return 1;
+}
+
 int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuState* cpu),
-                  void* cb_ctx) {
-  while (!m->cpu.halted) {
+                  void* cb_ctx) {  while (!m->cpu.halted) {
     if (m->poll) m->poll(m);
-  // Host keys (stdin: the console or a pipe) go to the board's key sink; the
-  // poll self-gates, so calling it every loop costs almost nothing.
-  HostKeyPoll();
+    // Host input (stdin: the console or a pipe) goes to the board's sinks; the
+    // poll self-gates, so calling it every loop costs almost nothing.
+    HostInputPoll();
     if (m->display) {
       // Attached display window (-display): pump its message queue and stop
       // the emulation when the user closes it, like QEMU quitting.
@@ -25,9 +35,16 @@ int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuStat
     }
     int asleep = m->cpu.wait;
     if (asleep) {
-      // Asleep (wfi/hlt): yield the host; Step still runs so the ISA can
-      // observe the wakeup and retire the instruction it resumes with.
-      HostSleepMs(1);
+      // Asleep (wfi/hlt): either jump the emulated clock to the next device
+      // deadline (--skip-idle: the guest's idle costs no host time, QEMU's
+      // virtual-clock warp) or yield the host for a millisecond and let the
+      // wait elapse in wall time. The fallback is not optional when no device
+      // is due: only the host can produce a key press.
+      int64_t wake_us = (m->skip_idle && m->next_event_us) ? m->next_event_us(m) : 0;
+      if (wake_us > 0)
+        HostTimerWarp(wake_us);
+      else
+        HostSleepMs(1);
     }
     m->isa->step(&m->cpu);
     if (asleep && m->cpu.wait) {
@@ -50,6 +67,11 @@ int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuStat
 }
 
 void BoardRun(Board* m, uint64_t max_inst) {
+  // The debug hub owns no address space, so the board layer — which does —
+  // supplies the reader its dump= items need (debug/debug.h). Reads go through
+  // the bus, so a region no device claims fails the dump instead of returning
+  // open-bus noise.
+  DebugSetMemReader(DebugReadPhys, &m->bus);
   DebugInit();
   if (m->gdb) {
     // The stub owns run control: sessions (attach/step/continue) alternate

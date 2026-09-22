@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "board/board.h"
+#include "debug/debug.h"
 #include "device/char/uart16550.h"
 #include "device/intc/plic.h"
 #include "device/misc/sifive_test.h"
@@ -89,9 +90,18 @@ static void OnUartIrq(void* ctx, int src, int level) {
 
 static uint64_t ReadTime(void* dev) { return ClintMtime((ClintDevice*)dev); }
 
+// Host input -> the ns16550a receiver: the virt machine's console is the
+// serial port, so this is the only input path a guest here has.
+static void OnHostSerial(void* ctx, int ch) {
+  VirtBoard* vm = (VirtBoard*)ctx;
+  if (DebugOn(kDbgMark)) DebugMark("hostserial", ch, 0);
+  Uart16550Receive(&vm->uart, ch);
+}
+
 static void VirtPoll(Board* m) {
   VirtBoard* vm = (VirtBoard*)m;
   ClintPoll(&vm->clint);
+  Uart16550Poll(&vm->uart);
 }
 
 // BoardDestroy frees the Board itself; this hook releases the extra
@@ -208,6 +218,8 @@ Board* VirtBoardCreate(const BoardOpts* opts) {
   Uart16550Init(&vm->uart);
   BusAddRegion(&m->bus, kUartBase, kUartSize, &kUart16550Ops, &vm->uart);
   Uart16550SetIrqSink(&vm->uart, OnUartIrq, &vm->plic);
+  m->serial_in = OnHostSerial;
+  m->serial_ctx = vm;
   SifiveTestBind(&vm->test, &m->cpu);
   SifiveTestRegister(&m->bus, &vm->test, kTestBase, kTestSize);
 

@@ -189,19 +189,37 @@ CEMU_DEBUG = item[,item...]
                            执行时取指行会淹没一切，见片 9）
   regs=N                    每 N 条指令打一次全寄存器表；halt/exit 必打
   watch=ADDR:SIZE[:r|w|rw]  地址观测（可重复逗号分隔；数字按 C 字面量解析，
-                            **十六进制必须写 0x**，否则静默丢弃——现已改为报错）
+                            **十六进制必须写 0x**，否则静默丢弃——现已改为报错）。
+                            **地址按物理地址匹配**：x86 开分页后要看内核某个符号
+                            必须先减去映射偏移（内核 .data 的 0xc02c0180 是物理
+                            0x2c0180），写线性地址会一行都不出——2026-09-21 片 12
+                            实测踩坑
+  dump=ADDR:SIZE:FILE       会话结束时按**物理地址**取回一段客机内存并落盘
+                            （可重复，上限 4 段、单段 5MB）。watch= 只说某地址
+                            被碰过，说不了客机留在"没人再读的结构"里的东西——
+                            停住的客机的 log buffer、页表、task struct 只能靠它。
+                            要求会话自行结束（--max-inst 或客机停机）：宿主信号
+                            会跳过会话收尾，什么也不写。例：取 Linux 的 __log_buf
+                            `dump=0x30a000:0x18000:build/logbuf.bin`
   budget=N                  单类别事件上限，超出抑制并计数，退出时汇总
                            （会话另有 5MB 输出硬顶：固件 ROM 影子拷贝这类"每字
                             节两次事件"的热点会把它吃满；定位引导期设备流量要用
                             skip= 把窗口挪过去——2026-09-19 片 10 实测）
-  mark                      无帧事件行（中断线跳变、宿主输入等板级/设备级观测）
+  mark                      无帧事件行：板级/设备级/解释器级观测，`a` 十进制、
+                            `b` 十六进制（位掩码与地址要能直接读）。现有 name：
+                            isa(中断线) intr(CPU INTR 线) inta(INTA 向量)
+                            pic0/pic1-imr|eoi|base ioapic lapic-irr|ack|eoi
+                            lidt/lgdt gate(门描述符) hostkey
+  screen                    无帧文本行：客机控制台镜像，**整行输出**（控制台一行
+                            80 列，事件表 DETAIL 只有 41，截断后读不了 call trace）
   utf8                      UTF-8 边框（默认 ASCII，Windows 代码页安全）
 ```
 
 - 输出走 stderr，`2>file` 留档；热路径零成本（发射点一个位测试，
   类别掩码 init 时解析一次）。
 - 事件表统一列 `KIND │ PC │ RAW │ MNEMONIC │ DETAIL │ FLAGS`，KIND：
-  I 指令 / L 读 / S 写 / T 陷阱 / B 设备 / W 观测点 / O IR 操作转储。
+  I 指令 / L 读 / S 写 / T 陷阱 / B 设备 / W 观测点 / O IR 操作转储 / K 标记
+  （K 与 screen 都是无帧行：K 走事件表，screen 走整行文本）。
 - 症状 → 命令配方速查：
 
 ```bash
@@ -225,6 +243,19 @@ CEMU_DEBUG="trace:line,mem,budget=50000" ./cemu.exe ... img 2> t.txt
 
 # 定期全寄存器现场
 CEMU_DEBUG="regs=100000" ./cemu.exe ... img 2> r.txt
+
+# 中断"送不到"：先看线（isa=设备侧到控制器，intr=控制器到 CPU），再看 ack/eoi
+# （三者都不出 = 控制器没present；intr 有而 inta 无 = CPU 没取；inta 有而无 eoi
+#  = 处理程序没跑完，多半交付落到了错的桩）——2026-09-21 片 12
+CEMU_DEBUG="mark" ./cemu.exe ... img 2> m.txt
+
+# 交付到了哪个桩：gate 给出该向量门描述符里的 handler 偏移（无帧标记，十六进制）
+# 门内容可疑时再按物理地址 watch 整个 IDT（x86 内核 .data 要减 0xc0000000）
+CEMU_DEBUG="mark" ./cemu.exe ... img 2> m.txt
+CEMU_DEBUG="watch=0x2c0000:0x800:w" ./cemu.exe ... img 2> idt.txt
+
+# 客机只往显存打（内核早期 console=tty0）：screen 给整行控制台镜像
+CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 ```
 
 - 交互式调试器/REPL、反汇编器、GUI 输出已立项为阶段 3.5（2026-09-05，见

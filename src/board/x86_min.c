@@ -71,6 +71,10 @@ static const uint16_t kPicSlaveBase = 0xA0;
 static const uint16_t kPitBase = 0x40;
 static const uint64_t kCom1Base = 0x3F8;
 static const uint64_t kCom1Size = 8;
+// COM1's interrupt line. The on-board serial port's IRQ is fixed by the PC/AT
+// wiring (COM1 -> IRQ4, COM2 -> IRQ3; PC/AT Technical Reference), and the PIIX3
+// routes it to both controllers like every other ISA line.
+static const int kCom1Irq = 4;
 static const uint64_t kDebugExitPort = 0xF4;
 static const uint64_t kDebugExitSize = 4;
 // The POST log port (QEMU isa-debugcon at its conventional 0x402; seabios
@@ -126,6 +130,7 @@ typedef struct X86Board {
   // INTR is one line and either controller can assert it (UpdateIntr).
   int pic_irq;
   int lapic_irq;
+  int intr_level;  // the combined pin level last driven (kDbgMark edge detect)
   IrqBus irqbus;  // the ISA IRQ fan-out: the 8259s on one side, the I/O APIC on the other
   uint8_t* rom;  // the -bios image, mapped in the ROM window (NULL = none)
   uint64_t rom_size;
@@ -197,7 +202,16 @@ static const DeviceOps kRomAliasOps = {"bios-rom-alias", RomAliasRead, RomAliasW
 // and the board owns the combined level, the way a single INTR pin behaves.
 static void UpdateIntr(X86Board* xm) {
   CpuState* cpu = &xm->base.cpu;
-  cpu->set_irq(cpu, 0, xm->pic_irq || xm->lapic_irq);
+  int level = xm->pic_irq || xm->lapic_irq;
+  // The CPU's INTR pin is otherwise invisible from outside: the ISA fan-out
+  // mark shows what reached the controllers, this one shows what left them
+  // (kDbgMark). Without it a guest that never handles its timer cannot be
+  // told apart from a controller that never asserted.
+  if (level != xm->intr_level) {
+    xm->intr_level = level;
+    if (DebugOn(kDbgMark)) DebugMark("intr", xm->pic_irq, xm->lapic_irq);
+  }
+  cpu->set_irq(cpu, 0, level);
 }
 
 static void OnPicIrq(void* ctx, int line, int level) {
@@ -220,6 +234,10 @@ static void OnLapicIrq(void* ctx, int line, int level) {
 static void OnIoapicDeliver(void* ctx, int dest, int logical, int vector) {
   X86Board* xm = (X86Board*)ctx;
   int match = logical ? (dest & LapicLogicalMask(&xm->lapic)) : (dest == LapicId(&xm->lapic));
+  // A redirection entry that names a destination nobody answers is a silently
+  // dropped interrupt; the mark reports the destination and whether it matched
+  // (kDbgMark, negative vector = no match).
+  if (DebugOn(kDbgMark)) DebugMark("ioapic", dest, match ? vector : -vector);
   if (match) LapicDeliver(&xm->lapic, vector);
 }
 
@@ -235,7 +253,11 @@ static void OnLapicEoi(void* ctx, int vector) {
 static int OnIntAck(void* ctx) {
   X86Board* xm = (X86Board*)ctx;
   int vec = LapicAcknowledge(&xm->lapic);
-  return vec >= 0 ? vec : PicAcknowledge(&xm->pic);
+  if (vec < 0) vec = PicAcknowledge(&xm->pic);
+  // The acknowledge is the point of no return for a request: the controller
+  // marks it in service and only the handler's EOI retires it (kDbgMark).
+  if (DebugOn(kDbgMark)) DebugMark("inta", vec, xm->pic_irq);
+  return vec;
 }
 
 // An ISA device's interrupt line into the PIC: the PIT on IRQ0, the IDE
@@ -261,6 +283,22 @@ static void OnHostKey(void* ctx, uint32_t scan, int extended, int up) {
   if (extended) I8042KeyByte(&xm->kbd, 0xe0);
   if (DebugOn(kDbgMark)) DebugMark("hostkey", (int)scan, up);
   I8042KeyByte(&xm->kbd, (uint8_t)(scan | (up ? 0x80u : 0u)));
+}
+
+// Host input -> COM1's receiver: the byte arrives at the UART exactly as a
+// character on the SIN pin would, so the guest reads it through the same
+// RBR/FIFO/IIR path and can be woken by IRQ4.
+static void OnHostSerial(void* ctx, int ch) {
+  X86Board* xm = (X86Board*)ctx;
+  if (DebugOn(kDbgMark)) DebugMark("hostserial", ch, 0);
+  Uart16550Receive(&xm->uart, ch);
+}
+
+// COM1's interrupt line into the ISA fan-out (the UART's own source number is
+// not the IRQ: the board owns the wiring).
+static void OnCom1Irq(void* ctx, int src, int level) {
+  (void)src;
+  OnIsaIrq(ctx, kCom1Irq, level);
 }
 
 // Chipset -> CPU: A20 is one line, driven by the keyboard controller's output
@@ -315,6 +353,21 @@ static void X86Poll(Board* m) {
   // The APIC timer is the machine's clock: xv6 preempts on it, and its count
   // is derived from the host clock rather than from steps.
   LapicPoll(&xm->lapic);
+  // COM1's character timeout is the same kind of source: the chip decides on
+  // its own that a partial receive FIFO has waited long enough.
+  Uart16550Poll(&xm->uart);
+}
+
+// The next moment a device wakes the processor on its own: the PC's two
+// time-driven sources are the PIT (IRQ0) and the APIC timer. The run loop's
+// --skip-idle jumps a halted CPU to whichever comes first.
+static int64_t X86NextEventUs(Board* m) {
+  X86Board* xm = (X86Board*)m;
+  int64_t pit = PitNextEventUs(&xm->pit);
+  int64_t apic = LapicNextEventUs(&xm->lapic);
+  if (pit <= 0) return apic;
+  if (apic <= 0) return pit;
+  return pit < apic ? pit : apic;
 }
 
 Board* X86BoardCreate(const BoardOpts* opts) {
@@ -406,6 +459,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   BusAddRegion(&m->io, kDebugExitPort, kDebugExitSize, &kDebugExitOps, dexit);
   DebugConRegister(&m->io, kDebugConPort);
   PicRegister(&m->io, pic, kPicMasterBase, kPicSlaveBase);
+  PicRegisterElcr(&m->io, pic);
   PitRegister(&m->io, pit, kPitBase);
   FwCfgRegister(&m->io, fwcfg);
   I8042Register(&m->io, kbd);
@@ -414,14 +468,14 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   CmosSetMemory(cmos, ram_size);
   PciRegister(&m->io, &xm->pci);
   IdeRegister(&m->io, ide);
+  // The bus-master engine moves a transfer through system memory (the PRD table
+  // and the host's buffers), so the controller needs the address space the task
+  // file never touches.
+  IdeSetDmaBus(ide, &m->bus);
   LapicRegister(&m->bus, lapic);
   IoapicRegister(&m->bus, &xm->ioapic);
   CgaRegister(&m->bus, &m->io, cga);
 
-  // Wiring: PIT ch0 -> PIC IRQ0 -> CPU INTR; IDE channels -> PIC IRQ14/15;
-  // INTA -> PicAcknowledge; the A20 gate comes from the keyboard controller and
-  // port 0x92. The hooks live on CpuState (like timer_read/timer_dev), so the
-  // machine can install them before the loader picks the ISA.
   // Wiring, the way a PC/AT is wired: every ISA IRQ line reaches both
   // controllers (the 8259 pair and the I/O APIC's pins), the LAPIC is the
   // processor's own interrupt source, and the A20 gate comes from the keyboard
@@ -436,11 +490,15 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   PitSetIrqSink(pit, OnIsaIrq, &xm->irqbus);
   I8042SetIrqSink(kbd, OnIsaIrq, &xm->irqbus);
   IdeSetIrqSink(ide, OnIsaIrq, &xm->irqbus);
+  Uart16550SetIrqSink(uart, OnCom1Irq, &xm->irqbus);
   IoapicSetDeliverSink(&xm->ioapic, OnIoapicDeliver, xm);
   I8042SetA20Sink(kbd, OnA20, &m->cpu);
-  // Keys from the host window enter the machine at the 8042 (IRQ1).
+  // Keys from the host window enter the machine at the 8042 (IRQ1); stdin
+  // enters it at COM1's receiver, which is where a terminal belongs on a PC.
   m->key_in = OnHostKey;
   m->key_ctx = xm;
+  m->serial_in = OnHostSerial;
+  m->serial_ctx = xm;
   Port92SetA20Sink(p92, OnA20, &m->cpu);
   m->cpu.int_ack = OnIntAck;
   m->cpu.ack_dev = xm;
@@ -451,6 +509,8 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   m->bin_base = kBootSectorLoad;
   m->default_isa = "x86";  // a BIOS reset has no image to name its ISA
   m->poll = X86Poll;
+  m->next_event_us = X86NextEventUs;
+  m->skip_idle = opts->skip_idle;
   m->destroy = X86Destroy;
   m->display_dev = cga;
   m->display_ops = &kCgaDisplayOps;

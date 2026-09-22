@@ -3,6 +3,105 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 13：内存取证设施 + D30/D22/D27/D19 落地（2026-09-22）
+
+**新增常驻设施（AGENTS.md §十）**：`CEMU_DEBUG` 的 `dump=ADDR:SIZE:FILE` —— 会话结束时按
+**物理地址**取回一段客机内存落盘（上限 4 段、单段 5MB）。watch= 只说某地址被碰过，说不了
+客机留在"没人再读的结构"里的东西。实现：debug.c/debug.h + host `HostFileCreate`；读取走
+`DebugSetMemReader`，由 board/run.c 用 BusRead 装配（debug/ 仍不碰地址空间）。**会话必须
+自行结束**（--max-inst 或客机停机）：宿主信号会跳过收尾、不落盘。自检：ROM 0xffff0 的
+16 字节与 bios.bin 尾部逐字节一致。
+
+**验收 2 卡点的物证（内核自己的 log）**：`dump=0x30a000:0x18000:build/logbuf.bin`
+（linux.iso 跑到 200M 条指令、2m26s，停 pc=0xc011664a、traps=65）取回 `__log_buf` 原文：
+- 内核最后一行日志是 `[ 19.768583] VFS: Mounted root (ext2 filesystem) on device 1:0.`
+- **之后再无任何输出，也没有一条 BUG/告警** —— 此前"卡在 RCU grace period / might_sleep
+  告警风暴"的说法是手工反汇编的产物，按 §九.2 作废。
+- 命令行：`BOOT_IMAGE=/bzImage root=/dev/sr0 initrd=/root.bin load_ramdisk=1
+  prompt_ramdisk=0 loglevel=7`；日志另有 `no APIC, boot with the "lapic" boot parameter
+  to force-enable it.`（确认 PIC-only 构建，LAPIC/IOAPIC 从未被访问）。
+- ⇒ 卡点在 `mount_root()` 之后、`free_initmem()`（"Freeing unused kernel memory"）之前，
+  即 `devtmpfs_mount` / MS_MOVE / chroot / `async_synchronize_full` 这一段。未定案。
+
+**D22 COM1 接收路径**：uart16550 补全 16550D 接收侧（16 字节 FIFO、FCR 触发级 1/4/8/14、
+4 字符时间的字符超时、LSR 的 OE/PE/FE/BI 与读清、IIR 优先级、MCR 回环、MSR 增量位、
+DLAB 分频），新增 `Uart16550Receive/Poll`；x86 板接线 COM1→IRQ4（`OnCom1Irq`）；宿主输入
+改为一条 stdin 两个去向（`HostInputOpen`：有串口的板把 stdin 交给串口收原始字节，窗口
+键盘仍走 8042 —— QEMU `-serial stdio` 模型）。实测：Linux 认到 `serial8250: ttyS0 at I/O
+0x3f8 (irq = 4) is a 16550A`（回环 autoprobe 生效）。
+
+**D27 ATAPI 命令集**：补 MODE SENSE(6/10)、GET CONFIGURATION、READ TOC（格式 0/1/2）、
+READ CD、SEEK、PREVENT/ALLOW MEDIUM REMOVAL，加 LUN 检查（ASC 0x25）、UNIT ATTENTION
+门控与托盘模型（tray_open/tray_locked，START STOP UNIT 的 LoEj 是唯一介质变更事件）。
+参考：tiny386/ide.c（QEMU hw/ide/core.c 的移植）。READ CD 的 2352 字节"读全部数据"按介质
+能力拒绝（ISO 里没有原始扇区）。实测：CD 引导链完好（12.7s 到 `Decompressing Linux`）。
+
+**D19 芯片组/IDE/IOAPIC**：
+- IDE **bus-master DMA**：BAR4=0xc000|1（16 端口，每通道 8 字节：cmd@0/status@2/PRDT@4）、
+  PRD 表遍历、方向位（bit3=1 = 引擎写内存 = 读盘，与 libata 的 ATA_DMA_WR 同向）、状态 W1C、
+  ATA READ/WRITE DMA(0xC8/0xCA)、ATAPI 数据相位按"引擎是否已启动"选 DMA（两种写入顺序都覆盖）、
+  IDENTIFY 补 word 49 bit8 / 53 bit1 / 63 / 64 / 65–68。接线 `IdeSetDmaBus(ide, &m->bus)`。
+- ATA 命令集扩展：SET FEATURES(0xEF)、CHECK POWER MODE / IDLE / STANDBY / SLEEP、
+  READ VERIFY(0x40)、INITIALIZE DEVICE PARAMETERS(0x91)；feature 寄存器开始保存。
+- **ELCR + PIC 电平触发**：0x4D0/0x4D1（`PicRegisterElcr`，elcr_mask 主 0xf8/从 0xde）、
+  ICW1 的 LTIM 位不再报错、按 ELCR|LTIM 选电平/边沿（QEMU pic_set_irq1 同款）。
+- IOAPIC 增加 lowest-priority 投递（单 APIC 下等价 fixed）。
+- **澄清**：0x3F7 不是 IDE 寄存器，是**软盘的 DIR**（seabios `PORT_FD_DIR`、v86 同名）——
+  属 D21 的范围，IDE 侧无需改。
+- **未做**：IOAPIC 的 NMI/SMI/INIT/ExtINT 四种交付模式需要本机没有的硬件输入（CPU 无 NMI
+  引脚、无 SMM、只有一个 APIC、没有"PIC 经 IOAPIC"的通路）；PIRQ 路由字节存在但本机没有
+  任何 PCI 设备拉 INTx（IDE 跑在兼容模式），无处可路由。
+
+## 阶段 4 片 12：x86 BT/BTS/BTR/BTC 的位串寻址 —— 内核卡在 calibrate_delay 的真因（2026-09-21）
+
+片 11 留下的卡点（内核在 0xc02ef710 自旋等 jiffies、2.5 亿条指令零推进）在本片定案。
+**不是设备侧问题**：片 11 的 pit_irq 探针已经证明 PIT/PIC/CPU 通路可用（cemu 与 QEMU
+各收 10 个 tick），本片实测 IRQ0 边沿一路打到运行结束（2464 次），master IMR=0xfa
+（IRQ0 未屏蔽）。真因是 x86 解释器的一条规格偏差。
+
+**症状链（全部由 CEMU_DEBUG 对拍 + QEMU 同 ISO 对照取得，不是推理）**：
+1. `mark` 新增的 CPU 侧标记显示：内核全程只收到 **1 次** IRQ0 交付
+   （`inta a=48` = 向量 0x30），之后 PIC 的 ISR bit0 永久置位，再无投递
+   （最后一次 `pic0-eoi` 远早于此）。
+2. 新增的 `gate` 标记给出那唯一一次交付读到的门：**handler = 0xc02ef560
+   （`ignore_int`，早期默认桩）**。内核因此打印
+   `Unknown interrupt or fault at: 00000246 00000060 c012ce00`（上下文正是
+   `setup_default_timer_irq` 解屏蔽那一刻），既不算 tick 也不发 EOI。
+3. QEMU 对照（同一 ISO、同一内核）：`-monitor` 读物理 0x2c0180 的门 = 0xc0102648
+   （真 IRQ stub），IRQ0 交付 2412 次，客机停在 0xc0106130 的 `hlt` 空闲。
+4. `watch=0x2c0000:0x800:w` 覆盖整个 IDT：向量 **0x20–0x3f 的门最后一次写入全部是
+   `setup_idt` 写的 `ignore_int`**（PC 0xc02ef487，256 次循环），内核的 C 代码只写了
+   异常向量与 0x80 —— 即 `init_IRQ()` 的 IRQ 门安装循环一个门都没装。
+5. 反汇编运行镜像（QEMU `pmemsave` + `objdump -m i386`）定位到该循环 0xc02deff3：
+   `bt %eax,0xc030e304` 判 `system_vectors` 位图，位清才装门。
+   `watch=0x30e304:0x20:rw` 显示该双字被 `trap_init` 的 `bts` 置成 **0xffffffff**，
+   而循环对 i=0x20..0xff 每次都读到同一个双字、取 `i & 31` 位 ⇒ **全部判成系统向量
+   ⇒ 224 个 IRQ 门全被跳过**。
+
+**根因（真 bug，SDM 明确）**：`BT/BTS/BTR/BTC` 的内存操作数是**位串**，
+SDM vol.2 的 Operation 是 `BitBase ← BitOffset DIV OperandSize` —— 位偏移越过一个
+操作数宽度时，有效地址要前进一个操作数（32 位操作数每 32 位进 4 字节，16 位每 16 位
+进 2 字节）；寄存器操作数才取模。原实现只读基址那一个操作数、用 `bit & 31` 取位，
+所以偏移 ≥ 32 时读错了字。
+
+**修复**：`src/cpu/isa/x86/exec.c` 的 bt/bts/btr/btc 分支——先取位偏移，内存操作数按
+`d.mlin += 4 * (bit >> 5)`（16 位 `2 * (bit >> 4)`）推进后再读写；写回走同一地址。
+
+**实测（linux.iso 单跑，150M 条指令）**：`Calibrating delay loop... 4.40 BogoMIPS
+(lpj=22016)`（定时器校准通过，时间戳 0.02s → 19.2s 正常走）→ RTC/8250/IDE-ATAPI
+（认出 `CEMU VIRTUAL CD-ROM`）/i8042 → `RAMDISK: Loading 3883KiB ... done` →
+**`VFS: Mounted root (ext2 filesystem) on device 1:0`**。PC 已进 `0xc014bf7b`
+（真任务栈 esp=0xc13e1b1c），不再自旋。
+
+**设施（本片为定位补的，已进 AGENTS.md §十）**：`screen` 镜像改整行输出（原来被事件表
+41 列截断，读不了 call trace）；`DebugMark` 的 `b` 改十六进制；新增标记
+`intr`/`inta`/`ioapic`/`lapic-irr|ack|eoi`/`lidt`/`lgdt`/`gate`；`i8259` 增加
+`imr`/`eoi`/`base`。另记两个坑：`watch=` 匹配**物理地址**（内核 .data 要减映射偏移）；
+QEMU 侧 `pmemsave` 必须给 Windows 路径。
+
+**下一片的卡点**：本片未跑到用户态（`VFS: Mounted root` 之后的行未取），回归与探针
+（`test/x86/probe/bt_bits.asm`，双跑对拍）待补。
+
 ## 阶段 4 片 11：验收 2 推进到内核 —— 五处 x86 语义缺口（rep 计数 0、BSR、x87 ESC、CMPXCHG、xadd 顺序）（2026-09-21）
 
 片 10 之后的卡点（ldlinux 的 do_sysappend 在 guest 0x103906 的 `rep movsd` 上

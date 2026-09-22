@@ -15,9 +15,25 @@ enum {
   // redirection entry index (0x11 = 17) — the value xv6's ioapicinit reads
   // back as its "maxintr" and then writes entries for.
   kVersion = 0x00110011,
-  // Delivery mode 000: hand the vector to the destination APIC, the only mode
-  // a PC's ISA/PCI interrupts use (see 简化登记 D19 for the rest).
+  // Delivery modes (82093AA §3.2.4 bits 10:8 of a redirection entry). Fixed and
+  // lowest-priority hand a vector to the destination APIC; the rest do not
+  // carry a vector at all and are described where they are handled.
   kDeliveryFixed = 0,
+  // Lowest priority: the chip picks the least-busy processor among the
+  // destinations. This machine has one APIC, so the arbitration always selects
+  // it and the delivery is the fixed one — the difference shows only with more
+  // than one destination.
+  kDeliveryLowest = 1,
+  // SMI, NMI, INIT and ExtINT are not delivered: SMI needs an SMM-capable
+  // processor and a SMI# line, NMI a processor NMI input, INIT a second APIC
+  // to reset, and ExtINT an INTA cycle answered by the 8259 pair rather than by
+  // the APIC. A uniprocessor PC with no SMM has none of those lines, and a
+  // guest that programs one of these modes is asking for hardware this machine
+  // does not have.
+  kDeliverySmi = 2,
+  kDeliveryNmi = 4,
+  kDeliveryInit = 5,
+  kDeliveryExtInt = 7,
 };
 
 static const uint64_t kIoapicBase = 0xFEC00000ULL;
@@ -50,7 +66,12 @@ static void SetPinLow(IoapicPin* p, uint32_t v) {
 static void Service(IoapicDevice* d, int pin) {
   IoapicPin* p = &d->pins[pin];
   if (p->mask) return;
-  if (p->delivery != kDeliveryFixed) return;
+  if (p->delivery == kDeliverySmi || p->delivery == kDeliveryNmi ||
+      p->delivery == kDeliveryInit || p->delivery == kDeliveryExtInt) {
+    // Hardware this machine does not have (see the mode list above): the pin
+    // stays quiet rather than being delivered as something it is not.
+    return;
+  }
   if (p->trigger) p->remote_irr = 1;
   if (d->deliver) d->deliver(d->deliver_ctx, (int)p->dest, (int)p->dest_mode, (int)(p->vector & 0xff));
 }

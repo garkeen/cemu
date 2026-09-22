@@ -195,12 +195,21 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - 验收阶梯：xv6-x86 → Linux（参照 v86/tests/full 清单）；riscv 侧
   xv6-riscv（OpenSBI fw_jump 引导）并行验收。
 - D13 剩余（x87 FPU）在 Linux 用户态销账；D14（VM86）在 DOS/BIOS 兼容
-  路线需要时评估（Linux 不需要）。
-- **现状（2026-09-19）**：验收 1（xv6-x86）✅ —— SeaBIOS → IDE 盘 → xv6 到 shell，
-  与 QEMU 基线逐项一致；验收 2（Linux）进行中 —— ATAPI（PACKET）与 El Torito
-  引导已通（SeaBIOS 认 CD、跳 0x7C00），isolinux 已加载 /bzImage 并跳入内核早期
-  引导，当前卡在内核早期的装载循环（guest 0x102xxx / 0x103906 反复重入，无异常、
-  无控制台输出；地址级定位见 progress.md 片 10）；验收 3（xv6-riscv）未开始
+  路线需要时评估（Linux 不需要）。**（2026-09-21 更新）**：x87 ESC 已按"无 FPU
+  处理器"语义落地（CR0.TS/EM 先 #NM，否则解码 modrm 当 NOP），内核启动期的 FPU
+  探测因此通过；仍缺的是 x87 算术与 **RDTSC（0F 31 仍为显式 #UD）**——二者的
+  前提是 CPUID 特性位如实为 0（EDX=0，无 FPU/TSC/APIC/MSR），实现与报位必须
+  始终自洽，否则内核会走到 RDTSC / LAPIC 上。
+- **现状（2026-09-21 片 12）**：验收 1（xv6-x86）✅ —— SeaBIOS → IDE 盘 → xv6 到 shell，
+  与 QEMU 基线逐项一致；验收 2（Linux）进行中 —— ATAPI（PACKET）/El Torito 引导已通，
+  片 11 补掉五处 x86 语义缺口（REP 计数 0、BSR/BSF、x87 ESC 的无 FPU 语义、CMPXCHG、
+  XADD 写回顺序）后内核进入保护模式运行；片 12 定案了片 11 的卡点：**`BT/BTS/BTR/BTC`
+  的内存操作数是位串**（SDM vol.2 Operation `BitBase ← BitOffset DIV OperandSize`），
+  原实现不按位偏移推进有效地址 ⇒ 内核 `init_IRQ()` 的 IRQ 门安装循环把 0x20–0xff 全
+  判成"系统向量" ⇒ 224 个 IRQ 门一个都没装 ⇒ 唯一一次 IRQ0 交付落到 `ignore_int`
+  （不算 tick、不发 EOI）⇒ PIC ISR 卡住 ⇒ 定时器死掉、`calibrate_delay_converge` 自旋。
+  修掉后 linux.iso 单跑通过定时器校准并走到 `VFS: Mounted root (ext2 filesystem)`
+  （RTC/8250/IDE-ATAPI/i8042/RAMDISK 全部就位）；验收 3（xv6-riscv）未开始
   （依赖 D22 的 COM1 接收路径）。
 
 ### 阶段 5：cesdk（放后：真实 OS 跑通后再做 SDK）

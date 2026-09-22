@@ -51,6 +51,9 @@ void LapicDeliver(LapicDevice* d, int vector);
 int LapicAcknowledge(LapicDevice* d);
 // Timer countdown against the host clock; called from the machine poll loop.
 void LapicPoll(LapicDevice* d);
+// Microseconds until the APIC timer expires, or 0 when it is idle or already
+// due. Same purpose as PitNextEventUs: the run loop's idle skip.
+int64_t LapicNextEventUs(LapicDevice* d);
 
 extern const DeviceOps kLapicOps;
 

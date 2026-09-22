@@ -69,14 +69,26 @@ void DebugText(const char* kind, const char* text);
 // the row prints even when the access itself faults).
 int DebugWatchHit(uint64_t addr, int size, int is_load);
 
+// ---- guest-memory dumps (dump=ADDR:SIZE:FILE) -------------------------------
+// A `watch` row says *that* an address was touched; it cannot say what the
+// guest left in a structure nobody reads again — a stopped guest's log buffer,
+// page tables, task structs. Reading those needs the address space, which the
+// hub does not own (bus/ stays outside debug/), so the board installs a
+// physical-memory reader and the dump items are written when the session ends.
+// A dump run must therefore stop by itself (--max-inst, or the guest halting):
+// a host signal skips the session end and writes nothing.
+typedef int (*DebugMemReadFn)(void* ctx, uint64_t addr, uint8_t* buf, int len);
+void DebugSetMemReader(DebugMemReadFn read, void* ctx);
+
 // Halt/exit: the final regs table + session summary (always, once debug is
 // active at all).
 void DebugSessionEnd(const struct frame* f, const char* stop_reason);
 
 // CEMU_DEBUG grammar this hub implements (AGENTS.md §X):
 //   trace[:line|table][=N], state, mem[:ld|st], trap, bus, regs=N,
-//   watch=ADDR:SIZE[:r|w|rw] (repeatable), budget=N (per-category cap),
-//   skip=N (per-category silent window before printing), utf8.
+//   watch=ADDR:SIZE[:r|w|rw] (repeatable), dump=ADDR:SIZE:FILE (repeatable),
+//   budget=N (per-category cap), skip=N (per-category silent window before
+//   printing), utf8. Addresses are physical.
 
 // Session output cap (bytes). All debug writes (table rows, state stream,
 // line trace, session summary) are accounted here; once the cap is hit,

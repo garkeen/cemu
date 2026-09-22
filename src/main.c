@@ -24,6 +24,7 @@ typedef struct Args {
   uint64_t bin_tohost;
   uint64_t max_inst;
   int dump_regs;
+  int skip_idle;  // --skip-idle: a halted CPU's idle time runs at full speed
   int gdb_port;  // -s / -gdb tcp::PORT; 0 = no stub
   int gdb_wait;  // -S: stopped until a client resumes (QEMU convention)
 } Args;
@@ -41,6 +42,8 @@ static void Usage(void) {
       "  --max-inst N      stop after N instructions (default unlimited)\n"
       "  --log FILE        also write logs to FILE\n"
       "  --dump-regs       dump registers on any exit\n"
+      "  --skip-idle       jump a halted CPU to the next device deadline\n"
+      "                    instead of letting the wait elapse in host time\n"
       "  -bios FILE        x86: map a firmware ROM image and reset into it\n"
       "  -hda FILE         x86: primary IDE master disk image\n"
       "  -hdb FILE         x86: primary IDE slave disk image\n"
@@ -84,6 +87,8 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       if (ParseU64(argv[++i], &a->max_inst)) return -1;
     } else if (strcmp(arg, "--dump-regs") == 0)
       a->dump_regs = 1;
+    else if (strcmp(arg, "--skip-idle") == 0)
+      a->skip_idle = 1;
     else if (strcmp(arg, "-display") == 0) {
       if (i + 1 >= argc) {
         LogError("-display expects a backend name");
@@ -143,7 +148,8 @@ int main(int argc, char** argv) {
                     .bios_path = a.bios_path,
                     .hda = a.hda,
                     .hdb = a.hdb,
-                    .cdrom = a.cdrom};
+                    .cdrom = a.cdrom,
+                    .skip_idle = a.skip_idle};
   Board* m = BoardCreate(a.machine_name, &opts);
   if (!m) return 1;
 
@@ -184,11 +190,14 @@ int main(int argc, char** argv) {
   else
     LogInfo("firmware boot: reset=%llx isa=%s", (unsigned long long)m->cpu.pc, lr.isa->name);
 
-  // Host keys: stdin always feeds the machine's key sink (the console cemu was
-  // started from, or a pipe a script drives). This is deliberately outside the
+  // Host input: stdin feeds the machine's sinks — its serial receiver when it
+  // has one (raw bytes: a terminal on COM1, or the virt machine's ns16550a),
+  // otherwise its keyboard (set-1 scan codes). This is deliberately outside the
   // display branch: a run without a window has stdin as its only input path,
   // and the window path is attached separately below.
-  if (m->key_in) HostKeyOpen(m->key_in, m->key_ctx);
+  if (m->serial_in || m->key_in) {
+    HostInputOpen(m->serial_in, m->serial_ctx, m->key_in, m->key_ctx);
+  }
 
   if (a.display_backend) {
     if (!m->display_ops) {

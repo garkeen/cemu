@@ -1,5 +1,6 @@
 #include "device/intc/lapic.h"
 
+#include "debug/debug.h"
 #include "host/host.h"
 
 // Register offsets (SDM vol.3 figure 11-18; one 32-bit register per 16 bytes).
@@ -92,6 +93,12 @@ static void UpdateIrq(LapicDevice* d) {
 
 void LapicDeliver(LapicDevice* d, int vector) {
   if (vector < 16 || vector > 255) return;
+  // The APIC-side of the interrupt path is invisible from the board (it only
+  // sees the INTR pin): whether a vector ever entered the APIC's IRR, whether
+  // the APIC answered the INTA, and whether the handler's EOI retired it
+  // (kDbgMark). A guest whose timer stops arriving is otherwise
+  // indistinguishable from one that never got the interrupt.
+  if (DebugOn(kDbgMark)) DebugMark("lapic-irr", vector, (int)d->reg[kLapicSvr / 16]);
   VectorSet(d->irr, vector);
   UpdateIrq(d);
 }
@@ -102,6 +109,7 @@ int LapicAcknowledge(LapicDevice* d) {
   int vec = HighestVector(d->irr);
   VectorClear(d->irr, vec);
   VectorSet(d->isr, vec);  // in service until the handler's EOI
+  if (DebugOn(kDbgMark)) DebugMark("lapic-ack", vec, (int)((d->reg[kLapicTpr / 16] >> 4) & 0xf));
   UpdateIrq(d);
   return vec;
 }
@@ -153,6 +161,15 @@ void LapicPoll(LapicDevice* d) {
   TimerExpire(d);
 }
 
+int64_t LapicNextEventUs(LapicDevice* d) {
+  if (d->timer_count == 0) return 0;
+  uint64_t burned = CountsElapsed(d, HostTimerNow());
+  if (burned >= d->timer_count) return 0;  // already due: LapicPoll has it
+  uint64_t per_sec = kLapicTimerFreq / TimerDivisor(d->reg[kLapicTimerDivide / 16]);
+  uint64_t left = d->timer_count - burned;
+  return (int64_t)((left * 1000000 + per_sec - 1) / per_sec);  // round up: never 0 while pending
+}
+
 static uint64_t LapicRead(void* dev, uint64_t addr, int size) {
   (void)size;
   LapicDevice* d = (LapicDevice*)dev;
@@ -189,6 +206,7 @@ static void LapicWrite(void* dev, uint64_t addr, int size, uint64_t val) {
       // which is why the reset-time EOI in firmware's init is harmless.
       int vec = HighestVector(d->isr);
       if (vec < 0) return;
+      if (DebugOn(kDbgMark)) DebugMark("lapic-eoi", vec, 0);
       VectorClear(d->isr, vec);
       if (d->eoi) d->eoi(d->eoi_ctx, vec);
       UpdateIrq(d);

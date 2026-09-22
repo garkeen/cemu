@@ -49,9 +49,25 @@ typedef struct Board {
   // (on the PC that is the 8042 controller and its IRQ1). NULL = no keyboard.
   void (*key_in)(void* ctx, uint32_t scan, int extended, int up);
   void* key_ctx;
+  // Serial channel: the board's byte sink, fed by the host's stdin (the console
+  // cemu was started from, or a pipe a script drives). On the PC that is COM1's
+  // receiver. A board with one takes stdin here and leaves the keyboard to the
+  // window — the QEMU `-serial stdio` split. NULL = no serial port.
+  void (*serial_in)(void* ctx, int ch);
+  void* serial_ctx;
   // Time-driven device refresh (CLINT MTIP, PIT counters); called by the run
   // loop every step and more often while the CPU sleeps.
   void (*poll)(struct Board* b);
+  // Idle skip (--skip-idle). While the CPU is halted the run loop normally
+  // lets the wait elapse in host time; with this set it instead jumps the
+  // emulated clock to the next device deadline (HostTimerWarp), so a guest
+  // that sleeps for a tick gets it at once — QEMU's virtual-clock warp. The
+  // board names that deadline through next_event_us (microseconds, 0 = no
+  // device will fire on its own, so the wait must be host time after all: only
+  // the host can produce a key press). NULL = this board has no time-based
+  // wakeup source and the flag does nothing.
+  int skip_idle;
+  int64_t (*next_event_us)(struct Board* b);
   // Board-specific teardown of non-RAM devices; BoardDestroy calls it after
   // freeing the standard parts.
   void (*destroy)(struct Board* b);
@@ -72,6 +88,10 @@ typedef struct BoardOpts {
   // CD-ROM image for the PC's secondary IDE master (-cdrom): a packet (ATAPI)
   // device with 2048-byte blocks. NULL = empty bay.
   const char* cdrom;
+  // --skip-idle: run a halted CPU's idle time at full speed (see Board). Off
+  // by default: with it off the emulated clock and the host clock agree, which
+  // is what a wall-time-faithful run needs.
+  int skip_idle;
 } BoardOpts;
 
 // Creates a board by name ("spike", "x86", "virt"); returns NULL for unknown

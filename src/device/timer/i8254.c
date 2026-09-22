@@ -240,6 +240,19 @@ void PitPoll(PitDevice* pit) {
   }
 }
 
+int64_t PitNextEventUs(PitDevice* pit) {
+  PitChannel* s = &pit->channels[0];
+  if (s->irq == -1) return 0;
+  if (s->mode != 2 && s->mode != 3) return 0;  // only these deliver edges
+  if (s->count_load_time == 0) return 0;       // never loaded: nothing to wait for
+  // PitPoll fires when d reaches last_irq_count + count (same tick domain as
+  // PitElapsed, so the two agree on when the edge is).
+  uint64_t d = PitElapsed(s);
+  uint64_t next = s->last_irq_count + s->count;
+  if (next <= d) return 0;  // already due: PitPoll has it
+  return (int64_t)((next - d) * 1000000 / PIT_FREQ);
+}
+
 static uint64_t PitRead(void* dev, uint64_t addr, int size) {
   (void)size;
   return PitIoRead((PitDevice*)dev, (uint16_t)(addr & 3));
