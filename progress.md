@@ -3,6 +3,40 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 15：x86 用户态写保护缺失 —— 验收 2 卡点定案（2026-09-22）
+
+**卡点定案**：片 13 取回的 `__log_buf` 停在 `VFS: Mounted root` 之后零输出。本轮用 gdb
+stub 抓回整块 32MB RAM，走客机任务链 + 页表 + libc 符号表，把卡点钉到指令级：卡住的进程
+是 `/linuxrc`（busybox init），睡在 `futex(FUTEX_WAIT_PRIVATE, 0xb784937c, 2, NULL)`；
+`0xb784937c` = libuClibc 基址 `0xb7801000` + `0x4837c`，`readelf -sW` 给出符号名
+`_stdio_openlist_del_lock`（12 字节），`GOT[0xe4]` 的 `R_386_GLOB_DAT` 重定位正指向它，
+与 `exec.c` 里 `mov edx,[ebx+0xe4]` 逐条对上。（此前用 `objdump -T` 的窄正则搜不到
+`static` 局部符号，那条"锁的身份"结论当时不可靠；改用符号表后坐实。）
+
+**真因**：`_stdio_openlist_del_lock.__lock` 在进程启动时不是 0。第一次 `fopen` 的
+`lock cmpxchg [lock],1`（期望 0）失败 ⇒ 走慢路径 `__lll_mutex_lock`（libc+0x8970）⇒
+`xchg [lock],2` ⇒ `futex_wait(addr,2)`；单线程无人唤醒 ⇒ 永久死锁。init 因此不读
+`/etc/inittab`、不 spawn getty，控制台与串口全静默 —— `VFS: Mounted root` 是症状，
+不是卡点。
+
+**锁字为什么非 0**：`page_translate_as()` 的用户态分支**只查 U/S 位，从不查 R/W 位**。
+SDM vol.3 §4.6 表 4-2：CPL=3 写一个 R/W=0 的页一律 #PF，与 CR0.WP 无关（cemu 只在
+内核态才看 R/W，且带 WP 条件）。后果是 Linux 的写时复制完全失效：内核把每个未触碰的
+匿名页映射到全局只读零页、指望首次写触发缺页，cemu 直接放行 ⇒ 写落进共享帧，写它的
+那个 VA 也拿不到私有副本。
+
+物证：`0xb7849000 / 0xb784b000 / 0xb784c000` 三个 VA 的 PTE 逐字节相同（`0030c265`），
+flags `PRUAD` —— **只读却带 D 位**，正是"写穿过只读 PTE"的指纹；全用户空间只有这 1 个
+帧被 ≥2 个 VA 共享，它同时映在内核线性区 `0xc030c000`（2.6.34 的 `empty_zero_page`），
+内容是用户写进去的 `INIT_LIST_HEAD` 自指指针表。旁证：整轮引导只有 65 条 #PF，正常光
+`.bss` 的 COW 就该上千 —— 写保护不生效把这些缺页全消掉了，这也是此前查不出真因的原因。
+
+**修**：4KB 与 4MB 两条叶子分支各补用户态写的 R/W 检查，注释按 §五 注明 SDM 出处。
+
+**验证**：构建 clang/ninja 零告警（`-Wall -Wextra`）；linux.iso 实测引导越过
+`VFS: Mounted root`，控制台出提示符，验收 2 通过。
+**未做**：回归套件本轮未跑。
+
 ## 阶段 4 片 14：复位设施 + 观测/入口缺口（D28/D29/D23 销账，D18 收窄）（2026-09-22）
 
 **D28 是误登记：断点在客户机虚拟地址上是好的。** xv6（分页开、cs base=0）实测：

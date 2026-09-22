@@ -614,7 +614,8 @@ static int cpl(void) { return (s->ar[cs_i] >> 5) & 3; }
 // a write (vol.3 4.7) — the RMW lands in RAM below this layer. The walk's
 // own reads are physical and bypass translation plus the debug mem/bus
 // events: page tables are machine state, not program accesses.
-// The program's own access: the U/S check runs against CPL (SDM vol.3 4.6).
+// The program's own access: U/S runs against CPL, and a write additionally
+// needs R/W on every level of the walk (SDM vol.3 4.6, table 4-2).
 static uint64_t page_translate(uint64_t lin, int write) {
   return page_translate_as(lin, write, cpl() == 3);
 }
@@ -635,7 +636,12 @@ static uint64_t page_translate_as(uint64_t lin, int write, int user) {
     // update in the PDE. (Bits 21:13 are reserved-0 in the SDM layout; the
     // 386-class #PF error code carries no RSVD flag, so a set reserved bit
     // surfaces as an ordinary fault.)
-    if (user ? !(pde & kPdeUs) : (write && (s->cr0 & kCr0Wp) && !(pde & kPdeRw)))
+    // A user-mode write needs R/W whatever CR0.WP says (SDM vol.3 4.6 table
+    // 4-2: WP governs supervisor writes only; at CPL=3 a write to a R/W=0 page
+    // faults outright). Without this the write lands in the shared read-only
+    // page the kernel handed out — its COW fault never happens.
+    if (user ? (!(pde & kPdeUs) || (write && !(pde & kPdeRw)))
+             : (write && (s->cr0 & kCr0Wp) && !(pde & kPdeRw)))
       pf_fault(lin, code | 1);
     uint32_t new_pde = pde | kPdeA | (write ? kPdeD : 0u);
     if (new_pde != pde) phys_store(pde_addr, 4, new_pde);
@@ -645,7 +651,11 @@ static uint64_t page_translate_as(uint64_t lin, int write, int user) {
   uint32_t pte = phys_load(pte_addr, 4, 0);
   if (!(pte & kPteP)) pf_fault(lin, code);
   int writable = (pde & kPdeRw) != 0 && (pte & kPteRw) != 0;
-  if (user ? (!(pde & kPdeUs) || !(pte & kPteUs))
+  // Same R/W rule as the 4MB leaf above (SDM vol.3 4.6 table 4-2): a user-mode
+  // write is refused by the page's own R/W alone, CR0.WP or not. This is the
+  // check that makes the kernel's copy-on-write work — every untouched
+  // anonymous page is handed out read-only and expects the write to fault.
+  if (user ? (!(pde & kPdeUs) || !(pte & kPteUs) || (write && !writable))
            : (write && (s->cr0 & kCr0Wp) && !writable))
     pf_fault(lin, code | 1);  // present: the entry was there, the right was not
   uint32_t new_pte = pte | kPteA | (write ? kPteD : 0u);
