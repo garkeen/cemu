@@ -39,7 +39,9 @@ cemu/
   progress.md      进度与决策记录
   reference.md     参考项目与用法
   tools/           depcheck.sh  依赖边检查
+                   clang.cmake  clang/mingw-w64 工具链文件（AGENTS.md 第七节）
   tools/front/     cemugui：gdb RSP 图形调试前端（宿主侧工具，非机器部件）
+                   front.c  rsp.h/.c
   src/
     main.c         入口：参数解析 + 装配
     cpu/           处理器
@@ -71,7 +73,7 @@ cemu/
     debug/         debug.h/.c  CEMU_DEBUG 观测中枢；gdbstub.h/.c  RSP 服务端
     host/          host.h  console_win.c  file_win.c  time_win.c
                    display_win.c  input_win.c  sock_win.c
-    util/          log.c  table.c  type.h
+    util/          log.h/.c  table.h/.c  type.h
   test/            run.sh  riscv64/  x86/
 ```
 
@@ -125,7 +127,7 @@ x86_min 装第三种 ISA）。类型是 `Board`，CLI 仍是 `--machine`（QEMU 
 |---|---|---|
 | spike_min | RAM 0x80000000 + HTIF | 阶段 1 跑 riscv-tests。tohost 从 ELF 符号表读，spike 同款约定 |
 | virt | DRAM 0x80000000、mask ROM 0x1000（QEMU 复位向量逐字）、CLINT 0x02000000、PLIC 0x0c000000、UART16550 0x10000000、test 0x100000 | 阶段 2 起 OpenSBI。权威来源 QEMU hw/riscv/virt.c + dumpdtb/pmemsave 实测 |
-| x86_min | 1MB RAM@0、PIC 0x20/0xA0、PIT 0x40、COM1 0x3F8、debug-exit 0xF4 | 阶段 1.5 起的 x86 平台。引导扇区契约：加载 0x7C00、CS:IP=0000:7C00、DL=0x80 |
+| x86_min | 32MB RAM@0（`--mem` 可调，上限 0xFEE00000）、PIC 0x20/0xA0、PIT 0x40、COM1 0x3F8→IRQ4、debug-exit 0xF4、debugcon 0x402、fw_cfg 0x510、i8042 0x60/0x64、port92 0x92、CMOS 0x70/0x71、LAPIC 0xFEE00000、IOAPIC 0xFEC00000、CGA 0xB8000+0x3D0、i440FX+PIIX3+IDE（`--hda/--hdb/--cdrom`）、ROM 窗口 0xC0000-0xFFFFF（`-bios`，复位 F000:FFF0） | 阶段 1.5 起的 x86 平台；PC 芯片组在阶段 4 片 1–14 补齐。引导扇区契约：加载 0x7C00、CS:IP=0000:7C00、DL=0x80 |
 
 对照真机：riscv `qemu-system-riscv64 -M spike -bios none -kernel rv64ui-p-add.elf`；
 x86 `qemu-system-i386 -device isa-debug-exit,iobase=0xf4,iosize=0x4`。
