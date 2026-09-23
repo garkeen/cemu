@@ -1,13 +1,20 @@
 # cemu 云端 CI（GitHub Actions）—— 每次 push / PR 跑一遍构建 + 全部回归。
 #
+# 工具链全部用镜像自带的，一个都不装（nasm 除外）。windows-latest 现在是
+# Windows Server 2025，镜像里已有：
+#   - LLVM 20.1.8（clang，C:\Program Files\LLVM\bin，机器 PATH）
+#   - CMake、Ninja 1.13.2
+#   - mingw-w64 gcc 15.2.0 —— runner-images 的 Install-Mingw64.ps1 把
+#     niXman/mingw-builds-binaries 解到 C:\ 并把 C:\mingw64\bin 加进机器 PATH
+# cemu 要的正是"clang 编译 + mingw-w64 sysroot"这一组合，镜像现成，所以没有
+# 任何安装步骤；唯一缺的是 nasm（test/x86/probe/*.asm 那三个探针要用），choco 补。
+#
 # 为什么必须是 windows-latest：cemu 是纯 Win32 程序（windows.h / winsock / GDI
 # 只在 src/host/ 里），宿主侧没有可移植分支，Linux runner 上连编译都过不去。
 #
 # 为什么不需要客户机工具链：测试镜像都已入库（test/riscv64/*.elf 136 份、
 # test/x86/*.elf 7 份、realmode.elf、pm_smoke.elf、smoke/cga 的 .bin），
-# CI 只构建 cemu 本体。装 nasm 是因为 test/x86/probe/*.asm 那三个冒烟探针的
-# .bin 被 .gitignore 覆盖（/test/x86/probe/*.bin），只能在 CI 现生成——不装就
-# 是三条 SKIP。
+# CI 只构建 cemu 本体。nasm 不装的话，三个探针格是 SKIP 而不是 FAIL。
 #
 # 构建与测试全部走 AGENTS.md 第七节的入口，不另造流程：
 #   cmake --build build                         （编译，-Wall -Wextra 须零告警）
@@ -17,12 +24,10 @@
 # check-* 目标由 CMake 自己解析 Git 的 bash 并以登录 shell 调用，因此
 # dirname/grep/sed/timeout 一定在 PATH 上（D23 的坑，不在 CI 里重演）。
 #
-# 与开发机的一处差异：tools/clang.cmake 把编译器钉在 D:/LLVM/bin/clang.exe。
-# 托管 runner 上没有这个安装——2026-09-23 首跑就死在这条（CMake 报
-# "D:/LLVM/bin/clang.exe is not a full path to an existing compiler tool"），
-# 所以 CI 不引那个工具链文件，改为在命令行上给出与它逐字等价的设置：编译器
-# 取 PATH 上的 clang，目标三元组取 --target=x86_64-w64-mingw32。哪天该文件
-# 改成可重定位（不钉绝对路径），这里就能回到 -DCMAKE_TOOLCHAIN_FILE。
+# 与开发机唯一的差异：不引 tools/clang.cmake —— 它把编译器钉在
+# D:/LLVM/bin/clang.exe（开发机的安装路径），托管 runner 上没有这个安装。
+# 与它逐字等价的设置直接写在配置命令行上：编译器取 PATH 上的 clang，
+# 目标三元组取 --target=x86_64-w64-mingw32（mingw sysroot 由 PATH 上的 gcc 定位）。
 
 name: ci
 
@@ -51,45 +56,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 与开发机同源的组合：clang 编译，mingw-w64 提供头文件与运行时。
-      # gcc 一并装上——它是 clang 定位 mingw sysroot 的锚点，也带来 binutils。
-      # update: true 让 pacman 先同步数据库，避免装包静默变成空操作。
-      - name: Install toolchain (clang / ninja / nasm / mingw-w64)
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          path: C:\msys64
-          update: true
-          install: >-
-            mingw-w64-x86_64-clang
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-nasm
-
-      # 接 PATH 之前先断言"东西真在"，不成立就红在这一步：首跑就是栽在
-      # "以为装了、其实 PATH 上什么都没有"，一路拖到 Configure 才报一句看不懂的
-      # 编译器找不到。
-      - name: Put toolchain on PATH
+      # 镜像里唯一没有的工具。装不上不算致命（三个探针格会 SKIP，不会 FAIL），
+      # 但要在下面那格把结论打出来，别让"少跑了三格"无声无息。
+      - name: nasm (not in the image; the three x86 probe cells want it)
         shell: pwsh
         run: |
-          $mingw = "C:\msys64\mingw64"
-          foreach ($t in "clang", "cmake", "ninja", "nasm") {
-            if (-not (Test-Path "$mingw\bin\$t.exe")) { throw "missing $mingw\bin\$t.exe" }
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm -y --no-progress
           }
-          Add-Content -Path $env:GITHUB_PATH -Value "$mingw\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\ProgramData\chocolatey\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\nasm"
 
-      # 编译器是谁、哪一版，直接打进日志——省下一轮"看不见的假设"。
+      # 编译器是谁、哪一版，直接打进日志：首轮两次翻车都是栽在"以为有、其实没有"。
       - name: Toolchain (paths + versions)
         run: |
-          command -v clang cmake ninja nasm
+          command -v clang cmake ninja gcc || true
           clang --version | head -1
           cmake --version | head -1
           ninja --version
-          nasm -v
+          gcc --version | head -1
+          nasm -v 2>/dev/null || echo "nasm missing: the three x86 probe cells will SKIP"
 
-      # 与 tools/clang.cmake 等价：clang + x86_64-w64-mingw32（mingw-w64 sysroot
-      # 由 PATH 上的 gcc 定位），编译器按名字交给 PATH 解析。
+      # 与 tools/clang.cmake 等价：clang + x86_64-w64-mingw32，编译器按名字交给
+      # PATH 解析（C:\Program Files\LLVM\bin），sysroot 由 PATH 上的
+      # C:\mingw64\bin\x86_64-w64-mingw32-gcc.exe 定位。
       - name: Configure
         id: configure
         run: >-
