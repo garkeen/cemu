@@ -22,6 +22,7 @@ typedef struct LapicDevice {
   uint32_t reg[0x40];  // 4KB MMIO / 16-byte stride = 256 slots, 32-bit each
   uint8_t irr[32];     // request registers: one bit per vector
   uint8_t isr[32];     // in-service registers
+  uint8_t tmr[32];     // trigger mode per vector, as last delivered (11.5.8)
   int64_t timer_base_us;  // host time the current count started from
   uint32_t timer_count;   // counts loaded at that instant (0 = timer idle)
   int irq_level;          // what this LAPIC last drove on the CPU's INTR line
@@ -43,8 +44,10 @@ void LapicSetEoiSink(LapicDevice* d, void (*eoi)(void* ctx, int vector), void* c
 int LapicId(const LapicDevice* d);
 int LapicLogicalMask(const LapicDevice* d);
 // Hands one vector to the LAPIC (an I/O APIC redirection entry, or any other
-// machine source): it lands in the IRR and may raise INTR.
-void LapicDeliver(LapicDevice* d, int vector);
+// machine source): it lands in the IRR and may raise INTR. `level_triggered`
+// is the request's trigger mode, held until the INTA that accepts the vector
+// moves it into the TMR (SDM vol.3 11.5.8).
+void LapicDeliver(LapicDevice* d, int vector, int level_triggered);
 // The INTA cycle: returns the vector to service and marks it in-service, or -1
 // when this LAPIC has nothing for the processor (then the machine's other
 // controller answers).

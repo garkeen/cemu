@@ -166,12 +166,28 @@ fi
 # gate/task-switch semantics, cmpxchg8b the 0F C7 instruction, memory the
 # vm.c allocator over 4MB pages, debug the SDM ch.17 DR breakpoints (32-bit
 # port of the upstream 64-bit-only test — mode-independent semantics, see
-# AGENTS.md D6). The kvm exit convention: report_summary
-# failures call exit(failures) — payload 0 only when every test passed.
-for t in taskswitch taskswitch2 cmpxchg8b memory debug; do
+# AGENTS.md D6), access the page-rights table (32-bit port of the upstream
+# 64-bit-only x86/access.c; it is the test that covers "a ring-3 write to a
+# user-readable read-only page faults whatever CR0.WP says" — the cell the
+# 片 15 fix restored, see AGENTS.md D31). The kvm exit convention:
+# report_summary failures call exit(failures) — payload 0 only when every
+# test passed.
+#
+# rmap_chain (also in upstream's i386 Makefile list) is not built: it maps its
+# pages from 0xfffffa000 — a 64-bit address that truncates to 0xffffa000 here —
+# and loops over fw_cfg's RAM_SIZE, so on a 32-bit machine the pointer wraps
+# past 4GB and the loop overwrites the page tables it is building.
+for t in taskswitch taskswitch2 cmpxchg8b memory debug access ioapic; do
   out=$(timeout 60 "$CEMU" --machine x86 --isa x86 "$dir/$t.elf" 2>&1)
   rc=$?
-  if [ "$rc" -eq 1 ]; then
+  # Exit status alone is not enough. A guest that exits cleanly reports payload
+  # 0 -> status 1, and the run is over; but cemu's own fatal stop used to exit
+  # 1 as well, so a guest that died on a missing feature (taskswitch2 reaching
+  # VM86) was scored green, and a FAIL line printed before it never mattered.
+  # Require the clean exit *and* the guest's own output to be free of failures:
+  # XFAIL is the suite's "expected failure" (memory's clflush/sfence/...), so
+  # only a FAIL not preceded by X counts.
+  if [ "$rc" -eq 1 ] && ! echo "$out" | grep -qE '(^|[^X])FAIL|\[fatal\]'; then
     pass=$((pass + 1))
   else
     fail=$((fail + 1))

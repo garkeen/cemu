@@ -73,7 +73,9 @@ static void Service(IoapicDevice* d, int pin) {
     return;
   }
   if (p->trigger) p->remote_irr = 1;
-  if (d->deliver) d->deliver(d->deliver_ctx, (int)p->dest, (int)p->dest_mode, (int)(p->vector & 0xff));
+  if (d->deliver)
+    d->deliver(d->deliver_ctx, (int)p->dest, (int)p->dest_mode, (int)(p->vector & 0xff),
+               (int)p->trigger);
 }
 
 // A guest turning a pin on (clearing its mask) can find the line already
@@ -122,7 +124,10 @@ static uint64_t IoapicRead(void* dev, uint64_t addr, int size) {
     case kRegVersion:
       return kVersion;
     case kRegArbitration:
-      return 0;  // no arbitration bus on this machine
+      // The arbitration ID is a read-only mirror of the ID (82093AA §3.2.2):
+      // this machine has no APIC arbitration bus, so the ID is all there is to
+      // report, and the write path above already ignores writes to it.
+      return d->id << 24;
     default:
       break;
   }
@@ -186,7 +191,8 @@ void IoapicInit(IoapicDevice* d) {
 void IoapicRegister(Bus* bus, IoapicDevice* d) { BusAddRegion(bus, kIoapicBase, kIoapicSize, &kIoapicOps, d); }
 
 void IoapicSetDeliverSink(IoapicDevice* d,
-                          void (*deliver)(void* ctx, int dest, int logical, int vector), void* ctx) {
+                          void (*deliver)(void* ctx, int dest, int logical, int vector, int trigger),
+                          void* ctx) {
   d->deliver = deliver;
   d->deliver_ctx = ctx;
 }

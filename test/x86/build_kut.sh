@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the kvm-unit-tests 32-bit flat images from the v86 checkout
-# (D:/code/c/TinyEMU/v86/tests/kvm-unit-tests) with LLVM clang + ld.lld.
+# (D:/code/c/EMU/v86/tests/kvm-unit-tests) with LLVM clang + ld.lld.
 # The images boot through the multiboot header in x86/cstart.S (loader:
 # flat protected mode, EAX = 0x2badb002, EBX = multiboot info) and exit via
 # the 0xF4 debug-exit device — the same contracts cemu's x86 machine
@@ -25,7 +25,7 @@
 #   3. lib objects carry path-mangled names: lib/stack.c and
 #      lib/x86/stack.c would otherwise collide in the archive.
 set -eu
-K=${KVM_UT:-D:/code/c/TinyEMU/v86/tests/kvm-unit-tests}
+K=${KVM_UT:-D:/code/c/EMU/v86/tests/kvm-unit-tests}
 OUT=$(cd "$(dirname "$0")" && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -135,5 +135,7 @@ testimg taskswitch
 testimg taskswitch2
 testimg cmpxchg8b
 testimg memory
+testimg ioapic
 testimg_src debug "$OUT/kut_debug.c"
-echo "built: taskswitch taskswitch2 cmpxchg8b memory debug"
+testimg_src access "$OUT/kut_access.c"
+echo "built: taskswitch taskswitch2 cmpxchg8b memory ioapic debug access"

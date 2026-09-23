@@ -37,14 +37,17 @@ typedef struct IoapicDevice {
   uint32_t id;     // bits 27:24 of the ID register
   IoapicPin pins[kIoapicPins];
   // Where a delivered entry goes: the destination APIC's id (physical mode) or
-  // its logical mask (logical mode) plus the vector.
-  void (*deliver)(void* ctx, int dest, int logical, int vector);
+  // its logical mask (logical mode), the vector, and the entry's trigger mode
+  // (0 edge, 1 level) — the APIC records the latter in its TMR so the handler
+  // can tell the two apart (SDM vol.3 11.5.8).
+  void (*deliver)(void* ctx, int dest, int logical, int vector, int trigger);
   void* deliver_ctx;
 } IoapicDevice;
 
 void IoapicInit(IoapicDevice* d);
 void IoapicRegister(Bus* bus, IoapicDevice* d);
-void IoapicSetDeliverSink(IoapicDevice* d, void (*deliver)(void* ctx, int dest, int logical, int vector),
+void IoapicSetDeliverSink(IoapicDevice* d,
+                          void (*deliver)(void* ctx, int dest, int logical, int vector, int trigger),
                           void* ctx);
 // An input pin changes level — the machine's device IRQ wires.
 void IoapicSetPin(IoapicDevice* d, int pin, int level);

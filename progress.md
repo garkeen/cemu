@@ -3,6 +3,152 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 17：测试判据收紧 + 一批被掩盖的真失败（2026-09-23）
+
+起点是 `access` 首跑 769 个假失败（见片 16 末尾），顺着往下挖，暴露出**判据本身太弱**
+这个更大的问题。
+
+**1. access 的 769 假失败 —— 测试自己的 bug（已修）**
+
+直方图显示失败全部落在 `pde.pse`（768/768），且 769 条 FAIL 报的都是同一个检查
+（"pte 80cf0 expected 800067"），没有一条是 "unexpected fault/access"、"error code" 或
+"pde"。根因：PSE 用例没有 PTE（叶就是 PDE），`at->ptep` 为 NULL，本该跳过 PTE 比较；但
+上游把判据写成 `at->ptep && *at->ptep != at->expected_pte, "pte %x ...", *at->ptep`
+——`*at->ptep` 作为可变参数被**无条件求值**，而空指针解引用是 UB，于是 GCC -O2 认定
+ptep 非空、删掉 `&&` 保护并把 load 提前。每个 PSE 用例都去读**线性地址 0**（实模式
+IVT），拿到常量 `0x80cf0`，与上一用例残留的 `expected_pte`（`0x800067`）比较 → 假失败。
+修法：把读取放进显式守卫（`actual_pte = at->ptep ? *at->ptep : at->expected_pte`），
+生成代码核对为 `cmovne`。修后 **1537 tests / 0 failures**，指令数 70,735,171 → 466,981。
+
+**副产品**：769 条 FAIL 里没有一条是缺页判定、错误码或 PDE/PTE 更新 —— cemu 的
+`page_translate_as` 在 1536 个合法组合上**全部正确**，片 15 的修复站得住。
+
+**2. LAPIC 缺 TMR（原 D32，已实现，台账该行删除）**
+
+`x86/ioapic.c` 的 4 个 TMR 用例读 `APIC_TMR`（0x180 区）。QEMU `hw/intc/apic.c` 是权威
+参考：`apic_set_irq()` 在**投递时**按 trigger 位设置/清除 TMR（`apic_set_bit/reset_bit`），
+`apic_eoi()` **只读**它（用来决定是否向 I/O APIC 广播 EOI），从不清除。据此实现：TMR 在
+`LapicDeliver` 按投递的 trigger 位写，EOI 读它来决定是否广播 `IoapicEoi`；顺带把
+ISR/TMR/IRR 三个向量集寄存器做成可读（0x100/0x180/0x200，8 个寄存器 × 16 字节步长，
+每寄存器 4 字节）。触发模式从重定向项的 trigger 位一路 plumb 到 `LapicDeliver`
+（`IoapicSetDeliverSink` 的 sink 多一个 trigger 形参）。
+
+**3. LAPIC 优先级方向反了（已修）**
+
+`HighestVector` 取的是**最低**置位向量，而 QEMU `get_highest_priority_int` 从最高字往下
+扫、取该字最高位 —— 即**高 vector 优先**；`x86/ioapic.c` 的 `ioapic simultaneous edge
+interrupts` 也要求 0x78 先于 0x66 被服务（`g_66_after_78`），两边一致。修后该用例通过。
+
+**4. IOAPIC 仲裁寄存器（已修）**
+
+索引 0x02 是 ID 的只读镜像（82093AA §3.2.2），原来恒返回 0。写路径本就忽略它，只补了读。
+
+**5. 宿主侧失败退出码与「通过」撞码（已修）—— 这是本轮最重要的一条**
+
+客机状态经 debug-exit 以 `(value << 1) | 1` 上报，**恒为奇数**；而 `Fatal` 与 main.c 的
+宿主错误路径原来都 `return 1` —— 与「客机报 0 失败」的通过码**完全相同**。后果：
+`taskswitch2` 撞上 `[fatal] VM86 not implemented (D14)` 后退出 1，被 `run.sh` 判成**通过**，
+而它此前已经打出 `FAIL: PF exeption`。新增 `kExitHostFailure = 2`（`util/log.h`，偶数码
+永不可能与客机状态相同），`Fatal` 与 main.c 全部宿主错误路径改用它。自检：缺文件现在
+rc=2。
+
+**6. `run.sh` 的 kvm 判据收紧（已修）**
+
+原来只看 `rc -eq 1`。改为 `rc -eq 1` **且** 客机输出里没有 `FAIL`（`XFAIL` 除外 ——
+`memory` 的 clflush/sfence/… 是套件自己的「预期失败」，其总结行是
+"8 tests, 7 expected failures"）也没有 `[fatal]`。理由写在脚本注释里。
+
+**7. `rmap_chain` 移出构建（已修）**
+
+它从 `0xfffffa000`（64 位地址，32 位下截断成 0xffffa000）开始按 fw_cfg 的 RAM_SIZE 循环
+装页，32 位机上前者回绕过 4GB、把正在构造的页表覆盖掉 → 三重故障。它在本机不可能有意义
+地跑，故从 `build_kut.sh` 移除（`ioapic` 同时接进 `run.sh`）。
+
+**回归（本轮实测）**：riscv64 **136 passed / 0 failed**；x86 **13 passed / 1 failed** ——
+红的只有 `taskswitch2`，且原因由脚本直接打印出来。
+
+**未完成：`taskswitch2` 的两处（本轮已定位，未修）**
+
+- `FAIL: PF exeption`。用 `watch=` 盯 `test_count`（0x449820）证明：该用例把变量清零后、
+  在 report 读它之前，**全程没有任何一次写命中**。而 `do_pf_tss` 的
+  `printf("PF task is running %p %lx", error_code, *error_code)` 打印出的错误码是 `2`
+  （正确），紧跟的 `cmpl $0x2,(%esi)` 却没走分支，于是 `incl 0x449820` 从未执行。即
+  **printf 时该字是 2、cmp 时不是**，而中间只有 `print_current_tss_info()`。错误码的
+  地址（handler 入口 esp）打印为 `0x44a9cc` —— 需要把 `do_int` 的任务门分支与
+  `do_task_switch` 的压帧路径（`has_ec` 只压错误码，未见返回帧 EFLAGS/CS/EIP 的压入）
+  对着 SDM vol.3 §7.2.1 走一遍才能定案。
+- VM86（D14）：用例 `test_vm86_switch` 靠 NT 置位 iret 做任务切换到 VM86 任务，断言只是
+  `report("VM86", 1)`（只要切过去再回来即算过），但进入 VM86 被显式 `Fatal` 拦住。
+  实现 VM86 模式是 D14 那个已决策的取舍（"Linux 不需要"），本轮没动。
+
+## 阶段 4 片 16：补 x86 页权限测试覆盖（access 的 32 位移植）（2026-09-22）
+
+片 15 的 bug 能漏掉，根因是**测试覆盖缺口**，而且缺得很具体：`test/x86/pm` 的 t16 测
+ring-0 写只读页（CR0.WP=1 → #PF(3)）、t18 测 ring-3 写 **U=0** 页（#PF(7)），**唯独没有
+"ring-3 写 U=1、W=0 的页"这一格**；5 个 kvm 用例也都没有。上游 kvm-unit-tests 里覆盖这
+一格的是 `x86/access.c`（页权限表驱动测试，oracle 的 `kwritable = !CR0.WP && !user`
+就是 SDM vol.3 §4.6 表 4-2 的直译），但它**只给 x86_64 编**——`x86/Makefile.i386` 里
+`access.flat` 被注释成 "These tests from Makefile.x86_64 don't compile"。
+
+**`test/x86/kut_access.c`**：access.c 的 32 位移植（与 `kut_debug.c` 同一先例，登记为
+AGENTS.md D31）。去掉本机不存在的轴（NX/bit51/PKU/SMEP）与 KVM-MMU 专属项，走表改两层
+（PDE/PTE），访问蹦床改 32 位寄存器，枚举从 27 位收到 11 位（2048 组合）。oracle、逐例
+判据、汇总行都是上游原码。**移植中自己抓到一处真 bug**：上游 `PT_INDEX` 是 4 级走表的
+位移（level2 右移 21、掩 511），32 位非 PAE 的 PDE 覆盖 10 位，必须右移 22、掩 1023
+——照抄会把 `0x40000000` 算成 PDE[0]，覆盖掉镜像自身的映射。已在反汇编上核对（位移 22
+出现 14 处、掩 1023 出现 7 处、掩 511 为 0）。
+
+**(c) i386 清单剩下 4 个用例的结论：只有 1 个能跑。**
+
+- `rmap_chain` 编入（编译零错，fw_cfg 有 RAM_SIZE）。
+- `ioapic` **不能跑**：中断注入走 kvm-unit-tests 的测试设备端口 `0x2000+line`，cemu 只有
+  QEMU 的 `0xF4` debug-exit，没有该设备。要跑得先给机器加这个设备（属新设备，另议）。
+- `apic` / `tscdeadline_latency` **不能跑**：都要 `rdtsc` + `MSR_IA32_TSCDEADLINE`
+  (0x6E0)。cemu 是 i686 无 TSC 模型（D13，`rdtsc` 为 #UD），MSR 表只有
+  0x1b / 0xc0000100-1 / 0x1a0。这是模型不是 bug，塞进套件只会是噪音。
+
+**复现性发现（未处理）**：本机重跑 `build_kut.sh` 会改动 5 个已入库镜像的字节
+（taskswitch 差 1049 B、memory 1504 B、debug 1648 B、cmpxchg8b 5539 B 且小 16 B、
+taskswitch2 6650 B 且小 16 B）⇒ 该 harness 在本机**不是逐字节可复现的**（clang 版本或
+v86 检出相对入库时已变动）。本轮把这 5 个还原，只留新增的 access.elf / rmap_chain.elf。
+
+**验证（实跑）**：`access` 首跑 **1537 tests / 769 failures**，直方图显示失败**全部**落在
+`pde.pse`（768/768），且 769 条 FAIL 报的都是同一个检查 —— "pte 80cf0 expected 800067"。
+
+**根因是测试自己的 bug，不是 cemu 的**：PSE 用例没有 PTE（叶就是 PDE），`at->ptep` 为
+NULL，本该跳过 PTE 比较。上游把判据写成
+
+    at->ptep && *at->ptep != at->expected_pte, "pte %x ...", *at->ptep
+
+但 `*at->ptep` 同时作为可变参数被**无条件求值**，而解引用空指针是 UB，于是优化器有权
+认定 ptep 非空、把 `at->ptep &&` 这个保护删掉并把 load 提前。GCC -O2 正是这么做的：每个
+PSE 用例都去读**线性地址 0**（实模式 IVT），拿到那里的常量 `0x80cf0`，与上一用例残留的
+`expected_pte`（`0x800067`）比较 → 假失败。修法是把读取放进显式守卫（先算
+`actual_pte = at->ptep ? *at->ptep : at->expected_pte` 再比较），已核对生成代码为
+`cmovne` 守卫、不再无条件解引用。修复后 **1537 tests / 0 failures，rc=1**，指令数从
+70,735,171 降到 466,981（769 次失败映射 dump 消失）。
+
+**副产品结论**：769 条 FAIL 里没有一条是 "unexpected fault" / "unexpected access" /
+"error code" / "pde"，即 cemu 的 `page_translate_as` 在 **1536 个合法组合上全部正确**
+（缺页/不欠页、错误码、PDE/PTE 更新都对），片 15 的修复站得住。
+
+**验证（其余）**：`build_kut.sh` 全绿（8 个镜像）；`kut_access.c` 单独编译 `-Wall
+-Wextra` 零告警（唯一告警来自上游 `processor.h` 的 sign-compare）。`rmap_chain` 的
+triple fault（发生在 `cr3=44d000 / cr4=10` 之后、第一条报告之前）未查。
+
+**补：kvm-unit-tests 测试设备（`device/misc/testdev.c`）** —— 为了让 `ioapic` 能跑。
+`x86/ioapic.c` 靠 `out` 到端口 `0x2000 + line` 注入 IRQ，cemu 原本只有 QEMU 的
+`0xF4` debug-exit，没有这个窗口。新设备照参考实现 v86 `src/cpu.js`（"only for
+kvm-unit-test"：`i` 从 0 到 0xF，写 `0x2000+i` 非 0 抬线、0 降线，三种宽度同一个处理
+器）实现，接到主板既有的 ISA IRQ 扇出（`OnIsaIrq` → `PicSetIrq` + `IoapicSetPin`），
+与 PIT/i8042/IDE 完全同构。编译零告警、`depcheck.sh` 通过。
+
+**但 `ioapic` 仍不能进套件**：它的 4 个 TMR 用例读 `APIC_TMR`（`0x180` 区）的 `0x79`
+位，而 cemu 的 LAPIC **没有 TMR**（`lapic.c` 只有 `irr`/`isr`，`0x180` 无处理）——
+这是未登记的规格缺口，已按 §二 登记为 **D32**（SDM vol.3 §11.5.8：接受中断时置位、
+EOI 时清零；需把重定向项的 trigger 位 plumb 到 `LapicDeliver`）。故 `ioapic` 暂不入
+`run.sh`，避免把已知必红的用例塞进套件。
+
 ## 阶段 4 片 15：x86 用户态写保护缺失 —— 验收 2 卡点定案（2026-09-22）
 
 **卡点定案**：片 13 取回的 `__log_buf` 停在 `VFS: Mounted root` 之后零输出。本轮用 gdb

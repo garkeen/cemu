@@ -16,6 +16,7 @@
 #include "device/misc/pci.h"
 #include "device/misc/piix3.h"
 #include "device/misc/port92.h"
+#include "device/misc/testdev.h"
 #include "device/storage/ide.h"
 #include "device/timer/i8254.h"
 #include "device/video/cga.h"
@@ -28,8 +29,10 @@
 // and identity-map through the 4MB-page directory, xv6's kernel assumes at
 // least its own 224MB PHYSTOP). Platform devices: 8259 PIC pair at 0x20/0xA0
 // (IRQ0..15), 8254 PIT at 0x40-0x43 (channel 0 -> IRQ0, the periodic timer that
-// wakes hlt), COM1 at 0x3F8-0x3FF, the debug-exit device at 0xF4 and fw_cfg at
-// 0x510/0x511 (QEMU contract) — all in a separate x86 I/O space (CpuState.io) —
+// wakes hlt), COM1 at 0x3F8-0x3FF, the debug-exit device at 0xF4, fw_cfg at
+// 0x510/0x511 (QEMU contract) and the kvm-unit-tests IRQ injection window at
+// 0x2000-0x200F (device/misc/testdev.c) — all in a separate x86 I/O space
+// (CpuState.io) —
 // and the Local APIC register page at 0xFEE00000 on the memory bus. The CGA card
 // (阶段 3.5 片 2) puts its 16KB frame buffer at 0xB8000 on the memory bus and
 // its ports at 0x3D0-0x3DF. Ports and MMIO nobody claims read all-ones and
@@ -122,6 +125,7 @@ typedef struct X86Board {
   I8042Device kbd;
   Port92Device port92;
   CmosDevice cmos;
+  TestDevDevice testdev;
   PciBus pci;
   I440fxDevice fx;
   IoapicDevice ioapic;
@@ -231,14 +235,14 @@ static void OnLapicIrq(void* ctx, int line, int level) {
 // The I/O APIC hands a redirection entry's vector to the destination APIC: a
 // physical-mode destination names its ID, a logical-mode one names its
 // flat-model mask (SDM vol.3 11.5.3; 82093AA §3.2.4 destination format).
-static void OnIoapicDeliver(void* ctx, int dest, int logical, int vector) {
+static void OnIoapicDeliver(void* ctx, int dest, int logical, int vector, int trigger) {
   X86Board* xm = (X86Board*)ctx;
   int match = logical ? (dest & LapicLogicalMask(&xm->lapic)) : (dest == LapicId(&xm->lapic));
   // A redirection entry that names a destination nobody answers is a silently
   // dropped interrupt; the mark reports the destination and whether it matched
   // (kDbgMark, negative vector = no match).
   if (DebugOn(kDbgMark)) DebugMark("ioapic", dest, match ? vector : -vector);
-  if (match) LapicDeliver(&xm->lapic, vector);
+  if (match) LapicDeliver(&xm->lapic, vector, trigger);
 }
 
 // An end of interrupt retires the I/O APIC pin whose vector was in service.
@@ -395,6 +399,9 @@ static void WireDevices(X86Board* xm) {
   I8042SetIrqSink(&xm->kbd, OnIsaIrq, &xm->irqbus);
   IdeSetIrqSink(&xm->ide, OnIsaIrq, &xm->irqbus);
   Uart16550SetIrqSink(&xm->uart, OnCom1Irq, &xm->irqbus);
+  // The kvm-unit-tests injection window drives the same ISA wires the devices
+  // do, so it reaches both controllers through the same fan-out.
+  TestDevSetIrqSink(&xm->testdev, OnIsaIrq, &xm->irqbus);
   IoapicSetDeliverSink(&xm->ioapic, OnIoapicDeliver, xm);
   I8042SetA20Sink(&xm->kbd, OnA20, &m->cpu);
   Port92SetA20Sink(&xm->port92, OnA20, &m->cpu);
@@ -427,6 +434,7 @@ static void X86Reset(Board* m) {
   CgaInit(&xm->cga);
   I8042Init(&xm->kbd);
   Port92Init(&xm->port92);
+  TestDevInit(&xm->testdev);
   CmosReset(&xm->cmos);
   // The PCI bus forgets its device list on reset (the devices keep their
   // configuration), so the three functions are re-enumerated here.
@@ -505,6 +513,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   I8042Init(kbd);
   Port92Init(p92);
   CmosInit(cmos);
+  TestDevInit(&xm->testdev);
   PciInit(&xm->pci);
   I440fxInit(&xm->fx, kPciBus0, kHostBridgeDev);
   Piix3BridgeInit(&xm->piix, kPciBus0, kPiixDev);
@@ -540,6 +549,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   I8042Register(&m->io, kbd);
   Port92Register(&m->io, p92);
   CmosRegister(&m->io, cmos);
+  TestDevRegister(&m->io, &xm->testdev);
   CmosSetMemory(cmos, ram_size);
   PciRegister(&m->io, &xm->pci);
   Piix3Register(&m->io, &xm->piix);

@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
   Args a;
   if (ParseArgs(&a, argc, argv) != 0) {
     Usage();
-    return 1;
+    return kExitHostFailure;
   }
   if (a.log_file) LogInitFile(a.log_file);
 
@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
                     .cdrom = a.cdrom,
                     .skip_idle = a.skip_idle};
   Board* m = BoardCreate(a.machine_name, &opts);
-  if (!m) return 1;
+  if (!m) return kExitHostFailure;
 
   uint64_t bin_base = a.bin_base ? a.bin_base : m->bin_base;
   LoadResult lr;
@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
     if (LoaderLoadImage(&m->bus, a.image, a.isa_name, bin_base, a.bin_tohost, m->bin_htif, &lr) !=
         0) {
       BoardDestroy(m);
-      return 1;
+      return kExitHostFailure;
     }
   } else {
     // Firmware boot (-bios): nothing is loaded, so the machine names its own
@@ -172,7 +172,7 @@ int main(int argc, char** argv) {
     if (!lr.isa) {
       LogError("machine %s has no default isa: give it an image file", a.machine_name);
       BoardDestroy(m);
-      return 1;
+      return kExitHostFailure;
     }
     lr.entry = m->reset_pc;
   }
@@ -204,12 +204,12 @@ int main(int argc, char** argv) {
     if (!m->display_ops) {
       LogError("machine %s has no display card", a.machine_name);
       BoardDestroy(m);
-      return 1;
+      return kExitHostFailure;
     }
     if (strcmp(a.display_backend, "win32") != 0) {
       LogError("unknown display backend %s (win32)", a.display_backend);
       BoardDestroy(m);
-      return 1;
+      return kExitHostFailure;
     }
     char title[128];
     snprintf(title, sizeof(title), "cemu %s - %s", a.machine_name, a.image ? a.image : "firmware");
@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
                         m->display_ops->Version, m->display_dev);
     if (!m->display) {
       BoardDestroy(m);
-      return 1;
+      return kExitHostFailure;
     }
     // The board's keyboard sink (the PC's 8042): window keys drive it.
     if (m->key_in) HostDisplaySetKeySink(m->display, m->key_in, m->key_ctx);
@@ -229,7 +229,7 @@ int main(int argc, char** argv) {
     m->gdb = GdbStubStart(m, a.gdb_port, a.gdb_wait);
     if (!m->gdb) {
       BoardDestroy(m);
-      return 1;
+      return kExitHostFailure;
     }
   }
 

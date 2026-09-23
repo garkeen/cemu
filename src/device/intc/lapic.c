@@ -13,6 +13,9 @@ enum {
   kLapicLdr = 0xD0,
   kLapicDfr = 0xE0,
   kLapicSvr = 0xF0,
+  kLapicIsr = 0x100,
+  kLapicTmr = 0x180,
+  kLapicIrr = 0x200,
   kLapicEsr = 0x280,
   kLapicIcrLo = 0x300,
   kLapicLvtTimer = 0x320,
@@ -40,21 +43,25 @@ static const uint64_t kLapicSize = 0x1000ULL;
 // comment assumes.
 static const uint64_t kLapicTimerFreq = 100000000ULL;
 
-static int LowBit(uint8_t bits) {
-  int n = 0;
-  while (!(bits & 1)) {
-    bits >>= 1;
-    n++;
+// The highest-priority request in a vector set. Priority is the vector's top
+// nibble and a larger nibble outranks a smaller one, so the winner is the
+// highest vector with a bit set: QEMU's hw/intc/apic.c get_highest_priority_int
+// scans from the top word down and takes that word's top bit, and
+// apic_irq_pending then refuses the vector unless its nibble beats the
+// processor priority — the same two rules as below. Vectors below 16 are
+// reserved and can never be delivered through the APIC (SDM vol.3 11.8.2).
+static int HighBit(uint8_t bits) {
+  int n = 7;
+  while (!(bits & 0x80)) {
+    bits <<= 1;
+    n--;
   }
   return n;
 }
 
-// The highest-priority request in a vector set: priority is the vector's top
-// nibble, so the *lowest* vector number wins. Vectors below 16 are reserved
-// and can never be delivered through the APIC (SDM vol.3 11.8.2).
 static int HighestVector(const uint8_t* set) {
-  for (int i = 2; i < 32; i++) {
-    if (set[i]) return (i << 3) + LowBit(set[i]);
+  for (int i = 31; i >= 2; i--) {
+    if (set[i]) return (i << 3) + HighBit(set[i]);
   }
   return -1;
 }
@@ -91,7 +98,7 @@ static void UpdateIrq(LapicDevice* d) {
   if (d->set_irq) d->set_irq(d->irq_ctx, 0, level);
 }
 
-void LapicDeliver(LapicDevice* d, int vector) {
+void LapicDeliver(LapicDevice* d, int vector, int level_triggered) {
   if (vector < 16 || vector > 255) return;
   // The APIC-side of the interrupt path is invisible from the board (it only
   // sees the INTR pin): whether a vector ever entered the APIC's IRR, whether
@@ -100,6 +107,17 @@ void LapicDeliver(LapicDevice* d, int vector) {
   // indistinguishable from one that never got the interrupt.
   if (DebugOn(kDbgMark)) DebugMark("lapic-irr", vector, (int)d->reg[kLapicSvr / 16]);
   VectorSet(d->irr, vector);
+  // The TMR records the trigger mode the vector was last *delivered* with:
+  // QEMU's apic_set_irq() sets the bit for a level request and clears it for
+  // an edge one, and nothing else ever writes it — the EOI only reads it (to
+  // decide whether the I/O APIC should be told to retire the pin), so a level
+  // interrupt's bit survives its own EOI. Reading it is how a handler tells
+  // whether the interrupt it is servicing was level- or edge-triggered
+  // (SDM vol.3 11.5.8; kvm-unit-tests x86/ioapic.c checks both ways round).
+  if (level_triggered)
+    VectorSet(d->tmr, vector);
+  else
+    VectorClear(d->tmr, vector);
   UpdateIrq(d);
 }
 
@@ -146,7 +164,8 @@ static void TimerArm(LapicDevice* d, uint32_t count) {
 // period the guest programmed hold.
 static void TimerExpire(LapicDevice* d) {
   uint32_t lvt = d->reg[kLapicLvtTimer / 16];
-  if (!(lvt & kLvtMasked) && (lvt & kLvtVector) >= 16) LapicDeliver(d, (int)(lvt & kLvtVector));
+  if (!(lvt & kLvtMasked) && (lvt & kLvtVector) >= 16)
+    LapicDeliver(d, (int)(lvt & kLvtVector), 0);  // the timer is an edge source
   uint32_t initial = d->reg[kLapicTimerInitial / 16];
   if (((lvt >> kLvtModeShift) & 3) == kLvtModePeriodic && initial != 0) {
     TimerArm(d, initial);
@@ -175,6 +194,20 @@ static uint64_t LapicRead(void* dev, uint64_t addr, int size) {
   LapicDevice* d = (LapicDevice*)dev;
   uint64_t off = addr - kLapicBase;
   if (off & 0xf) return 0;  // reserved bytes inside a register
+  // The vector sets (SDM vol.3 figure 11-18): eight registers of one bit per
+  // vector — in-service at 0x100, trigger mode at 0x180, request at 0x200. The
+  // TMR holds the trigger mode of the interrupt in service: the processor sets
+  // it at the INTA that accepted the vector and the EOI clears it (SDM vol.3
+  // 11.5.8), so a handler can tell an edge request from a level one. Its
+  // content comes from the redirection entry that delivered the vector, which
+  // is why the I/O APIC hands its trigger bit down with the vector.
+  if (off >= kLapicIsr && off < kLapicIrr + 0x20) {
+    const uint8_t* set = off < kLapicTmr ? d->isr : (off < kLapicIrr ? d->tmr : d->irr);
+    unsigned base = off < kLapicTmr ? kLapicIsr : (off < kLapicIrr ? kLapicTmr : kLapicIrr);
+    unsigned i = (unsigned)((off - base) / 16) * 4;  // 8 registers, 16-byte stride, 4 bytes each
+    return (uint32_t)set[i] | ((uint32_t)set[i + 1] << 8) | ((uint32_t)set[i + 2] << 16) |
+           ((uint32_t)set[i + 3] << 24);
+  }
   switch (off) {
     case kLapicVersion:
       return 0x50014;  // version 0x14, 5 LVT entries (SDM vol.3 11.4.5)
@@ -208,7 +241,11 @@ static void LapicWrite(void* dev, uint64_t addr, int size, uint64_t val) {
       if (vec < 0) return;
       if (DebugOn(kDbgMark)) DebugMark("lapic-eoi", vec, 0);
       VectorClear(d->isr, vec);
-      if (d->eoi) d->eoi(d->eoi_ctx, vec);
+      // Only a level request leaves an I/O APIC pin in service, and the TMR is
+      // what says which: QEMU's apic_eoi() broadcasts the I/O APIC EOI exactly
+      // when the retiring vector's TMR bit is set. The TMR itself is left
+      // alone — nothing clears it but the next delivery.
+      if ((d->tmr[vec >> 3] & (1u << (vec & 7))) && d->eoi) d->eoi(d->eoi_ctx, vec);
       UpdateIrq(d);
       return;
     }
@@ -251,6 +288,7 @@ void LapicInit(LapicDevice* d) {
   for (int i = 0; i < 32; i++) {
     d->irr[i] = 0;
     d->isr[i] = 0;
+    d->tmr[i] = 0;
   }
   d->timer_count = 0;
   d->timer_base_us = 0;

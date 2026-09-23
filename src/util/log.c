@@ -43,5 +43,5 @@ void Fatal(const char* fmt, ...) {
   va_start(ap, fmt);
   VLog("fatal", fmt, ap);
   va_end(ap);
-  exit(1);
+  exit(kExitHostFailure);
 }
