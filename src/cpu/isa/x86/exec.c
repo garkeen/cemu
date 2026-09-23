@@ -2668,9 +2668,12 @@ static void run_op2(uint8_t op2) {
       set_reg32(rm16());
       break;
     case 0xba: {  // grp8: bt/bts/btr/btc rm, imm8 (reg field 4-7)
-      fr->rec.mnemonic = d.reg == 4 ? "bt" : d.reg == 5 ? "bts" : d.reg == 6 ? "btr" : "btc";
       modrm();
       if (d.reg < 4) ud();
+      // The reg field is the sub-opcode, so the name is only known once modrm()
+      // has decoded it; picking it earlier reads the previous instruction's reg
+      // and labels all four "btc".
+      fr->rec.mnemonic = d.reg == 4 ? "bt" : d.reg == 5 ? "bts" : d.reg == 6 ? "btr" : "btc";
       uint32_t v, pos = imm8();
       if (d.w32) {
         v = RM32();

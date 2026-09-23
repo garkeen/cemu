@@ -122,6 +122,33 @@ else
   echo "SKIP (reset: no nasm and no prebuilt probe bin)"
 fi
 
+# BT/BTS/BTR/BTC bit-string addressing (test/x86/probe/bt_bits.asm): with a
+# memory bit base the register form walks the address on by one operand per
+# OperandSize bits (SDM vol.2 BT: "Effective Address + (4 * (BitOffset DIV
+# 32))"), while the immediate form's high bits are the assembler's business
+# and "the processor will ignore the high order bits" -- so the probe asserts
+# both halves and fails on either kind of wrong answer. The register half
+# guards the 片 12 fix: the linux.iso kernel's init_IRQ() installed zero IRQ
+# gates because its system_vectors bitmap test read the same dword for all 224
+# vectors. Dual run against qemu-system-i386: identical transcript, identical
+# status 11.
+btbin="$dir/probe/bt_bits.bin"
+if [ ! -f "$btbin" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f bin -o "$btbin" "$dir/probe/bt_bits.asm"
+fi
+if [ -f "$btbin" ]; then
+  out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$btbin" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'bt-bits ok'; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "bt-bits: rc=$rc"
+  fi
+else
+  echo "SKIP (bt-bits: no nasm and no prebuilt probe bin)"
+fi
+
 # PM: the protected-mode smoke probe (test/x86/pm). Multiboot ELF enters flat
 # PM, rebuilds GDT/IDT/TSS, and walks the stage-3 semantics: descriptor
 # loads, limit #GP, same-priv and cross-ring gate delivery with TSS stack

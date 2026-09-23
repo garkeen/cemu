@@ -3,6 +3,55 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 20：BT 位串探针（片 12 登记待补）+ 0xba 助记符；台账 D25/D26 删除（2026-09-23）
+
+**1. `test/x86/probe/bt_bits.asm`（片 12 登记"待补"的那支）**
+
+片 12 修 BT/BTS/BTR/BTC 的内存操作数位串寻址时，把探针登记为待补，但探针一直没落地
+（`test/x86/probe/` 只有 cd_atapi/pit_irq/rep_zero/reset）。本轮补上，九例覆盖两种编码、
+两种操作数宽度与三种跨越情形。
+
+**第一版探针的期望是错的 —— 我按"两种编码都推进地址"写，结果 cemu 与 QEMU 输出逐字节
+相同且都判失败。** 查手册定案（SDM vol.2 BT，经 felixcloutier 转写核对）：两种编码的
+分工不同。
+
+- **寄存器形式**（0F A3/AB/B3/BB）：处理器自己推进 ——
+  `Effective Address + (4 * (BitOffset DIV 32))`（16 位操作数则 `2 * (DIV 16)`），
+  在该处测 `BitOffset MOD OperandSize`；寄存器作位基址则取模、从不移动。
+- **立即数形式**（0F BA /4-/7）：高位是**汇编器**的事 —— 原文"some assemblers support
+  immediate bit offsets larger than 31 by using the immediate bit offset field in
+  combination with the displacement field ... **the processor will ignore the high
+  order bits if they are not zero**"。即处理器只取低 3/5 位、**不推进地址**；nasm 不折
+  高位，所以 `bt dword [m], 40` 测的是 m 的 bit 8，不是 m+4 的。
+
+所以 cemu 的立即数形式（`pos &= 31`、不推进）本来就是对的，片 12 只该修寄存器形式。
+**参考分歧**：tiny386 的 `BTEvIb`（`i386ins.def` 第 399-402 行）在立即数形式里也推进
+地址，是错的一侧 —— 按 §五"参考项目之间有分歧时以手册裁决"，从手册。
+探针因此**两半都断言**：只在寄存器形式推进或只在立即数形式推进，各错一种。
+
+**验证**：cemu 与 qemu-system-i386 转录逐字节一致（`1 2 3 4 5 6 7 8 9` + `bt-bits ok`，
+两侧 rc=11）。反证：抽掉片 12 的 `d.mlin += 4 * (bit >> 5)` 后，寄存器形式的
+1/2/4/5/6/8 全红、立即数形式与"首操作数内"的 3/7/9 保持绿。已接入 `run.sh`（x86 套件
+14 → 15 格）。
+
+**2. 顺带修掉 0xba 的助记符**
+
+写探针时看 `CEMU_DEBUG=trace:table` 发现立即数形式的四条全报成 `btc`：`case 0xba` 在
+`modrm()` **之前**用 `d.reg` 选名字，读到的还是上一条指令的 reg 字段。把赋值移到
+`modrm()`（与 `d.reg < 4` 的 #UD 检查）之后。审计其余按 `d.reg` 取子操作码的助记符
+赋值（0F 01 组的 sgdt/sidt/lgdt/lidt、0F 00 组的 verr/verw）都在 `modrm()` 之后，只此一处。
+
+**3. 台账：D25、D26 整行删除**（用户裁决）。D25 的前提是"配方缺失" —— `probe_ah.c` /
+`probe_harness.c` 源都在库，用户判定不必挂账；D26（ssvnapot 镜像的 1 MiB 填充）同样不
+再挂账。台账 12 → 10 行。
+
+**4. arch.md 的 bin 路线澄清**：补上入口契约的实际达成方式 —— multiboot 随 ELF 交付
+（`loader.c` 认 ELF 头 → `elf.c` 按 p_vaddr 铺段 → `x86_init` 扫头 8 KiB 找
+`0x1BADB002` 决定进扁平保护模式还是当 BIOS 引导扇区），故 kvm 的 `.elf` 无需"编成
+.bin"；xv6 验收走 SeaBIOS 路线，bin 路线未被使用。
+
+**回归**：x86 套件 15/0（只跑 x86，未跑全量）；零告警。
+
 ## 阶段 4 片 19：access 的 pde.bit13 轴 —— largepage PDE 保留位（D31 销账）（2026-09-23）
 
 起点是审 D31 那条台账（"flag 空间 27 位收到 11 位、2^27 不可跑"）。审下来发现两件事。

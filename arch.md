@@ -197,6 +197,13 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - bin 路线：multiboot 等价的入口契约，xv6 去掉 bootasm.S/bootmain.c
   编为 .bin；SeaBIOS 路线：官方 bios.bin 映射内存顶端，复位 F000:FFF0
   （bios.bin 已备料；跑通 SeaBIOS 本体属本阶段设备集成，不前置）。
+  实际达成方式：入口契约由 **multiboot** 提供，而它随 ELF 一起交付 ——
+  `board/loader.c` 认 `\x7fELF` 头，`board/elf.c` 把每个 PT_LOAD 段按
+  p_vaddr 拷进物理内存、取 e_entry；`x86_init` 再扫镜像头 8 KiB 找
+  `0x1BADB002`，命中即按 multiboot 契约进扁平保护模式（EAX=0x2BADB002、
+  EBX=multiboot info、CS=0x08/DS=0x10），否则当 BIOS 引导扇区（DL=0x80）。
+  所以 kvm-unit-tests 的 `.elf` 不需要"编成 .bin"这一步；xv6 验收走的是
+  SeaBIOS 路线，bin 路线未被使用。
 - 验收阶梯：xv6-x86 → Linux（参照 v86/tests/full 清单）；riscv 侧
   xv6-riscv（OpenSBI fw_jump 引导）并行验收。
 - D13 剩余（x87 FPU）在 Linux 用户态销账。x87 ESC 已按"无 FPU
@@ -208,11 +215,12 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   与 QEMU 基线逐项一致。验收 2（Linux）✅ —— 片 15 把卡点钉到指令级：用户态访问
   只查 U/S 不查 R/W（SDM vol.3 §4.6 表 4-2），写时复制失效，`/linuxrc` 死在
   `_stdio_openlist_del_lock` 的 futex 上；补上用户态写保护后引导越过
-  `VFS: Mounted root (ext2 filesystem)`，控制台出提示符。片 16–19 随后补测试覆盖
-  （access 的 32 位移植：12 位适用空间的穷举 2305 条，含 largepage PDE 保留位轴）、
+  `VFS: Mounted root (ext2 filesystem)`，控制台出提示符。片 16–20 随后补测试覆盖
+  （access 的 32 位移植：12 位适用空间的穷举 2305 条，含 largepage PDE 保留位轴；
+  BT 位串寻址探针）、
   收紧判据（宿主失败码 2 与客机通过码撞码、kvm 用例
   输出不再丢弃）、修 `taskswitch2`（SLDT/STR 内存目标恒 16 位）与 EFLAGS 保留位
-  不变式。回归：riscv64 136/0、x86 14/0。验收 3（xv6-riscv）未开始：素材
+  不变式。回归：riscv64 136/0、x86 15/0。验收 3（xv6-riscv）未开始：素材
   （xv6-riscv 镜像与 OpenSBI fw_jump）尚未取，串口输入通道已就绪。过程与证据见
   progress.md。
 
