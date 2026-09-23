@@ -1,0 +1,88 @@
+# cemu 云端 CI（GitHub Actions）—— 每次 push / PR 跑一遍构建 + 全部回归。
+#
+# 为什么必须是 windows-latest：cemu 是纯 Win32 程序（windows.h / winsock / GDI
+# 只在 src/host/ 里），宿主侧没有可移植分支，Linux runner 上连编译都过不去。
+#
+# 为什么不需要客户机工具链：测试镜像都已入库（test/riscv64/*.elf 136 份、
+# test/x86/*.elf 7 份、realmode.elf、pm_smoke.elf、smoke/cga 的 .bin），
+# CI 只构建 cemu 本体。装 nasm 是因为 test/x86/probe/*.asm 那三个冒烟探针的
+# .bin 被 .gitignore 覆盖（/test/x86/probe/*.bin），只能在 CI 现生成——不装就
+# 是三条 SKIP。
+#
+# 构建与测试全部走 AGENTS.md 第七节的原命令，不另造入口：
+#   cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE=tools/clang.cmake && cmake --build build
+#   cmake --build build --target check          （依赖边，tools/depcheck.sh）
+#   cmake --build build --target check-riscv64  （test/riscv64/run.sh）
+#   cmake --build build --target check-x86      （test/x86/run.sh）
+# check-* 目标由 CMake 自己解析 Git 的 bash 并以登录 shell 调用，因此
+# dirname/grep/sed/timeout 一定在 PATH 上（D23 的坑，不在 CI 里重演）。
+#
+# 唯一的环境适配：tools/clang.cmake 把编译器钉在开发机路径
+# D:/LLVM/bin/clang.exe（mingw-w64 当 sysroot、clang 当编译器）。托管 runner
+# 上没有这个安装，所以配置前把 D:\LLVM 指到 MSYS2 的 mingw-w64 树（junction，
+# 无需管理员权限；D: 是 runner 的数据盘，工作区本来就在上面）。这样工具链的
+# 组合与开发机同源，配置命令一字不改。
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连续 push 时取消上一轮，别让队列堆着。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    # 回归本身很快（riscv 136 格 + x86 14 格），但 guest 全靠 timeout 收场，
+    # 真挂住时得有人兜底：整轮硬顶 60 分钟。
+    timeout-minutes: 60
+    # Windows runner 的 run 默认是 pwsh；本仓库一切脚本都是 bash，显式钉死，
+    # 免得哪天命令里出现只有 sh 认识的写法。
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与开发机同源的组合：clang 编译，mingw-w64 提供头文件与运行时。
+      # gcc 一并装上——它是 clang 定位 mingw sysroot 的锚点，也带来 binutils。
+      - name: Install toolchain (clang / ninja / nasm / mingw-w64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-clang
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-nasm
+
+      - name: Put toolchain on PATH, satisfy tools/clang.cmake's D:/LLVM
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\msys64\mingw64\bin"
+          New-Item -ItemType Junction -Path "D:\LLVM" -Target "C:\msys64\mingw64" | Out-Null
+
+      - name: Configure
+        run: cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE=tools/clang.cmake
+
+      - name: Build (-Wall -Wextra must stay clean)
+        run: cmake --build build
+
+      - name: Dependency edges (AGENTS.md 第七节)
+        run: cmake --build build --target check
+
+      - name: riscv64 suite
+        run: cmake --build build --target check-riscv64
+
+      # 两套件都要出结论：riscv 红了也把 x86 跑完再收工。
+      - name: x86 suite
+        if: ${{ !cancelled() }}
+        run: cmake --build build --target check-x86
