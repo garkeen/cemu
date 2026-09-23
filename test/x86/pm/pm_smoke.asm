@@ -55,11 +55,15 @@
 ;       with A=D=0; a read sets PDE.A and leaves D clear, a write sets PDE.D
 ;       (t17 covers the 4KB walk only; kut_access.c builds its tables with
 ;       A|D already set, so no other test exercises this branch)
+;   t26 JMP through a 16-BIT TSS (SDM vol.3 fig 7-2): IP/FLAGS/GPRs/selectors
+;       come from the 16-bit offsets, the register image replaces only the low
+;       half, and the outgoing save writes back at those same offsets
 ; The tN numbers are report slots, not run order: t9 runs after t3 and t10
 ; runs after t7 (both need the ring levels already established); t14-t18 run
 ; at the end, inside the ring-0 resume flow after t13, t19-t24 (the LDT set)
-; run right before them, and t25 runs last: it takes PDE[0] over as a 4MB
-; leaf, so it must come after every test that relies on the 4KB tables.
+; run right before them, and t25/t26 run last: t25 takes PDE[0] over as a 4MB
+; leaf and t26 leaves the main TSS busy again, so both must come after every
+; test that relies on the 4KB tables or on an available main TSS.
 ; Reports one "tN ok" line per test plus "pm-smoke done", then exits through
 ; the QEMU isa-debug-exit port 0xF4 with payload 5 (status = (5<<1)|1 = 11).
 ;
@@ -86,6 +90,10 @@
 %define SEL_GATE10  0x48    ; DPL3 call gate -> gate10_entry, 2 params
 %define SEL_TSS2    0x50    ; 32-bit TSS #2 at TSS2_LIN
 %define SEL_LDT     0x58    ; the LDT descriptor itself (GDT-only, SDM 3.5)
+%define SEL_TSS3    0x60    ; 16-bit TSS at TSS3_LIN (SDM vol.3 fig 7-2)
+%define SEL_CODEHI  0x68    ; code, base 0x10000: a 16-bit TSS holds a 16-bit
+                            ; IP, so its task body must live in a 64K window —
+                            ; this segment maps the image's own address
 %define SEL_LDT0    0x0c    ; LDT entry 1: data DPL0 writable, limit 0x1ff
 %define SEL_LDTBIG  0x14    ; LDT entry 2: data DPL0 writable, 4 GiB
 %define SEL_LDTCODE 0x1c    ; LDT entry 3: code DPL0 readable, 4 GiB
@@ -95,7 +103,8 @@
 %define IDT_LIN    0x2100      ; gates built at runtime, 0x2a slots
 %define TSS_LIN    0x2400      ; TSS image: ESP0 at +4, SS0 at +8
 %define TSS2_LIN   0x2600      ; second TSS image (filled at runtime)
-%define RES_LIN    0x2500      ; result bytes r1..r25 (1 = ok, RAM starts 0)
+%define TSS3_LIN   0x2900      ; 16-bit TSS image (filled at runtime, 0x2c bytes)
+%define RES_LIN    0x2500      ; result bytes r1..r26 (1 = ok, RAM starts 0)
 %define OBS_LIN    0x2700      ; handler observation slots (dwords)
 %define LDT_LIN    0x2a00      ; six LDT entries, filled at runtime
 %define PD_LIN     0x60000     ; page directory (4 KiB aligned)
@@ -574,6 +583,24 @@ task3_entry:                   ; t12: the JMP-switched task body
   pop eax
   jmp far [ptr_maintss]        ; JMP back: main's TSS is available again
 
+t26_task_entry:                ; t26: the 16-bit TSS task body
+  mov dword [OBS_LIN + 0x90], eax  ; what the 16-bit register image loaded
+  push eax
+  push ds
+  mov ax, SEL_DATA0
+  mov ds, ax
+  mov ax, cs                     ; the segment this task runs under
+  movzx eax, ax
+  mov dword [OBS_LIN + 0x94], eax
+  pushfd
+  pop eax
+  and eax, 0x202                 ; IF and bit 1: the image carried neither
+  mov dword [OBS_LIN + 0x98], eax
+  pop ds
+  pop eax
+  mov ax, 0x5678                 ; the outgoing save must land at TSS3 +0x12
+  jmp far [ptr_maintss]          ; JMP back: main's TSS is available again
+
 task4_entry:                   ; t13a: arrived through the IDT task gate
   push eax
   push ds
@@ -1016,6 +1043,44 @@ pg_resume:
   mov byte [RES_LIN + 24], 1
 t25_end:
 
+  ; ---- t26: JMP through a 16-BIT TSS (SDM vol.3 fig 7-2) --------------------
+  ; The 16-bit shape carries IP at 0x0e, FLAGS at 0x10, the GPRs at 0x12 step
+  ; 2, ES/CS/SS/DS at 0x22 step 2 and the LDT at 0x2a — no CR3, no FS/GS and
+  ; no debug-trap word, and its minimum limit is 0x2b instead of 0x67. The
+  ; register image replaces only the low half (QEMU switch_tss_ra keeps the
+  ; rest), which the EAX check below pins. Its CS is SEL_CODEHI because a
+  ; 16-bit TSS holds a 16-bit IP: the body has to be reachable through a 64K
+  ; window, which that descriptor maps onto the image's own address.
+  mov dword [TSS_LIN + 0x1c], PD_LIN    ; the 32-bit TSS a switch reads must
+                                        ; carry the live CR3: this is the first
+                                        ; task switch with paging on
+  mov eax, t26_task_entry
+  sub eax, 0x10000
+  mov word [TSS3_LIN + 0x0e], ax        ; IP
+  mov word [TSS3_LIN + 0x10], 0x0002    ; FLAGS: bit 1 only, IF clear
+  mov word [TSS3_LIN + 0x12], 0x1234    ; AX
+  mov word [TSS3_LIN + 0x1a], RING0_TOP ; SP
+  mov word [TSS3_LIN + 0x22], SEL_DATA0 ; ES
+  mov word [TSS3_LIN + 0x24], SEL_CODEHI ; CS
+  mov word [TSS3_LIN + 0x26], SEL_DATA0 ; SS
+  mov word [TSS3_LIN + 0x28], SEL_DATA0 ; DS
+  mov word [TSS3_LIN + 0x2a], 0         ; LDT: none
+  mov eax, 0xDEADBEEF
+  jmp far [ptr_tss3]
+t26_ret:
+  cmp eax, 0xDEADBEEF                    ; the return restored main's GPRs
+  jne t26_done
+  cmp dword [OBS_LIN + 0x90], 0xDEAD1234 ; low half from the image, high half kept
+  jne t26_done
+  cmp dword [OBS_LIN + 0x94], SEL_CODEHI ; the task's CS came from TSS3 +0x24
+  jne t26_done
+  cmp dword [OBS_LIN + 0x98], 0x2        ; and its FLAGS from +0x10
+  jne t26_done
+  cmp word [TSS3_LIN + 0x12], 0x5678     ; the switch SAVED at the 16-bit offset
+  jne t26_done
+  mov byte [RES_LIN + 25], 1
+t26_done:
+
   ; ---- report ---------------------------------------------------------------------
   xor ebx, ebx
 .loop:
@@ -1049,7 +1114,7 @@ t25_end:
 .emit:
   call print
   inc ebx
-  cmp ebx, 25
+  cmp ebx, 26
   jl .loop
   mov esi, msg_done
   call print
@@ -1077,6 +1142,12 @@ gdt:
   dq 0                         ; 48: DPL3 call gate, count 2, built at runtime
   dq 0x0000890026000067        ; 50: 32-bit TSS #2 at TSS2_LIN, limit 0x67
   dq 0                         ; 58: the LDT descriptor, filled at runtime
+  dq 0x000081002900002b        ; 60: 16-BIT TSS at TSS3_LIN, limit 0x2b
+                               ; (SDM 7.2.1: a 16-bit TSS ends at the LDT
+                               ; selector; type 1 = available 16-bit TSS)
+  dq 0x00409b010000ffff        ; 68: code, base 0x10000, limit 0xffff, DPL0,
+                               ; 32-bit — the segment SEL_TSS3's IP indexes
+                               ; (bytes: ff ff | 00 00 | 01 | 9b | 40 | 00)
 gdt_end:
 
 gdtdesc:
@@ -1098,5 +1169,7 @@ ptr_gate10:  dd 0
              dw SEL_GATE10
 ptr_tss2:    dd 0
              dw SEL_TSS2
+ptr_tss3:    dd 0
+             dw SEL_TSS3
 ptr_maintss: dd 0
              dw SEL_TSS

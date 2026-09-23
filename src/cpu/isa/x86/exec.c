@@ -891,26 +891,47 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   seg_view v;
   desc_parse(sel, &v);
   uint8_t ty = v.ar & 0xf;
-  if (ty == 1 || ty == 3) Fatal("x86: 16-bit TSS not implemented (D15)");
-  if ((v.ar & 0x10) || (ty != 9 && ty != 0xb)) gp_fault(sel & ~3u);  // not a TSS
+  if ((v.ar & 0x10) || (ty != 1 && ty != 3 && ty != 9 && ty != 0xb)) gp_fault(sel & ~3u);
   if (source == kTaskIret && !(ty & 2)) ts_fault(sel & ~3u);  // must be busy
   if (source != kTaskIret && (ty & 2)) gp_fault(sel & ~3u);   // must be available
   if (!(v.ar & 0x80)) np_fault(sel & ~3u);
-  if (v.limit < 0x67) np_fault(sel & ~3u);  // 32-bit TSS minimum (SDM 7.2.1)
+  // The two TSS shapes carry the same state at different offsets and widths
+  // (SDM vol.3 fig 7-2 for the 16-bit one, fig 7-4 for the 32-bit one; the
+  // offsets below are QEMU switch_tss_ra's). A 16-bit TSS ends at the LDT
+  // selector — no CR3, no FS/GS and no debug-trap word — hence its smaller
+  // minimum limit (SDM 7.2.1: 0x2b against 0x67).
+  int tss16 = !(ty & 8);
+  if (v.limit < (tss16 ? 0x2b : 0x67)) np_fault(sel & ~3u);
 
-  // Save the outgoing task (SDM fig 7-4 dynamic fields): EIP, EFLAGS, the
-  // GPRs and the six segment selectors. The saved EFLAGS drops NT on an IRET
-  // switch — the outgoing task is being retired, not suspended (tiny386
-  // TS_IRET, v86's busy-target rule). The TSS is the processor's own
-  // structure, so every access to it below is a supervisor access.
-  kwr32(s->tr_base + 0x20, next_eip);
-  kwr32(s->tr_base + 0x24, source == kTaskIret ? fl->word & ~0x4000u : fl->word);
-  for (int i = 0; i < 8; i++) kwr32(s->tr_base + 0x28 + 4 * i, s->r[i].e);
+  // Save the outgoing task (SDM fig 7-2/7-4 dynamic fields): EIP, EFLAGS, the
+  // GPRs and the segment selectors, at the width the outgoing TSS uses. The
+  // saved EFLAGS drops NT on an IRET switch — the outgoing task is being
+  // retired, not suspended (tiny386 TS_IRET, v86's busy-target rule). The TSS
+  // is the processor's own structure, so every access below is a supervisor
+  // access.
+  // The save below writes into the OUTGOING TSS, whose shape is the one the
+  // current TR names — not the incoming one `v`. Mixing them writes a 32-bit
+  // TSS with 16-bit offsets (clobbering its CR3 field, which sits inside the
+  // 16-bit register block's stride) or the other way round.
+  int out16 = !(s->tr_ar & 0x8);
+  uint32_t saved_fl = source == kTaskIret ? fl->word & ~0x4000u : fl->word;
+  if (out16) {
+    kwr16(s->tr_base + 0x0e, (uint16_t)next_eip);
+    kwr16(s->tr_base + 0x10, (uint16_t)saved_fl);
+    for (int i = 0; i < 8; i++) kwr16(s->tr_base + 0x12 + 2 * i, (uint16_t)s->r[i].e);
+  } else {
+    kwr32(s->tr_base + 0x20, next_eip);
+    kwr32(s->tr_base + 0x24, saved_fl);
+    for (int i = 0; i < 8; i++) kwr32(s->tr_base + 0x28 + 4 * i, s->r[i].e);
+  }
   static const int seg_order[6] = {es_i, cs_i, ss_i, ds_i, fs_i, gs_i};
-  // The segment selectors sit on 4-byte strides in the TSS (SDM fig 7-4:
-  // ES 0x48, CS 0x4c, SS 0x50, DS 0x54, FS 0x58, GS 0x5c), each field two
-  // bytes wide with two reserved bytes after it.
-  for (int i = 0; i < 6; i++) kwr16(s->tr_base + 0x48 + 4 * i, s->sreg[seg_order[i]]);
+  // The selectors sit on a stride of their own in each shape (SDM fig 7-4:
+  // ES 0x48, CS 0x4c, SS 0x50, DS 0x54, FS 0x58, GS 0x5c, each field two
+  // bytes wide with two reserved bytes after it; fig 7-2: four fields at 0x22
+  // step 2). Both shapes store them as 16-bit selectors.
+  int nseg = out16 ? 4 : 6;
+  for (int i = 0; i < nseg; i++)
+    kwr16(s->tr_base + (out16 ? 0x22 + 2 * i : 0x48 + 4 * i), s->sreg[seg_order[i]]);
 
   // Busy bits (SDM 7.2.3): JMP/IRET clear the outgoing descriptor's,
   // JMP/CALL/INT set the incoming one's; IRET leaves the target busy (it
@@ -920,10 +941,12 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   if (source != kTaskIret)
     kbus_store(s->gdtr + (uint64_t)(sel >> 3) * 8 + 5, 1, (uint8_t)(v.ar | 2));
   // The incoming task's T flag (SDM vol.3 7.2.1, fig 7-4 byte 0 bit 0): a
-  // task-switch debug trap fires before the new task's first instruction.
+  // task-switch debug trap fires before the new task's first instruction. A
+  // 16-bit TSS has no such word (QEMU switch_tss_ra reads it only when
+  // type & 8), so the switch never traps in that shape.
   // Read before the back-link write below lands on the same word.
-  s->bt_pending = krd8(v.base) & 1;
-  if (source == kTaskCall) kwr16(v.base, s->tr);  // the back-link (fig 7-4)
+  s->bt_pending = tss16 ? 0 : (krd8(v.base) & 1);
+  if (source == kTaskCall) kwr16(v.base, s->tr);  // the back-link (fig 7-2/7-4)
 
   // TR commits before the new state loads: a faulting load leaves the
   // machine in the new task's context (tiny386 follows the SDM order; v86
@@ -933,18 +956,23 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   s->tr_limit = v.limit;
   s->tr_ar = (uint8_t)(v.ar | 2);
 
-  s->cr3 = krd32(v.base + 0x1c);  // carried along (SDM 7.2.1); the walk uses bits 31:12
-  // The incoming LDT (TSS +0x60) loads BEFORE the segment selectors: their
-  // TI=1 lookups go through the new task's own LDT (SDM 7.2.1 step order).
-  // It is not written back to the outgoing TSS (tiny386 and v86 agree).
-  load_ldtr(krd16(v.base + 0x60), 1);
+  // A 16-bit TSS has no CR3 field, so the switch leaves the page directory
+  // alone (QEMU applies CR3 only when type & 8).
+  if (!tss16) s->cr3 = krd32(v.base + 0x1c);  // carried along (SDM 7.2.1)
+  // The incoming LDT (TSS +0x60, or +0x2a in the 16-bit shape) loads BEFORE
+  // the segment selectors: their TI=1 lookups go through the new task's own
+  // LDT (SDM 7.2.1 step order). It is not written back to the outgoing TSS
+  // (tiny386 and v86 agree).
+  load_ldtr(krd16(v.base + (tss16 ? 0x2a : 0x60)), 1);
 
   // The TSS image supplies EFLAGS (SDM vol.3 7.2.1): the arithmetic and system
   // flags, IOPL and NT — and VM, which is how a task switch enters virtual-8086
-  // mode. The incoming CS and segment selectors are then real-mode values with
+  // mode. A 16-bit TSS carries only the low half of the register (QEMU masks
+  // the image to 16 bits), so VM cannot be set through that shape. The
+  // incoming CS and segment selectors are then real-mode values with
   // no descriptor behind them, so they load through seg_synth below. RF is
   // cleared by the switch.
-  uint32_t nf = krd32(v.base + 0x24);
+  uint32_t nf = tss16 ? krd16(v.base + 0x10) : krd32(v.base + 0x24);
   d.rf_load = 1;
   fl->word = (fl->word & ~(0x7fd7u | 0x30000u)) | (nf & (0x7fd7u | 0x20000u)) | 2;
   if (source == kTaskCall) fl->nt = 1;
@@ -953,7 +981,7 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   // do_task_switch; this is the one segment load the switch treats
   // specially). The new CPL is the CS RPL. A VM86 task's CS is a real-mode
   // selector: it is synthesized, never validated (SDM vol.3 17.3.1).
-  uint16_t new_cs = krd16(v.base + 0x4c);
+  uint16_t new_cs = krd16(v.base + (tss16 ? 0x24 : 0x4c));
   seg_view cv;
   if (fl->vm) {
     seg_synth(new_cs, &cv);
@@ -971,16 +999,25 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   }
   seg_commit(cs_i, new_cs, &cv);
 
-  for (int i = 0; i < 8; i++) s->r[i].e = krd32(v.base + 0x28 + 4 * i);
-  load_data(es_i, krd16(v.base + 0x48));
-  load_ss(krd16(v.base + 0x50));
-  load_data(ds_i, krd16(v.base + 0x54));
-  load_data(fs_i, krd16(v.base + 0x58));
-  load_data(gs_i, krd16(v.base + 0x5c));
+  // A 16-bit TSS image holds only the low half of each register: the high half
+  // survives the switch (QEMU switch_tss_ra loads 16 bits and keeps the rest).
+  // Its four selectors are ES/CS/SS/DS; FS and GS have no field there and load
+  // as null, which leaves them unusable (SDM fig 7-2).
+  if (tss16) {
+    for (int i = 0; i < 8; i++)
+      s->r[i].e = (s->r[i].e & 0xffff0000u) | krd16(v.base + 0x12 + 2 * i);
+  } else {
+    for (int i = 0; i < 8; i++) s->r[i].e = krd32(v.base + 0x28 + 4 * i);
+  }
+  load_data(es_i, krd16(v.base + (tss16 ? 0x22 : 0x48)));
+  load_ss(krd16(v.base + (tss16 ? 0x26 : 0x50)));
+  load_data(ds_i, krd16(v.base + (tss16 ? 0x28 : 0x54)));
+  load_data(fs_i, tss16 ? 0 : krd16(v.base + 0x58));
+  load_data(gs_i, tss16 ? 0 : krd16(v.base + 0x5c));
 
   s->cr0 |= 0x8;  // CR0.TS: the FPU state is per-task (SDM 7.2.1)
   if (has_ec) kpush32(ec);  // an exception's error code lands on the new stack
-  eip = krd32(v.base + 0x20);
+  eip = tss16 ? krd16(v.base + 0x0e) : krd32(v.base + 0x20);
 }
 
 // Protected-mode IRET (SDM vol.2 IRET Operation). Four shapes: a return
@@ -1227,11 +1264,10 @@ static void pm_far(uint16_t sel, uint32_t off, int is_call, uint32_t ret_eip) {
                      0, 0);
       return;
     }
-    if (ty == 9 || ty == 0xb) {  // a direct task switch through the TSS
+    if (ty == 9 || ty == 0xb || ty == 1 || ty == 3) {  // a direct task switch
       do_task_switch(sel, is_call ? kTaskCall : kTaskJmp, ret_eip, 0, 0);
       return;
     }
-    if (ty == 1 || ty == 3) Fatal("x86: 16-bit TSS not implemented (D15)");
     gp_fault(sel & ~3u);  // LDT descriptors and the rest never far-load
   }
   load_cs(sel);

@@ -159,14 +159,15 @@ fi
 # IDT task gates incl. error-code delivery), paging (identity map +
 # CR0.PG|WP on, not-present #PF ec=2 + CR2, read-only write #PF ec=3 under
 # CR0.WP=1, A/D bits on successful translations in both the 4KB walk and a
-# 4MB leaf, ring-3 user/supervisor #PF ec=7), and the LDT (LLDT/SLDT round
-# trip, TI=1 data loads with limit enforcement, cleared-LDTR lookup failure,
+# 4MB leaf, ring-3 user/supervisor #PF ec=7), the LDT (LLDT/SLDT round trip,
+# TI=1 data loads with limit enforcement, cleared-LDTR lookup failure,
 # VERR/VERW matrix, LAR/LSL values and failures, ARPL, task-switch LDTR load
-# from TSS +0x60).
-# Self-reports 25 "tN ok" lines then "pm-smoke done", exits status 11.
+# from TSS +0x60) and a 16-bit TSS (JMP switch through a type-1 descriptor:
+# IP/FLAGS/GPRs/selectors read and written at the fig 7-2 offsets).
+# Self-reports 26 "tN ok" lines then "pm-smoke done", exits status 11.
 #
-# Calibration: byte-identical to qemu-system-i386 -kernel on 23 of 25 tests
-# (pm_qemu3.txt). Two divergences, same root: this qemu build (10.2.92,
+# Calibration: byte-identical to qemu-system-i386 -kernel on 24 of 26 tests
+# (pm_qemu4.txt). Two divergences, same root: this qemu build (10.2.92,
 # v11.0.0-rc2-12119-gaa7f0eb8d8-dirty) does NOT execute data-segment limit
 # checks in TCG — t7 (ring-3 store past a GDT data segment limit) and t20
 # check 1 (store past an LDT segment limit; LSL confirms limit 0x1ff, the
@@ -175,7 +176,7 @@ fi
 # QEMU (same build) DOES emulate A/D bits (t17, t25) and computes LAR per the
 # 00FxFF00 mask with the undefined nibble zeroed (t22).
 # Pending: recalibrate t7/t20 against a clean QEMU build.
-expected_pm=25
+expected_pm=26
 out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$dir/pm/pm_smoke.elf" 2>&1)
 rc=$?
 n_ok=$(echo "$out" | grep -c ' ok$')
