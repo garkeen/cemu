@@ -14,23 +14,30 @@
  * test/x86/pm's t18 (ring-3 write to a U=0 page) and t16 (ring-0 write to
  * a W=0 page, CR0.WP=1) both missed it.
  *
- * Port notes (the removed axes are registered as AGENTS.md D31):
- *   - Removed: NX (PTE/PDE bit 63 + EFER.NXE) and PTE/PDE bit 51 -- this
- *     machine has neither 64-bit nor PAE paging; PKU (AD/WD/PKEY) and SMEP
- *     -- CPUID reports neither and CR4 has no such bits.
- *   - Removed: AC_ACCESS_TWICE and the three KVM-MMU ac_test_cases
+ * Port notes -- the axes this port keeps are exactly the ones a 32-bit non-PAE
+ * CPU has, and it enumerates them exhaustively: 12 bits, 4096 combinations, of
+ * which the 2305 legal ones run in about 0.4s (the image retires ~0.7M
+ * instructions). Nothing is sampled and nothing is skipped to save time -- an
+ * axis is dropped only because the hardware it describes does not exist here,
+ * so there is no behaviour to check:
+ *   - NX (PTE/PDE bit 63 + EFER.NXE) and PTE/PDE bit 51: this machine has
+ *     neither 64-bit nor PAE paging; CPUID reports no NX and EFER has no NXE.
+ *   - PKU (AD/WD/PKEY) and SMEP: CPUID reports neither, and CR4 has no bits
+ *     20/22 to hold them.
+ *   - AC_ACCESS_TWICE and the three KVM-MMU ac_test_cases
  *     (corrupt_hugepage_triger, check_pfec_on_prefetch_pte,
- *     check_smep_andnot_wp): they test the KVM MMU's own bookkeeping, not
- *     the CPU. check_large_pte_dirty_for_nowp is KEPT -- it is the CR0.WP=0
+ *     check_smep_andnot_wp): they test the KVM MMU's own bookkeeping, not the
+ *     CPU. check_large_pte_dirty_for_nowp is KEPT -- it is the CR0.WP=0
  *     read-only large-page write, i.e. the 4MB leaf branch.
- *   - The accessed/dirty axes are fixed set: the A/D *update* rule (a read
- *     sets A, a write sets D) is covered by test/x86/pm t17.
+ *   - pde.bit13 is KEPT and is the reserved-bit axis: this machine reports no
+ *     PSE-36, so PDE bits 21:13 stay reserved in a largepage entry and a set
+ *     one faults (SDM vol.3 fig 4-3, §4.3).
+ *   - The accessed/dirty axes are fixed set, so this test's tables always
+ *     arrive with A|D already on and never exercise the update itself; the
+ *     update rule is covered by test/x86/pm instead -- t17 for the 4KB walk
+ *     (PTE.A/D and PDE.A) and t25 for the 4MB leaf (PDE.A/D).
  *   - The walk is two levels (PDE, PTE); PSE stays an axis so the 4MB leaf
  *     is covered too.
- *   - The flag space is bounded to the axes a 32-bit non-PAE CPU has --
- *     11 bits, 2048 combinations. Upstream enumerates 27 bits and takes
- *     minutes even natively; cemu interprets at ~1.4 MIPS (200M
- *     instructions in 2m26s), so the full space is not runnable here.
  *   - Addresses: the test's virtual address is 0x40000000 (an unused PDE
  *     slot), the target page is at 8MB and the page-table pool at 16MB --
  *     all inside cemu's default 32MB RAM. Upstream's 0x123400000000 base,
@@ -87,6 +94,7 @@ enum {
     AC_PDE_WRITABLE_BIT,
     AC_PDE_USER_BIT,
     AC_PDE_PSE_BIT,
+    AC_PDE_BIT13_BIT,
 
     AC_ACCESS_USER_BIT,
     AC_ACCESS_WRITE_BIT,
@@ -105,6 +113,7 @@ enum {
 #define AC_PDE_WRITABLE_MASK (1 << AC_PDE_WRITABLE_BIT)
 #define AC_PDE_USER_MASK (1 << AC_PDE_USER_BIT)
 #define AC_PDE_PSE_MASK (1 << AC_PDE_PSE_BIT)
+#define AC_PDE_BIT13_MASK (1 << AC_PDE_BIT13_BIT)
 
 #define AC_ACCESS_USER_MASK (1 << AC_ACCESS_USER_BIT)
 #define AC_ACCESS_WRITE_MASK (1 << AC_ACCESS_WRITE_BIT)
@@ -179,6 +188,13 @@ static _Bool ac_test_legal(ac_test_t *at)
     if (F(AC_ACCESS_FETCH) && F(AC_ACCESS_WRITE))
         return false;
 
+    /*
+     * pde.bit13 checks handling of reserved bits in largepage PDEs. It is
+     * meaningless if there is a PTE (upstream wording).
+     */
+    if (!F(AC_PDE_PSE) && F(AC_PDE_BIT13))
+        return false;
+
     return true;
 }
 
@@ -246,11 +262,20 @@ static void ac_emulate_access(ac_test_t *at, unsigned flags)
     if (F(AC_ACCESS_WRITE))
         at->expected_error |= PFERR_WRITE_MASK;
 
-    pde_valid = F(AC_PDE_PRESENT);
+    /*
+     * A largepage PDE with a reserved bit set is unusable (upstream's
+     * pde_valid folds in bit51 and the NX/EFER pair too, which this machine
+     * does not have; ac_test_legal keeps bit13 out of the PTE walk, where it
+     * would mean nothing). The entry is present, so P stays set and the fault
+     * is an ordinary one -- the 386-class error code has no RSVD bit for
+     * upstream's PFERR_RESERVED_MASK to land in.
+     */
+    pde_valid = F(AC_PDE_PRESENT) && !F(AC_PDE_BIT13);
 
     if (!pde_valid) {
         at->expected_fault = 1;
-        at->expected_error &= ~PFERR_PRESENT_MASK;
+        if (!F(AC_PDE_PRESENT))
+            at->expected_error &= ~PFERR_PRESENT_MASK;
         goto fault;
     }
 
@@ -322,6 +347,9 @@ static void ac_test_setup_pte(ac_test_t *at, ac_pool_t *pool)
                 pte = at->phys & PT_PSE_BASE_ADDR_MASK;
                 pte |= PT_PAGE_SIZE_MASK;
             }
+            /* The reserved bit of a largepage PDE (SDM vol.3 fig 4-3). */
+            if (F(AC_PDE_BIT13))
+                pte |= 1UL << 13;
             if (F(AC_PDE_PRESENT))
                 pte |= PT_PRESENT_MASK;
             if (F(AC_PDE_WRITABLE))
@@ -351,7 +379,7 @@ static void ac_test_setup_pte(ac_test_t *at, ac_pool_t *pool)
 
 static const char *const kFlagNames[NR_AC_FLAGS] = {
     "pte.present", "pte.writable", "pte.user",
-    "pde.present", "pde.writable", "pde.user", "pde.pse",
+    "pde.present", "pde.writable", "pde.user", "pde.pse", "pde.bit13",
     "access.user", "access.write", "access.fetch",
     "cpu.cr0_wp",
 };

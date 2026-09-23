@@ -680,9 +680,11 @@ static uint64_t page_translate_as(uint64_t lin, int write, int user) {
   if ((pde & kPdePs) && (s->cr4 & kCr4Pse)) {
     // 4MB page (SDM vol.3 4.3): the PDE is the leaf — frame = bits 31:22,
     // offset = linear[21:0]; the permission check uses the PDE alone and A/D
-    // update in the PDE. (Bits 21:13 are reserved-0 in the SDM layout; the
-    // 386-class #PF error code carries no RSVD flag, so a set reserved bit
-    // surfaces as an ordinary fault.)
+    // update in the PDE. Bits 21:13 are reserved for a 4MB leaf (the frame
+    // stops at bit 22 and this machine reports no PSE-36), so a set one is
+    // rejected before the permission check; the error code is an ordinary
+    // present fault, the 386-class code having no RSVD flag (fig 4-3, §4.3).
+    if (pde & kPde4mReserved) pf_fault(lin, code | 1);
     // A user-mode write needs R/W whatever CR0.WP says (SDM vol.3 4.6 table
     // 4-2: WP governs supervisor writes only; at CPL=3 a write to a R/W=0 page
     // faults outright). Without this the write lands in the shared read-only

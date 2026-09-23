@@ -190,23 +190,31 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   图形 OS 显示前置就绪，衔接阶段 4。
 
 ### 阶段 4：设备全集与真实 OS（此后为纯设备/IO 阶段；进行中）
-- PC 设备模型全集（CGA、PS/2、PIC、PIT、UART、IDE、LAPIC、IOAPIC）。
+- PC 设备模型全集（CGA、PS/2、PIC、PIT、UART、IDE、LAPIC、IOAPIC）✅
+  —— 片 1–14 逐项落地。余下的规格缺口（IOAPIC 的 NMI/SMI/INIT/ExtINT 交付模式、
+  PIRQ 消费者、PM/ACPI、ATA LBA-48/multi-sector、RTC 周期与闹钟中断、软盘与 8237
+  DMA、i8042 命令集、CGA 图形模式与光栅时序）按 AGENTS.md 第十节台账在册。
 - bin 路线：multiboot 等价的入口契约，xv6 去掉 bootasm.S/bootmain.c
   编为 .bin；SeaBIOS 路线：官方 bios.bin 映射内存顶端，复位 F000:FFF0
   （bios.bin 已备料；跑通 SeaBIOS 本体属本阶段设备集成，不前置）。
 - 验收阶梯：xv6-x86 → Linux（参照 v86/tests/full 清单）；riscv 侧
   xv6-riscv（OpenSBI fw_jump 引导）并行验收。
-- D13 剩余（x87 FPU）在 Linux 用户态销账；D14（VM86）在 DOS/BIOS 兼容
-  路线需要时评估（Linux 不需要）。x87 ESC 已按"无 FPU
+- D13 剩余（x87 FPU）在 Linux 用户态销账。x87 ESC 已按"无 FPU
   处理器"语义落地（CR0.TS/EM 先 #NM，否则当 NOP），内核启动期 FPU 探测因此通过；
   仍缺 x87 算术与 RDTSC（0F 31 仍 #UD），前提是 CPUID 特性位如实为 0（EDX=0）。
-- **现状（2026-09-22）**：验收 1（xv6-x86）✅ SeaBIOS → IDE 盘 → xv6 到 shell，
-  与 QEMU 基线逐项一致。验收 2（Linux）进行中：引导链已通（ATAPI/El Torito → 内核保护
-  模式 → `VFS: Mounted root (ext2 filesystem)`），**卡在 `mount_root()` 之后、
-  `free_initmem()` 之前那一段**（`devtmpfs_mount` / MS_MOVE / chroot /
-  `async_synchronize_full`）——内核日志在 `VFS: Mounted root` 之后零输出、零告警，
-  未定案；设备侧（COM1 接收、ATAPI 命令集、IDE DMA、ELCR/电平 PIC、机器复位）已补齐。
-  验收 3（xv6-riscv）未开始（串口输入通道已就绪）。过程与证据见 progress.md。
+  D14（VM86）已在片 18 按 SDM vol.3 17.3 实现并销账（IRET 返回 VM86、
+  任务切换从 TSS 装载 VM、`seg_synth` 段合成、VM86 帧投递、TSS I/O 许可位图）。
+- **现状（2026-09-23）**：验收 1（xv6-x86）✅ SeaBIOS → IDE 盘 → xv6 到 shell，
+  与 QEMU 基线逐项一致。验收 2（Linux）✅ —— 片 15 把卡点钉到指令级：用户态访问
+  只查 U/S 不查 R/W（SDM vol.3 §4.6 表 4-2），写时复制失效，`/linuxrc` 死在
+  `_stdio_openlist_del_lock` 的 futex 上；补上用户态写保护后引导越过
+  `VFS: Mounted root (ext2 filesystem)`，控制台出提示符。片 16–19 随后补测试覆盖
+  （access 的 32 位移植：12 位适用空间的穷举 2305 条，含 largepage PDE 保留位轴）、
+  收紧判据（宿主失败码 2 与客机通过码撞码、kvm 用例
+  输出不再丢弃）、修 `taskswitch2`（SLDT/STR 内存目标恒 16 位）与 EFLAGS 保留位
+  不变式。回归：riscv64 136/0、x86 14/0。验收 3（xv6-riscv）未开始：素材
+  （xv6-riscv 镜像与 OpenSBI fw_jump）尚未取，串口输入通道已就绪。过程与证据见
+  progress.md。
 
 ### 阶段 5：cesdk（放后：真实 OS 跑通后再做 SDK）
 - 交付：crun 运行时（_start、putch→UART、halt→sifive_test）、klib、

@@ -131,23 +131,24 @@ fi
 # state save/restore round trip, busy-bit #GP, IRET nested-task return,
 # IDT task gates incl. error-code delivery), paging (identity map +
 # CR0.PG|WP on, not-present #PF ec=2 + CR2, read-only write #PF ec=3 under
-# CR0.WP=1, A/D bits on successful translations, ring-3 user/supervisor
-# #PF ec=7), and the LDT (LLDT/SLDT round trip, TI=1 data loads with limit
-# enforcement, cleared-LDTR lookup failure, VERR/VERW matrix, LAR/LSL values
-# and failures, ARPL, task-switch LDTR load from TSS +0x60).
-# Self-reports 24 "tN ok" lines then "pm-smoke done", exits status 11.
+# CR0.WP=1, A/D bits on successful translations in both the 4KB walk and a
+# 4MB leaf, ring-3 user/supervisor #PF ec=7), and the LDT (LLDT/SLDT round
+# trip, TI=1 data loads with limit enforcement, cleared-LDTR lookup failure,
+# VERR/VERW matrix, LAR/LSL values and failures, ARPL, task-switch LDTR load
+# from TSS +0x60).
+# Self-reports 25 "tN ok" lines then "pm-smoke done", exits status 11.
 #
-# Calibration: byte-identical to qemu-system-i386 -kernel on 22 of 24 tests
-# (pm_qemu2.txt). Two divergences, same root: this qemu build (10.2.92,
+# Calibration: byte-identical to qemu-system-i386 -kernel on 23 of 25 tests
+# (pm_qemu3.txt). Two divergences, same root: this qemu build (10.2.92,
 # v11.0.0-rc2-12119-gaa7f0eb8d8-dirty) does NOT execute data-segment limit
 # checks in TCG — t7 (ring-3 store past a GDT data segment limit) and t20
 # check 1 (store past an LDT segment limit; LSL confirms limit 0x1ff, the
 # store still lands) both let the store through where SDM vol.3 5.2.1/5.3
 # mandate #GP. cemu faults and the judge below counts on cemu's output.
-# QEMU (same build) DOES emulate A/D bits (t17) and computes LAR per the
+# QEMU (same build) DOES emulate A/D bits (t17, t25) and computes LAR per the
 # 00FxFF00 mask with the undefined nibble zeroed (t22).
 # Pending: recalibrate t7/t20 against a clean QEMU build.
-expected_pm=24
+expected_pm=25
 out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$dir/pm/pm_smoke.elf" 2>&1)
 rc=$?
 n_ok=$(echo "$out" | grep -c ' ok$')
@@ -169,7 +170,8 @@ fi
 # AGENTS.md D6), access the page-rights table (32-bit port of the upstream
 # 64-bit-only x86/access.c; it is the test that covers "a ring-3 write to a
 # user-readable read-only page faults whatever CR0.WP says" — the cell the
-# 片 15 fix restored, see AGENTS.md D31). The kvm exit convention:
+# 片 15 fix restored — plus, through its pde.bit13 axis, the reserved bits of
+# a largepage PDE). The kvm exit convention:
 # report_summary failures call exit(failures) — payload 0 only when every
 # test passed.
 #

@@ -51,10 +51,15 @@
 ;       there) and leaves the index alone
 ;   t24 a task switch loads the incoming TSS's LDT (+0x60): the task body
 ;       SLDTs it, reads through an LDT segment and VERRs an LDT code entry
+;   t25 A/D bits in a 4MB leaf: CR4.PSE on, PDE[0] becomes a largepage entry
+;       with A=D=0; a read sets PDE.A and leaves D clear, a write sets PDE.D
+;       (t17 covers the 4KB walk only; kut_access.c builds its tables with
+;       A|D already set, so no other test exercises this branch)
 ; The tN numbers are report slots, not run order: t9 runs after t3 and t10
 ; runs after t7 (both need the ring levels already established); t14-t18 run
-; at the end, inside the ring-0 resume flow after t13, and t19-t24 (the LDT
-; set) run right before them.
+; at the end, inside the ring-0 resume flow after t13, t19-t24 (the LDT set)
+; run right before them, and t25 runs last: it takes PDE[0] over as a 4MB
+; leaf, so it must come after every test that relies on the 4KB tables.
 ; Reports one "tN ok" line per test plus "pm-smoke done", then exits through
 ; the QEMU isa-debug-exit port 0xF4 with payload 5 (status = (5<<1)|1 = 11).
 ;
@@ -90,7 +95,7 @@
 %define IDT_LIN    0x2100      ; gates built at runtime, 0x2a slots
 %define TSS_LIN    0x2400      ; TSS image: ESP0 at +4, SS0 at +8
 %define TSS2_LIN   0x2600      ; second TSS image (filled at runtime)
-%define RES_LIN    0x2500      ; result bytes r1..r24 (1 = ok, RAM starts 0)
+%define RES_LIN    0x2500      ; result bytes r1..r25 (1 = ok, RAM starts 0)
 %define OBS_LIN    0x2700      ; handler observation slots (dwords)
 %define LDT_LIN    0x2a00      ; six LDT entries, filled at runtime
 %define PD_LIN     0x60000     ; page directory (4 KiB aligned)
@@ -990,6 +995,27 @@ pg_resume:
   mov ax, SEL_DATA0
   mov ds, ax
 
+  ; ---- t25: A/D bits in a 4MB leaf (SDM vol.3 4.3) --------------------------
+  mov eax, cr4
+  or eax, 0x10                 ; CR4.PSE: PS in a PDE means a 4MB leaf only
+  mov cr4, eax                 ; while PSE is set
+  mov dword [PD_LIN], 0x83     ; PDE[0] = largepage entry, frame 0, P|R/W|PS,
+  RELOAD_CR3                   ; A=D=0 so the update is observable
+  mov eax, [SCRATCH]           ; a read sets PDE.A and must leave D clear
+  mov edx, [PD_LIN]
+  and edx, 0x60
+  cmp edx, 0x20
+  jne t25_end
+  and dword [PD_LIN], ~0x60    ; clear both for the write pass (this store's
+  RELOAD_CR3                   ; own walk sets A, the store then clears it)
+  mov dword [SCRATCH], 0x4D42  ; a write sets PDE.D as well
+  mov edx, [PD_LIN]
+  and edx, 0x60
+  cmp edx, 0x60
+  jne t25_end
+  mov byte [RES_LIN + 24], 1
+t25_end:
+
   ; ---- report ---------------------------------------------------------------------
   xor ebx, ebx
 .loop:
@@ -1023,7 +1049,7 @@ pg_resume:
 .emit:
   call print
   inc ebx
-  cmp ebx, 24
+  cmp ebx, 25
   jl .loop
   mov esi, msg_done
   call print

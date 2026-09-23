@@ -3,6 +3,62 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 19：access 的 pde.bit13 轴 —— largepage PDE 保留位（D31 销账）（2026-09-23）
+
+起点是审 D31 那条台账（"flag 空间 27 位收到 11 位、2^27 不可跑"）。审下来发现两件事。
+
+**1. 那条台账的论证基础不成立**
+
+实测 access 全套 **0.24 秒**（466,981 条指令 / 1537 条用例 ≈ 304 条每例）。而"全空间不可跑"
+的依据是片 16 定边界时那 70,735,171 条指令 —— 那个数字来自 769 个假失败（片 17 修掉的
+空指针 UB），修掉后同一套降了 **151 倍**：收窄的运行时间前提，在定下它的第二天就没了。
+
+更要紧的是 16 个被删的 bit 分两类，台账把它们混成了一类：
+
+- **14 个本机不存在的轴**（NX×3、bit51×2、PKU×3、SMEP、PKE、access_twice）：32 位非 PAE
+  机器没有这些硬件，删掉是对的，不是"为省时间抽样"。说明移进 `kut_access.c` 的头注释
+  （源码即范围声明），不再挂账。
+- **pde.bit13**：这个轴**适用**本机 —— 4MB 页的 PDE 把帧放在 bits 31:22，bits 21:13 是保留
+  位，置位即 #PF（SDM vol.3 fig 4-3 把 bit 21 标 "RSvd"、20:13 标 "Reserved"，§4.3 要求
+  为 0；本机 CPUID 无 PSE-36，不会把 20:13 提升成地址位）。上游 access.c 的注释写明
+  "pde.bit13 checks handling of reserved bits in largepage PDEs"。而 cemu 的 4MB 叶分支
+  **根本没有保留位检查** —— 注释承认了这件事却没做检查，且移植时这个轴被静默删掉、没进
+  台账（按 §二 属未登记简化）。
+
+**2. 补上检查与轴**
+
+- `exec.c` 的 4MB 叶分支在权限检查**之前**加保留位检查（`kPde4mReserved`，定义在 x86.h，
+  出处 fig 4-3/§4.3）。386 类错误码没有 RSVD 位，故障就是普通的 present 故障（`code | 1`）
+  —— 这正是上游模型里 `PFERR_RESERVED_MASK` 在本机落不下去的原因。
+- `kut_access.c` 恢复 `AC_PDE_BIT13_BIT`：枚举、mask、`ac_test_legal`（无 PSE 时该轴无意义，
+  上游原话）、`ac_test_setup_pte` 置 bit13、`ac_emulate_access` 的 `pde_valid` 折入
+  `!F(AC_PDE_BIT13)`（present 时 P 位保持），并进 flag 名表。
+
+**验证**：access **2305 tests / 0 failures**（+768 条，0.42 s）。反证：抽掉 cemu 的检查后
+同一镜像 **256 failures**（直方图全部带 pde.present）⇒ 轴有牙。
+
+**3. 4MB 叶的 A/D 更新补覆盖（pm t25）**
+
+审 A/D 那条时发现替代理由只对一半：pm t17 覆盖 4KB 走表（PTE.A/D + PDE.A），而
+`check_large_pte_dirty_for_nowp` 只测"WP=0 写只读 4MB 叶不故障" —— `ac_test_setup_pte`
+无条件预置 A|D（331/342 行），所以 access 里 A/D **更新**从不发生（值本来就等于期望值）。
+4MB 叶的 `new_pde = pde | A | D` 写回因此零覆盖。新增 pm t25：CR4.PSE 置位、PDE[0] 换成
+A=D=0 的 4MB 叶，读一次要求 A=1/D=0，再清 A|D 写一次要求 D=1。失败分支跳自己的 `t25_end`
+（跳 `pg_done` 会反向重入 t25 死循环 —— 第一版踩到过）。反证：把 4MB 叶的 A/D 写回改成
+`new_pde = pde` 后 t25 BAD。
+
+**QEMU 标定**：`test/x86/pm/pm_qemu3.txt` —— 25 格里 23 格与 cemu 逐字节一致，两处分歧仍是
+t7/t20（QEMU TCG 不执行数据段限长检查，见 run.sh 注释）；t25 两侧都过。run.sh 的
+`expected_pm` 24 → 25。
+
+**顺带**：重建 kvm 镜像时发现 taskswitch/taskswitch2/cmpxchg8b/memory/debug 五份是 09-19
+入库的，二进制里嵌着**旧路径** `D:/code/c/TinyEMU/...` 的 `__FILE__` 串（片 16 把 KVM_UT
+改到 EMU/ 之后没重建）。一并重建，六份镜像现在路径一致。
+
+**回归**：riscv64 136/0、x86 14/0、depcheck ok、零告警。
+
+**台账**：D31 整行删除。
+
 ## 阶段 4 片 18：taskswitch2 转绿 —— SLDT/STR 的 32 位内存写 + VM86（D14 销账）（2026-09-23）
 
 起点是片 17 留下的唯一红格：`taskswitch2` 的 `FAIL: PF exeption` 与它撞上的

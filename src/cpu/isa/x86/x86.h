@@ -52,6 +52,13 @@ enum { kCr4Vme = 1u, kCr4Pvi = 2u, kCr4Tsd = 4u, kCr4De = 8u, kCr4Pse = 0x10u };
 enum { kPdeP = 1u, kPdeRw = 2u, kPdeUs = 4u, kPdeA = 0x20u, kPdeD = 0x40u,
        kPdePs = 0x80u };
 enum { kPteP = 1u, kPteRw = 2u, kPteUs = 4u, kPteA = 0x20u, kPteD = 0x40u };
+// A 4-MByte page keeps its frame in PDE bits 31:22, so bits 21:13 are
+// reserved and must be 0; a set one is a page fault (SDM vol.3 fig 4-3 labels
+// bit 21 "RSvd" and bits 20:13 "Reserved", and §4.3 requires them 0). PSE-36
+// — the feature that would promote bits 20:13 to address bits — is not in
+// this machine's CPUID, so they stay reserved. The 386-class #PF error code
+// carries no RSVD flag, so the fault reads as an ordinary present fault.
+enum { kPde4mReserved = 0x3fe000u };
 
 // One general-purpose bank cell, named exactly the way the architecture
 // names its parts: a 32-bit register, whose low half is the 16-bit one,
