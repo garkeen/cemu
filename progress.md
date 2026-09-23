@@ -3,6 +3,68 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 18：taskswitch2 转绿 —— SLDT/STR 的 32 位内存写 + VM86（D14 销账）（2026-09-23）
+
+起点是片 17 留下的唯一红格：`taskswitch2` 的 `FAIL: PF exeption` 与它撞上的
+`[fatal] VM86 not implemented (D14)`。
+
+**1. `FAIL: PF exeption` —— SLDT/STR 把内存目标写成 32 位（已修）**
+
+用 `CEMU_DEBUG=watch=0x44a9cc:4:rw` 盯现场那个错误码槽位（地址取自实测的
+`pt_regs`），31 条命中里最后两条说明一切：
+
+```
+| W | 0x401495 | 0f 00 4d fa | str | w 44a9ca:4 <- 20 |   ← print_current_tss_info 的 str
+| W | 0x4002e7 | ff 36       | push| r 44a9cc:4 -> 2  |   ← do_pf_tss 读错误码
+```
+
+`0f 00 4d fa` 是 `str -0x6(%ebp)`，目标是 `u16`，本该只写 2 字节（0x44a9ca/0x44a9cb），
+却写了 **4 字节**，把上方两字节（0x44a9cc/0x44a9cd，正是任务门投递压在中断栈上的
+#PF 错误码槽）清零 ⇒ 紧随的 `cmpl $0x2,(%esi)` 读到 0 ⇒ `test_count++` 不执行 ⇒ FAIL。
+（`printf` 时读到 2、`cmp` 时读到 0 的矛盾，就是这么来的；中间只隔了一个
+`print_current_tss_info`。）
+
+SDM vol.2 STR 原文："When the destination operand is a memory location, the segment
+selector is written to memory as a **16-bit quantity, regardless of operand size**"；
+SLDT 同款。32 位寄存器目标才零扩展。cemu 原来按 `d.w32` 分派，内存目标走了
+`set_rm32`。修：新增 `set_sys_sel`（内存恒 16 位；32 位寄存器零扩展）。顺带补齐同组
+的模式限制（SDM vol.2 各页）：SLDT/STR/VERR/VERW/LAR/LSL 在实模式与 VM86 下 #UD、
+LTR 在实模式 #UD 且 CPL≠0 时 #GP(0)（LTR 原来既无 PE 检查也无 CPL 检查）。
+
+**2. D14：VM86（已实现，台账该行删除）**
+
+按 SDM vol.3 17.3 与 vol.2 各指令页实现，参考 QEMU `do_interrupt_protected` 与
+tiny386 `set_seg`：
+
+- **进入**：IRET 在 CPL 0 且栈上 EFLAGS 映像 VM=1 时走 `RETURN-TO-VIRTUAL-8086-MODE`
+  （弹 ESP/SS/ES/DS/FS/GS 整套 VM86 帧，CPL→3）；任务切换从 TSS 映像装载 VM
+  （VM86 任务的 CS/SS 是实模式选择子，不查描述符）。
+- **段语义**：`seg_synth` —— 实模式与 VM86 都由选择子合成缓存（base = sel<<4、64K 限、
+  16 位、DPL 3；VM86 的 CPL 3 就从这里被 `cpl()` 读到），且不写描述符的 A 位。
+  段装载（load_data/load_ss/load_cs）、far 控制流（pm_far / RETF）在 VM86 走实模式那条路。
+- **投递**：从 VM86 进 ring 0 处理器时按 SDM 17.3.3 压 VM86 帧（GS FS DS ES 在
+  SS/ESP 之上，EFLAGS 映像保 VM=1），活动 EFLAGS 清 VM。
+- **VM86 内的 IRET**：IOPL=3 时只弹 EIP/CS/EFLAGS（IOPL/VM 不从映像装载），IOPL<3
+  时 #GP(0) 陷阱到监视器。
+- **POPF/PUSHF**：按 SDM vol.2 POPF/PUSHF Operation 的整张模式表实现（CPL 与 IOPL 决定
+  哪些位可改；VM86 无 VME 时 POPF 需 IOPL=3 否则 #GP，PUSHF 同；映像不携带 VM/RF）。
+- **I/O 特权**：`io_allowed` —— 实模式恒允许；CPL≤IOPL 允许；其余（含 VM86，该模式
+  忽略 IOPL）查 TSS 的 I/O 许可位图（SDM vol.2 IN/OUT Operation）。CLI/STI 的 IOPL
+  检查同批补上。
+
+**3. 回归打回的两格暴露了一个潜伏 bug（已修）**
+
+POPF 按 SDM 改成"保留位不受映像影响"后，`realmode` 的 `DAS` 与 `sahf` 转红 —— 它们用
+`pushw <flags>; popfw` 装载初始标志，再比对结果标志的低字节。根因不是 POPF：是 cemu
+的 EFLAGS **保留位（bit 3/5/15）会被历史镜像写成 1**（旧 POPF/IRET 把映像的保留位原样
+装进寄存器），而硬件上它们恒读 0（SDM vol.1 3.4.3 表 3-1）。修法落在不变式上而非测试
+上：`step.c` 的单点提交处把 bit 1 置 1、bit 3/5/15 清 0（`kEflagsOne`/`kEflagsZero`，
+定义在 x86.h），任何指令装载的映像都无法破坏它。
+
+**验证**：`taskswitch2` **11 PASS / 0 FAIL**（含 `PF exeption` 与 `VM86`）；
+`test/run.sh`：riscv64 **136 / 0**、x86 **14 / 0**（x86 从 13 格增到 14 —— taskswitch2
+由红转绿）；`cmake --build build --target check` 依赖边 ok。
+
 ## 阶段 4 片 17：测试判据收紧 + 一批被掩盖的真失败（2026-09-23）
 
 起点是 `access` 首跑 769 个假失败（见片 16 末尾），顺着往下挖，暴露出**判据本身太弱**

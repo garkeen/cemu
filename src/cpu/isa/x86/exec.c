@@ -159,26 +159,6 @@ static void IoBpHit(uint16_t port) {
   }
 }
 
-// The port-I/O funnel: every IN/OUT runs the I/O breakpoint check after the
-// access, and — like the memory funnel — reports the device hit to the debug
-// hub's bus category (the winning region's name; the unclaimed region has one
-// too, so an accidental touch of a port nobody implements is visible).
-static uint32_t io_in(uint16_t port, int size) {
-  BusRegion* r;
-  uint32_t v = (uint32_t)BusRead(cpu->io, port, size);
-  if (DebugOn(kDbgBus) && BusProbe(cpu->io, port, size, &r) == 0)
-    DebugBus(fr, r->ops->name, port, size, 1, v);
-  IoBpHit(port);
-  return v;
-}
-static void io_out(uint16_t port, int size, uint32_t v) {
-  BusRegion* r;
-  if (DebugOn(kDbgBus) && BusProbe(cpu->io, port, size, &r) == 0)
-    DebugBus(fr, r->ops->name, port, size, 0, v);
-  BusWrite(cpu->io, port, size, v);
-  IoBpHit(port);
-}
-
 // DR7.GD (SDM vol.3 17.2.4): any access to the debug registers raises #DB
 // with DR6.BD, and GD self-clears so the handler can read DR6/DR7.
 static void dr_guard(void) {
@@ -462,6 +442,19 @@ static void set_rm32(uint32_t v) {
   }
 }
 
+// The destination of SLDT/STR (SDM vol.2 both): a memory operand is always
+// written as a 16-bit quantity regardless of operand size, and a 32-bit
+// register destination receives the selector zero-extended (the upper 16 bits
+// are cleared). Storing 32 bits to memory would clobber the two bytes above
+// the destination — the interrupt stack's error-code slot, in the kvm
+// taskswitch2 #PF case.
+static void set_sys_sel(uint16_t sel) {
+  if (d.is_mem || !d.w32)
+    set_rm16(sel);
+  else
+    set_rm32(sel);
+}
+
 // The 8/16/32 rm access at the size the case wants, in one name each arm.
 #define RM8() rm8()
 #define SET_RM8(v) set_rm8(v)
@@ -550,21 +543,15 @@ typedef struct seg_view {
   uint8_t dbit;
 } seg_view;
 
-// Real mode synthesizes sel<<4 with a 64K limit (SDM vol.3 3.4.4); protected
-// mode parses the table entry. No checks here — the loaders validate before
-// committing, in the SDM vol.3 5.3 pseudocode order (the checks live in the
-// SDM, not in tiny386, whose limit/type checks are partial). TI=1 reads the
-// LDT through its descriptor cache (SDM vol.3 2.4.4): a null LDTR caches
-// limit 0, so the caller's table-limit check fails with the selector and no
-// special case exists (tiny386 read_desc, v86 lookup_segment_selector).
+// A descriptor-table entry, as the system paths read it (TSS, LDT, gate
+// targets, task switches) and as a protected-mode segment load reads it. No
+// checks here — the loaders validate before committing, in the SDM vol.3 5.3
+// pseudocode order (the checks live in the SDM, not in tiny386, whose
+// limit/type checks are partial). TI=1 reads the LDT through its descriptor
+// cache (SDM vol.3 2.4.4): a null LDTR caches limit 0, so the caller's
+// table-limit check fails with the selector and no special case exists
+// (tiny386 read_desc, v86 lookup_segment_selector).
 static void desc_parse(uint16_t sel, seg_view* v) {
-  if (!(s->cr0 & 1)) {
-    v->base = (uint64_t)sel << 4;
-    v->limit = 0xffff;
-    v->ar = 0x93;  // present, DPL0, data, read-write
-    v->dbit = 0;
-    return;
-  }
   // The GDT and LDT bases are linear addresses (SDM vol.3 3.5.1), so an entry
   // comes through the paging unit: a kernel whose tables sit above the identity
   // map (xv6's GDT and IDT live at 0x8011xxxx) has no other way to reach them —
@@ -580,6 +567,19 @@ static void desc_parse(uint16_t sel, seg_view* v) {
   v->dbit = (uint8_t)((desc >> 54) & 1);
 }
 
+// Real mode and virtual-8086 mode synthesize the descriptor cache from the
+// selector (SDM vol.3 3.4.4 and 17.3.1): base = selector*16, 64K limit, 16-bit,
+// and no table is consulted. VM86's segments all carry DPL 3 — that is where
+// cpl() reads the mode's CPL 3 from — and there is no descriptor whose A bit
+// could be written back.
+static void seg_synth(uint16_t sel, seg_view* v) {
+  v->base = (uint64_t)sel << 4;
+  v->limit = 0xffff;
+  v->hi = 0;
+  v->ar = fl->vm ? 0xf3 : 0x93;  // present, DPL 3 (VM86) / DPL 0 (real), data RW
+  v->dbit = 0;
+}
+
 // The limit of the descriptor table a selector names (SDM vol.3 2.4/3.5).
 static uint32_t table_limit(uint16_t sel) { return sel & 4 ? s->ldtr_limit : s->gdtr_limit; }
 
@@ -588,20 +588,67 @@ static uint32_t table_limit(uint16_t sel) { return sel & 4 ? s->ldtr_limit : s->
 // is loaded from it) — in whichever table the selector names. Both halves
 // are processor accesses: IRET commits the ring-3 CS first and writes that
 // descriptor's A bit back afterwards, which is only legal because the write
-// is a supervisor access to a U=0 GDT page.
+// is a supervisor access to a U=0 GDT page. Real mode and VM86 name no
+// descriptor, so there is nothing to mark.
 static void seg_commit(int seg, uint16_t sel, const seg_view* v) {
   s->sreg[seg] = sel;
   s->base[seg] = v->base;
   s->limit[seg] = v->limit;
   s->ar[seg] = v->ar;
   s->dbit[seg] = v->dbit;
-  if ((s->cr0 & 1) && (sel & 0xfffc) && !(v->ar & 1))
+  if ((s->cr0 & 1) && !fl->vm && (sel & 0xfffc) && !(v->ar & 1))
     kbus_store((sel & 4 ? s->ldtr_base : s->gdtr) + (uint64_t)(sel >> 3) * 8 + 5, 1,
                (uint8_t)(v->ar | 1));
 }
 
 // CPL is the CS descriptor's DPL (SDM vol.1 3.4.5); the cache is the source.
+// VM86's segments are synthesized with DPL 3, so the mode's CPL 3 comes from
+// the same place every other mode's does.
 static int cpl(void) { return (s->ar[cs_i] >> 5) & 3; }
+
+// I/O privilege (SDM vol.2 IN/OUT Operation): real mode always allows, and so
+// does protected mode at CPL <= IOPL. Everything else — CPL above IOPL, and
+// any VM86 access, where the mode ignores IOPL — is allowed only where the
+// TSS's I/O permission bitmap holds a 0 bit for every byte of the port range.
+// The bitmap starts at the TSS's iomap_base (TSS +0x66) with one bit per port;
+// a bitmap that does not reach the port, or a TR that holds no 32-bit TSS,
+// denies.
+static int io_allowed(uint16_t port, int size) {
+  if (!(s->cr0 & 1)) return 1;
+  if (!fl->vm && cpl() <= fl->iopl) return 1;
+  uint8_t ty = s->tr_ar & 0xf;
+  if (!(s->tr_ar & 0x80) || (ty != 9 && ty != 0xb)) return 0;
+  uint32_t iobase = krd16(s->tr_base + 0x66);
+  for (int i = 0; i < size; i++) {
+    uint32_t off = iobase + ((uint32_t)(port + i) >> 3);
+    if (off > s->tr_limit) return 0;
+    if (krd8(s->tr_base + off) & (1u << ((port + i) & 7))) return 0;
+  }
+  return 1;
+}
+
+// The port-I/O funnel: every IN/OUT runs the privilege check, then the I/O
+// breakpoint check after the access, and — like the memory funnel — reports the
+// device hit to the debug hub's bus category (the winning region's name; the
+// unclaimed region has one too, so an accidental touch of a port nobody
+// implements is visible).
+static uint32_t io_in(uint16_t port, int size) {
+  if (!io_allowed(port, size)) gp_fault(0);
+  BusRegion* r;
+  uint32_t v = (uint32_t)BusRead(cpu->io, port, size);
+  if (DebugOn(kDbgBus) && BusProbe(cpu->io, port, size, &r) == 0)
+    DebugBus(fr, r->ops->name, port, size, 1, v);
+  IoBpHit(port);
+  return v;
+}
+static void io_out(uint16_t port, int size, uint32_t v) {
+  if (!io_allowed(port, size)) gp_fault(0);
+  BusRegion* r;
+  if (DebugOn(kDbgBus) && BusProbe(cpu->io, port, size, &r) == 0)
+    DebugBus(fr, r->ops->name, port, size, 0, v);
+  BusWrite(cpu->io, port, size, v);
+  IoBpHit(port);
+}
 
 // The two-level 4KB page walk (SDM vol.3 4.3, 4.6, 4.7). CR3 names the page
 // directory; each level's R/W and U/S combine with the next (a page is
@@ -670,8 +717,8 @@ static uint64_t page_translate_as(uint64_t lin, int write, int user) {
 // order.
 static void load_data(int seg, uint16_t sel) {
   seg_view v;
-  if (!(s->cr0 & 1)) {
-    desc_parse(sel, &v);
+  if (!(s->cr0 & 1) || fl->vm) {  // real mode and VM86 load unchecked (SDM 17.3.1)
+    seg_synth(sel, &v);
     seg_commit(seg, sel, &v);
     return;
   }
@@ -695,8 +742,8 @@ static void load_data(int seg, uint16_t sel) {
 // #SS; the privilege faults are #GP.
 static void load_ss(uint16_t sel) {
   seg_view v;
-  if (!(s->cr0 & 1)) {
-    desc_parse(sel, &v);
+  if (!(s->cr0 & 1) || fl->vm) {  // real mode and VM86 load unchecked (SDM 17.3.1)
+    seg_synth(sel, &v);
     seg_commit(ss_i, sel, &v);
     return;
   }
@@ -716,8 +763,8 @@ static void load_ss(uint16_t sel) {
 // forms.
 static void load_cs(uint16_t sel) {
   seg_view v;
-  if (!(s->cr0 & 1)) {
-    desc_parse(sel, &v);
+  if (!(s->cr0 & 1) || fl->vm) {  // real mode and VM86 load unchecked (SDM 17.3.1)
+    seg_synth(sel, &v);
     seg_commit(cs_i, sel, &v);
     return;
   }
@@ -890,27 +937,36 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   // It is not written back to the outgoing TSS (tiny386 and v86 agree).
   load_ldtr(krd16(v.base + 0x60), 1);
 
+  // The TSS image supplies EFLAGS (SDM vol.3 7.2.1): the arithmetic and system
+  // flags, IOPL and NT — and VM, which is how a task switch enters virtual-8086
+  // mode. The incoming CS and segment selectors are then real-mode values with
+  // no descriptor behind them, so they load through seg_synth below. RF is
+  // cleared by the switch.
   uint32_t nf = krd32(v.base + 0x24);
-  if (nf & 0x20000) Fatal("x86: VM86 not implemented (D14)");
-  d.rf_load = 1;  // the TSS image's RF is the authoritative one (SDM 7.2.1)
-  fl->word = (fl->word & ~(0x7fd7u | 0x30000u)) | (nf & 0x7fd7u) | 2;
+  d.rf_load = 1;
+  fl->word = (fl->word & ~(0x7fd7u | 0x30000u)) | (nf & (0x7fd7u | 0x20000u)) | 2;
   if (source == kTaskCall) fl->nt = 1;
 
   // The incoming CS: every defect faults #TS, not-present #NP (v86
   // do_task_switch; this is the one segment load the switch treats
-  // specially). The new CPL is the CS RPL.
+  // specially). The new CPL is the CS RPL. A VM86 task's CS is a real-mode
+  // selector: it is synthesized, never validated (SDM vol.3 17.3.1).
   uint16_t new_cs = krd16(v.base + 0x4c);
-  if ((new_cs & 0xfffc) == 0) ts_fault(0);
-  if ((uint32_t)(new_cs >> 3) * 8 + 7 > table_limit(new_cs)) ts_fault(new_cs & ~3u);
   seg_view cv;
-  desc_parse(new_cs, &cv);
-  if ((cv.ar & 0x18) != 0x18) ts_fault(new_cs & ~3u);  // executable
-  int conf = cv.ar & 4;
-  int nrpl = new_cs & 3;
-  if (conf ? (((cv.ar >> 5) & 3) > nrpl) : (((cv.ar >> 5) & 3) != nrpl))
-    ts_fault(new_cs & ~3u);
-  if (!(cv.ar & 0x80)) np_fault(new_cs & ~3u);
-  if (conf) cv.ar = (uint8_t)((cv.ar & ~0x60u) | (nrpl << 5));
+  if (fl->vm) {
+    seg_synth(new_cs, &cv);
+  } else {
+    if ((new_cs & 0xfffc) == 0) ts_fault(0);
+    if ((uint32_t)(new_cs >> 3) * 8 + 7 > table_limit(new_cs)) ts_fault(new_cs & ~3u);
+    desc_parse(new_cs, &cv);
+    if ((cv.ar & 0x18) != 0x18) ts_fault(new_cs & ~3u);  // executable
+    int conf = cv.ar & 4;
+    int nrpl = new_cs & 3;
+    if (conf ? (((cv.ar >> 5) & 3) > nrpl) : (((cv.ar >> 5) & 3) != nrpl))
+      ts_fault(new_cs & ~3u);
+    if (!(cv.ar & 0x80)) np_fault(new_cs & ~3u);
+    if (conf) cv.ar = (uint8_t)((cv.ar & ~0x60u) | (nrpl << 5));
+  }
   seg_commit(cs_i, new_cs, &cv);
 
   for (int i = 0; i < 8; i++) s->r[i].e = krd32(v.base + 0x28 + 4 * i);
@@ -925,13 +981,41 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   eip = krd32(v.base + 0x20);
 }
 
-// Protected-mode IRET (SDM vol.2 IRET Operation): a same-privilege return
-// pops EIP/CS/EFLAGS; an outward return (CS RPL > CPL) additionally pops
-// ESP/SS, and only outward or CPL-0 returns may reload IOPL/NT. NT=1 is the
-// nested-task return: the current TSS's back-link names the interrupted
-// task, and no pops happen.
+// Protected-mode IRET (SDM vol.2 IRET Operation). Four shapes: a return
+// within virtual-8086 mode (VM86 stays VM86 and pops only EIP/CS/EFLAGS), a
+// nested-task return (NT=1: the current TSS's back-link names the interrupted
+// task and no pops happen), a return *to* virtual-8086 mode (the EFLAGS image
+// has VM=1 and CPL=0), and the protected-mode return — a same-privilege return
+// pops EIP/CS/EFLAGS, an outward return (CS RPL > CPL) additionally pops
+// ESP/SS, and only outward or CPL-0 returns may reload IOPL/NT.
 static void pm_iret(void) {
   int w = d.w32 ? 4 : 2;
+
+  // RETURN-FROM-VIRTUAL-8086-MODE: the processor is in VM86 and stays there, so
+  // only EIP, CS and EFLAGS come off the stack. IOPL and VM never load, and the
+  // instruction needs IOPL=3 — otherwise it traps to the virtual-8086 monitor
+  // with #GP(0). The new CS is a VM86 segment, checked only against the 64K
+  // limit its own base implies.
+  if (fl->vm) {
+    if (fl->iopl != 3) gp_fault(0);
+    uint32_t new_eip = stack_peek(w, 0);
+    uint16_t sel = (uint16_t)stack_peek(w, w);
+    uint32_t flv = stack_peek(w, 2 * (uint32_t)w);
+    if (!d.w32) flv &= 0xffff;
+    seg_view cv;
+    seg_synth(sel, &cv);
+    if (new_eip > cv.limit) gp_fault(0);
+    seg_commit(cs_i, sel, &cv);
+    // CF..OF, TF/IF/DF, NT and RF load; IOPL and VM keep their live values.
+    uint32_t mask = d.w32 ? 0x14fd7u : 0x4fd7u;
+    d.rf_load = 1;
+    fl->word = (fl->word & ~mask) | (flv & mask) | 2;
+    esp = s->dbit[ss_i] ? esp + (uint32_t)w * 3
+                        : (esp & 0xffff0000u) | (uint16_t)(esp + (uint32_t)w * 3);
+    eip = new_eip;
+    return;
+  }
+
   if (fl->nt) {
     uint8_t ty = s->tr_ar & 0xf;
     if (!(s->tr_ar & 0x80) || (ty != 1 && ty != 3 && ty != 9 && ty != 0xb))
@@ -948,6 +1032,41 @@ static void pm_iret(void) {
   uint16_t sel = (uint16_t)stack_peek(w, w);
   uint32_t flv = stack_peek(w, 2 * (uint32_t)w);
   if (!d.w32) flv &= 0xffff;
+
+  // RETURN-TO-VIRTUAL-8086-MODE: the interrupted procedure was a VM86 one and
+  // this is a CPL-0 return, so the frame is the VM86 one a delivery pushed —
+  // ESP, SS, ES, DS, FS and GS above the flags image — and the whole EFLAGS
+  // image loads (VM=1 among it, which is what puts the processor back in VM86).
+  // CPL becomes 3 with the new CS (SDM vol.2 IRET Operation).
+  if ((flv & 0x20000u) && cpl() == 0) {
+    uint32_t new_esp = stack_peek(w, 3 * (uint32_t)w);
+    uint16_t new_ss = (uint16_t)stack_peek(w, 4 * (uint32_t)w);
+    uint16_t new_es = (uint16_t)stack_peek(w, 5 * (uint32_t)w);
+    uint16_t new_ds = (uint16_t)stack_peek(w, 6 * (uint32_t)w);
+    uint16_t new_fs = (uint16_t)stack_peek(w, 7 * (uint32_t)w);
+    uint16_t new_gs = (uint16_t)stack_peek(w, 8 * (uint32_t)w);
+    d.rf_load = 1;
+    fl->word = flv | 2;  // VM=1: seg_synth below caches DPL 3 from it
+    seg_view cv;
+    seg_synth(sel, &cv);
+    if (new_eip > cv.limit) gp_fault(0);
+    seg_commit(cs_i, sel, &cv);
+    seg_view sv;
+    seg_synth(new_ss, &sv);
+    seg_commit(ss_i, new_ss, &sv);
+    seg_synth(new_es, &sv);
+    seg_commit(es_i, new_es, &sv);
+    seg_synth(new_ds, &sv);
+    seg_commit(ds_i, new_ds, &sv);
+    seg_synth(new_fs, &sv);
+    seg_commit(fs_i, new_fs, &sv);
+    seg_synth(new_gs, &sv);
+    seg_commit(gs_i, new_gs, &sv);
+    esp = new_esp;
+    eip = new_eip;
+    return;
+  }
+
   int newpl = sel & 3;
   if (newpl < cpl()) gp_fault(sel & ~3u);  // returns inward don't exist
   int outer = newpl > cpl();
@@ -963,9 +1082,10 @@ static void pm_iret(void) {
   ret_cs_check(sel, newpl, &cv);
   if (outer) ret_ss_check(new_ss, newpl, &sv);
 
-  // The flags image: CF..OF/TF/IF/DF always; IOPL and NT only on an outward
-  // or CPL-0 return (SDM vol.2 IRET). RF/VM never load (D14).
-  // RF loads with the system-flag set (SDM IRET Operation); VM never does.
+  // The flags image: CF..OF/TF/IF/DF always, plus IOPL, NT and RF on an
+  // outward or CPL-0 return (SDM vol.2 IRET Operation). A protected-mode
+  // return always leaves VM86, so VM is cleared and never loaded here — a VM=1
+  // image was handled by RETURN-TO-VIRTUAL-8086-MODE above.
   uint32_t mask = (outer || cpl() == 0 ? 0x17fd7u : 0x0fd7u);
   d.rf_load = 1;
   fl->word = (fl->word & ~(mask | 0x30000u)) | (flv & mask) | 2;
@@ -1074,7 +1194,9 @@ static void call_gate(uint16_t sel, uint64_t desc, int is_call, uint32_t ret_eip
 // does (v86 far_jump).
 static void pm_far(uint16_t sel, uint32_t off, int is_call, uint32_t ret_eip) {
   uint16_t ret_cs = s->sreg[cs_i];
-  if (!(s->cr0 & 1)) {
+  // Real mode and VM86 take the far pointer as-is: CS is a segment number, not
+  // a descriptor (SDM vol.3 17.3.1; tiny386 JMPFAR/CALLFAR take the same arm).
+  if (!(s->cr0 & 1) || fl->vm) {
     load_cs(sel);
     if (is_call) {
       push_w(ret_cs);
@@ -1180,7 +1302,7 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
     fl->if_ = 0;
     fl->tf = 0;
     seg_view v;
-    desc_parse((uint16_t)seg, &v);
+    seg_synth((uint16_t)seg, &v);
     seg_commit(cs_i, (uint16_t)seg, &v);
     eip = off;
     d.delivered = 1;  // the TF trap postpones to the handler's first insn
@@ -1248,6 +1370,17 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
 
   if (gate16) {
     if (switched) {
+      // A delivery out of virtual-8086 mode pushes the mode's own frame (SDM
+      // vol.3 17.3.3; QEMU do_interrupt_protected): GS, FS, DS and ES above the
+      // usual SS/ESP, so IRET's RETURN-TO-VIRTUAL-8086-MODE can restore the
+      // whole context. The EFLAGS image below keeps VM=1 — that is how the
+      // return knows where it is going.
+      if (fl->vm) {
+        kpush16(s->sreg[gs_i]);
+        kpush16(s->sreg[fs_i]);
+        kpush16(s->sreg[ds_i]);
+        kpush16(s->sreg[es_i]);
+      }
       kpush16((uint16_t)old_ss);
       kpush16((uint16_t)old_esp);
     }
@@ -1260,6 +1393,12 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
     if (vec_has_ec(vec) && origin == kIntException) kpush16((uint16_t)ec);
   } else {
     if (switched) {
+      if (fl->vm) {
+        kpush32(s->sreg[gs_i]);
+        kpush32(s->sreg[fs_i]);
+        kpush32(s->sreg[ds_i]);
+        kpush32(s->sreg[es_i]);
+      }
       kpush32(old_ss);
       kpush32(old_esp);
     }
@@ -1270,6 +1409,10 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
   }
   fl->tf = 0;
   fl->nt = 0;
+  // The handler is a protected-mode one: the delivery leaves VM86 (the image
+  // above keeps VM=1 for the return) — SDM vol.3 17.3.3, QEMU clears
+  // TF|VM|RF|NT here.
+  fl->vm = 0;
   if (gt == 6 || gt == 0xe) fl->if_ = 0;  // interrupt gates clear IF
   eip = gate16 ? (off & 0xffff) : off;
   d.delivered = 1;  // the TF trap postpones to the handler's first insn
@@ -1983,19 +2126,16 @@ static void run_op2(uint8_t op2) {
     case 0x00: {  // 0f 00 group: sldt/str/lldt/ltr/verr/verw (reg field)
       modrm();
       switch (d.reg) {
-        case 0:  // sldt: the visible LDTR (SDM vol.2 SLDT; unprivileged)
+        case 0:  // sldt: the visible LDTR (SDM vol.2 SLDT; unprivileged, but
+                 // the instruction is not recognized outside protected mode)
           fr->rec.mnemonic = "sldt";
-          if (d.w32)
-            set_rm32(s->ldtr);
-          else
-            set_rm16(s->ldtr);
+          if (!(s->cr0 & 1) || fl->vm) ud();
+          set_sys_sel(s->ldtr);
           break;
-        case 1:  // str: the visible TR selector
+        case 1:  // str: the visible TR selector (SDM vol.2 STR; same mode rule)
           fr->rec.mnemonic = "str";
-          if (d.w32)
-            set_rm32(s->tr);
-          else
-            set_rm16(s->tr);
+          if (!(s->cr0 & 1) || fl->vm) ud();
+          set_sys_sel(s->tr);
           break;
         case 2: {  // lldt (privileged: SDM vol.2)
           fr->rec.mnemonic = "lldt";
@@ -2005,8 +2145,11 @@ static void run_op2(uint8_t op2) {
           load_ldtr(sel, 0);
           break;
         }
-        case 3: {  // ltr: a system descriptor for an available TSS
+        case 3: {  // ltr: a system descriptor for an available TSS (SDM vol.2
+                   // LTR; privileged, and not recognized outside protected mode)
           fr->rec.mnemonic = "ltr";
+          if (!(s->cr0 & 1)) ud();
+          if (cpl() != 0) gp_fault(0);
           uint16_t sel = rm16();
           if ((sel & 0xfffc) == 0) gp_fault(0);
           if (sel & 4) gp_fault(sel & ~3u);  // TSS descriptors are GDT-only (SDM 7.2)
@@ -2028,7 +2171,7 @@ static void run_op2(uint8_t op2) {
         case 4:
         case 5: {  // verr/verw: ZF answers "readable/writable at this CPL"
           fr->rec.mnemonic = d.reg == 4 ? "verr" : "verw";
-          if (!(s->cr0 & 1)) ud();  // PM-only (SDM vol.2)
+          if (!(s->cr0 & 1) || fl->vm) ud();  // PM-only (SDM vol.2)
           // A lookup defect (null selector, outside table) only clears ZF —
           // the SDM's exception list has no selector faults for VERR/VERW
           // (v86's verr/verw agree). VERR: any readable segment; VERW:
@@ -2060,7 +2203,7 @@ static void run_op2(uint8_t op2) {
     case 0x02:
     case 0x03: {  // lar/lsl: the descriptor's rights byte / effective limit
       fr->rec.mnemonic = op2 == 0x02 ? "lar" : "lsl";
-      if (!(s->cr0 & 1)) ud();  // PM-only (SDM vol.2)
+      if (!(s->cr0 & 1) || fl->vm) ud();  // PM-only (SDM vol.2)
       modrm();
       uint16_t sel = rm16();
       seg_view v;
@@ -3694,17 +3837,27 @@ void run_op(uint8_t op) {
       break;  // wait: no x87 in this machine
     case 0x9c:
       fr->rec.mnemonic = "pushf";
-      push_w(fl->word | 2);
+      // VM86 without VME may push the flags only at IOPL=3 (SDM vol.2 PUSHF
+      // Operation); the image never carries VM or RF.
+      if (fl->vm && fl->iopl != 3) gp_fault(0);
+      push_w((fl->word & ~0x30000u) | 2);
       break;      // pushf
-    case 0x9d: {  // popf: bit 1 stays set; VM never loads, RF does (SDM
-                  // EFLAGS.RF: the #DB handler re-arms RF through its image)
+    case 0x9d: {  // popf: which bits the image may change depends on the mode
+                  // (SDM vol.2 POPF Operation, table 4-16). VM never loads and
+                  // RF is 0 after POPF; a 16-bit pop touches only the low half.
       fr->rec.mnemonic = "popf";
       uint32_t v = pop_w();
-      d.rf_load = 1;
-      if (d.w32)
-        fl->word = (v & ~(0x20000u)) | 2;
-      else
-        fl->word = (fl->word & 0xffff0000u) | (v | 2);
+      // IOPL loads only at CPL 0 (real mode counts as CPL 0) and IF only at
+      // CPL <= IOPL; VM86 without VME needs IOPL=3 and keeps IOPL put.
+      uint32_t mask = 0x7fd7u;  // CF PF AF ZF SF TF IF DF OF IOPL NT
+      if (fl->vm) {
+        if (fl->iopl != 3) gp_fault(0);
+        mask = 0x4fd7u;
+      } else if ((s->cr0 & 1) && cpl() != 0) {
+        mask = cpl() > fl->iopl ? 0x4dd7u : 0x4fd7u;
+      }
+      if (!d.w32) mask &= 0xffffu;
+      fl->word = (fl->word & ~(mask | 0x10000u)) | (v & mask) | 2;
       break;
     }
     case 0x9e: {  // sahf: AH -> SF ZF AF PF CF (SDM)
@@ -3915,7 +4068,7 @@ void run_op(uint8_t op) {
     case 0xca: {  // retf imm16
       fr->rec.mnemonic = "retf";
       uint32_t n = imm16();
-      if (s->cr0 & 1) {
+      if ((s->cr0 & 1) && !fl->vm) {  // VM86 pops the real-mode frame
         pm_ret(n);
         break;
       }
@@ -3929,7 +4082,7 @@ void run_op(uint8_t op) {
     }
     case 0xcb:
       fr->rec.mnemonic = "retf";
-      if (s->cr0 & 1) {
+      if ((s->cr0 & 1) && !fl->vm) {  // VM86 pops the real-mode frame
         pm_ret(0);
         break;
       }
@@ -3968,7 +4121,7 @@ void run_op(uint8_t op) {
       uint16_t sel = (uint16_t)pop_w();
       uint32_t flv = pop_w();
       seg_view v;
-      desc_parse(sel, &v);
+      seg_synth(sel, &v);
       seg_commit(cs_i, sel, &v);
       eip = new_eip;
       d.rf_load = 1;
@@ -4168,10 +4321,14 @@ void run_op(uint8_t op) {
       break;  // stc
     case 0xfa:
       fr->rec.mnemonic = "cli";
+      // CLI needs CPL <= IOPL, and in VM86 (no VME on this machine) IOPL=3
+      // (SDM vol.2 CLI Operation).
+      if ((s->cr0 & 1) && (fl->vm ? fl->iopl != 3 : cpl() > fl->iopl)) gp_fault(0);
       fl->if_ = 0;
       break;    // cli
     case 0xfb:  // sti: the next instruction is not interruptible (SDM)
       fr->rec.mnemonic = "sti";
+      if ((s->cr0 & 1) && (fl->vm ? fl->iopl != 3 : cpl() > fl->iopl)) gp_fault(0);
       fl->if_ = 1;
       s->intr_inhibit = 1;
       break;

@@ -202,6 +202,12 @@ void x86_step(CpuState* c) {
   // unless this instruction itself loaded an EFLAGS image (iret/popf/task
   // switch), whose RF is the authoritative one (SDM vol.3 17.3.1).
   if (!d.rf_load) fl->rf = 0;
+  // The reserved bits are constants of the register, not state: bit 1 reads 1
+  // and bits 3, 5 and 15 read 0 (SDM vol.1 3.4.3 table 3-1). An image an
+  // instruction loaded from the stack or a TSS may hold anything there, so the
+  // commit restores them — otherwise the garbage leaks into the low byte a
+  // guest reads back with pushf.
+  fl->word = (fl->word & ~kEflagsZero) | kEflagsOne;
   // Debug traps (SDM vol.3 17.3.1, priority table 6-2): the task-switch trap
   // (TSS.T), data/I-O watchpoints and single-step all fire after the
   // instruction completes, reporting the next instruction's address in one

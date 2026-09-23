@@ -76,6 +76,11 @@ typedef union cell {
 // EFLAGS as the manual presents it: whole word for pushf/popf/iret, single
 // flags everywhere else. Bit 1 is reserved-one (never named); the PM-relevant
 // upper bits (IOPL, NT) join the named set once gates load a flags image.
+//
+// Bits 1, 3, 5 and 15 are constants of the register rather than state — bit 1
+// reads 1, the rest read 0 (SDM vol.1 3.4.3 table 3-1) — so no image loaded
+// from the stack or a TSS can carry them; the step commit forces them.
+enum { kEflagsOne = 0x2u, kEflagsZero = 0x8028u };
 typedef union eflags {
   uint32_t word;
   struct {
