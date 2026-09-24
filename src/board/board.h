@@ -63,6 +63,12 @@ typedef struct Board {
   // (on the PC that is the 8042 controller and its IRQ1). NULL = no keyboard.
   void (*key_in)(void* ctx, uint32_t scan, int extended, int up);
   void* key_ctx;
+  // Mouse channel: the board's pointer sink, fed by the host window's mouse
+  // (on the PC that is the 8042's auxiliary port and its IRQ12). One event
+  // carries the movement in mouse counts, the wheel, and the button state
+  // afterwards (bit 0 left, bit 1 right, bit 2 middle). NULL = no pointer.
+  void (*mouse_in)(void* ctx, int dx, int dy, int dz, int buttons);
+  void* mouse_ctx;
   // Serial channel: the board's byte sink, fed by the host's stdin (the console
   // cemu was started from, or a pipe a script drives). On the PC that is COM1's
   // receiver. A board with one takes stdin here and leaves the keyboard to the

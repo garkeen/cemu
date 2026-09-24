@@ -61,6 +61,30 @@ void DebugGdbNote(const char* note);
 // a/b are the two numbers the call site wants in the detail cell.
 void DebugMark(const char* what, int a, int b);
 
+// ---- synthetic host input (mouse=) -----------------------------------------
+// A guest-driven test can reach everything the guest can program, but not the
+// host event path itself: a probe running as a guest cannot move a pointer.
+// This item feeds the machine's pointer sink exactly the way the display
+// window does, which is what makes the host-input path observable from a
+// headless run — the same role QEMU's monitor `mouse_move` plays for its
+// tests.
+//
+//   mouse=DX:DY:BUTTONS[:WHEEL]@N
+//
+// DX/DY are the movement in mouse counts and WHEEL the wheel movement (signed
+// C literals — hex needs 0x); BUTTONS is the button state after the event
+// (bit 0 left, bit 1 right, bit 2 middle); @N is the period in instructions.
+// The event repeats every N instructions, so a guest that enables the mouse
+// whenever it likes still sees one. An item without @N, or with fewer than
+// three fields, is an error, not a silent drop.
+typedef struct DebugInjection {
+  int dx, dy, dz, buttons;
+} DebugInjection;
+
+// Fills `out` with one pointer event due at instruction `inst_count` and
+// returns 1; returns 0 when none is due. Call in a loop until it returns 0.
+int DebugNextMouseEvent(uint64_t inst_count, DebugInjection* out);
+
 // Frameless text row (kDbgScreen): the guest console as read back from the
 // video device, for guests that print only to VRAM.
 void DebugText(const char* kind, const char* text);

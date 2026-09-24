@@ -174,6 +174,44 @@ else
   echo "SKIP (rtc-irq: no nasm and no prebuilt probe bin)"
 fi
 
+# PS/2 mouse on the 8042's auxiliary port (test/x86/probe/ps2mouse.asm): the
+# guest drives the protocol half itself — 0xa8/0xa7 gate the interface, the
+# reset/identify answers and the wheel handshake set the device id, 0xe9 reads
+# the status, and the 0xeb poll's packet pins the byte layout — and then the
+# host half runs, which no guest can drive: CEMU_DEBUG=mouse= feeds the board's
+# pointer sink exactly the way the display window does (a button press, then a
+# movement carrying one wheel detent). IRQ12 is observed through the 8259
+# slave's request register, so no IDT, no remap and no sti are involved.
+# A multiboot ELF in the pm suite's shape rather than a boot sector: the checks
+# do not fit in the single sector QEMU's BIOS loads from a drive image.
+# Dual run against qemu-system-i386 -kernel (monitor: `mouse_button 1` then
+# `mouse_move 10 10 -1` — its Y/Z axes are screen-oriented, so the same host
+# movement is spelled with the signs flipped) passes with the same status 11 and
+# a byte-identical packet. Three divergences, all recorded in progress.md and
+# all in the report line rather than asserted: the power-on command byte (41 vs
+# 47), an unknown command's answer (nothing vs the resend QEMU's own source
+# has), and 0xa7 (QEMU keeps queueing the device's answer while this model stops
+# it at the wire — the spec's reading, and v86's).
+mouseelf="$dir/probe/ps2mouse.elf"
+if [ ! -f "$mouseelf" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f elf32 -o "$dir/probe/ps2mouse.o" "$dir/probe/ps2mouse.asm" &&
+    ld.lld -m elf_i386 -T "$dir/probe/ps2mouse.ld" -o "$mouseelf" "$dir/probe/ps2mouse.o"
+fi
+if [ -f "$mouseelf" ]; then
+  out=$(CEMU_DEBUG="mouse=0:0:1@100000,mouse=10:-10:1:1@100000" timeout 60 "$CEMU" \
+        --machine x86 --isa x86 "$mouseelf" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'unk=fe auxoff=00 irr=10 pkt=09000000290af601' &&
+     echo "$out" | grep -q 'ps2mouse ok'; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "ps2mouse: rc=$rc"
+  fi
+else
+  echo "SKIP (ps2mouse: no nasm and no prebuilt probe elf)"
+fi
+
 # PM: the protected-mode smoke probe (test/x86/pm). Multiboot ELF enters flat
 # PM, rebuilds GDT/IDT/TSS, and walks the stage-3 semantics: descriptor
 # loads, limit #GP, same-priv and cross-ring gate delivery with TSS stack

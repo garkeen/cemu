@@ -214,8 +214,17 @@ CEMU_DEBUG = item[,item...]
                             `b` 十六进制（位掩码与地址要能直接读）。现有 name：
                             isa(中断线) intr(CPU INTR 线) inta(INTA 向量)
                             pic0/pic1-imr|eoi|base ioapic lapic-irr|ack|eoi
-                            lidt/lgdt gate(门描述符) hostkey reset-req(设备请求
-                            机器复位)
+                            lidt/lgdt gate(门描述符) hostkey kbd-byte kbd-irq
+                            aux-byte aux-irq(IRQ12) hostmouse mouse-inj
+                            reset-req(设备请求机器复位)
+  mouse=DX:DY:BUTTONS[:WHEEL]@N
+                            合成指针事件（宿主输入注入）：每 N 条指令往板级的
+                            指针 sink 送一次，DX/DY/WHEEL 是有符号 C 字面量
+                            （十六进制要写 0x），BUTTONS 是按键位（bit0 左、
+                            bit1 右、bit2 中）。**探针作为客人按不了鼠标**，
+                            宿主事件路径只有这一条自动化通道（QEMU 侧的对应物
+                            是监视器的 mouse_move/mouse_button）。@N 必填：
+                            缺省的节奏等于替调用方做决定
   screen                    无帧文本行：客机控制台镜像，**整行输出**（控制台一行
                             80 列，事件表 DETAIL 只有 41，截断后读不了 call trace）
   utf8                      UTF-8 边框（默认 ASCII，Windows 代码页安全）
@@ -281,7 +290,7 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 | D17 | cga.c 渲染与光栅时序缺口 | CGA 图形模式（0x3D8 bit1）不渲染（黑屏）；过扫描边框不渲染（视频禁止时填黑）；0x3DA 回扫状态为宿主时钟近似（262 行×63.6µs 帧模型，行内只分活跃/消隐两相，非逐像素光栅）；属性/光标闪烁取固定场倍数周期，不跟随场相位 | IBM CGA Technical Reference；FreeVGA；QEMU vga 行为旁证 | 阶段 4 VGA 图形切片（图形模式随 VGA 一起做）；需要精确光栅时序的软件（raster 技巧 demo）出现时再校准 | 登记中 |
 | D19 | PIIX3 芯片组、IDE 与 IOAPIC | IOAPIC 只投递 fixed 与 lowest-priority，**NMI/SMI/INIT/ExtINT 四种交付模式不投递**；PIIX3 ISA 桥的 PIRQ 路由字节 0x60-0x63 无消费者（IDE 跑兼容模式，没有 PCI 设备拉 INTx）；XBCS/PM/DMA 块未做；ATA 侧无 LBA-48 与 multi-sector（未实现的命令按规格 ABRT） | ATA/ATAPI-7 §6.3（未实现命令的应答就是 ABRT）；QEMU hw/isa/piix3.c、seabios src/fw/pciinit.c piix_isa_bridge_setup；IOAPIC 交付模式：82093AA datasheet §3.2.4；NMI 输入：SDM vol.3 §6.7 | NMI/SMI 交付模式要先给 CPU 加 NMI 输入（本机无 SMM、单 APIC、无 PIC→IOAPIC 通路）；PIRQ 需要真拉 INTx 的 PCI 设备；PM/ACPI 在需要挂起/电源管理时；LBA-48 在需要 >128 GiB 或客户机强制时 | 登记中 |
 | D21 | 软盘与 DMA 通路缺失 | 无 Intel 8272 软盘控制器、无 8237 DMA（通道 2 给软盘、通道 0 给内存刷新），CMOS 设备字节也不报软驱；再加上 8042 软驱数据线语义，整条"软盘引导 + PC 兼容传软盘"的路径都不存在。后果：Linux 0.11/0.12 那类把引导码写死成 DL=0（且要求每道 15/18 扇区）的软盘引导镜像无法引导 —— 只能走硬盘/光盘引导的镜像 | PC/AT Technical Reference（FDC 命令集）；Intel 8237A datasheet；QEMU hw/block/fdc.c + hw/dma/i8257.c；SeaBIOS src/hw/floppy.c（INT 13h 路径） | 需要软盘引导的镜像（如 oldlinux 的 0.11/0.12 套件）作为验收件时；Linux 阶梯本身不需要（ISO 路线） | 登记中 |
-| D20 | i8042/PS/2 键盘 | 键盘设备只**应答**命令（每条 0xFA；0xFF→ACK+0xAA、0xF2→ACK+0xAB 0x83、0xEE→0xEE），但不真正执行：0xF0/0xED/0xF3 的参数字节只回 ACK、不切换扫描码集/LED/typematic；扫描码一律按 set 1 发（命令字节翻译位只存不译）；无鼠标（AUX）；输出队列满时丢字节（无 overrun 位） | PC/AT Technical Reference；QEMU `ps2.c`/`pckbd.c`（tiny386/i8042.c 同源）：ACK 逐命令、IRQ1 门控 `mode & KBD_INT && !(mode & DISABLE_KBD)` | 需要 set 2 键盘、鼠标或真正走 PS/2 设备命令的客户机时 | 登记中 |
+| D20 | i8042/PS2 键盘侧 | 键盘设备只**应答**命令（每条 0xFA；0xFF→ACK+0xAA、0xF2→ACK+0xAB 0x83、0xEE→0xEE），但不真正执行：0xF0/0xED/0xF3 的参数字节只回 ACK、不切换扫描码集/LED/typematic；扫描码一律按 set 1 发（命令字节翻译位只存不译） | PC/AT Technical Reference；QEMU `ps2.c`/`pckbd.c`（tiny386/i8042.c 同源）：ACK 逐命令、IRQ1 门控 `mode & KBD_INT && !(mode & DISABLE_KBD)` | 需要 set 2 键盘、或真正走 PS/2 键盘命令的客户机时 | 登记中 |
 | E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中 |
 
 ## 附：关键行为裁决存档（修复时的先例依据）

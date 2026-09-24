@@ -3,6 +3,53 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 23：PS/2 鼠标（8042 辅助端口）+ CEMU_DEBUG 的宿主输入注入（2026-09-24）
+
+D20 分两片：本片是**鼠标**；键盘侧（0xF0 扫描码集切换 / 翻译位真正生效 / 0xF4/0xF5 使能）
+留下一片，台账那行改成只记键盘侧。
+
+**参考**：v86 `src/ps2.js`（`send_mouse_packet` 的位布局、`port60_read` 的 AUX 优先级、
+`port64_read` 的 0x20 位、0xD4/0xA7/0xA8、IMPS/2 的 200-100-80 侦测）+ QEMU
+`hw/input/ps2.c`/`pckbd.c`（命令集、`ps2_mouse_sync`、状态位与交付），行为以 PS/2 mouse
+协议（aeb `scancodes-13`）裁决。
+
+**设备**（新增 `device/input/ps2mouse.c/h`）：命令集（0xE6/0xE7 缩放、0xE8 分辨率、0xE9
+状态、0xEA 流模式、0xEB 轮询、0xEC/0xEE wrap、0xF0 远程、0xF2 ID、0xF3 采样率 + IMPS/2
+侦测、0xF4/0xF5 使能/禁用、0xF6 默认、0xFF 复位）；包是 9 位补码的 dx/dy（范围 -256..+255，
+越界置溢出位）加滚轮第 4 字节；上报关掉时**丢弃**位移（v86 同款；QEMU 是累积后再报）。
+状态字节按规格带按键位（QEMU/v86 都不带）。
+
+**控制器**（`device/input/i8042.c`）：两个输出队列（键盘 / AUX）+ status bit 5，命令字节
+bit 1（AUX 中断）与 bit 5（关 AUX 接口），命令 0xA7/0xA8/0xA9/0xD4，IRQ12。只有一个输出
+缓冲，所以同一时刻只有一方"在架上"，键盘优先（QEMU 的 obsrc 链、v86 的注释同款）。0xA7
+关掉时设备的字节**在线上就丢**（规格：8042 拉住时钟线；v86 停流是同款想法；QEMU 只是继续
+排队）。复位的命令字节加上 bit 1（两个中断都开，QEMU 同款）。
+
+**宿主通道**：`display_win.c` 的鼠标消息（WM_MOUSEMOVE 换算成增量、五个按键、滚轮、
+按住时捕获、离开/失焦丢弃增量基准）→ `board.h` 的 `mouse_in` → `x86_min.c` 的
+`OnHostMouse`。
+
+**注入**（`CEMU_DEBUG=mouse=DX:DY:BUTTONS[:WHEEL]@N`）：**探针作为客人按不了鼠标**，宿主
+事件路径只能从宿主侧注入 —— 这是唯一能让这条路径自动化对拍的办法，QEMU 侧的对应物是监视器
+的 `mouse_move`/`mouse_button`。周期是每 N 条指令一次，所以客人什么时候使能设备都收得到。
+
+**探针**（`test/x86/probe/ps2mouse.{asm,ld}`，已接入 run.sh）：前半客人自己驱动协议
+（0xA8/0xA7、复位/BAT/ID、滚轮握手、0xE9 状态、0xEB 轮询的包、未知命令），后半跑宿主事件
+路径。两个设计点：IRQ12 用 8259 从片的 **IRR** 观测（OCW3 0x0a + 读 A0=0 的基址端口）——
+不必建 IDT、不必重映射、不必 sti，两侧一致；用 **multiboot ELF** 而不是 512 字节引导扇区 ——
+检查装不进一个扇区（QEMU 的 BIOS 从盘镜像也只读一个扇区），而 pm 套件已经跑在这套入口契约上。
+
+**验证**：cemu `cmd=47 st=000250 unk=fe auxoff=00 irr=10 pkt=09000000290af601` +
+`ps2mouse ok`，rc=11；QEMU 双跑（`-kernel` + 监视器 `mouse_button 1` / `mouse_move 10 10 -1`
+—— 它的 Y/Z 轴是屏幕向，所以同样的宿主位移符号相反）同样 rc=11，**包逐字节一致**。三处
+分歧只打印不断言：开机命令字节（41 vs 47）、未知命令的应答（什么都不回 vs 本模型的 resend，
+而 QEMU 自己的源码里就是 resend）、0xA7（QEMU 继续排队 vs 本模型线上丢）。x86 套件 17/0。
+
+**途中踩的坑**（都记在这里，免得下一个人再踩）：32 位模式下 `mov ecx,0` + `loop` 是 2^32
+次而不是 65536；`mouse_cmd` 里已经读过一次应答、外面的 `RD` 又读一次（多读一字节）；0xf2
+的 ID 字节漏读，后面全部错位一个字节；8259 的 IRR/ISR 在 A0=0 的基址端口读（0x20/0xa0），
+不是数据端口 0x21/0xa1。
+
 ## 阶段 4 片 22：CMOS RTC 的周期/闹钟中断（D18 销账）（2026-09-24）
 
 **参考**：QEMU `hw/rtc/mc146818rtc.c` + `mc146818rtc_regs.h`（速率表 `rates[]` / 周期码到

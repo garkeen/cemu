@@ -4,6 +4,7 @@
 #include "board/board.h"
 #include "device/char/uart16550.h"
 #include "device/input/i8042.h"
+#include "device/input/ps2mouse.h"
 #include "device/intc/i8259.h"
 #include "device/intc/lapic.h"
 #include "device/intc/ioapic.h"
@@ -123,6 +124,7 @@ typedef struct X86Board {
   LapicDevice lapic;
   CgaDevice cga;
   I8042Device kbd;
+  Ps2MouseDevice mouse;
   Port92Device port92;
   CmosDevice cmos;
   TestDevDevice testdev;
@@ -289,6 +291,28 @@ static void OnHostKey(void* ctx, uint32_t scan, int extended, int up) {
   I8042KeyByte(&xm->kbd, (uint8_t)(scan | (up ? 0x80u : 0u)));
 }
 
+// Host pointer -> the 8042's auxiliary port: the movement, the wheel and the
+// button state go to the PS/2 mouse, whose bytes (its ACKs, its replies and
+// its data packets) come back through the controller's AUX queue, which raises
+// IRQ12 while a byte waits.
+static void OnHostMouse(void* ctx, int dx, int dy, int dz, int buttons) {
+  X86Board* xm = (X86Board*)ctx;
+  if (DebugOn(kDbgMark)) DebugMark("hostmouse", dx, dy);
+  Ps2MouseEvent(&xm->mouse, dx, dy, dz, buttons);
+}
+
+// The 8042's auxiliary wire, both directions: command 0xd4 hands the device a
+// byte, and whatever the device answers lands in the controller's AUX queue.
+static void OnKbdToAux(void* ctx, uint8_t byte) {
+  X86Board* xm = (X86Board*)ctx;
+  Ps2MouseWrite(&xm->mouse, byte);
+}
+
+static void OnAuxByte(void* ctx, uint8_t byte) {
+  X86Board* xm = (X86Board*)ctx;
+  I8042AuxByte(&xm->kbd, byte);
+}
+
 // Host input -> COM1's receiver: the byte arrives at the UART exactly as a
 // character on the SIN pin would, so the guest reads it through the same
 // RBR/FIFO/IIR path and can be woken by IRQ4.
@@ -400,6 +424,10 @@ static void WireDevices(X86Board* xm) {
   LapicSetEoiSink(&xm->lapic, OnLapicEoi, xm);
   PitSetIrqSink(&xm->pit, OnIsaIrq, &xm->irqbus);
   I8042SetIrqSink(&xm->kbd, OnIsaIrq, &xm->irqbus);
+  // The controller's auxiliary port and the PS/2 mouse on the far side of it:
+  // command 0xd4's bytes go down, the device's answers come back up.
+  I8042SetAuxSink(&xm->kbd, OnKbdToAux, xm);
+  Ps2MouseSetTxSink(&xm->mouse, OnAuxByte, xm);
   IdeSetIrqSink(&xm->ide, OnIsaIrq, &xm->irqbus);
   Uart16550SetIrqSink(&xm->uart, OnCom1Irq, &xm->irqbus);
   CmosSetIrqSink(&xm->cmos, OnIsaIrq, &xm->irqbus);
@@ -437,6 +465,7 @@ static void X86Reset(Board* m) {
   IoapicInit(&xm->ioapic);
   CgaInit(&xm->cga);
   I8042Init(&xm->kbd);
+  Ps2MouseInit(&xm->mouse);
   Port92Init(&xm->port92);
   TestDevInit(&xm->testdev);
   CmosReset(&xm->cmos);
@@ -503,6 +532,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   LapicDevice* lapic = &xm->lapic;
   CgaDevice* cga = &xm->cga;
   I8042Device* kbd = &xm->kbd;
+  Ps2MouseDevice* mouse = &xm->mouse;
   Port92Device* p92 = &xm->port92;
   CmosDevice* cmos = &xm->cmos;
   IdeDevice* ide = &xm->ide;
@@ -515,6 +545,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   IoapicInit(&xm->ioapic);
   CgaInit(cga);
   I8042Init(kbd);
+  Ps2MouseInit(mouse);
   Port92Init(p92);
   CmosInit(cmos);
   TestDevInit(&xm->testdev);
@@ -577,6 +608,8 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   // enters it at COM1's receiver, which is where a terminal belongs on a PC.
   m->key_in = OnHostKey;
   m->key_ctx = xm;
+  m->mouse_in = OnHostMouse;
+  m->mouse_ctx = xm;
   m->serial_in = OnHostSerial;
   m->serial_ctx = xm;
 

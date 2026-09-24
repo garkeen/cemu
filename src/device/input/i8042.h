@@ -9,6 +9,14 @@
 // SeaBIOS's A20 code sends the 0xd1 ("write output port") command pair — so
 // the status register must exist even before keys do.
 //
+// The controller owns two byte streams, one per port it serves: the keyboard
+// on IRQ1 and the auxiliary port (the PS/2 mouse) on IRQ12. Each has its own
+// output queue, but the chip has a single output buffer, so only one queue is
+// on offer at 0x60 at a time — the keyboard's wins — and status bit 5 says
+// which one the byte came from. Commands 0xa7/0xa8 gate the auxiliary
+// interface, and 0xd4 routes the next 0x60 write down the mouse wire
+// (I8042SetAuxSink); the device's answers come back through I8042AuxByte.
+//
 // The output port carries the A20 gate in bit 1 (IBM PC/AT Technical
 // Reference). The model drives the board's A20 line through a sink callback,
 // the same shape as the IRQ sinks of the timers; the rest of the output port
@@ -18,13 +26,16 @@
 // before an extended key — pushed by the host window's keyboard
 // (I8042KeyByte). A byte waiting at 0x60 sets output-buffer-full, and the
 // controller holds its IRQ line up while a byte waits, the command byte
-// enables the keyboard interrupt and the keyboard is clocked (PC/AT Technical
-// Reference; QEMU pckbd's kbd_update_irq spells the same three conditions).
-// That level is how the guest's keyboard driver learns a key is there; the
-// guest drops it by reading the byte.
+// enables the interrupt and the device is not disabled (PC/AT Technical
+// Reference; QEMU pckbd's kbd_update_irq_lines spells the same conditions).
+// That level is how the guest's driver learns a byte is there; the guest drops
+// it by reading the byte.
 typedef struct I8042Device {
   void (*set_a20)(void* ctx, int on);
   void* a20_ctx;
+  // Command 0xd4's payload: one byte for the auxiliary device.
+  void (*write_aux)(void* ctx, uint8_t byte);
+  void* write_aux_ctx;
   void (*set_irq)(void* ctx, int line, int level);
   void* irq_ctx;
   // Command 0xFE pulses the CPU's reset line: on a PC that is a machine reset,
@@ -40,7 +51,12 @@ void I8042Register(Bus* io, I8042Device* d);
 void I8042SetA20Sink(I8042Device* d, void (*set_a20)(void* ctx, int on), void* ctx);
 void I8042SetIrqSink(I8042Device* d, void (*set_irq)(void* ctx, int line, int level), void* ctx);
 void I8042SetResetSink(I8042Device* d, void (*request_reset)(void* ctx), void* ctx);
+// Command 0xd4: the controller hands the next data byte to this sink, which is
+// the auxiliary device (the PS/2 mouse).
+void I8042SetAuxSink(I8042Device* d, void (*write_aux)(void* ctx, uint8_t byte), void* ctx);
 // One byte from the keyboard device into the controller's output queue.
 void I8042KeyByte(I8042Device* d, uint8_t scancode);
+// One byte from the auxiliary device (the mouse) into the AUX output queue.
+void I8042AuxByte(I8042Device* d, uint8_t byte);
 
 #endif

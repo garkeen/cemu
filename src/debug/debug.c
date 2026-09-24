@@ -222,6 +222,84 @@ static void AddWatch(const char* spec) {
   g_nwatch++;
 }
 
+// ---- synthetic host input (mouse=) -----------------------------------------
+
+enum { kMaxMouseInj = 4 };
+static struct {
+  int dx, dy, dz, buttons;
+  uint64_t period;   // instructions between events
+  uint64_t next_at;  // the instruction count of the next one
+} g_mouse_inj[kMaxMouseInj];
+static int g_nmouse_inj;
+
+int DebugNextMouseEvent(uint64_t inst_count, DebugInjection* out) {
+  for (int i = 0; i < g_nmouse_inj; i++) {
+    if (inst_count < g_mouse_inj[i].next_at) continue;
+    // Catch up in one step if the item came due while nobody was looking, so a
+    // backlog does not arrive as a burst.
+    do {
+      g_mouse_inj[i].next_at += g_mouse_inj[i].period;
+    } while (g_mouse_inj[i].next_at <= inst_count);
+    out->dx = g_mouse_inj[i].dx;
+    out->dy = g_mouse_inj[i].dy;
+    out->dz = g_mouse_inj[i].dz;
+    out->buttons = g_mouse_inj[i].buttons;
+    if (DebugOn(kDbgMark)) DebugMark("mouse-inj", out->dx, out->dy);
+    return 1;
+  }
+  return 0;
+}
+
+// mouse=DX:DY:BUTTONS[:WHEEL]@N — signed C literals (hex needs 0x), and the
+// period is required: a default would silently pick a cadence for the caller.
+static void AddMouseInjection(const char* spec) {
+  if (g_nmouse_inj >= kMaxMouseInj) {
+    LogError("debug: too many mouse= items, dropping '%s'", spec);
+    return;
+  }
+  char body[128];
+  if (strlen(spec) >= sizeof(body)) {
+    LogError("debug: mouse= item too long ('%s')", spec);
+    return;
+  }
+  strcpy(body, spec);
+  char* at = strrchr(body, '@');
+  if (!at) {
+    LogError("debug: mouse= expects DX:DY:BUTTONS[:WHEEL]@N ('%s')", spec);
+    return;
+  }
+  *at = 0;
+  long vals[4] = {0, 0, 0, 0};
+  int n = 0;
+  char* save = NULL;
+  for (char* f = strtok_r(body, ":", &save); f && n < 4; f = strtok_r(NULL, ":", &save)) {
+    char* end = NULL;
+    vals[n] = strtol(f, &end, 0);
+    if (!*f || !end || *end) {
+      LogError("debug: mouse= field '%s' is not a number ('%s')", f, spec);
+      return;
+    }
+    n++;
+  }
+  if (n < 3) {
+    LogError("debug: mouse= needs at least DX:DY:BUTTONS ('%s')", spec);
+    return;
+  }
+  char* end = NULL;
+  long period = strtol(at + 1, &end, 0);
+  if (!end || *end || period <= 0) {
+    LogError("debug: mouse= period must be a positive number ('%s')", spec);
+    return;
+  }
+  g_mouse_inj[g_nmouse_inj].dx = (int)vals[0];
+  g_mouse_inj[g_nmouse_inj].dy = (int)vals[1];
+  g_mouse_inj[g_nmouse_inj].buttons = (int)vals[2];
+  g_mouse_inj[g_nmouse_inj].dz = (int)vals[3];
+  g_mouse_inj[g_nmouse_inj].period = (uint64_t)period;
+  g_mouse_inj[g_nmouse_inj].next_at = (uint64_t)period;
+  g_nmouse_inj++;
+}
+
 void DebugInit(void) {
   g_inited = 1;
   const char* spec = getenv("CEMU_DEBUG");
@@ -255,6 +333,8 @@ void DebugInit(void) {
       AddWatch(tok + 6);
     else if (!strncmp(tok, "dump=", 5))
       AddDump(tok + 5);
+    else if (!strncmp(tok, "mouse=", 6))
+      AddMouseInjection(tok + 6);
     else if (!strncmp(tok, "budget=", 7))
       g_budget = atoi(tok + 7);
     else if (!strncmp(tok, "skip=", 5))

@@ -24,6 +24,13 @@ struct HostDisplay {
   void* dev;
   void (*key_cb)(void* ctx, uint32_t scan, int extended, int up);
   void* key_ctx;
+  void (*mouse_cb)(void* ctx, int dx, int dy, int dz, int buttons);
+  void* mouse_ctx;
+  // Pointer tracking: the PS/2 packet carries movement, not a position, so
+  // the window reports each WM_MOUSEMOVE as a delta from the previous one.
+  // `mouse_valid` is cleared when the pointer leaves the client area (or the
+  // window loses focus), so re-entering does not read as one huge jump.
+  int mouse_x, mouse_y, mouse_valid, mouse_buttons;
   uint32_t shown_version;
   int64_t next_pump_us;
   int closed;
@@ -64,6 +71,68 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
       uint32_t scan = (uint32_t)((lp >> 16) & 0xff);
       int up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
       d->key_cb(d->key_ctx, scan, (int)((lp >> 24) & 1), up);
+      return 0;
+    }
+    case WM_MOUSEMOVE: {
+      if (!d->mouse_cb) return DefWindowProcA(hwnd, msg, wp, lp);
+      int x = (int)(short)LOWORD(lp), y = (int)(short)HIWORD(lp);
+      if (d->mouse_valid)
+        d->mouse_cb(d->mouse_ctx, x - d->mouse_x, y - d->mouse_y, 0, d->mouse_buttons);
+      d->mouse_x = x;
+      d->mouse_y = y;
+      d->mouse_valid = 1;
+      // Ask for WM_MOUSELEAVE so the delta base is dropped when the pointer
+      // leaves; Win32 sends it once per TrackMouseEvent call.
+      TRACKMOUSEEVENT tme;
+      memset(&tme, 0, sizeof(tme));
+      tme.cbSize = sizeof(tme);
+      tme.dwFlags = TME_LEAVE;
+      tme.hwndTrack = hwnd;
+      TrackMouseEvent(&tme);
+      return 0;
+    }
+    case WM_MOUSELEAVE:
+      d->mouse_valid = 0;
+      return 0;
+    case WM_KILLFOCUS:
+      // Focus going away costs us the pointer too: without this the next
+      // WM_MOUSEMOVE after the user comes back would report one huge delta.
+      d->mouse_valid = 0;
+      return DefWindowProcA(hwnd, msg, wp, lp);
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP: {
+      if (!d->mouse_cb) return DefWindowProcA(hwnd, msg, wp, lp);
+      // Button state after the event: bit 0 left, bit 1 right, bit 2 middle —
+      // the order the PS/2 packet's first byte uses.
+      int bit = (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP)     ? 0x01
+                : (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP)   ? 0x02
+                                                                   : 0x04;
+      int down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
+      if (down)
+        d->mouse_buttons |= bit;
+      else
+        d->mouse_buttons &= ~bit;
+      // A press or release with no movement still reaches the guest: the
+      // packet carries the buttons, and the device sends one for the event.
+      d->mouse_cb(d->mouse_ctx, 0, 0, 0, d->mouse_buttons);
+      // Keep reporting while a button is held even if the pointer leaves the
+      // client area — that is what a drag is.
+      if (down)
+        SetCapture(hwnd);
+      else if (!d->mouse_buttons)
+        ReleaseCapture();
+      return 0;
+    }
+    case WM_MOUSEWHEEL: {
+      if (!d->mouse_cb) return DefWindowProcA(hwnd, msg, wp, lp);
+      // The wheel arrives in multiples of WHEEL_DELTA; the PS/2 wheel byte
+      // counts detents, so one notch is one.
+      int dz = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+      if (dz) d->mouse_cb(d->mouse_ctx, 0, 0, dz, d->mouse_buttons);
       return 0;
     }
     case WM_CLOSE:
@@ -146,6 +215,13 @@ void HostDisplaySetKeySink(HostDisplay* d,
                            void* ctx) {
   d->key_cb = cb;
   d->key_ctx = ctx;
+}
+
+void HostDisplaySetMouseSink(HostDisplay* d,
+                             void (*cb)(void* ctx, int dx, int dy, int dz, int buttons),
+                             void* ctx) {
+  d->mouse_cb = cb;
+  d->mouse_ctx = ctx;
 }
 
 void HostDisplayFree(HostDisplay* d) {

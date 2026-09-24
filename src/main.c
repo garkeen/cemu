@@ -221,8 +221,10 @@ int main(int argc, char** argv) {
       BoardDestroy(m);
       return kExitHostFailure;
     }
-    // The board's keyboard sink (the PC's 8042): window keys drive it.
+    // The board's keyboard sink (the PC's 8042): window keys drive it, and
+    // the pointer sink drives the same controller's auxiliary port.
     if (m->key_in) HostDisplaySetKeySink(m->display, m->key_in, m->key_ctx);
+    if (m->mouse_in) HostDisplaySetMouseSink(m->display, m->mouse_in, m->mouse_ctx);
   }
 
   if (a.gdb_port) {

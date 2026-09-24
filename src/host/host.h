@@ -79,6 +79,16 @@ void HostDisplaySetKeySink(HostDisplay* d,
                            void (*cb)(void* ctx, uint32_t scan, int extended, int up),
                            void* ctx);
 
+// The pointer channel: the window's mouse messages go to the machine's pointer
+// sink (on the PC that is the 8042's auxiliary port and its PS/2 mouse). The
+// window reports movement as a delta from the previous position, in mouse
+// counts, because that is what the PS/2 packet carries; `dz` is the wheel in
+// detents and `buttons` the state after the event — bit 0 left, bit 1 right,
+// bit 2 middle, the order the packet's first byte uses.
+void HostDisplaySetMouseSink(HostDisplay* d,
+                             void (*cb)(void* ctx, int dx, int dy, int dz, int buttons),
+                             void* ctx);
+
 // The host's own keyboard source: stdin, read at the machine's input sinks —
 // the console the user runs cemu from, or a pipe a script drives. A board with
 // a serial port takes stdin at its receiver (raw bytes); otherwise it takes it
