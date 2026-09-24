@@ -17,8 +17,16 @@
 // the format the status register asks for (BCD/binary, 12/24 hour), writes set
 // the clock by biasing the host clock, and the update-in-progress bit never
 // reads set — an emulated RTC updates instantaneously.
+//
+// Status register C carries the three interrupt flags (periodic, alarm,
+// update-ended) and the chip raises IRQ8 from them; the line is level and the
+// guest lowers it by reading status C, exactly as on the MC146818.
 typedef struct CmosDevice {
   struct CmosState* st;  // private state: index register + CMOS RAM + clock bias
+  // The RTC's interrupt line (IRQ8 in the PC/AT wiring) is the board's to
+  // route, so the device reaches it through a sink like the PIT does.
+  void (*set_irq)(void* ctx, int line, int level);
+  void* irq_ctx;
 } CmosDevice;
 
 void CmosInit(CmosDevice* d);
@@ -29,5 +37,10 @@ void CmosRegister(Bus* io, CmosDevice* d);
 // Tells the RTC how much RAM the machine carries; the extended-memory
 // registers answer from it.
 void CmosSetMemory(CmosDevice* d, uint64_t ram_size);
+void CmosSetIrqSink(CmosDevice* d, void (*set_irq)(void*, int, int), void* ctx);
+// The machine poll loop calls this every step (the same contract as PitPoll):
+// the periodic and alarm flags come from wall time, so they must fire while
+// the CPU runs, not only when the guest touches a register.
+void CmosPoll(CmosDevice* d);
 
 #endif

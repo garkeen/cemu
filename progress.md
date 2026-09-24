@@ -3,6 +3,43 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 22：CMOS RTC 的周期/闹钟中断（D18 销账）（2026-09-24）
+
+**参考**：QEMU `hw/rtc/mc146818rtc.c` + `mc146818rtc_regs.h`（速率表 `rates[]` / 周期码到
+32768Hz 节拍的换算、status C 读后清零、闹钟掩码 `(v & 0xc0) == 0xc0`），行为以 MC146818
+datasheet 裁决。
+
+**设备侧**（`device/misc/cmos.c`）：状态位补齐（status A 的 RS 字段、status B 的
+PIE/AIE/UIE、status C 的 IRQF/PF/AF/UF）；`CmosPoll` 由板级轮询驱动（与 `PitPoll` 同契约），
+周期截止时间**每次轮询从寄存器重算**（客人改 status A/B 立即生效，QEMU 也是在那些写入上
+重挂定时器），一秒边界上置 UF 并比较闹钟；status C 读后清零并落 IRQ8 线；status B 写入时
+重算线（把已置位的标志立即投递）；复位清掉三个使能（它们不是电池备份的，QEMU 同款）。
+线号 8 走 `OnIsaIrq` 扇出进 8259 从片的线 0。板级：`CmosSetIrqSink` + `X86Poll` 里加
+`CmosPoll`（睡眠路径每轮仍轮询，所以 hlt 的客人也能被 IRQ8 唤醒）。
+
+**探针**（`test/x86/probe/rtc_irq.asm`）：status A RS=6（1024 Hz）、status B =
+PIE|AIE|24h、三个闹钟寄存器全写 0xc0（don't care = 匹配任意值，所以 AF 每秒一次，不用
+做 BCD 算术），然后 **hlt 等待**，由 ISR 读 status C 记录见过哪些标志。两个刻意的设计：
+用 hlt 而不是自旋 —— **1 Hz 的事件无法用指令预算跨模拟器界定**（同一个预算在 cemu 上
+是 ~1 秒墙钟、在 QEMU 上只有 ~30ms）；只报 pf/af/uf 的 0/1、不报计数 —— 计数依赖宿主
+时序，而双跑要对拍转录。
+
+**踩到的两个 bug**：
+
+1. **`cmos.c` 的真 bug**：`reg <= kRegYear` 把闹钟寄存器 0x01/0x03/0x05 也当成时间寄存器，
+   于是**读秒闹钟返回的是年份**（一个做闹钟读-改-写的驱动会拿到垃圾）。加 `IsTimeReg`
+   把它们排除在时钟之外。
+2. **探针自己的 bug**：写完索引口后没有重新把 `al` 装成 0xc0，于是 `out 0x71, al` 把
+   索引值 3 和 5 写进了分/时闹钟寄存器 —— 只有秒闹钟是 0xc0，分与时永远不匹配，AF 永不
+   置位。定位办法：AF 与 UF 在同一个块里置位，先加一个 UF 观测证明**块跑了**（uf=1），
+   于是问题只可能在比较结果；再让客人回读寄存器，`b=62 a1=00` 说明 status B 写进去了
+   而 0x01 读回 0x00（那是上面第 1 条 bug 导致的读路径），顺着查才看到 AL 没重装。
+
+**验证**：cemu 与 qemu-system-i386 **转录逐字节一致**（`b=62 a1=c0` / `pf=01 af=01 uf=01`
+/ `rtc-irq ok`），两侧 rc=11；已接入 run.sh（x86 套件 15 → 16 格）。
+
+**台账**：D18 整行删除。
+
 ## 阶段 4 片 21：x86 16 位 TSS 任务切换（D15 销账）（2026-09-23）
 
 **参考**：v86 与 tiny386 都只做 32 位 TSS（前者 assert、后者 assert 9/11），所以布局取自

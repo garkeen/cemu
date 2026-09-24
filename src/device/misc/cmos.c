@@ -28,14 +28,35 @@ enum {
   kRegMemExtmem2High = 0x35,
 };
 
-// Status register A: the update-in-progress flag. The model updates
-// instantaneously, so reads always see it clear — firmware that waits for the
-// bit to fall (seabios rtc_updating) passes straight through.
-enum { kStatusAUip = 0x80 };
-// Status register B (MC146818 datasheet).
-enum { kStatusB24Hour = 0x02, kStatusBBin = 0x04, kStatusBSet = 0x80 };
+// Status register A: the update-in-progress flag and the periodic-rate field.
+// The model updates instantaneously, so reads always see UIP clear — firmware
+// that waits for the bit to fall (seabios rtc_updating) passes straight
+// through.
+enum { kStatusAUip = 0x80, kStatusARate = 0x0f };
+// Status register B (MC146818 datasheet): the three interrupt enables gate
+// IRQ8, SET holds the clock still while the guest writes it.
+enum {
+  kStatusBSet = 0x80,
+  kStatusBPie = 0x40,
+  kStatusBAie = 0x20,
+  kStatusBUie = 0x10,
+  kStatusBBin = 0x04,
+  kStatusB24Hour = 0x02,
+};
+// Status register C (MC146818 datasheet): one flag per interrupt source plus
+// IRQF, which mirrors the line. A read returns them and clears them all. The
+// flag positions line up with status B's enables (PF/PIE 0x40, AF/AIE 0x20,
+// UF/UIE 0x10), which is how QEMU gates the line with one mask.
+enum { kStatusCIrqf = 0x80, kStatusCPf = 0x40, kStatusCAf = 0x20, kStatusCUf = 0x10 };
 // Status register D: bit 7 reports the battery-backed RAM as valid.
 enum { kStatusDVrt = 0x80 };
+
+// The alarm registers (MC146818 datasheet): the RTC compares the live clock
+// against these every second.
+enum { kRegSecondsAlarm = 0x01, kRegMinutesAlarm = 0x03, kRegHoursAlarm = 0x05 };
+
+// The RTC's interrupt line in the PC/AT wiring (the 8259 slave's line 0).
+static const int kCmosIrqLine = 8;
 
 // Memory-size registers (seabios src/fw/paravirt.c qemu_preinit reads exactly
 // these): 0x30/0x31 hold the memory above 1MiB in KiB, 0x34/0x35 the memory
@@ -50,8 +71,28 @@ struct CmosState {
   uint8_t nmi_off;  // bit 7 of the last 0x70 write (stored, not acted on)
   uint8_t regs[128];
   uint64_t ram_size;
-  int64_t bias_sec;  // offset the guest's last clock write asked for
+  int64_t bias_sec;      // offset the guest's last clock write asked for
+  uint64_t periodic_at;  // HostTimerNow() us the next PF is due; 0 = not armed
+  uint64_t second_at;    // ... the next update-ended/alarm second is due
+  int irq;               // the IRQ8 line's current level
 };
+
+// The RTC's time base is a 32768Hz crystal, and status A's RS field says how
+// many of its ticks make one periodic-interrupt period: RS=0 is none, RS=1/2
+// are 128/256 ticks, RS=3..15 are 4,8,16,32,64,128,256,512,1024,2048,4096,
+// 8192,16384 — 122us at RS=3 through 500ms at RS=15 (MC146818 datasheet table;
+// QEMU mc146818rtc_regs.h writes the same numbers as rates[] =
+// {0,256,128,8192,4096,2048,1024,512,256,128,64,32,16,8,4,2} Hz, i.e.
+// 32768/ticks).
+static const uint32_t kRtcPeriodTicks[16] = {
+  0, 128, 256, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
+};
+
+// The periodic period in microseconds of host time; 0 when RS selects none.
+static uint64_t CmosPeriodUs(const struct CmosState* st) {
+  uint32_t ticks = kRtcPeriodTicks[st->regs[kRegStatusA] & kStatusARate];
+  return ticks ? (uint64_t)ticks * 1000000 / 32768 : 0;
+}
 
 // ---- calendar (Howard Hinnant's civil-from-days pair, public domain) --------
 
@@ -165,15 +206,133 @@ static void CmosWriteTime(struct CmosState* st, int reg, uint8_t val) {
   st->bias_sec = CmosShadowEpoch(st) - HostTimerNow() / 1000000;
 }
 
+// ---- interrupts: the status C flags and IRQ8 ---------------------------------
+
+// An alarm field, decoded to 24-hour form; -1 means don't care. The mask is
+// the top two bits both set, which is how QEMU rtc_from_bcd() reads it: the
+// datasheet puts the don't-care bit in the alarm register's bit 7 and spends
+// bit 6 on the 12-hour PM flag, so the pair is what a mask looks like once the
+// mode is folded in.
+static int CmosAlarmField(const struct CmosState* st, int reg) {
+  uint8_t v = st->regs[reg];
+  if ((v & 0xc0) == 0xc0) return -1;
+  int bin = st->regs[kRegStatusB] & kStatusBBin;
+  int h = bin ? (v & 0x3f) : FromBcd(v & 0x3f);
+  if (reg == kRegHoursAlarm && !(st->regs[kRegStatusB] & kStatusB24Hour)) {
+    // 12-hour mode: bit 7 is the PM flag and the value counts 1..12, exactly
+    // as the hours register itself does (see CmosReadTime).
+    if (h == 12) h = 0;
+    if (v & 0x80) h += 12;
+  }
+  return h;
+}
+
+// Does the alarm match the live clock right now? A don't-care field matches
+// every value — an all-don't-care alarm fires once a second. (QEMU computes
+// the next matching instant instead, which is the same relation asked
+// continuously.)
+static int CmosAlarmDue(const struct CmosState* st) {
+  int64_t rem = CmosEpoch(st) % 86400;
+  if (rem < 0) rem += 86400;
+  int a_s = CmosAlarmField(st, kRegSecondsAlarm);
+  int a_m = CmosAlarmField(st, kRegMinutesAlarm);
+  int a_h = CmosAlarmField(st, kRegHoursAlarm);
+  if (a_s >= 0 && a_s != (int)(rem % 60)) return 0;
+  if (a_m >= 0 && a_m != (int)((rem / 60) % 60)) return 0;
+  if (a_h >= 0 && a_h != (int)(rem / 3600)) return 0;
+  return 1;
+}
+
+// IRQ8 follows the enabled flags: the line is a level, and reading status C
+// clears the flags, which is what drops it (MC146818 datasheet; QEMU lowers
+// its IRQ on exactly that read). Enabling an interrupt whose flag is already
+// set raises the line at once — QEMU does the same when status B is written.
+static void CmosSyncIrq(CmosDevice* d) {
+  struct CmosState* st = d->st;
+  int level =
+      ((st->regs[kRegStatusC] & kStatusCPf) && (st->regs[kRegStatusB] & kStatusBPie)) ||
+      ((st->regs[kRegStatusC] & kStatusCAf) && (st->regs[kRegStatusB] & kStatusBAie)) ||
+      ((st->regs[kRegStatusC] & kStatusCUf) && (st->regs[kRegStatusB] & kStatusBUie));
+  // Status C's IRQF mirrors the line (MC146818 datasheet; QEMU keeps the same
+  // bit in step with its qemu_irq_raise/lower).
+  if (level)
+    st->regs[kRegStatusC] |= kStatusCIrqf;
+  else
+    st->regs[kRegStatusC] &= (uint8_t)~kStatusCIrqf;
+  if (level == st->irq) return;
+  st->irq = level;
+  if (d->set_irq) d->set_irq(d->irq_ctx, kCmosIrqLine, level);
+}
+
+void CmosSetIrqSink(CmosDevice* d, void (*set_irq)(void*, int, int), void* ctx) {
+  d->set_irq = set_irq;
+  d->irq_ctx = ctx;
+}
+
+void CmosPoll(CmosDevice* d) {
+  struct CmosState* st = d->st;
+  if (!st) return;
+  uint64_t now = HostTimerNow();
+
+  // The periodic flag. The deadline is re-derived from the registers on every
+  // poll rather than latched when armed, so a guest reprogramming status A or
+  // B takes effect at once (QEMU re-arms its timer on those writes). One flag
+  // per poll is enough: PF is a single bit and the guest clears it by reading
+  // status C. QEMU arms the timer only while PIE is set, so PF does not
+  // accumulate with the interrupt disabled (the datasheet's block diagram
+  // feeds the flag from the rate generator alone) — cemu follows QEMU, this
+  // device's behavioural reference.
+  uint64_t period = (st->regs[kRegStatusB] & kStatusBPie) ? CmosPeriodUs(st) : 0;
+  if (period == 0) {
+    st->periodic_at = 0;
+  } else if (st->periodic_at == 0) {
+    st->periodic_at = now + period;
+  } else if (now >= st->periodic_at) {
+    st->periodic_at = now + period;
+    st->regs[kRegStatusC] |= kStatusCPf;
+  }
+
+  // The update cycle ends once a second: that is when UF sets and when the
+  // alarm is compared. Both flags set whatever their enables say — only the
+  // line is gated (QEMU sets UF/AF in status C unconditionally and masks the
+  // IRQ with status B).
+  if (st->second_at == 0) {
+    st->second_at = now + 1000000;
+  } else if (now >= st->second_at) {
+    st->second_at = now + 1000000;
+    st->regs[kRegStatusC] |= kStatusCUf;
+    if (CmosAlarmDue(st)) st->regs[kRegStatusC] |= kStatusCAf;
+  }
+
+  CmosSyncIrq(d);
+}
+
 // ---- registers --------------------------------------------------------------
 
-static uint8_t CmosReadReg(const struct CmosState* st, int reg) {
-  if (reg <= kRegYear) return CmosReadTime(st, reg);
+// The registers the live clock answers for: 0x00, 0x02, 0x04, 0x06..0x09.
+// 0x01/0x03/0x05 sit inside that range but are the ALARM registers — they hold
+// whatever the guest wrote and take part in the comparison, not in the clock
+// (MC146818 datasheet). Treating them as time registers made a read of the
+// seconds alarm answer with the year.
+static int IsTimeReg(int reg) {
+  return reg <= kRegYear && reg != kRegSecondsAlarm && reg != kRegMinutesAlarm &&
+         reg != kRegHoursAlarm;
+}
+
+static uint8_t CmosReadReg(CmosDevice* d, int reg) {
+  struct CmosState* st = d->st;
+  if (IsTimeReg(reg)) return CmosReadTime(st, reg);
   switch (reg) {
     case kRegStatusA:
       return (uint8_t)(st->regs[reg] & ~kStatusAUip);
-    case kRegStatusC:
-      return 0;  // no interrupt flags: nothing raises the RTC IRQ yet (D18)
+    case kRegStatusC: {
+      // A read hands back the three flags and clears them, which is what drops
+      // IRQ8 (MC146818 datasheet; QEMU lowers its IRQ on the same read).
+      uint8_t v = st->regs[reg];
+      st->regs[reg] = 0;
+      CmosSyncIrq(d);
+      return v;
+    }
     case kRegStatusD:
       return (uint8_t)(st->regs[reg] | kStatusDVrt);
     case kRegMemExtmemLow:
@@ -191,31 +350,42 @@ static uint8_t CmosReadReg(const struct CmosState* st, int reg) {
   }
 }
 
-static void CmosWriteReg(struct CmosState* st, int reg, uint8_t val) {
-  if (reg <= kRegYear) {
+static void CmosWriteReg(CmosDevice* d, int reg, uint8_t val) {
+  struct CmosState* st = d->st;
+  if (IsTimeReg(reg)) {
     CmosWriteTime(st, reg, val);
     return;
   }
   if (reg == kRegStatusC) return;  // read-only (MC146818 datasheet)
+  if (reg == kRegStatusB && (val & kStatusBSet)) {
+    // SET stops the update cycle, and the update-ended interrupt goes with it
+    // (MC146818 datasheet; QEMU clears UIE on the same write).
+    val = (uint8_t)(val & ~kStatusBUie);
+  }
   st->regs[reg] = val;
+  // A status B write can unmask a flag that is already pending, or mask one
+  // that holds the line up (QEMU re-checks the line on that write).
+  if (reg == kRegStatusB) CmosSyncIrq(d);
 }
 
 static uint64_t CmosRead(void* dev, uint64_t addr, int size) {
   (void)size;
-  struct CmosState* st = ((CmosDevice*)dev)->st;
+  CmosDevice* d = (CmosDevice*)dev;
+  struct CmosState* st = d->st;
   if (addr == kCmosIndexPort) return (uint64_t)(st->index | (st->nmi_off << 7));
-  return CmosReadReg(st, st->index);
+  return CmosReadReg(d, st->index);
 }
 
 static void CmosWrite(void* dev, uint64_t addr, int size, uint64_t val) {
   (void)size;
-  struct CmosState* st = ((CmosDevice*)dev)->st;
+  CmosDevice* d = (CmosDevice*)dev;
+  struct CmosState* st = d->st;
   if (addr == kCmosIndexPort) {
     st->nmi_off = (uint8_t)((val >> 7) & 1);
     st->index = (uint8_t)(val & 0x7f);
     return;
   }
-  CmosWriteReg(st, st->index, (uint8_t)val);
+  CmosWriteReg(d, st->index, (uint8_t)val);
 }
 
 static const DeviceOps kCmosOps = {"cmos", CmosRead, CmosWrite};
@@ -228,6 +398,14 @@ void CmosReset(CmosDevice* d) {
   if (!d->st) return;
   d->st->index = 0;
   d->st->nmi_off = 0;
+  // The interrupt enables are not battery-backed either: a reset masks all
+  // three, clears the pending flags and drops the line (QEMU clears
+  // PIE/AIE/SQWE on its reset).
+  d->st->regs[kRegStatusB] &= (uint8_t)~(kStatusBPie | kStatusBAie | kStatusBUie);
+  d->st->regs[kRegStatusC] = 0;
+  d->st->periodic_at = 0;
+  d->st->second_at = 0;
+  CmosSyncIrq(d);
 }
 
 void CmosInit(CmosDevice* d) {

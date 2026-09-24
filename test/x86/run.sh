@@ -149,6 +149,31 @@ else
   echo "SKIP (bt-bits: no nasm and no prebuilt probe bin)"
 fi
 
+# CMOS RTC interrupts (test/x86/probe/rtc_irq.asm, AGENTS.md D18): status A
+# RS=6 (1024 Hz) plus status B's PIE|AIE and an all-don't-care alarm, then the
+# guest HALTS and counts which of status C's flags its IRQ8 handler sees. It
+# reports pf/af/uf, never a tick count (that depends on host timing). The
+# wait is bounded by hlt iterations, which is not the same wall time on the two
+# emulators (~16ms each on cemu, ~1ms on QEMU) — the loop leaves as soon as AF
+# arrives, so the bound only matters when the interrupt never comes.
+# Dual run against qemu-system-i386: identical transcript, identical status 11.
+rtcbin="$dir/probe/rtc_irq.bin"
+if [ ! -f "$rtcbin" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f bin -o "$rtcbin" "$dir/probe/rtc_irq.asm"
+fi
+if [ -f "$rtcbin" ]; then
+  out=$(timeout 60 "$CEMU" --machine x86 --isa x86 "$rtcbin" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'rtc-irq ok'; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "rtc-irq: rc=$rc"
+  fi
+else
+  echo "SKIP (rtc-irq: no nasm and no prebuilt probe bin)"
+fi
+
 # PM: the protected-mode smoke probe (test/x86/pm). Multiboot ELF enters flat
 # PM, rebuilds GDT/IDT/TSS, and walks the stage-3 semantics: descriptor
 # loads, limit #GP, same-priv and cross-ring gate delivery with TSS stack

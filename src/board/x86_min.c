@@ -360,6 +360,9 @@ static void X86Poll(Board* m) {
   // COM1's character timeout is the same kind of source: the chip decides on
   // its own that a partial receive FIFO has waited long enough.
   Uart16550Poll(&xm->uart);
+  // The RTC's periodic rate and its once-a-second update/alarm comparison are
+  // wall-clock sources too (PitPoll's contract).
+  CmosPoll(&xm->cmos);
 }
 
 // The next moment a device wakes the processor on its own: the PC's two
@@ -399,6 +402,7 @@ static void WireDevices(X86Board* xm) {
   I8042SetIrqSink(&xm->kbd, OnIsaIrq, &xm->irqbus);
   IdeSetIrqSink(&xm->ide, OnIsaIrq, &xm->irqbus);
   Uart16550SetIrqSink(&xm->uart, OnCom1Irq, &xm->irqbus);
+  CmosSetIrqSink(&xm->cmos, OnIsaIrq, &xm->irqbus);
   // The kvm-unit-tests injection window drives the same ISA wires the devices
   // do, so it reaches both controllers through the same fan-out.
   TestDevSetIrqSink(&xm->testdev, OnIsaIrq, &xm->irqbus);
