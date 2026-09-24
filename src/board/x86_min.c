@@ -4,6 +4,7 @@
 #include "board/board.h"
 #include "device/char/uart16550.h"
 #include "device/input/i8042.h"
+#include "device/input/msmouse.h"
 #include "device/input/ps2kbd.h"
 #include "device/input/ps2mouse.h"
 #include "device/intc/i8259.h"
@@ -127,6 +128,7 @@ typedef struct X86Board {
   I8042Device kbd;
   Ps2KbdDevice ps2kbd;
   Ps2MouseDevice mouse;
+  MsMouseDevice msmouse;
   Port92Device port92;
   CmosDevice cmos;
   TestDevDevice testdev;
@@ -293,6 +295,21 @@ static void OnHostKey(void* ctx, uint32_t scan, int extended, int up) {
   Ps2KbdKey(&xm->ps2kbd, scan, extended, up);
 }
 
+// Host pointer -> the serial mouse (msmouse.c), which is what a 1985-era guest
+// drives: -mouse serial selects it, and it pushes its packets out of COM1's
+// receiver. It has no wheel and two buttons, so those are dropped.
+static void OnHostMouseSerial(void* ctx, int dx, int dy, int dz, int buttons) {
+  X86Board* xm = (X86Board*)ctx;
+  (void)dz;
+  if (DebugOn(kDbgMark)) DebugMark("hostmouse", dx, dy);
+  MsMouseEvent(&xm->msmouse, dx, dy, buttons);
+}
+
+static void OnMsMouseByte(void* ctx, uint8_t byte) {
+  X86Board* xm = (X86Board*)ctx;
+  Uart16550Receive(&xm->uart, byte);
+}
+
 // The 8042's keyboard wire, both directions, plus the translation bit.
 static void OnKbdToDev(void* ctx, uint8_t byte) {
   X86Board* xm = (X86Board*)ctx;
@@ -449,6 +466,7 @@ static void WireDevices(X86Board* xm) {
   I8042SetKbdSink(&xm->kbd, OnKbdToDev, xm);
   Ps2KbdSetTxSink(&xm->ps2kbd, OnKbdByte, xm);
   I8042SetTranslateSink(&xm->kbd, OnKbdTranslate, xm);
+  MsMouseSetTxSink(&xm->msmouse, OnMsMouseByte, xm);
   IdeSetIrqSink(&xm->ide, OnIsaIrq, &xm->irqbus);
   Uart16550SetIrqSink(&xm->uart, OnCom1Irq, &xm->irqbus);
   CmosSetIrqSink(&xm->cmos, OnIsaIrq, &xm->irqbus);
@@ -488,6 +506,7 @@ static void X86Reset(Board* m) {
   I8042Init(&xm->kbd);
   Ps2KbdInit(&xm->ps2kbd);
   Ps2MouseInit(&xm->mouse);
+  MsMouseInit(&xm->msmouse);
   Port92Init(&xm->port92);
   TestDevInit(&xm->testdev);
   CmosReset(&xm->cmos);
@@ -569,6 +588,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   I8042Init(kbd);
   Ps2KbdInit(&xm->ps2kbd);
   Ps2MouseInit(mouse);
+  MsMouseInit(&xm->msmouse);
   Port92Init(p92);
   CmosInit(cmos);
   TestDevInit(&xm->testdev);
@@ -631,7 +651,8 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   // enters it at COM1's receiver, which is where a terminal belongs on a PC.
   m->key_in = OnHostKey;
   m->key_ctx = xm;
-  m->mouse_in = OnHostMouse;
+  // One host pointer, one guest device: -mouse picks which (board.h).
+  m->mouse_in = opts->mouse == kMouseSerial ? OnHostMouseSerial : OnHostMouse;
   m->mouse_ctx = xm;
   m->serial_in = OnHostSerial;
   m->serial_ctx = xm;

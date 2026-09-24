@@ -251,6 +251,43 @@ else
   echo "SKIP (ps2kbd: no nasm and no prebuilt probe elf)"
 fi
 
+# Microsoft serial mouse on COM1 (test/x86/probe/sermouse.asm): the device a
+# 1985-era guest drives — no registers, no bus presence, it just pushes 3-byte
+# packets out of the serial port as if they had arrived on the SIN pin. The host
+# is what produces them (CEMU_DEBUG=mouse=, and -mouse serial routes the host
+# pointer there instead of to the 8042's auxiliary port), so the probe is a
+# receiver: it sets COM1 up the way such a driver does (1200 baud, 7 data bits,
+# no parity, one stop bit, FIFO on) and asserts the two packets — a left-button
+# press with no movement, then a movement with the button still held:
+#
+#   60 00 00   the button's: bit 6 always set, bit 5 left, no movement
+#   6c 0a 36   the movement's: dx = +10, dy = -10 (low six bits 0x36 = -10 with
+#              11 in byte 1's high pair)
+#
+# No QEMU dual run: the monitor's mouse commands go to the first registered
+# mouse handler (the default PC's PS/2 mouse), so the msmouse chardev never
+# receives them — measured, and written up in the probe's header. The layout
+# rests on QEMU's chardev/msmouse.c, not on a double run.
+mouselff="$dir/probe/sermouse.elf"
+if [ ! -f "$mouselff" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f elf32 -o "$dir/probe/sermouse.o" "$dir/probe/sermouse.asm" &&
+    ld.lld -m elf_i386 -T "$dir/probe/sermouse.ld" -o "$mouselff" "$dir/probe/sermouse.o"
+fi
+if [ -f "$mouselff" ]; then
+  out=$(CEMU_DEBUG="mouse=0:0:1@100000,mouse=10:-10:1@100000" \
+        timeout 30 "$CEMU" --machine x86 --isa x86 -mouse serial "$mouselff" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'pkt=6000006c0a36' &&
+     echo "$out" | grep -q 'sermouse ok'; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "sermouse: rc=$rc"
+  fi
+else
+  echo "SKIP (sermouse: no nasm and no prebuilt probe elf)"
+fi
+
 # PM: the protected-mode smoke probe (test/x86/pm). Multiboot ELF enters flat
 # PM, rebuilds GDT/IDT/TSS, and walks the stage-3 semantics: descriptor
 # loads, limit #GP, same-priv and cross-ring gate delivery with TSS stack

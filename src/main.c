@@ -18,6 +18,7 @@ typedef struct Args {
   const char* hdb;        // -hdb FILE: primary IDE slave image
   const char* cdrom;      // -cdrom FILE: secondary IDE master CD-ROM image
   const char* display_backend;  // -display win32; NULL = headless
+  const char* mouse_name;       // -mouse ps2|serial (NULL = the board's default)
   uint64_t mem_size;
   uint64_t mem_base;
   uint64_t bin_base;
@@ -120,6 +121,8 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       a->hdb = argv[++i];
     else if (strcmp(arg, "-cdrom") == 0)
       a->cdrom = argv[++i];
+    else if (strcmp(arg, "-mouse") == 0)
+      a->mouse_name = argv[++i];
     else if (arg[0] == '-' && arg[1] == '-')
       return -1;
     else
@@ -143,13 +146,29 @@ int main(int argc, char** argv) {
   }
   if (a.log_file) LogInitFile(a.log_file);
 
+  // -mouse: which pointing device the host's pointer drives (the PC board is
+  // the only one with a choice). An unknown name is an error, not a silent
+  // fallback to the default.
+  int mouse = kMousePs2;
+  if (a.mouse_name) {
+    if (strcmp(a.mouse_name, "ps2") == 0)
+      mouse = kMousePs2;
+    else if (strcmp(a.mouse_name, "serial") == 0)
+      mouse = kMouseSerial;
+    else {
+      LogError("-mouse expects ps2 or serial");
+      return kExitHostFailure;
+    }
+  }
+
   BoardOpts opts = {.ram_base = a.mem_base,
                     .ram_size = a.mem_size,
                     .bios_path = a.bios_path,
                     .hda = a.hda,
                     .hdb = a.hdb,
                     .cdrom = a.cdrom,
-                    .skip_idle = a.skip_idle};
+                    .skip_idle = a.skip_idle,
+                    .mouse = mouse};
   Board* m = BoardCreate(a.machine_name, &opts);
   if (!m) return kExitHostFailure;
 

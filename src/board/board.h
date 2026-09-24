@@ -93,6 +93,13 @@ typedef struct Board {
   void (*destroy)(struct Board* b);
 } Board;
 
+// -mouse: which pointing device the host's pointer drives. A machine can have
+// both a PS/2 mouse and a serial mouse attached, but one host pointer cannot
+// sensibly drive both at once — the guest would see every movement twice — so
+// the board feeds exactly one. QEMU makes the same choice with its
+// `-serial msmouse` being opt-in; here the default is the PS/2 port.
+enum { kMousePs2 = 0, kMouseSerial = 1 };
+
 // Command-line overridable knobs; 0 means "board default". A board may reject
 // values that contradict its layout contract.
 typedef struct BoardOpts {
@@ -112,6 +119,8 @@ typedef struct BoardOpts {
   // by default: with it off the emulated clock and the host clock agree, which
   // is what a wall-time-faithful run needs.
   int skip_idle;
+  // Which pointing device the host's pointer feeds (kMousePs2 / kMouseSerial).
+  int mouse;
 } BoardOpts;
 
 // Creates a board by name ("spike", "x86", "virt"); returns NULL for unknown
