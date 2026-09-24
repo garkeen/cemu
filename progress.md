@@ -3,6 +3,46 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 25：串口鼠标销账 + 验收 4（Windows 1.01）基线与显示形状裁决（2026-09-24）
+
+**验收 4 的验收件与 QEMU 基线**：`build/windows/windows101.img`（1.44MB、MS-DOS 3.3
+引导软盘、卷标 WIN101；根目录 42 项 = DOS 3.3 三个系统文件 + Windows 1.01 全套
+WIN100.BIN/OVL、WIN.COM/CNF/INI、WINOLDAP、各 EXE 与 FON、HPLASER.DRV；AUTOEXEC.BAT
+只有 `@echo off` + `WIN`，无 CONFIG.SYS）。QEMU 实测（`-fda` + `-boot a`，7 秒截屏）：
+SeaBIOS → 软盘引导 → DOS → `WIN` → **MS-DOS Executive 桌面**，屏幕 **640×350**。
+
+**镜像的两条硬结论**：① 显示是 **EGA** —— WIN100.OVL 的模块表（KERNEL/USER/GDI/SYSTEM/
+KEYBOARD/MOUSE/DISPLAY/SOUND/COMM）里 DISPLAY 模块只有一个，描述串为 `DISPLAY : 133, 96,
+72 : EGA (more than 64K) with Enhanced Color Display`，全镜像无 CGA/Hercules/Color-Graphics
+字符串；② 镜像里**没有 DOS 鼠标驱动**（无 MOUSE.SYS/COM、无 CONFIG.SYS），鼠标模块导出的
+`MOUSEGETINTVECT` 是 INT 33h 通道的形态 —— 所以窗口里那个箭头能不能动，要到 EGA 点亮之后
+才有条件判。
+
+**串口鼠标（COM1，Microsoft "M" 协议）销账**：设备本体 `device/input/msmouse.c/h`（3 字节包、
+bit 6 恒置、dx/dy 为 8 位补码拆在 byte 1 的高位对与后续字节的低 6 位、越界按 QEMU 同款钳位、
+按键变化无位移也报）+ `-mouse ps2|serial`（board.h 的 kMousePs2/kMouseSerial，默认 ps2：
+一台机同时挂两个鼠标会被一个宿主指针喂两遍）。本轮补齐交付面：新增
+`test/x86/probe/sermouse.ld`（原先缺这个文件，探针根本编不出来）、探针进 `test/x86/run.sh`。
+cemu 侧 `pkt=6000006c0a36` + `sermouse ok`，rc=11；x86 套件 19/0。
+
+**探针改为开接收 FIFO（关键修正）**：原探针只写 LCR 不写 FCR。16550 在 FIFO 关闭时 RBR 只留
+1 字节、其余按溢出丢弃（QEMU `serial_receive1` 即实机语义），三字节包因此**必然丢** —— 它原先
+只能在本机"无视 FCR.FE 一直缓存 16 字节"的接收路径上通过。补上 `FCR=0xc7` 后探针在两种语义下
+都成立，本机这处分歧登记为 **D32**。
+
+**没有 QEMU 双跑，原因是 QEMU 侧（非协议分歧）**：监视器的 `mouse_button/mouse_move` 走 QEMU
+输入层，事件投给**第一个注册的鼠标处理器** —— 默认 PC 上是机器的 PS/2 鼠标，`-serial msmouse`
+的 chardev 收不到。证据：`-trace "serial_*"` 全程只有 `serial_read [0x05] -> 0x60`
+（THRE|TEMT，DR 不置位），无任何 msmouse trace 点输出；`-M isapc`（无 PS/2 鼠标）同样 rc=7。
+探针头与套件注释都记了这条，避免后人重踩。布局依据是 QEMU `chardev/msmouse.c` 的字段构造。
+
+**显示实现形状（用户裁决）**：不按"CGA 图形 → EGA → VGA"三段各自成卡，而是
+**一个 VGA 家族核 + CGA/EGA 兼容模式** —— 核给 4 平面 64K+ 显存、0x3C0-0x3DF 四组寄存器、
+平面与链式两种寻址、256 色 DAC；CGA/EGA 是它的兼容模式层（验收 4 要的 EGA 640×350 就在其中），
+现有 `cga.c` 的文本路径并入核而不是加分支。量级与阶段归属见 arch.md 阶段 4（核 + 兼容模式
+约 700–1100 行，VGA 特有部分再 500–1000 行）。台账 D17 已按此改写，D21（软盘引导链）改记为
+验收 4 的硬前置。
+
 ## 阶段 4 片 24：PS/2 键盘侧 —— 命令集与翻译位（D20 销账）（2026-09-24）
 
 D20 的后半：键盘不再是"只回 ACK 的壳"。设备从 i8042 里拆出来成 `device/input/ps2kbd.c/h`

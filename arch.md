@@ -138,7 +138,9 @@ x86 `qemu-system-i386 -device isa-debug-exit,iobase=0xf4,iosize=0x4`。
 xpack riscv gcc（guest riscv）、nasm（D:/nasm，2.16.03 在 D:/SSDOWN/tools）、
 LLVM 23.1（D:/LLVM，seabios 与 x86 构建用）、mingw gcc 8.1（cemu 本体）、
 qemu-system-i386（D:/qemu）。seabios bios.bin 已从源码构建成功（256KiB，
-复位向量逐字节验证，为阶段 4 SeaBIOS 路线备料）。
+复位向量逐字节验证，为阶段 4 SeaBIOS 路线备料）——**在库外**，路径
+`D:\code\c\EMU\seabios\out\bios.bin`（seabios 是与 cemu 平级的参考/素材目录，跑
+`-bios` 时指过去即可；x86 的软盘/光盘引导都靠它的 INT 13h/10h/16h）。
 
 ### 阶段 1：ISA 一致性 ✅
 RV64IMAFDC + Zicsr + Zifencei + M 态 CSR。riscv-tests 127 项全绿曾达成。
@@ -193,7 +195,7 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - PC 设备模型全集（CGA、PS/2、PIC、PIT、UART、IDE、LAPIC、IOAPIC）✅
   —— 片 1–14 逐项落地。余下的规格缺口（IOAPIC 的 NMI/SMI/INIT/ExtINT 交付模式、
   PIRQ 消费者、PM/ACPI、ATA LBA-48/multi-sector、RTC 周期与闹钟中断、软盘与 8237
-  DMA、i8042 命令集、CGA 图形模式与光栅时序）按 AGENTS.md 第十节台账在册。
+  DMA、i8042 命令集、显示家族（CGA 图形与光栅时序、EGA/VGA））按 AGENTS.md 第十节台账在册。
 - bin 路线：multiboot 等价的入口契约，xv6 去掉 bootasm.S/bootmain.c
   编为 .bin；SeaBIOS 路线：官方 bios.bin 映射内存顶端，复位 F000:FFF0
   （bios.bin 已备料；跑通 SeaBIOS 本体属本阶段设备集成，不前置）。
@@ -223,6 +225,20 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   不变式。回归：riscv64 136/0、x86 15/0。验收 3（xv6-riscv）未开始：素材
   （xv6-riscv 镜像与 OpenSBI fw_jump）尚未取，串口输入通道已就绪。过程与证据见
   progress.md。
+- **验收 4（Windows 1.01）与显示实现形状**（2026-09-24 用户裁决）：验收件
+  `build/windows/windows101.img`（1.44MB、MS-DOS 3.3 引导软盘，卷标 WIN101），QEMU
+  基线是 **EGA 640×350** 下的 MS-DOS Executive 桌面（7 秒时截屏）。它给出两条硬前置：
+  **软盘引导链**（8272 FDC + 8237 DMA 通道 2 + CMOS 软驱字节 + 引导 DL=0x00，台账
+  D21）与**显示**（台账 D17）。显示不按"CGA 图形 → EGA → VGA"三段各自成卡，而是
+  **一个 VGA 家族核 + CGA/EGA 兼容模式**：核提供 4 平面 64K+ 显存、
+  0x3C0-0x3DF 四组寄存器（CRTC/Sequencer/Graphics/Attribute）、平面与链式两种寻址、
+  256 色 DAC；CGA 与 EGA 是它的兼容模式层 —— EGA 640×350 正是验收 4 要的那一层，
+  CGA 的 320×200/640×200 也落在同一张模式表上。现有 `cga.c` 的文本路径并入核，
+  不往 `cga.c` 里加分支（AGENTS.md 禁止特判）。
+  量级参考本仓库既有设备（cga.c 311 行 = CGA 文本；i8259 361 行；ide.c 1774 行 =
+  ATA/ATAPI 子集）：核 + CGA/EGA 兼容模式约 700–1100 行，VGA 特有的链式模式与
+  256 色 DAC/VBE 再 500–1000 行，显示通道（DisplaySourceOps 宽高可变 + 宿主窗口随
+  模式换尺寸）约 100–200 行。
 
 ### 阶段 5：cesdk（放后：真实 OS 跑通后再做 SDK）
 - 交付：crun 运行时（_start、putch→UART、halt→sifive_test）、klib、
