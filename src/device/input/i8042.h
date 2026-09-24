@@ -13,9 +13,15 @@
 // on IRQ1 and the auxiliary port (the PS/2 mouse) on IRQ12. Each has its own
 // output queue, but the chip has a single output buffer, so only one queue is
 // on offer at 0x60 at a time — the keyboard's wins — and status bit 5 says
-// which one the byte came from. Commands 0xa7/0xa8 gate the auxiliary
-// interface, and 0xd4 routes the next 0x60 write down the mouse wire
-// (I8042SetAuxSink); the device's answers come back through I8042AuxByte.
+// which one the byte came from. In the other direction the controller hands the
+// bytes it is given to the device on that port: the keyboard's to
+// I8042SetKbdSink (a command or its parameter) and the auxiliary device's to
+// I8042SetAuxSink (command 0xd4's payload), with the devices' answers coming
+// back through I8042KbdByte and I8042AuxByte. Command byte bit 6, the scancode
+// translation bit, reaches the keyboard through I8042SetTranslateSink — it is
+// the controller's bit, but it is the keyboard's output that changes.
+//
+// Commands 0xa7/0xa8 gate the auxiliary interface.
 //
 // The output port carries the A20 gate in bit 1 (IBM PC/AT Technical
 // Reference). The model drives the board's A20 line through a sink callback,
@@ -24,7 +30,7 @@
 //
 // Keys arrive as scancode bytes — make codes, 0x80|make on a release, 0xe0
 // before an extended key — pushed by the host window's keyboard
-// (I8042KeyByte). A byte waiting at 0x60 sets output-buffer-full, and the
+// (I8042KbdByte). A byte waiting at 0x60 sets output-buffer-full, and the
 // controller holds its IRQ line up while a byte waits, the command byte
 // enables the interrupt and the device is not disabled (PC/AT Technical
 // Reference; QEMU pckbd's kbd_update_irq_lines spells the same conditions).
@@ -33,6 +39,12 @@
 typedef struct I8042Device {
   void (*set_a20)(void* ctx, int on);
   void* a20_ctx;
+  // One byte for the keyboard device (a command or a parameter).
+  void (*write_kbd)(void* ctx, uint8_t byte);
+  void* write_kbd_ctx;
+  // The translation bit as it changes (command byte bit 6).
+  void (*set_translate)(void* ctx, int on);
+  void* translate_ctx;
   // Command 0xd4's payload: one byte for the auxiliary device.
   void (*write_aux)(void* ctx, uint8_t byte);
   void* write_aux_ctx;
@@ -54,8 +66,14 @@ void I8042SetResetSink(I8042Device* d, void (*request_reset)(void* ctx), void* c
 // Command 0xd4: the controller hands the next data byte to this sink, which is
 // the auxiliary device (the PS/2 mouse).
 void I8042SetAuxSink(I8042Device* d, void (*write_aux)(void* ctx, uint8_t byte), void* ctx);
+// The keyboard device: the controller hands it every byte written to 0x60 that
+// is not a command byte or the output port (ps2kbd.c owns the command set).
+void I8042SetKbdSink(I8042Device* d, void (*write_kbd)(void* ctx, uint8_t byte), void* ctx);
+// Command byte bit 6 (translation) as it changes: the keyboard device's output
+// encoding depends on it.
+void I8042SetTranslateSink(I8042Device* d, void (*set_translate)(void* ctx, int on), void* ctx);
 // One byte from the keyboard device into the controller's output queue.
-void I8042KeyByte(I8042Device* d, uint8_t scancode);
+void I8042KbdByte(I8042Device* d, uint8_t scancode);
 // One byte from the auxiliary device (the mouse) into the AUX output queue.
 void I8042AuxByte(I8042Device* d, uint8_t byte);
 

@@ -221,6 +221,9 @@ static void I8042WriteData(I8042Device* d, uint8_t val) {
   switch (st->expecting) {
     case kExpectCmdByte:
       st->cmd_byte = val;
+      // The translation bit is the controller's, but what changes is the
+      // keyboard's output encoding, so the device hears about it.
+      if (d->set_translate) d->set_translate(d->translate_ctx, (val & kModeKcc) ? 1 : 0);
       break;
     case kExpectOutPort:
       st->outport = val;
@@ -235,25 +238,11 @@ static void I8042WriteData(I8042Device* d, uint8_t val) {
         d->write_aux(d->write_aux_ctx, val);
       break;
     default:
-      // A byte for the keyboard device itself. Every one is answered: the
-      // firmware's probe waits for that ACK, and without it SeaBIOS's PS/2
-      // setup times out and leaves the controller with the keyboard disabled —
-      // IRQ1 then never comes up. QEMU's ps2.c queues one ACK per command
-      // and one per parameter byte, which is exactly this; the two
-      // self-identifying commands answer with their extra bytes as well.
+      // A byte for the keyboard device: ps2kbd.c owns its command set, its
+      // ACKs and its scancodes, exactly as ps2mouse.c owns the auxiliary
+      // device's.
       st->last_data = val;
-      if (val == 0xff) {  // reset: ACK, then power-on-reset
-        QueuePush(&st->kbd, 0xfa);
-        QueuePush(&st->kbd, 0xaa);
-      } else if (val == 0xf2) {  // identify: ACK, then the device id
-        QueuePush(&st->kbd, 0xfa);
-        QueuePush(&st->kbd, 0xab);
-        QueuePush(&st->kbd, 0x83);
-      } else if (val == 0xee) {  // echo answers itself
-        QueuePush(&st->kbd, 0xee);
-      } else {  // 0xf0 set-scancode-set, 0xed LEDs, 0xf3 typematic, 0xf4/0xf5, ...
-        QueuePush(&st->kbd, 0xfa);
-      }
+      if (d->write_kbd) d->write_kbd(d->write_kbd_ctx, val);
       break;
   }
   st->expecting = kExpectNone;
@@ -307,6 +296,10 @@ void I8042Init(I8042Device* d) {
   // open — see port92.h for why the gate starts open.
   st->cmd_byte = kModeKbdInt | kModeAuxInt | kModeSys | kModeKcc;
   st->outport = kOutPortA20;
+  d->write_kbd = NULL;
+  d->write_kbd_ctx = NULL;
+  d->set_translate = NULL;
+  d->translate_ctx = NULL;
   d->write_aux = NULL;
   d->write_aux_ctx = NULL;
   d->set_a20 = NULL;
@@ -343,7 +336,17 @@ void I8042SetAuxSink(I8042Device* d, void (*write_aux)(void* ctx, uint8_t byte),
   d->write_aux_ctx = ctx;
 }
 
-void I8042KeyByte(I8042Device* d, uint8_t scancode) {
+void I8042SetKbdSink(I8042Device* d, void (*write_kbd)(void* ctx, uint8_t byte), void* ctx) {
+  d->write_kbd = write_kbd;
+  d->write_kbd_ctx = ctx;
+}
+
+void I8042SetTranslateSink(I8042Device* d, void (*set_translate)(void* ctx, int on), void* ctx) {
+  d->set_translate = set_translate;
+  d->translate_ctx = ctx;
+}
+
+void I8042KbdByte(I8042Device* d, uint8_t scancode) {
   if (DebugOn(kDbgMark)) DebugMark("kbd-byte", (int)scancode, 0);
   QueuePush(&d->st->kbd, scancode);
   I8042SyncIrq(d);

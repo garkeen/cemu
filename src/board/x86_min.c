@@ -4,6 +4,7 @@
 #include "board/board.h"
 #include "device/char/uart16550.h"
 #include "device/input/i8042.h"
+#include "device/input/ps2kbd.h"
 #include "device/input/ps2mouse.h"
 #include "device/intc/i8259.h"
 #include "device/intc/lapic.h"
@@ -124,6 +125,7 @@ typedef struct X86Board {
   LapicDevice lapic;
   CgaDevice cga;
   I8042Device kbd;
+  Ps2KbdDevice ps2kbd;
   Ps2MouseDevice mouse;
   Port92Device port92;
   CmosDevice cmos;
@@ -280,15 +282,31 @@ static void OnIsaIrq(void* ctx, int line, int level) {
   if (DebugOn(kDbgMark)) DebugMark("isa", line, level);
 }
 
-// Host keys -> the 8042: the keyboard's byte (0xe0 first for an extended key,
-// bit 7 on a release) lands in the controller's output queue, which raises
-// IRQ1 while a byte waits; the guest's keyboard driver reads it from 0x60.
+// Host keys -> the keyboard device -> the 8042: the device turns the host's
+// set-1 triple into whatever the guest's scancode set and the controller's
+// translation bit call for, and its bytes land in the controller's keyboard
+// queue, which raises IRQ1 while one waits.
 static void OnHostKey(void* ctx, uint32_t scan, int extended, int up) {
   X86Board* xm = (X86Board*)ctx;
   if (scan == 0 || scan > 0x7f) return;  // Win32 sends no scan code for a few keys
-  if (extended) I8042KeyByte(&xm->kbd, 0xe0);
   if (DebugOn(kDbgMark)) DebugMark("hostkey", (int)scan, up);
-  I8042KeyByte(&xm->kbd, (uint8_t)(scan | (up ? 0x80u : 0u)));
+  Ps2KbdKey(&xm->ps2kbd, scan, extended, up);
+}
+
+// The 8042's keyboard wire, both directions, plus the translation bit.
+static void OnKbdToDev(void* ctx, uint8_t byte) {
+  X86Board* xm = (X86Board*)ctx;
+  Ps2KbdWrite(&xm->ps2kbd, byte);
+}
+
+static void OnKbdByte(void* ctx, uint8_t byte) {
+  X86Board* xm = (X86Board*)ctx;
+  I8042KbdByte(&xm->kbd, byte);
+}
+
+static void OnKbdTranslate(void* ctx, int on) {
+  X86Board* xm = (X86Board*)ctx;
+  Ps2KbdSetTranslate(&xm->ps2kbd, on);
 }
 
 // Host pointer -> the 8042's auxiliary port: the movement, the wheel and the
@@ -428,6 +446,9 @@ static void WireDevices(X86Board* xm) {
   // command 0xd4's bytes go down, the device's answers come back up.
   I8042SetAuxSink(&xm->kbd, OnKbdToAux, xm);
   Ps2MouseSetTxSink(&xm->mouse, OnAuxByte, xm);
+  I8042SetKbdSink(&xm->kbd, OnKbdToDev, xm);
+  Ps2KbdSetTxSink(&xm->ps2kbd, OnKbdByte, xm);
+  I8042SetTranslateSink(&xm->kbd, OnKbdTranslate, xm);
   IdeSetIrqSink(&xm->ide, OnIsaIrq, &xm->irqbus);
   Uart16550SetIrqSink(&xm->uart, OnCom1Irq, &xm->irqbus);
   CmosSetIrqSink(&xm->cmos, OnIsaIrq, &xm->irqbus);
@@ -465,6 +486,7 @@ static void X86Reset(Board* m) {
   IoapicInit(&xm->ioapic);
   CgaInit(&xm->cga);
   I8042Init(&xm->kbd);
+  Ps2KbdInit(&xm->ps2kbd);
   Ps2MouseInit(&xm->mouse);
   Port92Init(&xm->port92);
   TestDevInit(&xm->testdev);
@@ -545,6 +567,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   IoapicInit(&xm->ioapic);
   CgaInit(cga);
   I8042Init(kbd);
+  Ps2KbdInit(&xm->ps2kbd);
   Ps2MouseInit(mouse);
   Port92Init(p92);
   CmosInit(cmos);

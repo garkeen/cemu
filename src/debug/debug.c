@@ -224,80 +224,137 @@ static void AddWatch(const char* spec) {
 
 // ---- synthetic host input (mouse=) -----------------------------------------
 
-enum { kMaxMouseInj = 4 };
+enum { kMaxInj = 4 };
 static struct {
-  int dx, dy, dz, buttons;
-  uint64_t period;   // instructions between events
-  uint64_t next_at;  // the instruction count of the next one
-} g_mouse_inj[kMaxMouseInj];
-static int g_nmouse_inj;
+  int kind;
+  int dx, dy, dz, buttons;  // mouse
+  uint32_t scan;            // key
+  int extended, up;         // key
+  uint64_t period;          // instructions between events
+  uint64_t next_at;         // the instruction count of the next one
+} g_inj[kMaxInj];
+static int g_ninj;
 
-int DebugNextMouseEvent(uint64_t inst_count, DebugInjection* out) {
-  for (int i = 0; i < g_nmouse_inj; i++) {
-    if (inst_count < g_mouse_inj[i].next_at) continue;
+int DebugNextInjection(uint64_t inst_count, DebugInjection* out) {
+  for (int i = 0; i < g_ninj; i++) {
+    if (inst_count < g_inj[i].next_at) continue;
     // Catch up in one step if the item came due while nobody was looking, so a
     // backlog does not arrive as a burst.
     do {
-      g_mouse_inj[i].next_at += g_mouse_inj[i].period;
-    } while (g_mouse_inj[i].next_at <= inst_count);
-    out->dx = g_mouse_inj[i].dx;
-    out->dy = g_mouse_inj[i].dy;
-    out->dz = g_mouse_inj[i].dz;
-    out->buttons = g_mouse_inj[i].buttons;
-    if (DebugOn(kDbgMark)) DebugMark("mouse-inj", out->dx, out->dy);
+      g_inj[i].next_at += g_inj[i].period;
+    } while (g_inj[i].next_at <= inst_count);
+    out->kind = g_inj[i].kind;
+    out->dx = g_inj[i].dx;
+    out->dy = g_inj[i].dy;
+    out->dz = g_inj[i].dz;
+    out->buttons = g_inj[i].buttons;
+    out->scan = g_inj[i].scan;
+    out->extended = g_inj[i].extended;
+    out->up = g_inj[i].up;
+    if (DebugOn(kDbgMark))
+      DebugMark(out->kind == kInjMouse ? "mouse-inj" : "key-inj",
+                out->kind == kInjMouse ? out->dx : (int)out->scan,
+                out->kind == kInjMouse ? out->dy : out->up);
     return 1;
   }
   return 0;
 }
 
-// mouse=DX:DY:BUTTONS[:WHEEL]@N — signed C literals (hex needs 0x), and the
-// period is required: a default would silently pick a cadence for the caller.
-static void AddMouseInjection(const char* spec) {
-  if (g_nmouse_inj >= kMaxMouseInj) {
-    LogError("debug: too many mouse= items, dropping '%s'", spec);
-    return;
+// The @N suffix every injection item carries: the period in instructions, which
+// is required — a default would silently pick a cadence for the caller.
+static int ParseInjectionPeriod(char* body, const char* spec, uint64_t* out) {
+  char* at = strrchr(body, '@');
+  if (!at) {
+    LogError("debug: injection needs '@N' (the period in instructions): '%s'", spec);
+    return 0;
   }
+  *at = 0;
+  char* end = NULL;
+  long period = strtol(at + 1, &end, 0);
+  if (!end || *end || period <= 0) {
+    LogError("debug: injection period must be a positive number ('%s')", spec);
+    return 0;
+  }
+  *out = (uint64_t)period;
+  return 1;
+}
+
+// Both items are FIELD[:FIELD...]@N with signed C literals (hex needs 0x). A
+// field that is not a number is an error: a silently dropped item would look
+// like a probe that never gets its event.
+static int ParseInjectionFields(char* body, const char* spec, long* vals, int want, int max) {
+  int n = 0;
+  char* save = NULL;
+  for (char* f = strtok_r(body, ":", &save); f; f = strtok_r(NULL, ":", &save)) {
+    if (n == max) break;
+    char* end = NULL;
+    vals[n] = strtol(f, &end, 0);
+    if (!*f || !end || *end) {
+      LogError("debug: injection field '%s' is not a number ('%s')", f, spec);
+      return 0;
+    }
+    n++;
+  }
+  if (n < want) {
+    LogError("debug: injection needs at least %d fields ('%s')", want, spec);
+    return 0;
+  }
+  return n;
+}
+
+// mouse=DX:DY:BUTTONS[:WHEEL]@N
+static void AddMouseInjection(const char* spec) {
   char body[128];
   if (strlen(spec) >= sizeof(body)) {
     LogError("debug: mouse= item too long ('%s')", spec);
     return;
   }
   strcpy(body, spec);
-  char* at = strrchr(body, '@');
-  if (!at) {
-    LogError("debug: mouse= expects DX:DY:BUTTONS[:WHEEL]@N ('%s')", spec);
-    return;
-  }
-  *at = 0;
+  uint64_t period = 0;
+  if (!ParseInjectionPeriod(body, spec, &period)) return;
   long vals[4] = {0, 0, 0, 0};
-  int n = 0;
-  char* save = NULL;
-  for (char* f = strtok_r(body, ":", &save); f && n < 4; f = strtok_r(NULL, ":", &save)) {
-    char* end = NULL;
-    vals[n] = strtol(f, &end, 0);
-    if (!*f || !end || *end) {
-      LogError("debug: mouse= field '%s' is not a number ('%s')", f, spec);
-      return;
-    }
-    n++;
-  }
-  if (n < 3) {
-    LogError("debug: mouse= needs at least DX:DY:BUTTONS ('%s')", spec);
+  if (!ParseInjectionFields(body, spec, vals, 3, 4)) return;
+  if (g_ninj >= kMaxInj) {
+    LogError("debug: too many injection items, dropping '%s'", spec);
     return;
   }
-  char* end = NULL;
-  long period = strtol(at + 1, &end, 0);
-  if (!end || *end || period <= 0) {
-    LogError("debug: mouse= period must be a positive number ('%s')", spec);
+  g_inj[g_ninj].kind = kInjMouse;
+  g_inj[g_ninj].dx = (int)vals[0];
+  g_inj[g_ninj].dy = (int)vals[1];
+  g_inj[g_ninj].buttons = (int)vals[2];
+  g_inj[g_ninj].dz = (int)vals[3];
+  g_inj[g_ninj].period = period;
+  g_inj[g_ninj].next_at = period;
+  g_ninj++;
+}
+
+// key=SCAN[:EXT[:UP]]@N
+static void AddKeyInjection(const char* spec) {
+  char body[128];
+  if (strlen(spec) >= sizeof(body)) {
+    LogError("debug: key= item too long ('%s')", spec);
     return;
   }
-  g_mouse_inj[g_nmouse_inj].dx = (int)vals[0];
-  g_mouse_inj[g_nmouse_inj].dy = (int)vals[1];
-  g_mouse_inj[g_nmouse_inj].buttons = (int)vals[2];
-  g_mouse_inj[g_nmouse_inj].dz = (int)vals[3];
-  g_mouse_inj[g_nmouse_inj].period = (uint64_t)period;
-  g_mouse_inj[g_nmouse_inj].next_at = (uint64_t)period;
-  g_nmouse_inj++;
+  strcpy(body, spec);
+  uint64_t period = 0;
+  if (!ParseInjectionPeriod(body, spec, &period)) return;
+  long vals[3] = {0, 0, 0};
+  if (!ParseInjectionFields(body, spec, vals, 1, 3)) return;
+  if (vals[0] < 0 || vals[0] > 0x7f) {
+    LogError("debug: key= scan code must be 0..0x7f ('%s')", spec);
+    return;
+  }
+  if (g_ninj >= kMaxInj) {
+    LogError("debug: too many injection items, dropping '%s'", spec);
+    return;
+  }
+  g_inj[g_ninj].kind = kInjKey;
+  g_inj[g_ninj].scan = (uint32_t)vals[0];
+  g_inj[g_ninj].extended = (int)vals[1];
+  g_inj[g_ninj].up = (int)vals[2];
+  g_inj[g_ninj].period = period;
+  g_inj[g_ninj].next_at = period;
+  g_ninj++;
 }
 
 void DebugInit(void) {
@@ -335,6 +392,8 @@ void DebugInit(void) {
       AddDump(tok + 5);
     else if (!strncmp(tok, "mouse=", 6))
       AddMouseInjection(tok + 6);
+    else if (!strncmp(tok, "key=", 4))
+      AddKeyInjection(tok + 4);
     else if (!strncmp(tok, "budget=", 7))
       g_budget = atoi(tok + 7);
     else if (!strncmp(tok, "skip=", 5))

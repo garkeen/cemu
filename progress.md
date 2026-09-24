@@ -3,6 +3,46 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 24：PS/2 键盘侧 —— 命令集与翻译位（D20 销账）（2026-09-24）
+
+D20 的后半：键盘不再是"只回 ACK 的壳"。设备从 i8042 里拆出来成 `device/input/ps2kbd.c/h`
+（与 ps2mouse.c 对称：控制器只做队列/状态位/中断，设备做命令集与编码），控制器通过
+`I8042SetKbdSink` 把字节交给它，`I8042KbdByte` 收回它的应答，命令字节 bit 6（翻译位）变化
+时用 `I8042SetTranslateSink` 通知它。
+
+**参考**：aeb `scancodes-10`（三套扫描码、make/break 约定、翻译表与"Set 1 should not be
+translated"）、`scancodes-12`（命令集："Each command (other than 0xfe) is ACKed by 0xfa.
+Each unknown command is NACKed by 0xfe"、0xf7-0xfd 在非 set 3 下**无影响**）、QEMU
+`hw/input/ps2.c` 的 `translate_table[256]`。
+
+**编码模型**：设备原生 set 2，宿主说的是 set 1，所以设备存"客人选的 set + 控制器的翻译位"
+再决定发什么 —— 翻译开（默认）或 set 1 → 宿主原样的 set 1 字节；翻译关且 set 2 → set-2 等价
+编码（断码用 0xf0 前缀、扩展键保留 0xe0）。表由 QEMU 的 `translate_table`（set 2 → set 1，
+与 aeb §10.3 的表一致，0x7f 以上只有 0x83→0x41、0x84→0x54 两个非恒等项）**反演**得到：
+零冲突、127 项，十个键手查全对（Esc 01↔76、'1' 02↔16、'A' 1e↔1c、Enter 1c↔5a、
+LShift 2a↔12、space 39↔29、Backspace 0e↔66、Tab 0f↔0d、LCtrl 1d↔14、LAlt 38↔11）。
+
+**回复也要翻译**：翻译位作用在设备的应答上 —— 客人读"你在哪套"得到 0x41（set 2），读 MF2 的
+ID 得到 `ab 41`（aeb §10.3 的 1/2/3→43/41/3f 与 83→41）。0xfa/0xfe/0xaa 在表里是恒等，
+所以 ACK 不会被搅乱。命令集：0xf0（查询/选 1 或 2；3 本机不认，按"参数不可接受"回 0xfe）、
+0xf2、0xee、0xed/0xf3（收参数、无观测效果：本机无 LED、重复键是宿主产生的）、0xf4/0xf5
+（扫描使能真生效）、0xff（ACK+0xAA，set 回 2）、0xf7-0xfd（set 3 属性，收下不存）、未知
+命令一律 0xfe。
+
+**注入**：`CEMU_DEBUG=key=SCAN[:EXT[:UP]]@N`，与 `mouse=` 对称（探针按不了键，宿主事件路径
+只能从宿主侧驱动）。
+
+**探针**（`test/x86/probe/ps2kbd.{asm,ld}`，已接入 run.sh）：命令半由客人自己驱动（29 条
+断言，含翻译后的回复），翻译半三相位：翻译开+set 2 → `1e9ee048e0c8`（set 1）；翻译关+set 2
+→ `1cf01ce075e0f075`（set 2，含 0xf0 断码与 0xe0 扩展）；翻译关+set 1 → 又是 set 1。
+
+**验证**：cemu `s3=fe cmd=47 seq=1e9ee048e0c8 seq=1cf01ce075e0f075 seq=1e9ee048e0c8` +
+`ps2kbd ok`，rc=11；QEMU 双跑（`-kernel` + 监视器 `sendkey a 10` / `sendkey up 10`）同样
+**rc=11**，命令半 29 条断言全过，三相位拿到的是**同一组字节**（相位边界对不齐，是监视器
+按键时序造成的轮转；编码本身一致）。三处只打印不断言的分歧：set 3 的应答（QEMU 接受并切
+过去，本机只认 1/2 并回 0xfe）、命令字节的值（61 vs 47，QEMU 留了自己的位）、相位轮转。
+x86 套件 18/0。
+
 ## 阶段 4 片 23：PS/2 鼠标（8042 辅助端口）+ CEMU_DEBUG 的宿主输入注入（2026-09-24）
 
 D20 分两片：本片是**鼠标**；键盘侧（0xF0 扫描码集切换 / 翻译位真正生效 / 0xF4/0xF5 使能）

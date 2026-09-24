@@ -212,6 +212,45 @@ else
   echo "SKIP (ps2mouse: no nasm and no prebuilt probe elf)"
 fi
 
+# PS/2 keyboard on the 8042's keyboard port (test/x86/probe/ps2kbd.asm): the
+# command half runs on the guest's own initiative (0xf0 query/select, 0xf2 ID,
+# 0xee echo, 0xed/0xf3 parameters, 0xf4/0xf5, 0xff reset, an unknown command,
+# and the translated replies — a translating 8042 turns "I am in set 2" into
+# 0x41 and the MF2 ID into 0xab 0x41), and the translation half needs the host,
+# so CEMU_DEBUG=key= presses 'a' and the Up arrow, press and release each. Three
+# phases: translation on + set 2 -> the host's set-1 bytes; translation off +
+# set 2 -> the set-2 encoding with its 0xf0 break prefix and 0xe0 extended
+# prefix; translation off + set 1 -> set 1 again ("Set 1 should not be
+# translated", aeb scancodes-10 §10.1).
+# Dual run against qemu-system-i386 -kernel (monitor: `sendkey a 10` then
+# `sendkey up 10`, repeated) passes with the same status 11, and its command
+# half agrees on all 29 assertions. The sequences are asserted here rather than
+# in the probe, and three divergences are printed rather than asserted: the
+# set-3 answer (QEMU accepts set 3 and switches to it, this model claims sets 1
+# and 2 only and draws the resend), the command byte's value (61 vs 47 — QEMU
+# leaves its own bits in it), and the phase boundaries (QEMU's monitor events do
+# not land on the probe's phase edges, so its sequences carry the same bytes
+# rotated — the encodings themselves agree).
+kbdelf="$dir/probe/ps2kbd.elf"
+if [ ! -f "$kbdelf" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f elf32 -o "$dir/probe/ps2kbd.o" "$dir/probe/ps2kbd.asm" &&
+    ld.lld -m elf_i386 -T "$dir/probe/ps2kbd.ld" -o "$kbdelf" "$dir/probe/ps2kbd.o"
+fi
+if [ -f "$kbdelf" ]; then
+  out=$(CEMU_DEBUG="key=0x1e@100000,key=0x1e:0:1@100000,key=0x48:1@100000,key=0x48:1:1@100000" \
+        timeout 60 "$CEMU" --machine x86 --isa x86 "$kbdelf" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 11 ] && echo "$out" | grep -q 's3=fe cmd=47 seq=1e9ee048e0c8 seq=1cf01ce075e0f075 seq=1e9ee048e0c8' &&
+     echo "$out" | grep -q 'ps2kbd ok'; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "ps2kbd: rc=$rc"
+  fi
+else
+  echo "SKIP (ps2kbd: no nasm and no prebuilt probe elf)"
+fi
+
 # PM: the protected-mode smoke probe (test/x86/pm). Multiboot ELF enters flat
 # PM, rebuilds GDT/IDT/TSS, and walks the stage-3 semantics: descriptor
 # loads, limit #GP, same-priv and cross-ring gate delivery with TSS stack

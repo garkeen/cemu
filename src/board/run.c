@@ -23,13 +23,18 @@ int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuStat
     // Host input (stdin: the console or a pipe) goes to the board's sinks; the
     // poll self-gates, so calling it every loop costs almost nothing.
     HostInputPoll();
-    // CEMU_DEBUG=mouse=: the synthetic pointer (debug/debug.h). A headless run
-    // has no window and a guest-driven test cannot press a button, so the host
-    // pointer path would otherwise be unreachable from a test; these events
-    // enter through the same sink the window drives.
+    // CEMU_DEBUG=mouse=/key=: the synthetic pointer and keyboard
+    // (debug/debug.h). A headless run has no window, and a guest-driven test
+    // cannot press a button or a key, so the host input paths would otherwise
+    // be unreachable from a test; these events enter through the same sinks the
+    // window drives.
     DebugInjection inj;
-    while (DebugNextMouseEvent(m->cpu.inst_count, &inj)) {
-      if (m->mouse_in) m->mouse_in(m->mouse_ctx, inj.dx, inj.dy, inj.dz, inj.buttons);
+    while (DebugNextInjection(m->cpu.inst_count, &inj)) {
+      if (inj.kind == kInjMouse) {
+        if (m->mouse_in) m->mouse_in(m->mouse_ctx, inj.dx, inj.dy, inj.dz, inj.buttons);
+      } else {
+        if (m->key_in) m->key_in(m->key_ctx, inj.scan, inj.extended, inj.up);
+      }
     }
     if (m->display) {
       // Attached display window (-display): pump its message queue and stop
