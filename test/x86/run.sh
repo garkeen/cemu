@@ -287,6 +287,59 @@ if [ -f "$mouselff" ]; then
 else
   echo "SKIP (sermouse: no nasm and no prebuilt probe elf)"
 fi
+# Floppy read/write smoke (test/x86/probe/fddsmoke.asm): SeaBIOS boots the
+# generated 1.44 MiB image from A:, the boot sector writes a deterministic
+# sector through INT 13h AH=03, reads it back through AH=02, and compares all
+# 512 bytes.  SeaBIOS owns the 8272A/8237 programming; the probe checks the
+# complete firmware-to-medium path and needs no video BIOS or OS.
+#
+# This follows the same raw-binary branch as the earlier boot-sector probes:
+# nasm builds it when the .bin is absent, an existing .bin runs without nasm,
+# and no tool plus no prebuilt product is an explicit SKIP.
+fddsmokebin="$dir/probe/fddsmoke.bin"
+if [ ! -f "$fddsmokebin" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f bin -o "$fddsmokebin" "$dir/probe/fddsmoke.asm"
+fi
+
+floppy_bios=${CEMU_BIOS:-}
+if [ -z "$floppy_bios" ]; then
+  for candidate in \
+    "$dir/../../seabios/out/bios.bin" \
+    "$dir/../../../seabios/out/bios.bin"; do
+    if [ -f "$candidate" ]; then
+      floppy_bios=$candidate
+      break
+    fi
+  done
+fi
+
+if [ -f "$fddsmokebin" ]; then
+  if command -v mktemp >/dev/null 2>&1 && command -v dd >/dev/null 2>&1; then
+    floppy_tmp=$(mktemp -d "${TMPDIR:-/tmp}/cemu-floppy.XXXXXX" 2>/dev/null || true)
+  else
+    floppy_tmp=
+  fi
+  biosimg="$floppy_tmp/fddsmoke.img"
+  if [ -n "$floppy_tmp" ] && [ -f "$floppy_bios" ] &&
+     dd if=/dev/zero of="$biosimg" bs=512 count=2880 2>/dev/null &&
+     dd if="$fddsmokebin" of="$biosimg" bs=512 count=1 conv=notrunc 2>/dev/null; then
+    out=$(timeout 30 "$CEMU" --machine x86 --isa x86 -bios "$floppy_bios" \
+      -fda "$biosimg" 2>&1)
+    rc=$?
+    if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'floppy ok'; then
+      pass=$((pass + 1))
+    else
+      fail=$((fail + 1))
+      report_fail "floppy: rc=$rc"
+    fi
+  else
+    echo "SKIP (floppy: missing mktemp/dd or CEMU_BIOS/SeaBIOS image)"
+  fi
+  [ -n "$floppy_tmp" ] && rm -rf "$floppy_tmp"
+else
+  echo "SKIP (floppy: no nasm and no prebuilt boot-sector probe)"
+fi
+
 
 # PM: the protected-mode smoke probe (test/x86/pm). Multiboot ELF enters flat
 # PM, rebuilds GDT/IDT/TSS, and walks the stage-3 semantics: descriptor

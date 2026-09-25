@@ -3,6 +3,7 @@
 
 #include "board/board.h"
 #include "device/char/uart16550.h"
+#include "device/dma/i8237.h"
 #include "device/input/i8042.h"
 #include "device/input/msmouse.h"
 #include "device/input/ps2kbd.h"
@@ -20,6 +21,7 @@
 #include "device/misc/piix3.h"
 #include "device/misc/port92.h"
 #include "device/misc/testdev.h"
+#include "device/storage/fdc.h"
 #include "device/storage/ide.h"
 #include "device/timer/i8254.h"
 #include "device/video/cga.h"
@@ -65,6 +67,13 @@
 // the machine has a disk at all: firmware reads the boot sector off it with
 // int13h, and an operating system reads the rest of its medium through the same
 // task file.
+//
+// The floppy controller (0x3F0-0x3F5 and 0x3F7) and the 8237 DMA engine are
+// how the machine has a *removable* disk: an image is a whole disk sitting in
+// drive A:, firmware boots it down the same int13h path it uses for a hard
+// disk, and the sector data moves over DMA channel 2 rather than through the
+// controller's own port (D21 — the pair is what makes a floppy-boot image
+// reachable at all).
 static const uint64_t kDefaultRamSize = 32ULL << 20;
 // The chipset's MMIO windows start at the Local APIC page
 // (device/intc/lapic.c) and continue up through the PCI/BIOS holes at the top
@@ -137,6 +146,12 @@ typedef struct X86Board {
   IoapicDevice ioapic;
   Piix3BridgeDevice piix;
   IdeDevice ide;
+  // The floppy subsystem: the 8272 controller and the 8237 whose channel 2
+  // carries its sector data. They are separate devices on a real PC (the
+  // controller only raises DRQ; the DMA engine walks memory), so they are
+  // separate here too, wired together by this board.
+  I8237Device dma;
+  FdcDevice fdc;
   // INTR is one line and either controller can assert it (UpdateIntr).
   int pic_irq;
   int lapic_irq;
@@ -364,6 +379,15 @@ static void OnCom1Irq(void* ctx, int src, int level) {
   OnIsaIrq(ctx, kCom1Irq, level);
 }
 
+// The floppy controller's DMA channel: the 8237 walks system memory on the
+// controller's behalf, and the channel's mode register decides which way the
+// bytes go — which is the whole reason D21 spans two devices. The controller
+// only says how much it wanted to move and gets back how much moved.
+static int OnFdcDma(void* ctx, uint8_t* buf, int len) {
+  X86Board* xm = (X86Board*)ctx;
+  return I8237Transfer(&xm->dma, kFdcDmaChannel, buf, len);
+}
+
 // Chipset -> CPU: A20 is one line, driven by the keyboard controller's output
 // port (command 0xd1) and by System Control Port A bit 1.
 static void OnA20(void* ctx, int on) {
@@ -407,6 +431,7 @@ static void X86Destroy(Board* m) {
   X86Board* xm = (X86Board*)m;
   free(xm->rom);
   IdeDestroy(&xm->ide);
+  FdcDestroy(&xm->fdc);
 }
 
 static void X86Poll(Board* m) {
@@ -470,6 +495,10 @@ static void WireDevices(X86Board* xm) {
   IdeSetIrqSink(&xm->ide, OnIsaIrq, &xm->irqbus);
   Uart16550SetIrqSink(&xm->uart, OnCom1Irq, &xm->irqbus);
   CmosSetIrqSink(&xm->cmos, OnIsaIrq, &xm->irqbus);
+  // The floppy controller's IRQ6 into the same fan-out, and channel 2 of the
+  // DMA engine for its sector data.
+  FdcSetIrqSink(&xm->fdc, OnIsaIrq, &xm->irqbus);
+  FdcSetDmaSink(&xm->fdc, OnFdcDma, xm);
   // The kvm-unit-tests injection window drives the same ISA wires the devices
   // do, so it reaches both controllers through the same fan-out.
   TestDevSetIrqSink(&xm->testdev, OnIsaIrq, &xm->irqbus);
@@ -510,6 +539,8 @@ static void X86Reset(Board* m) {
   Port92Init(&xm->port92);
   TestDevInit(&xm->testdev);
   CmosReset(&xm->cmos);
+  I8237Reset(&xm->dma);
+  FdcReset(&xm->fdc);
   // The PCI bus forgets its device list on reset (the devices keep their
   // configuration), so the three functions are re-enumerated here.
   PciInit(&xm->pci);
@@ -592,6 +623,8 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   Port92Init(p92);
   CmosInit(cmos);
   TestDevInit(&xm->testdev);
+  I8237Init(&xm->dma);
+  FdcInit(&xm->fdc);
   PciInit(&xm->pci);
   I440fxInit(&xm->fx, kPciBus0, kHostBridgeDev);
   Piix3BridgeInit(&xm->piix, kPciBus0, kPiixDev);
@@ -613,6 +646,13 @@ Board* X86BoardCreate(const BoardOpts* opts) {
     BoardDestroy(m);
     return NULL;
   }
+  // The floppy is a whole medium in the drive; the controller serves it and
+  // the DMA engine moves its data (D21).
+  if (opts->fda && FdcAttach(&xm->fdc, 0, opts->fda) != 0) {
+    LogError("cannot attach -fda image '%s'", opts->fda);
+    BoardDestroy(m);
+    return NULL;
+  }
   PciAddDevice(&xm->pci, &xm->fx.pci);
   PciAddDevice(&xm->pci, &xm->piix.pci);
   PciAddDevice(&xm->pci, &ide->pci);
@@ -629,9 +669,18 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   CmosRegister(&m->io, cmos);
   TestDevRegister(&m->io, &xm->testdev);
   CmosSetMemory(cmos, ram_size);
+  // What firmware sees of the floppy: the equipment byte, and nothing else.
+  // With no -fda both nibbles stay zero and SeaBIOS never registers a drive
+  // at all (seabios src/hw/floppy.c floppy_setup).
+  CmosSetFloppy(cmos, FdcCmosType(&xm->fdc, 0), FdcCmosType(&xm->fdc, 1));
   PciRegister(&m->io, &xm->pci);
   Piix3Register(&m->io, &xm->piix);
   IdeRegister(&m->io, ide);
+  I8237Register(&m->io, &xm->dma);
+  // The engine moves a transfer through system memory, so it needs the
+  // address space the peripheral never touches.
+  I8237SetMemBus(&xm->dma, &m->bus);
+  FdcRegister(&m->io, &xm->fdc);
   // The bus-master engine moves a transfer through system memory (the PRD table
   // and the host's buffers), so the controller needs the address space the task
   // file never touches.

@@ -115,6 +115,10 @@ typedef struct BoardOpts {
   // CD-ROM image for the PC's secondary IDE master (-cdrom): a packet (ATAPI)
   // device with 2048-byte blocks. NULL = empty bay.
   const char* cdrom;
+  // Floppy image for the PC's A: drive (-fda), served by the 8272 controller
+  // over the 8237's channel 2. NULL = no floppy, and firmware then sees no
+  // drive at all.
+  const char* fda;
   // --skip-idle: run a halted CPU's idle time at full speed (see Board). Off
   // by default: with it off the emulated clock and the host clock agree, which
   // is what a wall-time-faithful run needs.

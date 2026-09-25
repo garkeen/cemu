@@ -21,6 +21,8 @@ enum {
   kRegStatusB = 0x0b,
   kRegStatusC = 0x0c,
   kRegStatusD = 0x0d,
+  kRegFloppyType = 0x10,
+  kRegEquipment = 0x14,
   kRegMemExtmemLow = 0x30,
   kRegMemExtmemHigh = 0x31,
   kRegCentury = 0x32,
@@ -54,6 +56,11 @@ enum { kStatusDVrt = 0x80 };
 // The alarm registers (MC146818 datasheet): the RTC compares the live clock
 // against these every second.
 enum { kRegSecondsAlarm = 0x01, kRegMinutesAlarm = 0x03, kRegHoursAlarm = 0x05 };
+
+// The equipment byte's floppy bits (CMOS 0x14): bit 0 says the machine has a
+// floppy at all, bits 7:6 how many there are minus one. Firmware and DOS read
+// this byte to size the drive table.
+enum { kEquipmentFloppy = 0x01, kEquipmentFloppyCount = 0xc0 };
 
 // The RTC's interrupt line in the PC/AT wiring (the 8259 slave's line 0).
 static const int kCmosIrqLine = 8;
@@ -435,4 +442,17 @@ void CmosRegister(Bus* io, CmosDevice* d) {
 
 void CmosSetMemory(CmosDevice* d, uint64_t ram_size) {
   if (d->st) d->st->ram_size = ram_size;
+}
+
+void CmosSetFloppy(CmosDevice* d, uint8_t type_a, uint8_t type_b) {
+  if (!d->st) return;
+  struct CmosState* st = d->st;
+  // Register 0x10 is two nibbles — drive A high, drive B low — and it is the
+  // only place firmware looks before deciding a floppy exists (seabios
+  // src/hw/rtc.h CMOS_FLOPPY_DRIVE_TYPE, read by floppy_setup).
+  st->regs[kRegFloppyType] = (uint8_t)((type_a << 4) | (type_b & 0x0f));
+  int count = (type_a ? 1 : 0) + (type_b ? 1 : 0);
+  uint8_t v = (uint8_t)(st->regs[kRegEquipment] & ~(kEquipmentFloppy | kEquipmentFloppyCount));
+  if (count > 0) v |= (uint8_t)(kEquipmentFloppy | ((count - 1) << 6));
+  st->regs[kRegEquipment] = v;
 }

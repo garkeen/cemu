@@ -17,6 +17,7 @@ typedef struct Args {
   const char* hda;        // -hda FILE: primary IDE master image (x86 PC board)
   const char* hdb;        // -hdb FILE: primary IDE slave image
   const char* cdrom;      // -cdrom FILE: secondary IDE master CD-ROM image
+  const char* fda;        // -fda FILE: the PC's A: floppy image
   const char* display_backend;  // -display win32; NULL = headless
   const char* mouse_name;       // -mouse ps2|serial (NULL = the board's default)
   uint64_t mem_size;
@@ -49,6 +50,7 @@ static void Usage(void) {
       "  -hda FILE         x86: primary IDE master disk image\n"
       "  -hdb FILE         x86: primary IDE slave disk image\n"
       "  -cdrom FILE       x86: secondary IDE master CD-ROM image\n"
+      "  -fda FILE         x86: floppy image for drive A:\n"
       "  -display win32    open a window on the machine's display card\n"
       "  -s                gdb stub on tcp::1234 (guest runs until attached)\n"
       "  -gdb tcp::PORT    gdb stub on PORT\n"
@@ -121,6 +123,8 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       a->hdb = argv[++i];
     else if (strcmp(arg, "-cdrom") == 0)
       a->cdrom = argv[++i];
+    else if (strcmp(arg, "-fda") == 0)
+      a->fda = argv[++i];
     else if (strcmp(arg, "-mouse") == 0)
       a->mouse_name = argv[++i];
     else if (arg[0] == '-' && arg[1] == '-')
@@ -167,6 +171,7 @@ int main(int argc, char** argv) {
                     .hda = a.hda,
                     .hdb = a.hdb,
                     .cdrom = a.cdrom,
+                    .fda = a.fda,
                     .skip_idle = a.skip_idle,
                     .mouse = mouse};
   Board* m = BoardCreate(a.machine_name, &opts);

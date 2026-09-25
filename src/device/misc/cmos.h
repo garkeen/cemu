@@ -37,6 +37,13 @@ void CmosRegister(Bus* io, CmosDevice* d);
 // Tells the RTC how much RAM the machine carries; the extended-memory
 // registers answer from it.
 void CmosSetMemory(CmosDevice* d, uint64_t ram_size);
+// Tells the CMOS which floppy drives the machine has, using the drive-type
+// codes of register 0x10 (4 = 1.44MB 3.5", 0 = no drive; high nibble A:, low
+// nibble B:). Firmware reads that register before it ever touches the
+// controller — SeaBIOS src/hw/floppy.c floppy_setup under CONFIG_QEMU adds a
+// drive only when its nibble is nonzero — so it is the equipment byte, not
+// the controller, that makes a floppy exist for the guest.
+void CmosSetFloppy(CmosDevice* d, uint8_t type_a, uint8_t type_b);
 void CmosSetIrqSink(CmosDevice* d, void (*set_irq)(void*, int, int), void* ctx);
 // The machine poll loop calls this every step (the same contract as PitPoll):
 // the periodic and alarm flags come from wall time, so they must fire while
