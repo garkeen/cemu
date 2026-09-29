@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "host/host.h"
+#include "device/video/display.h"  // the device-side vtable this window calls
 #include "util/log.h"
 
 // Pump cadence: process messages / check for repaints at most this often.
@@ -17,11 +18,13 @@ enum { kPumpIntervalUs = 4000 };
 
 struct HostDisplay {
   HWND hwnd;
-  int width;
-  int height;
-  const uint32_t* fb;
-  uint32_t (*version_cb)(void* dev);
+  // The device's vtable (device/video/display.h): the size, the pixel buffer
+  // and the change counter all come from it, because a card whose mode changes
+  // (the VGA family core) changes its picture's size at runtime.
+  const DisplaySourceOps* ops;
   void* dev;
+  int width;   // the picture's size the window currently shows
+  int height;
   void (*key_cb)(void* ctx, uint32_t scan, int extended, int up);
   void* key_ctx;
   void (*mouse_cb)(void* ctx, int dx, int dy, int dz, int buttons);
@@ -37,15 +40,28 @@ struct HostDisplay {
   BITMAPINFO bi;
 };
 
-// The only blit path: 1:1 (the client area is exactly the device framebuffer, because
-// the window is not resizable), and it covers the whole client area — which is why
-// WM_ERASEBKGND below can stay a no-op. The version counter is consumed here so the
-// pump's invalidate loop is quiescent until the device publishes a new frame.
+// The only blit path: the picture is scaled to the client area, preserving its
+// aspect ratio, and the area around it is black. The window is resizable (a
+// VGA's modes come in several sizes) and the version counter is consumed here
+// so the pump's invalidate loop is quiescent until a new frame is published.
 static void Blit(HostDisplay* d, HDC dc) {
+  RECT rc;
+  GetClientRect(d->hwnd, &rc);
+  int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+  if (cw <= 0 || ch <= 0 || d->width <= 0 || d->height <= 0) return;
+  // Fit, never crop: scale by whichever axis runs out first (integer
+  // arithmetic, so a mode that fits 1:1 stays 1:1).
+  const int fit_width = (int64_t)cw * d->height <= (int64_t)ch * d->width;
+  const int num = fit_width ? cw : ch;
+  const int den = fit_width ? d->width : d->height;
+  const int w = (int)((int64_t)d->width * num / den);
+  const int h = (int)((int64_t)d->height * num / den);
+  HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+  FillRect(dc, &rc, black);
   SetStretchBltMode(dc, COLORONCOLOR);
-  StretchDIBits(dc, 0, 0, d->width, d->height, 0, 0, d->width, d->height, d->fb, &d->bi,
-                DIB_RGB_COLORS, SRCCOPY);
-  d->shown_version = d->version_cb(d->dev);
+  StretchDIBits(dc, (cw - w) / 2, (ch - h) / 2, w, h, 0, 0, d->width, d->height,
+                d->ops->Framebuffer(d->dev), &d->bi, DIB_RGB_COLORS, SRCCOPY);
+  d->shown_version = d->ops->Version(d->dev);
 }
 
 static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -59,7 +75,10 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
       return 0;
     }
     case WM_ERASEBKGND:
-      return 1;  // the blit covers the client area; avoid flicker
+      return 1;  // Blit paints the whole client area (picture plus letterbox)
+    case WM_SIZE:
+      InvalidateRect(hwnd, NULL, FALSE);  // the picture scales to the client area
+      return 0;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
     case WM_KEYUP:
@@ -146,20 +165,37 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
   }
 }
 
-HostDisplay* HostDisplayOpen(const char* title, int width, int height,
-                             const uint32_t* fb,
-                             uint32_t (*version_cb)(void* dev), void* dev) {
+// Resizes the window to the picture the device publishes now. The client area
+// follows the card's mode: a VGA text mode is 720x400, its EGA graphics mode
+// 640x350, its CGA mode 320x200 — one window whose size the mode decides.
+static void FollowPictureSize(HostDisplay* d) {
+  int w = d->ops->Width(d->dev), h = d->ops->Height(d->dev);
+  if (w <= 0 || h <= 0 || (w == d->width && h == d->height)) return;
+  d->width = w;
+  d->height = h;
+  BITMAPINFOHEADER* bh = &d->bi.bmiHeader;
+  bh->biWidth = w;
+  bh->biHeight = -h;  // top-down rows
+  // Keep the window's outer size in step so the client area is exactly one
+  // picture again (the user can still resize afterwards: Blit scales).
+  RECT rc = {0, 0, w, h};
+  AdjustWindowRect(&rc, (DWORD)GetWindowLongPtrA(d->hwnd, GWL_STYLE), FALSE);
+  SetWindowPos(d->hwnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+               SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+  InvalidateRect(d->hwnd, NULL, FALSE);
+}
+
+HostDisplay* HostDisplayOpen(const char* title, const DisplaySourceOps* ops, void* dev) {
   HostDisplay* d = (HostDisplay*)calloc(1, sizeof(*d));
   if (!d) return NULL;
-  d->width = width;
-  d->height = height;
-  d->fb = fb;
-  d->version_cb = version_cb;
+  d->ops = ops;
   d->dev = dev;
+  d->width = ops->Width(dev);
+  d->height = ops->Height(dev);
   BITMAPINFOHEADER* h = &d->bi.bmiHeader;
   h->biSize = sizeof(*h);
-  h->biWidth = width;
-  h->biHeight = -height;  // top-down rows
+  h->biWidth = d->width;
+  h->biHeight = -d->height;  // top-down rows
   h->biPlanes = 1;
   h->biBitCount = 32;
   h->biCompression = BI_RGB;  // 0xffRRGGBB little-endian = B,G,R,255 bytes
@@ -172,11 +208,12 @@ HostDisplay* HostDisplayOpen(const char* title, int width, int height,
   wc.lpszClassName = "cemu_display";
   RegisterClassA(&wc);
 
-  // Fixed size on purpose: the emulated machine's display has exactly one size, so the
-  // window drops WS_THICKFRAME/WS_MAXIMIZEBOX and the client area is always the device
-  // framebuffer — which is what keeps the WM_PAINT blit 1:1.
-  static const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-  RECT rc = {0, 0, width, height};
+  // Resizable: the emulated card's modes come in several sizes and the user may
+  // want a bigger picture; Blit scales the picture to whatever the client area
+  // is, preserving its aspect ratio.
+  static const DWORD kStyle =
+      WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME;
+  RECT rc = {0, 0, d->width, d->height};
   AdjustWindowRect(&rc, kStyle, FALSE);
   d->hwnd = CreateWindowA("cemu_display", title, kStyle, CW_USEDEFAULT, CW_USEDEFAULT,
                           rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, wc.hInstance,
@@ -203,9 +240,10 @@ void HostDisplayPump(HostDisplay* d) {
     DispatchMessageA(&msg);
   }
   if (d->closed) return;
+  FollowPictureSize(d);
   // Invalidate only: WM_PAINT is the single blit path, so one published frame costs one
   // blit instead of the old immediate blit plus the paint that followed it.
-  if (d->version_cb(d->dev) != d->shown_version) InvalidateRect(d->hwnd, NULL, FALSE);
+  if (d->ops->Version(d->dev) != d->shown_version) InvalidateRect(d->hwnd, NULL, FALSE);
 }
 
 int HostDisplayClosed(const HostDisplay* d) { return d && d->closed; }

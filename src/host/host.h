@@ -57,15 +57,18 @@ int HostSockReadable(HostSock* s);
 void HostSockClose(HostSock* s);
 
 // ---- Display window (display_win.c; GDI, same thread as the run loop) ------
-// Shows a fixed XRGB (0xffRRGGBB) pixel buffer owned by a device; the window
-// repaints whenever version_cb(dev) returns a counter different from the one
-// last shown. The pump (HostDisplayPump) is called from the board run loop —
-// no extra thread, no guest-facing API.
+// Shows a device picture through the DisplaySourceOps vtable (device/video/display.h):
+// the window reads the size, the XRGB pixel buffer and a change counter from
+// the device, so a card whose mode changes size (the VGA family core) is
+// followed — the window resizes itself to the mode and scales the picture into
+// the client area otherwise. The pump (HostDisplayPump) is called from the
+// board run loop — no extra thread, no guest-facing API.
 typedef struct HostDisplay HostDisplay;
+// The display-source vtable (device/video/display.h) is named here as an
+// incomplete type: the window calls it, the host layer does not define it.
+typedef struct DisplaySourceOps DisplaySourceOps;
 
-HostDisplay* HostDisplayOpen(const char* title, int width, int height,
-                             const uint32_t* fb,
-                             uint32_t (*version_cb)(void* dev), void* dev);
+HostDisplay* HostDisplayOpen(const char* title, const DisplaySourceOps* ops, void* dev);
 // Message pump + repaint; cheap enough to call every run-loop step (it
 // rate-limits itself internally).
 void HostDisplayPump(HostDisplay* d);

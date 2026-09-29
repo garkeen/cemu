@@ -18,6 +18,7 @@ typedef struct Args {
   const char* hdb;        // -hdb FILE: primary IDE slave image
   const char* cdrom;      // -cdrom FILE: secondary IDE master CD-ROM image
   const char* fda;        // -fda FILE: the PC's A: floppy image
+  const char* vgabios;    // -vgabios FILE: the display card's option ROM
   const char* display_backend;  // -display win32; NULL = headless
   const char* mouse_name;       // -mouse ps2|serial (NULL = the board's default)
   uint64_t mem_size;
@@ -51,6 +52,7 @@ static void Usage(void) {
       "  -hdb FILE         x86: primary IDE slave disk image\n"
       "  -cdrom FILE       x86: secondary IDE master CD-ROM image\n"
       "  -fda FILE         x86: floppy image for drive A:\n"
+      "  -vgabios FILE     x86: the display card's option ROM (int10 services)\n"
       "  -display win32    open a window on the machine's display card\n"
       "  -s                gdb stub on tcp::1234 (guest runs until attached)\n"
       "  -gdb tcp::PORT    gdb stub on PORT\n"
@@ -125,6 +127,8 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       a->cdrom = argv[++i];
     else if (strcmp(arg, "-fda") == 0)
       a->fda = argv[++i];
+    else if (strcmp(arg, "-vgabios") == 0)
+      a->vgabios = argv[++i];
     else if (strcmp(arg, "-mouse") == 0)
       a->mouse_name = argv[++i];
     else if (arg[0] == '-' && arg[1] == '-')
@@ -172,6 +176,7 @@ int main(int argc, char** argv) {
                     .hdb = a.hdb,
                     .cdrom = a.cdrom,
                     .fda = a.fda,
+                    .vgabios_path = a.vgabios,
                     .skip_idle = a.skip_idle,
                     .mouse = mouse};
   Board* m = BoardCreate(a.machine_name, &opts);
@@ -237,10 +242,7 @@ int main(int argc, char** argv) {
     }
     char title[128];
     snprintf(title, sizeof(title), "cemu %s - %s", a.machine_name, a.image ? a.image : "firmware");
-    m->display =
-        HostDisplayOpen(title, m->display_ops->width, m->display_ops->height,
-                        m->display_ops->Framebuffer(m->display_dev),
-                        m->display_ops->Version, m->display_dev);
+    m->display = HostDisplayOpen(title, m->display_ops, m->display_dev);
     if (!m->display) {
       BoardDestroy(m);
       return kExitHostFailure;

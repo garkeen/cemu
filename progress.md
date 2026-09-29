@@ -3,6 +3,86 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 27：VGA 家族核 + CGA/EGA 兼容模式（int10 通路打通）（2026-09-29）
+
+**先决问题：机器此前根本没有 int10。** 查显示链路时发现 SeaBIOS 是 `CONFIG_NO_VGABIOS=1`
+构建的（`out/autoconf.h`），ROM 里的 `entry_10:` 就是一条 `iretw` 桩
+（`seabios/src/romlayout.S:666`），`src/output.c:77` 也据此判断"没有 vgabios"而跳过屏幕
+输出。VGA 家族的 int10 服务不是 SeaBIOS 核心提供的，而是**显卡自己的 option ROM**
+（SeaVGABIOS，`seabios/vgasrc/`）。没有它，DOS/Windows 无法通过 int10 切出文本模式，
+所以"只写显卡"不可能点亮 EGA 640×350——按用户裁决"按 CONFIG_NO_VGABIOS=0 构建"。
+
+**ROM 窗口底部的槽是给 option ROM 的，不是给 BIOS 自己的。** 三个镜像的实测：官方
+seabios 1.17.0 与 QEMU 的 `bios-256k.bin` 内容都从 0xD3FE0/0xD4200 起（底部空 ~80KB），
+而我们自建的 clang/lld 版从 0xC9C10 起（底部只剩 39952 字节，38400 字节的 VGA ROM 只
+差 1552 字节塞进去）。所以不碰 `ROM_SIZE`，而是把**本机根本没有的设备驱动**从配置里关掉
+（USB/UHCI/OHCI/EHCI/XHCI、NVMe、virtio、LSI/MEGASAS/MPT/ESP SCSI、SD、TPM、Xen、
+AHCI、QEMU flash-floppy、LPT、bootsplash 共 25 项；x86_min 一个都不挂），有效内容
+222192 → 135232 字节，底部空出 126912 字节，VGA ROM 落在 C0000-C95FF。顺带的好处是
+POST 不再去探测这些不存在的控制器。
+
+**固件构建（`D:\code\c\EMU\seabios`，纯 clang/lld 的 ninja 链）**：`.config` 与
+`out/autoconf.h` 开 `VGA_STANDARD_VGA`（它 `select VGA_STDVGA_PORTS`）+ `BUILD_VGABIOS`，
+关 `VGA_VBE`（线性帧缓冲那部分不做）与 `VGA_PCI`（我们的显卡没有 PCI 身份）；`scripts/gen-ninja.py`
+按上游 Makefile 的 "VGA build rules" 补上 SRCVGA 管道（16 位 whole-compile → `vgaentry.S`
+→ `vgalayout.lds` 链接 → objcopy → `buildrom.py` 填 55AA/size/checksum）。产物
+`out/vgabios.bin` = 38400 字节（QEMU 的 `vgabios-stdvga.bin` 是 39424），头部与跳转同款。
+**注意：seabios 目录不是 git 仓库**，这些配置与脚本改动没有版本控制，全靠本条记录复现。
+
+**option ROM 怎么交给固件**：SeaBIOS 的 `optionroms.c` 不扫 C0000 裸内存去**执行** VGA
+ROM（`vgarom_setup` 只跑 PCI VGA ROM 和 fw_cfg 的 `vgaroms/*`），所以走它本来就支持的
+通路：`-vgabios FILE` → 主板把 ROM 作为 fw_cfg 文件 `vgaroms/vgabios.bin` 发布 →
+`run_file_roms(..., isvga=1)` → 固件自己 `rom_reserve` 把它影子到 C0000。为此给
+`device/misc/fwcfg.c` 补上 QEMU 的文件目录接口（0x19 目录、0x20+i 选择键、大端字段），
+`FwCfgAddFile` 是唯一入口。**第一个 bug 就在这里**：目录计数我写成了小端，SeaBIOS 把
+1 个条目读成 16777216 个并死在目录循环里（`paravirt.c` 的 `be32_to_cpu`）；改正后端到端
+跑通：SeaBIOS 打出 "No VGA found, scan for other display" → "Running option rom at
+c000:0003" → "Start SeaVGABIOS" → 它自己的 POST 文本经 int10 写进显卡文本区
+（`CEMU_DEBUG=screen` 读到 `SeaBIOS (version 1.17.0-...)` 与 `Booting from Floppy...`），
+floppy 探针 rc=11 照旧。
+
+**VGA 家族核**（`src/device/video/vga.{h,c}`，约 900 行；`cga.c/cga.h/cga_font.c` 删除）：
+4 平面 256KB（四字节交错布局，QEMU/tiny386 同款）、0x3B0-0x3DF 单块解码（misc 输出的
+色彩位选半边）、四组寄存器 + DAC + 0x3D8/0x3D9 的 CGA 兼容闩锁、0xA0000-0xBFFFF 孔径按
+GR6 映射模式解析（平面/奇偶/链式）、写模式 0-3（rotate/set-reset/bitmask/逻辑运算）、
+读模式 0/1 与比较模式、CRTC 自身的时序寄存器算出帧周期与回扫状态。渲染覆盖：文本
+（字形取自 **plane 2**，即 BIOS 在模式设置时加载的字库，8/9 点宽、8/14/16 行单元格、
+光标、闪烁）、16 色平面图形（含 EGA 640×350）、CGA 4/5/6 的 2bpp/1bpp 形状（CGA 调色板
+选择/强度/视频使能闩锁参与取色）。**没有设备内字库**是这一片的一个结论：SeaVGABIOS 的
+模式表自己 `stdvga_load_font` 往 plane 2 写 8x16 字模（`stdvgamodes.c:529`），所以
+`cga_font.c` 那 2KB 字模随删卡一起删掉。显示通道随之换代：`DisplaySourceOps` 的宽高
+从常量变成 `Width()/Height()` 回调，宿主窗口在模式变化时改尺寸、并且可缩放（等比拉伸）。
+
+**探针 `test/x86/probe/vga_probe.asm`（本片的验收件）**：由真实软件路径驱动——用 int10
+切模式，再验 BIOS 留下的寄存器与平面寻址：(1) mode 3 的 CRTC 几何（R13=0x28、R9=0x4f、
+显示结束 399）；(2) **mode 0x10 EGA 640×350**（R9=0x40、R13=0x28、显示结束 349、AR10
+图形位、AR12=0x0f、GR5 shift=0）；(3) 四平面逐个写读回 + 写前隔离读；(4) mode 4
+CGA 320×200（GR5 shift=1、SR1 bit3 的 2:1 时钟）。探针自报观测值（失败时打印它读到的
+字节），QEMU `-vga std` 同一镜像**同样打印 `vga-probe ok`**（基线
+`test/x86/probe/vga_probe_qemu.txt`）。定位过程中改的三处都在探针、不在卡：属性控制器
+的 index/data 翻转位协议（BIOS 的写序列结束时把它留在 1，与真卡一致；探针要先读 0x3DA
+复位）、隔离检查对 plane 3 的绕回（"下一个平面"是已写过的 plane 0）、以及 `print_hex8`
+自己 pop 两次导致只打一个数字就挂住。**卡的侧没有发现缺陷**。
+
+**回归**：x86 套件 21 passed / 0 failed（原 20 + vga 格），`--target check` 依赖边 ok，
+构建零告警。台账：D17 改写为剩余缺口（链式 256 色只做寻址不渲染、无 VBE、行比较/分屏
+与 panning 未实现、过扫描与 CGA 复合伪色未做、光笔端口无、闪烁相位近似、没有帧缓冲
+dump 设施），D21 收窄到 8042 的软驱数据线。**win101 按用户要求在本片完成前未运行**；
+下一步是拿它做验收 4 的第一次实跑。
+
+## 阶段 4 片 26：FDC/8237 软盘引导与 BIOS 写读探针（2026-09-25）
+
+软盘通路的另一半（D21 的大头）：`device/storage/fdc.{h,c}` 是 8272A 控制器（端口
+0x3F0-0x3F5/0x3F7；命令集以 SeaBIOS `src/hw/floppy.c` 的握手为行为基准：轮询 RQM、
+DIO 方向按读写区分、复位后四条 SENSE INTERRUPT STATUS 退掉四个逻辑驱动的挂起中断），
+`device/dma/i8237.{h,c}` 是 8237A 总线主控（两级级联 8 通道、页寄存器在芯片之外），
+两者在主板上接起来——控制器只说"搬这么多字节"，8237 走总线（FDC 从不自己碰内存）。
+CMOS 设备字节用 `CmosSetFloppy` 报软驱类型（无 `-fda` 时两个半字节都是 0，SeaBIOS
+索性不注册任何驱动器）。介质是整张镜像、以读写方式打开，格式表给出几何，客户机从
+READ ID 学到。验收件 `test/x86/probe/fddsmoke.asm`：SeaBIOS 从 A: 引导生成的 1.44MB
+镜像，引导扇区用 INT 13h AH=03 写 512 字节、AH=02 读回并逐字节比对（SeaBIOS 自己编程
+8272A/8237，探针不重复实现一遍 DMA 编程模型），`floppy ok` → rc=11。
+
 ## 阶段 4 片 25：串口鼠标销账 + 验收 4（Windows 1.01）基线与显示形状裁决（2026-09-24）
 
 **验收 4 的验收件与 QEMU 基线**：`build/windows/windows101.img`（1.44MB、MS-DOS 3.3

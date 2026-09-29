@@ -340,6 +340,59 @@ else
   echo "SKIP (floppy: no nasm and no prebuilt boot-sector probe)"
 fi
 
+# VGA family core (test/x86/probe/vga_probe.asm): the display card is driven the
+# way real software drives it — the VGA BIOS's int10 services set the modes (80x25
+# text, EGA 640x350, CGA 320x200) and the probe then checks the register file and
+# the plane addressing the BIOS left behind.  It needs the firmware *and* the
+# card's option ROM (-vgabios: the SeaVGABIOS built from the same tree); without
+# that ROM the machine has no int10 at all, so the probe cannot run.
+#
+# Dual run: qemu-system-i386 -vga std on the same image prints the same line
+# (test/x86/probe/vga_probe_qemu.txt).
+vgaprobin="$dir/probe/vga_probe.bin"
+if [ ! -f "$vgaprobin" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f bin -o "$vgaprobin" "$dir/probe/vga_probe.asm"
+fi
+
+vgarom=${CEMU_VGAROM:-}
+if [ -z "$vgarom" ]; then
+  for candidate in \
+    "$dir/../../seabios/out/vgabios.bin" \
+    "$dir/../../../seabios/out/vgabios.bin"; do
+    if [ -f "$candidate" ]; then
+      vgarom=$candidate
+      break
+    fi
+  done
+fi
+
+if [ -f "$vgaprobin" ]; then
+  if command -v mktemp >/dev/null 2>&1 && command -v dd >/dev/null 2>&1; then
+    vga_tmp=$(mktemp -d "${TMPDIR:-/tmp}/cemu-vga.XXXXXX" 2>/dev/null || true)
+  else
+    vga_tmp=
+  fi
+  vgaimg="$vga_tmp/vga_probe.img"
+  if [ -n "$vga_tmp" ] && [ -f "$floppy_bios" ] && [ -f "$vgarom" ] &&
+     dd if=/dev/zero of="$vgaimg" bs=512 count=2880 2>/dev/null &&
+     dd if="$vgaprobin" of="$vgaimg" bs=512 count=1 conv=notrunc 2>/dev/null; then
+    out=$(timeout 30 "$CEMU" --machine x86 --isa x86 -bios "$floppy_bios" \
+      -vgabios "$vgarom" -fda "$vgaimg" 2>&1)
+    rc=$?
+    if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'vga-probe ok'; then
+      pass=$((pass + 1))
+    else
+      fail=$((fail + 1))
+      report_fail "vga: rc=$rc"
+    fi
+  else
+    echo "SKIP (vga: missing mktemp/dd, the SeaBIOS image or the card's option ROM)"
+  fi
+  [ -n "$vga_tmp" ] && rm -rf "$vga_tmp"
+else
+  echo "SKIP (vga: no nasm and no prebuilt boot-sector probe)"
+fi
+
 
 # PM: the protected-mode smoke probe (test/x86/pm). Multiboot ELF enters flat
 # PM, rebuilds GDT/IDT/TSS, and walks the stage-3 semantics: descriptor

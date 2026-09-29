@@ -119,6 +119,13 @@ typedef struct BoardOpts {
   // over the 8237's channel 2. NULL = no floppy, and firmware then sees no
   // drive at all.
   const char* fda;
+  // The display card's own ROM (-vgabios FILE): the int10 video BIOS a PC's
+  // display card carries. NULL = no ROM, and the firmware's int10 stub is all
+  // a guest finds — DOS-era programs set their video mode through int10, so
+  // without it none of them can leave text mode. The machine delivers it to
+  // the firmware the way a card without a PCI device does (fw_cfg romfile
+  // "vgaroms/vgabios.bin"; device/misc/fwcfg.h).
+  const char* vgabios_path;
   // --skip-idle: run a halted CPU's idle time at full speed (see Board). Off
   // by default: with it off the emulated clock and the host clock agree, which
   // is what a wall-time-faithful run needs.

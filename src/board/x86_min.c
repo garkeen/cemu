@@ -24,7 +24,7 @@
 #include "device/storage/fdc.h"
 #include "device/storage/ide.h"
 #include "device/timer/i8254.h"
-#include "device/video/cga.h"
+#include "device/video/vga.h"
 #include "host/host.h"
 #include "util/log.h"
 
@@ -38,9 +38,10 @@
 // 0x510/0x511 (QEMU contract) and the kvm-unit-tests IRQ injection window at
 // 0x2000-0x200F (device/misc/testdev.c) — all in a separate x86 I/O space
 // (CpuState.io) —
-// and the Local APIC register page at 0xFEE00000 on the memory bus. The CGA card
-// (阶段 3.5 片 2) puts its 16KB frame buffer at 0xB8000 on the memory bus and
-// its ports at 0x3D0-0x3DF. Ports and MMIO nobody claims read all-ones and
+// and the Local APIC register page at 0xFEE00000 on the memory bus. The display
+// card (阶段 4 图形切片) is the VGA family core: its aperture is the
+// 0xA0000-0xBFFFF window on the memory bus and its register file sits at
+// 0x3B0-0x3DF. Ports and MMIO nobody claims read all-ones and
 // drop writes — x86 I/O decode never faults — and an address no memory region
 // covers answers the same way, the open-bus value of a PC whose decoders all
 // decline the cycle.
@@ -133,7 +134,7 @@ typedef struct X86Board {
   PitDevice pit;
   FwCfgDevice fwcfg;
   LapicDevice lapic;
-  CgaDevice cga;
+  VgaDevice vga;
   I8042Device kbd;
   Ps2KbdDevice ps2kbd;
   Ps2MouseDevice mouse;
@@ -159,6 +160,10 @@ typedef struct X86Board {
   IrqBus irqbus;  // the ISA IRQ fan-out: the 8259s on one side, the I/O APIC on the other
   uint8_t* rom;  // the -bios image, mapped in the ROM window (NULL = none)
   uint64_t rom_size;
+  // The display card's option ROM (-vgabios), handed to the firmware through
+  // fw_cfg; the bytes belong to this machine and live until it is destroyed.
+  uint8_t* vgabios;
+  uint32_t vgabios_size;
 } X86Board;
 
 static uint64_t UnclaimedRead(void* dev, uint64_t addr, int size) {
@@ -427,9 +432,52 @@ static int LoadRom(X86Board* xm, const char* path) {
   return 0;
 }
 
+// The romfile name firmware looks under for a VGA BIOS that has no PCI device
+// of its own: SeaBIOS runs every file named "vgaroms/*" as a VGA option ROM
+// (src/optionroms.c run_file_roms("vgaroms/", isvga=1)) and shadows it to
+// 0xc0000 itself (rom_reserve), which is where a display card's ROM belongs —
+// so the machine does not have to place it, and the card needs no PCI function.
+static const char kVgaRomFileName[] = "vgaroms/vgabios.bin";
+
+static int LoadVgaRom(X86Board* xm, FwCfgDevice* fwcfg, const char* path) {
+  HostFile* f = HostFileOpenRead(path);
+  if (!f) {
+    LogError("cannot open vga bios image '%s'", path);
+    return -1;
+  }
+  int64_t size = HostFileSize(f);
+  if (size <= 0) {
+    HostFileClose(f);
+    LogError("empty vga bios image '%s'", path);
+    return -1;
+  }
+  uint8_t* rom = (uint8_t*)malloc((size_t)size);
+  if (!rom) {
+    HostFileClose(f);
+    return -1;
+  }
+  size_t got = HostFileRead(f, rom, (size_t)size);
+  HostFileClose(f);
+  if (got != (size_t)size) {
+    free(rom);
+    LogError("short read on vga bios image '%s'", path);
+    return -1;
+  }
+  if (FwCfgAddFile(fwcfg, kVgaRomFileName, rom, (uint32_t)size) != 0) {
+    free(rom);
+    return -1;
+  }
+  xm->vgabios = rom;
+  xm->vgabios_size = (uint32_t)size;
+  LogInfo("vga bios '%s': %u bytes as the fw_cfg romfile %s", path, xm->vgabios_size,
+          kVgaRomFileName);
+  return 0;
+}
+
 static void X86Destroy(Board* m) {
   X86Board* xm = (X86Board*)m;
   free(xm->rom);
+  free(xm->vgabios);
   IdeDestroy(&xm->ide);
   FdcDestroy(&xm->fdc);
 }
@@ -437,7 +485,7 @@ static void X86Destroy(Board* m) {
 static void X86Poll(Board* m) {
   X86Board* xm = (X86Board*)m;
   PitPoll(&xm->pit);
-  CgaPoll(&xm->cga);
+  VgaPoll(&xm->vga);
   // The APIC timer is the machine's clock: xv6 preempts on it, and its count
   // is derived from the host clock rather than from steps.
   LapicPoll(&xm->lapic);
@@ -531,7 +579,7 @@ static void X86Reset(Board* m) {
   FwCfgInit(&xm->fwcfg);
   LapicInit(&xm->lapic);
   IoapicInit(&xm->ioapic);
-  CgaInit(&xm->cga);
+  VgaInit(&xm->vga);
   I8042Init(&xm->kbd);
   Ps2KbdInit(&xm->ps2kbd);
   Ps2MouseInit(&xm->mouse);
@@ -602,7 +650,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   PitDevice* pit = &xm->pit;
   FwCfgDevice* fwcfg = &xm->fwcfg;
   LapicDevice* lapic = &xm->lapic;
-  CgaDevice* cga = &xm->cga;
+  VgaDevice* vga = &xm->vga;
   I8042Device* kbd = &xm->kbd;
   Ps2MouseDevice* mouse = &xm->mouse;
   Port92Device* p92 = &xm->port92;
@@ -613,9 +661,13 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   PicInit(pic);
   PitInit(pit);
   FwCfgInit(fwcfg);
+  if (opts->vgabios_path && LoadVgaRom(xm, fwcfg, opts->vgabios_path) != 0) {
+    BoardDestroy(m);
+    return NULL;
+  }
   LapicInit(lapic);
   IoapicInit(&xm->ioapic);
-  CgaInit(cga);
+  VgaInit(vga);
   I8042Init(kbd);
   Ps2KbdInit(&xm->ps2kbd);
   Ps2MouseInit(mouse);
@@ -687,7 +739,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   IdeSetDmaBus(ide, &m->bus);
   LapicRegister(&m->bus, lapic);
   IoapicRegister(&m->bus, &xm->ioapic);
-  CgaRegister(&m->bus, &m->io, cga);
+  VgaRegister(&m->bus, &m->io, vga);
 
   // Wiring, the way a PC/AT is wired: every ISA IRQ line reaches both
   // controllers (the 8259 pair and the I/O APIC's pins), the LAPIC is the
@@ -716,7 +768,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   m->skip_idle = opts->skip_idle;
   m->reset = X86Reset;  // port 0x92 bit 0 / RCR 0xCF9 / i8042 0xFE (D18)
   m->destroy = X86Destroy;
-  m->display_dev = cga;
-  m->display_ops = &kCgaDisplayOps;
+  m->display_dev = vga;
+  m->display_ops = &kVgaDisplayOps;
   return m;
 }

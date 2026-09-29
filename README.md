@@ -18,6 +18,8 @@
 **阶段 4（设备全集与真实 OS）进行中**：验收 1 xv6-x86 已到 shell；验收 2 Linux
 引导链已到 `VFS: Mounted root (ext2 filesystem)`，卡在其后一段（未定案）；
 验收 3 xv6-riscv 未开始。逐轮记录见 [progress.md](progress.md)。
+x86 固件（SeaBIOS + 显卡 option ROM）来自库外的一棵源码树，其现状、重建步骤与配置
+快照见 [firmware.md](firmware.md)。
 
 ## 构建
 
@@ -51,11 +53,16 @@ build/cemu.exe --machine virt -bios fw_jump.bin
 # PC 主板：固件 ROM 引导 + 硬盘 / 光驱
 build/cemu.exe --machine x86 -bios bios.bin -hda xv6.img
 build/cemu.exe --machine x86 -display win32 -cdrom linux.iso
+
+# PC 主板 + 显示：显卡的 option ROM 提供 int10 视频服务
+# （vgaroms/vgabios.bin 一般是 seabios 树按 CONFIG_NO_VGABIOS=0 构建的产物）
+build/cemu.exe --machine x86 -display win32 -bios bios.bin \
+  -vgabios vgabios.bin -fda win101.img
 ```
 
 `.bin` 需要 `--isa NAME`（ELF 自报 ISA）。常用：`--mem MB`、`--max-inst N`、
-`--skip-idle`、`-hdb`、`-gdb tcp::PORT` / `-s` / `-S`（gdb RSP stub，配套图形
-前端 `cemugui`）。
+`--skip-idle`、`-hdb`、`-fda`、`-vgabios`、`-gdb tcp::PORT` / `-s` / `-S`（gdb RSP
+stub，配套图形前端 `cemugui`）。
 
 ## 测试
 
@@ -66,8 +73,8 @@ cmake --build build --target check-riscv64  # riscv64 套件
 cmake --build build --target check-x86      # x86 套件
 ```
 
-测试镜像已入库，不需要客户机工具链；x86 的三个探针 `.bin` 由 nasm 现生成
-（没装 nasm 则这三格 SKIP）。所有运行都限时（脚本内 `timeout` 包裹）。
+测试镜像已入库，不需要客户机工具链；x86 探针的 `.bin` 由 nasm 现生成
+（没装 nasm 则对应那格 SKIP）。所有运行都限时（脚本内 `timeout` 包裹）。
 
 ## 调试
 

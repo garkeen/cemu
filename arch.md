@@ -61,7 +61,7 @@ cemu/
       intc/         i8259  lapic  ioapic  plic
       input/        i8042（PS/2 键盘控制器）
       storage/      ide（PIIX ATA/ATAPI）
-      video/        cga  cga_font（+ display.h 显示后端契约）
+      video/        vga（VGA 家族核，CGA/EGA 是其兼容模式；+ display.h 显示后端契约）
       misc/         htif  sifive_test  debug_exit  i440fx  piix3  pci
                     cmos  port92  fwcfg  debugcon
     board/         主板：设备布局 + 复位态 + 接线 + 装载 + 运行循环
@@ -127,7 +127,7 @@ x86_min 装第三种 ISA）。类型是 `Board`，CLI 仍是 `--machine`（QEMU 
 |---|---|---|
 | spike_min | RAM 0x80000000 + HTIF | 阶段 1 跑 riscv-tests。tohost 从 ELF 符号表读，spike 同款约定 |
 | virt | DRAM 0x80000000、mask ROM 0x1000（QEMU 复位向量逐字）、CLINT 0x02000000、PLIC 0x0c000000、UART16550 0x10000000、test 0x100000 | 阶段 2 起 OpenSBI。权威来源 QEMU hw/riscv/virt.c + dumpdtb/pmemsave 实测 |
-| x86_min | 32MB RAM@0（`--mem` 可调，上限 0xFEE00000）、PIC 0x20/0xA0、PIT 0x40、COM1 0x3F8→IRQ4、debug-exit 0xF4、debugcon 0x402、fw_cfg 0x510、i8042 0x60/0x64、port92 0x92、CMOS 0x70/0x71、LAPIC 0xFEE00000、IOAPIC 0xFEC00000、CGA 0xB8000+0x3D0、i440FX+PIIX3+IDE（`--hda/--hdb/--cdrom`）、ROM 窗口 0xC0000-0xFFFFF（`-bios`，复位 F000:FFF0） | 阶段 1.5 起的 x86 平台；PC 芯片组在阶段 4 片 1–14 补齐。引导扇区契约：加载 0x7C00、CS:IP=0000:7C00、DL=0x80 |
+| x86_min | 32MB RAM@0（`--mem` 可调，上限 0xFEE00000）、PIC 0x20/0xA0、PIT 0x40、COM1 0x3F8→IRQ4、debug-exit 0xF4、debugcon 0x402、fw_cfg 0x510、i8042 0x60/0x64、port92 0x92、CMOS 0x70/0x71、LAPIC 0xFEE00000、IOAPIC 0xFEC00000、CGA 0xB8000+0x3D0 → VGA 家族核 0xA0000-0xBFFFF+0x3B0-0x3DF（option ROM 走 `-vgabios`）、i440FX+PIIX3+IDE（`--hda/--hdb/--cdrom`）、ROM 窗口 0xC0000-0xFFFFF（`-bios`，复位 F000:FFF0） | 阶段 1.5 起的 x86 平台；PC 芯片组在阶段 4 片 1–14 补齐。引导扇区契约：加载 0x7C00、CS:IP=0000:7C00、DL=0x80 |
 
 对照真机：riscv `qemu-system-riscv64 -M spike -bios none -kernel rv64ui-p-add.elf`；
 x86 `qemu-system-i386 -device isa-debug-exit,iobase=0xf4,iosize=0x4`。
@@ -192,10 +192,10 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   图形 OS 显示前置就绪，衔接阶段 4。
 
 ### 阶段 4：设备全集与真实 OS（此后为纯设备/IO 阶段；进行中）
-- PC 设备模型全集（CGA、PS/2、PIC、PIT、UART、IDE、LAPIC、IOAPIC）✅
-  —— 片 1–14 逐项落地。余下的规格缺口（IOAPIC 的 NMI/SMI/INIT/ExtINT 交付模式、
-  PIRQ 消费者、PM/ACPI、ATA LBA-48/multi-sector、RTC 周期与闹钟中断、软盘与 8237
-  DMA、i8042 命令集、显示家族（CGA 图形与光栅时序、EGA/VGA））按 AGENTS.md 第十节台账在册。
+- PC 设备模型全集（VGA 家族核、PS/2、PIC、PIT、UART、IDE/ATAPI、软盘 FDC+8237、LAPIC、IOAPIC）✅
+  —— 片 1–14 逐项落地，片 26 补软盘通路，片 27 补显示家族。余下的规格缺口（IOAPIC 的
+  NMI/SMI/INIT/ExtINT 交付模式、PIRQ 消费者、PM/ACPI、ATA LBA-48/multi-sector）按
+  AGENTS.md 第十节台账在册。
 - bin 路线：multiboot 等价的入口契约，xv6 去掉 bootasm.S/bootmain.c
   编为 .bin；SeaBIOS 路线：官方 bios.bin 映射内存顶端，复位 F000:FFF0
   （bios.bin 已备料；跑通 SeaBIOS 本体属本阶段设备集成，不前置）。
@@ -225,20 +225,21 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   不变式。回归：riscv64 136/0、x86 15/0。验收 3（xv6-riscv）未开始：素材
   （xv6-riscv 镜像与 OpenSBI fw_jump）尚未取，串口输入通道已就绪。过程与证据见
   progress.md。
-- **验收 4（Windows 1.01）与显示实现形状**（2026-09-24 用户裁决）：验收件
+- **验收 4（Windows 1.01）与显示实现形状**（2026-09-24 用户裁决；2026-09-29 落地）：验收件
   `build/windows/windows101.img`（1.44MB、MS-DOS 3.3 引导软盘，卷标 WIN101），QEMU
   基线是 **EGA 640×350** 下的 MS-DOS Executive 桌面（7 秒时截屏）。它给出两条硬前置：
-  **软盘引导链**（8272 FDC + 8237 DMA 通道 2 + CMOS 软驱字节 + 引导 DL=0x00，台账
-  D21）与**显示**（台账 D17）。显示不按"CGA 图形 → EGA → VGA"三段各自成卡，而是
-  **一个 VGA 家族核 + CGA/EGA 兼容模式**：核提供 4 平面 64K+ 显存、
-  0x3C0-0x3DF 四组寄存器（CRTC/Sequencer/Graphics/Attribute）、平面与链式两种寻址、
-  256 色 DAC；CGA 与 EGA 是它的兼容模式层 —— EGA 640×350 正是验收 4 要的那一层，
-  CGA 的 320×200/640×200 也落在同一张模式表上。现有 `cga.c` 的文本路径并入核，
-  不往 `cga.c` 里加分支（AGENTS.md 禁止特判）。
-  量级参考本仓库既有设备（cga.c 311 行 = CGA 文本；i8259 361 行；ide.c 1774 行 =
-  ATA/ATAPI 子集）：核 + CGA/EGA 兼容模式约 700–1100 行，VGA 特有的链式模式与
-  256 色 DAC/VBE 再 500–1000 行，显示通道（DisplaySourceOps 宽高可变 + 宿主窗口随
-  模式换尺寸）约 100–200 行。
+  **软盘引导链**（8272 FDC + 8237 DMA 通道 2 + CMOS 软驱字节 + 引导 DL=0x00；片 26 交付）
+  与**显示**。显示不按"CGA 图形 → EGA → VGA"三段各自成卡，而是**一个 VGA 家族核 +
+  CGA/EGA 兼容模式**（片 27 交付）：核提供 4 平面 256KB、0x3C0-0x3DF 四组寄存器
+  （CRTC/Sequencer/Graphics/Attribute）、平面/奇偶/链式寻址、256 色 DAC、CRTC 驱动的
+  光栅状态；CGA 与 EGA 是它的兼容模式层 —— EGA 640×350 正是验收 4 要的那一层，CGA 的
+  320×200/640×200 落在同一套寻址里。`cga.c` 已并入核（随卡删除，不留分支）。
+  **机器的 int10 由显卡的 option ROM 提供**：SeaBIOS 按 `CONFIG_NO_VGABIOS=0` 重建
+  （SeaVGABIOS，38400 字节），主板用 `-vgabios` 把它作为 fw_cfg 文件 `vgaroms/vgabios.bin`
+  交给固件，固件自己影子到 C0000——显卡因此不需要 PCI 身份。验收见
+  `test/x86/probe/vga_probe.asm`（int10 切 mode 3/0x10/0x04 后核对寄存器与平面寻址，
+  QEMU `-vga std` 同一镜像同样通过）。剩余显示缺口见 AGENTS.md D17（链式 256 色只做
+  寻址不渲染、无 VBE、渲染结果缺无头 dump 设施）。
 
 ### 阶段 5：cesdk（放后：真实 OS 跑通后再做 SDK）
 - 交付：crun 运行时（_start、putch→UART、halt→sifive_test）、klib、
