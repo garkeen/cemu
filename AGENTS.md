@@ -108,6 +108,17 @@ ISA 头，`virt.c` 仅引 `platform.h`。
   会话内的临时手跑（调试观测、state 对拍、探针复现）同样必须前置
   `timeout <秒>`，防止被测程序死循环导致不退出的挂起（realmode 套件
   尾部 fninit #UD 死循环即由 timeout+输出判据容纳）。
+- **测试只能跑探针，不许跑 bios/img/iso**（用户裁决）：套件里任何一格都不得
+  引导固件镜像、软盘镜像或光盘镜像。理由是它们慢（一个 SeaBIOS 自举到 DOS 就要
+  千万条指令、一分多钟），且依赖库外的产物（本仓的 `build/` 与 `../seabios/out/`
+  都不在版本控制里，换台机器那几格只能 SKIP，计数也随之漂移）。设备语义一律用
+  **自足探针**钉：探针自己编程那台设备（`test/*/probe/`，multiboot ELF 或引导扇区，
+  从 `-bios`/`-fda`/`-cdrom` 起来的都不算），`timeout` 内在秒级跑完。会话内的临时手跑
+  同样受此约束。**违反此条的格直接删除，不改写成探针**（用户裁决）：片 26/27 引入的
+  `floppy` 与 `vga` 两格（`-bios ../seabios/out/bios.bin -vgabios ... -fda`）已从
+  `test/x86/run.sh` 删除，覆盖改由两个自足探针承担（`vga_core` 直接写 0x3C4/0x3CE/
+  0x3C0 与孔径；`fdc_dma` 自己下 8272A/8237 命令与 DMA 编程，都不借 SeaBIOS 的手），
+  x86 套件 21 格（13 单格 + kvm 7 镜像 + realmode 1）。
 - 落盘体积：**任何**写入文件不得超过 5MB——测试对拍数据/捕获文件、
   CEMU_DEBUG 观测落盘（`2>file` 的 trace/state/mem/regs 等）一律算；
   超出即视为违规，须改用采样、截断或 CEMU_DEBUG `budget=` 抑制等
@@ -203,6 +214,13 @@ CEMU_DEBUG = item[,item...]
                             要求会话自行结束（--max-inst 或客机停机）：宿主信号
                             会跳过会话收尾，什么也不写。例：取 Linux 的 __log_buf
                             `dump=0x30a000:0x18000:build/logbuf.bin`
+  fbdump=FILE                会话结束时把**显示卡的渲染缓冲**落成二进制 PPM
+                            （P6，与 QEMU `screendump` 同格式，两张图可逐字节
+                            diff；可重复，上限 2 段，超 5MB 拒写不截断）。
+                            dump= 只能取回内存里的东西，而画面根本不在内存里——
+                            它是卡自己的 XRGB 缓冲（display.h 的 vtable），由主板
+                            交给中枢（D17 里缺的就是这个：无头核对渲染的唯一手段）。
+                            同样要求会话自行结束。例：`fbdump=build/fb.ppm`
   budget=N                  单类别事件上限，超出抑制并计数，退出时汇总
                            （会话另有 5MB 输出硬顶：固件 ROM 影子拷贝这类"每字
                             节两次事件"的热点会把它吃满；定位引导期设备流量要用
@@ -217,6 +235,10 @@ CEMU_DEBUG = item[,item...]
                             lidt/lgdt gate(门描述符) hostkey kbd-byte kbd-irq
                             aux-byte aux-irq(IRQ12) hostmouse mouse-inj key-inj
                             reset-req(设备请求机器复位)
+                            fdc-cmd(原始命令字/解码值) fdc-res(结果相位) fdc-irq
+                            fdc-rw fdc-xfer(实际搬运字节) dma-xfer(计数寄存器/
+                            mode&lt;&lt;8|道号&lt;&lt;4|masked) dma-reg
+                            hostserial hostbyte inputopen inputpoll
   mouse=DX:DY:BUTTONS[:WHEEL]@N
   key=SCAN[:EXT[:UP]]@N
                             合成宿主输入（探针作为客人按不了鼠标、也按不了键，
@@ -290,7 +312,7 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 | D7 | LR/SC 单核预留集 | 无多核冲突语义 | spike 单核同款；规格允许 SC 假失败 | 多核引入时 | 登记中 |
 | D11 | htif.c HTIF syscall（dev0/cmd0）报错退出 | 无 fesvr syscall 设备 | fesvr htif_t::handle_syscall | 阶段 5 cesdk | 登记中 |
 | D13 | x86 x87 FPU 与 RDTSC | **x87 FPU 未实现**：本机 CPUID 报 EDX.FPU = 0（无 FPU），因此 ESC 指令（D8-DF）按"无 FPU 处理器"语义执行——CR0.TS/EM 置位时先 #NM，否则解码 modrm 后当 NOP（tiny386 ESC() 同款；386SX/486SX 上 Linux 就是这么引导的）。**RDTSC 仍为显式 ud()**（0F 31） | intel SDM vol.2/vol.3（ESC 与 CR0.EM/TS 语义）；tiny386 i386.c 的 ESC() 宏；Linux arch/x86/boot/setup.S 的 FPU 探测（靠 ESC 为 NOP 判定"无 FPU"） | 真 FPU（含 RDTSC 与 CPUID 特性位）在需要 x87 算术的客户机出现时（Linux 用户态/浮点程序） | 登记中 |
-| D17 | vga.c 渲染与显示通道 | VGA 家族核本身已实现（4 平面 256KB、0x3C0-0x3DF 四组寄存器、平面/奇偶/链式寻址、写模式 0-3、读模式 0/1、256 色 DAC、文本与 16 色平面图形渲染、CRTC 驱动光栅状态），CGA/EGA 是它的兼容层；剩下的是：**链式 256 色（模式 13h）只做寻址不渲染**（渲染器只画文本、16 色平面与 CGA 4/5/6 的 2bpp/1bpp）；**无 VBE**（固件 CONFIG_VGA_VBE=0，int10 4F 不支持，无线框模式与线性帧缓冲）；**行比较/分屏（CRTC R18）与滚动的平滑滚动（panning）未实现**；**过扫描边框不渲染**、**CGA 复合 NTSC 伪色未做**；**光笔端口 0x3DB/0x3DC 未实现**（VGA 家族无此设备）；**闪烁/光标相位仍取墙钟的场倍数周期**，不跟随实际场相位；**渲染结果没有无头核对手段**（没有 QEMU `screendump` 那样的帧缓冲 dump，图形画面只能靠 `-display` 目验） | IBM VGA Technical Reference；IBM CGA Technical Reference；FreeVGA；QEMU hw/display/vga.c 行为旁证 | 链式 256 色与 VBE 在需要 Mode X / 线性帧缓冲的客户机（win101 之上的图形软件）出现时；光栅精确时序在需要逐像素时序的软件（raster 技巧 demo）出现时再校准；帧缓冲 dump 设施在做像素级双跑对拍前先补（QEMU `screendump` 的对应物） | 登记中 |
+| D17 | vga.c 渲染与显示通道 | VGA 家族核本身已实现（4 平面 256KB、0x3C0-0x3DF 四组寄存器、平面/奇偶/链式寻址、写模式 0-3、读模式 0/1、256 色 DAC、文本与 16 色平面图形渲染、CRTC 驱动光栅状态），CGA/EGA 是它的兼容层；剩下的是：**链式 256 色（模式 13h）只做寻址不渲染**（渲染器只画文本、16 色平面与 CGA 4/5/6 的 2bpp/1bpp）；**无 VBE**（固件 CONFIG_VGA_VBE=0，int10 4F 不支持，无线框模式与线性帧缓冲）；**行比较/分屏（CRTC R18）与滚动的平滑滚动（panning）未实现**；**过扫描边框不渲染**、**CGA 复合 NTSC 伪色未做**；**光笔端口 0x3DB/0x3DC 未实现**（VGA 家族无此设备）；**闪烁/光标相位仍取墙钟的场倍数周期**，不跟随实际场相位 | IBM VGA Technical Reference；IBM CGA Technical Reference；FreeVGA；QEMU hw/display/vga.c 行为旁证 | 链式 256 色与 VBE 在需要 Mode X / 线性帧缓冲的客户机（win101 之上的图形软件）出现时；光栅精确时序在需要逐像素时序的软件（raster 技巧 demo）出现时再校准 | 登记中 |
 | D19 | PIIX3 芯片组、IDE 与 IOAPIC | IOAPIC 只投递 fixed 与 lowest-priority，**NMI/SMI/INIT/ExtINT 四种交付模式不投递**；PIIX3 ISA 桥的 PIRQ 路由字节 0x60-0x63 无消费者（IDE 跑兼容模式，没有 PCI 设备拉 INTx）；XBCS/PM/DMA 块未做；ATA 侧无 LBA-48 与 multi-sector（未实现的命令按规格 ABRT） | ATA/ATAPI-7 §6.3（未实现命令的应答就是 ABRT）；QEMU hw/isa/piix3.c、seabios src/fw/pciinit.c piix_isa_bridge_setup；IOAPIC 交付模式：82093AA datasheet §3.2.4；NMI 输入：SDM vol.3 §6.7 | NMI/SMI 交付模式要先给 CPU 加 NMI 输入（本机无 SMM、单 APIC、无 PIC→IOAPIC 通路）；PIRQ 需要真拉 INTx 的 PCI 设备；PM/ACPI 在需要挂起/电源管理时；LBA-48 在需要 >128 GiB 或客户机强制时 | 登记中 |
 | D21 | i8042.c 软驱数据线 | 8042 侧的软驱数据线（键盘控制器输出端口上那条给软驱控制器的数据线）没有建模；本机的软驱路径由 8272A + 8237 通道 2 承担，固件不经过这条线 | PC/AT Technical Reference（8042 输出端口）；IBM 8042 数据表 | 需要复现"经 8042 传盘"的硬件时 | 登记中 |
 | D32 | uart16550.c 接收侧 FIFO 语义 | `PushRx` 无视 FCR.FE 一直缓存 16 字节：实机 16550 在 FIFO 关闭时只保留 1 字节（RBR），后续字节按溢出丢弃并置 LSR.OE，本机不丢。后果：不开 FIFO 的客户机驱动在本机也能收全突发（sermouse 探针原先正是靠这处偏差通过的），在实机/QEMU 上会丢字节 | 16550D datasheet（FCR.FE、RBR 单字节与 OE）；QEMU hw/char/serial.c `serial_receive1` | 需要精确接收溢出语义的客户机出现时（sermouse 探针已改为开 FIFO，销账无阻塞） | 登记中 |

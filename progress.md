@@ -3,6 +3,94 @@
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
 
+## 阶段 4 片 28：两个自足探针补回被删格的覆盖 —— vga_core 接线、fdc_dma 收敛并双跑（2026-09-30）
+
+`floppy`/`vga` 两格删除后留下两支替代探针：`vga_core`（VGA 家族核，直接写寄存器与孔径）
+与 `fdc_dma`（FDC/8237，自己下 8272A 命令与 DMA 编程）。本轮把停在半途的 `fdc_dma`
+收敛并双跑，两处关键修正：**结果相位读满 7 字节**（少读一个字节模型就停在结果相位，后续
+命令的写全被 DIO 门控丢掉）、**DMA 模式字节按 8237A 传输类型段取 0x46/0x4a**（设备→内存
+用于磁盘读，内存→设备用于磁盘写；旧稿的 0x4a/0x8a 连模式段都是错的）。另清掉死标签与
+重复填充，补齐 ST1/ST2 掩码（0xbd/0x7c），并在每次传输后断言通道 2 的 TC 位；位址字节
+C1/H0/R1/N2（过 EOT 后的头位置）由双跑校准后写进断言。
+
+双跑：cemu `rc=11` + `fdc-dma ok`；QEMU 串口转录逐字相同（QEMU 无 debug-exit，串口行
+即判据）。`test/x86/run.sh` 新增 `fdc-dma` 格（mktemp/dd 生成空白 1.44M 镜像，无
+`-bios`/`-vgabios`）。
+
+回归：riscv64 **136 passed / 0 failed**、x86 **21 passed / 0 failed**、依赖边 check ok。
+
+## win101 首次实跑：卡在 DOS 提示符，顺带补齐三处观测面（2026-09-29）
+
+**先决对照（本轮最重要的一条）**：此前"QEMU 能跑 win101"只是口头基线，从没验过
+**我们自己编译的 bios.bin**。补上：`qemu-system-i386 -machine pc -m 32 -bios
+../seabios/out/bios.bin -drive format=raw,file=build/windows/windows101.img,if=floppy
+-boot a -vga std -display none`，t=12s 监视器 `screendump` 抓到 **640×350**（Windows 1.01
+桌面），客人 `CS=0x0df9 EIP=3510` 在跑；再加 `-fw_cfg
+name=etc/vgaroms/vgabios.bin,file=../seabios/out/vgabios.bin`（**用我们自己的
+vgabios**）同样进桌面。**所以固件树、显卡 option ROM、软盘镜像全部无罪，问题在 cemu
+侧。**（cemu 本身没有 `-vga`/`-cga` 开关：x86_min 上那张卡是固定装的 VGA 家族核，
+少任何选项都不会让 win101 起来。）
+
+**cemu 上的现象**：SeaBIOS + SeaVGABIOS + 软盘引导全通，`CEMU_DEBUG=screen` 镜像到
+`A>` 提示符为止（清屏 + 第 1 行 `A>`，属性全 0x07）。`regs=50000` 时间线显示到
+19.95M 指令时客人仍在 `cs=0x0070`（DOS 内核的中断处理程序）执行——**机器没有死锁**，
+SeaBIOS 只是停在 `src/kbd.c` 的等键循环（反汇编 `bios.bin` 的 `f000:b230`：
+`while (BDA[0x1A] == BDA[0x1C])`，es=0x40 即 BDA 0x1A/0x1C 是键盘缓冲 head/tail）。
+`WIN100.OVL` 已加载到线性 0x89000（`MS-DOS Executive` 在 0x89b19），读盘量与 173 次
+IRQ6 吻合（200KB+ 的 OVL ≈ 170 扇区），BDA `video_mode` 仍是 0x03：**Windows 起来过、
+加载完主 OVL，然后退回 DOS，没有切过 EGA 640×350**。这是验收 4 的真正卡点，未定案。
+
+**两条被推翻的猜测（记下来免得后人重踩）**：① "字库没加载导致花屏"——错。SeaBIOS 的
+`get_font_access()`（SR2=0x04、SR4=0x07、GR6=0x04）把字库写到 **0xA0000** 而不是
+0xB0000，cemu 上确实发生了 4096 次对 0xA0000-0xA1FFF 的写；先前读 0xB0000 全 0xFF 是
+找错了地方（且文本模式下孔径只看得到 plane 0/1，`dump=` 经设备读孔径根本看不到
+plane 2 里的字库——这正是 D17 那条缺口的直接后果）。② "IRQ6 中断风暴"——错，173 次
+就是读 170 来个扇区。
+
+**三处观测面补齐（本轮交付）**：
+1. **`fbdump=FILE`（D17 销掉那半句）**：会话结束时把显示卡的渲染缓冲落成**二进制 PPM
+   （P6）**，与 QEMU `screendump` 同格式，两张图可逐字节 diff。中枢不拥有设备，所以
+   主板经 `DebugSetFbReader` 交出卡自己的 vtable 两跳（`display_ops->Width/Height` 与
+   `->Framebuffer`），与既有的 `DebugSetMemReader` 同一接缝。超 5MB 拒写不截断。
+   **首次使用就否掉了"渲染器坏了"**：win101 在 3M 指令（SeaBIOS banner）与 20M 指令
+   （挂住时刻）两处的画面都是 720×400、只有黑与 a8a8a8 两种颜色、字形清晰——文本
+   渲染路径是对的，用户看到的"乱"另有原因（窗口侧缩放或模式切换瞬间，待查）。
+2. **`skip`/`budget` 的分类目记账**：`CatIdx()` 只扫低 8 位，把 `kDbgRegs`/`kDbgGdb`/
+   `kDbgMark`/`kDbgScreen` 全塞进索引 7 互相吃预算与静默窗口；`state` 类目更是**完全
+   没有预算门**（`StateRow(f)` 无条件调用），所以一条 `state,skip=N,budget=M` 会把
+   整条流打出来撞上 5MB 硬顶。现在每个 `kDbg*` 位占一个计数槽（`kCatSlots=16`），
+   `state` 走 `Allow()`，会话汇总按新槽位汇报。
+3. **存储/DMA 的 mark 事件：代码里本来就有**（`fdc-cmd`/`fdc-res`/`fdc-irq`/`fdc-rw`/
+   `fdc-xfer`/`dma-xfer`/`dma-reg`），本轮只是把它们与宿主输入那几个
+   （`hostserial`/`hostbyte`/`inputopen`/`inputpoll`）补进 AGENTS.md §十 的 name
+   清单——先前"存储通路在事件流里是瞎的"是 grep 写错模式造成的误判，win101 那次
+   mark 日志里就有 220 条 `fdc-cmd`、130 条 `dma-xfer`。
+
+**尚未定案**：Windows 为何退回 DOS。下一步有了 1、2 两项观测面才追得动：state 窗口
+现在真的能开窗，配合 fbdump 逐帧对拍 QEMU 的 screendump。台账 D17 删去"渲染结果没有
+无头核对手段"那半句，其余缺口不动。
+
+**本节的方法违规（用户裁决后记）**：win101 的取证全部靠手跑 SeaBIOS（`-bios
+../seabios/out/bios.bin -vgabios ... -fda build/windows/windows101.img`），单次一到
+三分钟、连跑八次；而用户裁决**任何测试都不许跑 bios/img/iso，只能跑探针，违反的格
+直接删除**。顺带查出更早的问题：`test/x86/run.sh` 的 `floppy`（片 26）与 `vga`
+（片 27）两格本身就是拿库外镜像跑的（那两格在本机 0 SKIP，所以"21 passed"里含它们）。
+**已删除**（run.sh 第 290–395 行，106 行），x86 套件从 21 格降到 19 格
+（11 单格 + kvm 7 镜像 + realmode 1），`bash -n` 通过。代价要说清：FDC/8237 与
+VGA 家族核**暂时没有自动化覆盖**了，要补就写自足探针（探针自己下 8272A/8237 命令
+与 DMA 编程，VGA 直接写 0x3C4/0x3CE/0x3C0 与孔径，都不借 SeaBIOS 的手）。
+其余验证按新规则全部合规：全量重建零告警；`--target check` 依赖边 ok；riscv64
+136 passed / 0 failed；新设施自测 `state,skip=500000,budget=5` 在 600k 指令的运行里
+正好打出 4 行（窗口从第 500001 条开始，第 5 条越过 --max-inst），会话汇总
+`supp[3]=99995`（= 100000 预算 − 5）；`fbdump` 在无显示卡的机器上按预期报错。
+落盘体积全程合规：观测产物最大 864KB（720×400 的 P6 PPM），内存 dump 654KB，mark 日志
+387KB，都在 5MB 之下。
+riscv64 套件 **136 passed / 0 failed**。新设施自测：`state,skip=500000,budget=5` 在
+600k 指令的运行里正好打出 4 行（窗口从第 500001 条开始，第 5 条越过 --max-inst），
+会话汇总 `supp[3]=99995`（= 100000 预算 − 5）；`fbdump` 在无显示卡的机器上按预期报错。
+落盘体积全程合规：观测产物最大 864KB（720×400 的 P6 PPM），内存 dump 654KB，mark 日志
+387KB，都在 5MB 之下。
+
 ## 阶段 4 片 27：VGA 家族核 + CGA/EGA 兼容模式（int10 通路打通）（2026-09-29）
 
 **先决问题：机器此前根本没有 int10。** 查显示链路时发现 SeaBIOS 是 `CONFIG_NO_VGABIOS=1`

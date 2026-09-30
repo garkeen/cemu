@@ -17,6 +17,23 @@ static int DebugReadPhys(void* ctx, uint64_t addr, uint8_t* buf, int len) {
   return 1;
 }
 
+// The display card's picture, for fbdump= (debug/debug.h). The hub owns no
+// device, so the board hands it the card's own vtable calls: the size it
+// reports now, and the XRGB buffer behind them (device/video/display.h).
+static int DebugFbInfo(void* ctx, int* w, int* h) {
+  Board* m = (Board*)ctx;
+  if (!m->display_ops) return 0;
+  *w = m->display_ops->Width(m->display_dev);
+  *h = m->display_ops->Height(m->display_dev);
+  return 1;
+}
+
+static const uint32_t* DebugFbPixels(void* ctx) {
+  Board* m = (Board*)ctx;
+  if (!m->display_ops) return NULL;
+  return m->display_ops->Framebuffer(m->display_dev);
+}
+
 int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuState* cpu),
                   void* cb_ctx) {  while (!m->cpu.halted) {
     if (m->poll) m->poll(m);
@@ -93,6 +110,7 @@ void BoardRun(Board* m, uint64_t max_inst) {
   // the bus, so a region no device claims fails the dump instead of returning
   // open-bus noise.
   DebugSetMemReader(DebugReadPhys, &m->bus);
+  DebugSetFbReader(DebugFbInfo, DebugFbPixels, m);
   DebugInit();
   if (m->gdb) {
     // The stub owns run control: sessions (attach/step/continue) alternate

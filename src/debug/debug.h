@@ -113,6 +113,20 @@ int DebugWatchHit(uint64_t addr, int size, int is_load);
 typedef int (*DebugMemReadFn)(void* ctx, uint64_t addr, uint8_t* buf, int len);
 void DebugSetMemReader(DebugMemReadFn read, void* ctx);
 
+// ---- framebuffer dumps (fbdump=FILE) -----------------------------------------
+// dump= shows what the guest left in memory; a rendered picture is not in
+// memory at all — it is the display card's own XRGB buffer
+// (device/video/display.h), which this hub does not own. The board installs
+// these two accessors (the card's picture size, then its pixels) and the item
+// is written when the session ends, beside dump=, as the same binary PPM
+// (P6) QEMU's `screendump` writes: the two pictures then compare byte for
+// byte, which is the headless way to check a renderer (AGENTS.md D17). A
+// picture over the 5MB file cap is refused, not truncated, and a run with an
+// fbdump must stop by itself (--max-inst, or the guest halting).
+typedef int (*DebugFbInfoFn)(void* ctx, int* w, int* h);
+typedef const uint32_t* (*DebugFbPixelsFn)(void* ctx);
+void DebugSetFbReader(DebugFbInfoFn info, DebugFbPixelsFn pixels, void* ctx);
+
 // Halt/exit: the final regs table + session summary (always, once debug is
 // active at all).
 void DebugSessionEnd(const struct frame* f, const char* stop_reason);
@@ -120,6 +134,7 @@ void DebugSessionEnd(const struct frame* f, const char* stop_reason);
 // CEMU_DEBUG grammar this hub implements (AGENTS.md §X):
 //   trace[:line|table][=N], state, mem[:ld|st], trap, bus, regs=N,
 //   watch=ADDR:SIZE[:r|w|rw] (repeatable), dump=ADDR:SIZE:FILE (repeatable),
+//   fbdump=FILE (repeatable, binary PPM of the display card's picture),
 //   budget=N (per-category cap), skip=N (per-category silent window before
 //   printing), utf8. Addresses are physical.
 

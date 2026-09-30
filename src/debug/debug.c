@@ -21,14 +21,17 @@ static int g_ascii = 1;  // plain borders by default (console codepages
                          // mangle UTF-8); `utf8` switches on
 static int g_header_every = 40;
 static int g_regs_period;      // 0 = off
-static int g_budget = 100000;  // per-category event cap
-static uint64_t g_skip = 0;    // per-category events suppressed BEFORE printing
+// Per-category event cap, and the silent window each category counts through
+// before it starts printing (AGENTS.md §X). One value, applied to every
+// category's own counter: "per-category" is about the accounting, not about
+// spelling the number once per category.
+static int g_budget = 100000;
+static uint64_t g_skip = 0;
 
 // Hard session output cap (bytes). Every debug write is accounted here; once
 // the cap is hit, further writes are dropped so a misconfigured CEMU_DEBUG
-// can't fill the disk (the `state` category alone can otherwise emit gigabytes
-// since it bypasses the per-category budget). ~5MB is plenty for any real
-// diagnosis; raise it with a code change if you genuinely need more.
+// can't fill the disk. ~5MB is plenty for any real diagnosis; raise it with a
+// code change if you genuinely need more.
 static const uint64_t kOutLimit = 5ULL * 1024 * 1024;
 static uint64_t g_out_bytes;
 static int g_limit_hit;
@@ -40,9 +43,15 @@ static const TableColumn kEventCols[] = {
 };
 static Table* g_tbl;
 
-// Per-category counters for the budget suppression and the summary.
-static uint64_t g_emitted[8];
-static uint64_t g_suppressed[8];
+// One counter slot per category. Every kDbg* item is its own single bit, so
+// the bit position is the slot index: scanning only the low eight bits filed
+// kDbgRegs, kDbgGdb, kDbgMark and kDbgScreen into one shared slot, where they
+// ate each other's budget and skip window (a `mark` run whose slot was spent
+// by kDbgRegs' periodic register table stops printing marks, and `skip` for one
+// of them silently moved the others' windows).
+enum { kCatSlots = 16 };
+static uint64_t g_emitted[kCatSlots];
+static uint64_t g_suppressed[kCatSlots];
 static uint64_t g_traps;
 
 // ---- watchpoints ----------------------------------------------------------
@@ -166,6 +175,98 @@ static void WriteDump(const int idx) {
   int n = snprintf(line, sizeof(line), "== dump: %llx:%llu -> %s (%llu bytes)\n",
                    (unsigned long long)addr, (unsigned long long)size, path,
                    (unsigned long long)wrote);
+  if (n > 0 && DebugAccountOut((size_t)n)) HostWriteErr(line, (size_t)n);
+}
+
+// ---- framebuffer dumps (fbdump=FILE) ----------------------------------------
+// A rendered picture is not in guest memory: it is the display card's own
+// XRGB buffer (device/video/display.h), which this hub does not own. The
+// board installs the two accessors and the item is written at session end,
+// beside dump=, in the same binary PPM (P6) QEMU's `screendump` writes, so
+// the two pictures compare byte for byte. AGENTS.md §七 caps every file this
+// repo writes at 5MB, so a picture over the cap is refused, not truncated.
+enum { kMaxFbDumps = 2 };
+static struct {
+  char file[128];
+} g_fbdump[kMaxFbDumps];
+static int g_nfbdump;
+static DebugFbInfoFn g_fb_info;
+static DebugFbPixelsFn g_fb_pixels;
+static void* g_fb_ctx;
+
+void DebugSetFbReader(DebugFbInfoFn info, DebugFbPixelsFn pixels, void* ctx) {
+  g_fb_info = info;
+  g_fb_pixels = pixels;
+  g_fb_ctx = ctx;
+}
+
+static void AddFbDump(const char* spec) {
+  if (g_nfbdump >= kMaxFbDumps) {
+    LogError("debug: too many framebuffer dumps, dropping '%s'", spec);
+    return;
+  }
+  if (!*spec || strlen(spec) >= sizeof(g_fbdump[0].file)) {
+    LogError("debug: fbdump expects a file name ('%s')", spec);
+    return;
+  }
+  snprintf(g_fbdump[g_nfbdump].file, sizeof(g_fbdump[0].file), "%s", spec);
+  g_nfbdump++;
+}
+
+// Writes the card's picture as a P6 PPM: the same header and the same
+// top-to-bottom RGB order QEMU's screendump emits, so a diff of the two files
+// is a diff of the two pictures. The pixel buffer is the card's own XRGB
+// (0xffRRGGBB per display.h), converted to the PPM's RGB triples here.
+static void WriteFbDump(const int idx) {
+  const char* path = g_fbdump[idx].file;
+  char line[192];
+  // The board installs both accessors unconditionally (board/run.c), so
+  // "no card" and "a card with nothing to show" are the same report: the card
+  // this machine has, if any, publishes no picture.
+  int w = 0, h = 0;
+  if (!g_fb_info || !g_fb_pixels || !g_fb_info(g_fb_ctx, &w, &h) || w <= 0 || h <= 0) {
+    LogError("debug: fbdump %s: this machine's display card has no picture", path);
+    return;
+  }
+  const uint64_t pixels = (uint64_t)w * (uint64_t)h;
+  const uint64_t rgb = pixels * 3;
+  char hdr[32];
+  const int hn = snprintf(hdr, sizeof(hdr), "P6\n%d %d\n255\n", w, h);
+  if (rgb + (uint64_t)hn > kDumpLimit) {
+    LogError("debug: fbdump %s: %dx%d needs %llu bytes, over the 5MB file cap", path, w, h,
+             (unsigned long long)(rgb + (uint64_t)hn));
+    return;
+  }
+  const uint32_t* px = g_fb_pixels(g_fb_ctx);
+  if (!px) {
+    LogError("debug: fbdump %s: the card has no framebuffer", path);
+    return;
+  }
+  uint8_t* buf = (uint8_t*)malloc((size_t)(rgb + (uint64_t)hn));
+  if (!buf) {
+    LogError("debug: fbdump %s: out of memory", path);
+    return;
+  }
+  memcpy(buf, hdr, (size_t)hn);
+  uint8_t* out = buf + hn;
+  for (uint64_t i = 0; i < pixels; i++) {
+    const uint32_t p = px[i];
+    out[i * 3 + 0] = (uint8_t)((p >> 16) & 0xff);
+    out[i * 3 + 1] = (uint8_t)((p >> 8) & 0xff);
+    out[i * 3 + 2] = (uint8_t)(p & 0xff);
+  }
+  HostFile* f = HostFileCreate(path);
+  if (!f) {
+    LogError("debug: fbdump %s: cannot create the file", path);
+    free(buf);
+    return;
+  }
+  const size_t total = (size_t)(rgb + (uint64_t)hn);
+  const size_t wrote = HostFileWriteAt(f, 0, buf, total);
+  HostFileClose(f);
+  free(buf);
+  int n = snprintf(line, sizeof(line), "== fbdump: %dx%d -> %s (%zu of %zu bytes)\n", w, h, path,
+                   wrote, total);
   if (n > 0 && DebugAccountOut((size_t)n)) HostWriteErr(line, (size_t)n);
 }
 
@@ -390,6 +491,8 @@ void DebugInit(void) {
       AddWatch(tok + 6);
     else if (!strncmp(tok, "dump=", 5))
       AddDump(tok + 5);
+    else if (!strncmp(tok, "fbdump=", 7))
+      AddFbDump(tok + 7);
     else if (!strncmp(tok, "mouse=", 6))
       AddMouseInjection(tok + 6);
     else if (!strncmp(tok, "key=", 4))
@@ -417,9 +520,9 @@ int DebugOn(uint32_t cat) { return g_inited && ((g_mask & cat) || (g_nwatch && c
 
 // Category index for the budget counters (bit position clamped into range).
 static int CatIdx(uint32_t cat) {
-  for (int i = 0; i < 8; i++)
+  for (int i = 0; i < kCatSlots; i++)
     if (cat & (1u << i)) return i;
-  return 7;
+  return kCatSlots - 1;
 }
 
 // The window is closed; the budget counts from here.
@@ -582,7 +685,11 @@ void DebugInsn(frame* f) {
       TableRowEnd(g_tbl);
     }
   }
-  if (g_mask & kDbgState) StateRow(f);
+  // The state stream is a category like any other: it spends its own budget
+  // and its own skip window, and the session summary reports what it
+  // suppressed. It used to bypass both, which is how one `state,skip=N` run
+  // printed the whole stream and ran into the 5MB output cap.
+  if ((g_mask & kDbgState) && Allow(kDbgState)) StateRow(f);
   if (g_regs_period && (f->cpu->inst_count % (uint64_t)g_regs_period) == 0) {
     // Periodic register table reuses DumpRegs through a Frame-less path.
     f->isa->dump_regs(f->cpu);
@@ -701,17 +808,18 @@ void DebugSessionEnd(const frame* f, const char* stop_reason) {
   if (!g_inited) return;
   // Pure compat-trace mode stays byte-identical to the old interpreter's
   // output; the summary is a new-format feature.
-  if (g_mask == kDbgTraceLine && !g_ndump) return;
-  if (!(g_mask || g_nwatch || g_ndump)) return;
+  if (g_mask == kDbgTraceLine && !g_ndump && !g_nfbdump) return;
+  if (!(g_mask || g_nwatch || g_ndump || g_nfbdump)) return;
   if (g_mask & kDbgRegs) f->isa->dump_regs(f->cpu);
   char line[160];
   int n = snprintf(line, sizeof(line), "== session: inst=%llu traps=%llu",
                    (unsigned long long)f->cpu->inst_count, (unsigned long long)g_traps);
-  for (int i = 0; i < 8; i++)
+  for (int i = 0; i < kCatSlots; i++)
     if (g_suppressed[i])
       n += snprintf(line + n, sizeof(line) - (size_t)n, " supp[%d]=%llu", i,
                     (unsigned long long)g_suppressed[i]);
   snprintf(line + n, sizeof(line) - (size_t)n, " stop=%s\n", stop_reason);
   if (DebugAccountOut(strlen(line))) HostWriteErr(line, strlen(line));
   for (int i = 0; i < g_ndump; i++) WriteDump(i);
+  for (int i = 0; i < g_nfbdump; i++) WriteFbDump(i);
 }
