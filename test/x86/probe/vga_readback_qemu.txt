@@ -6,25 +6,20 @@
 #       -display none -serial file:... -no-reboot \
 #       -device isa-debug-exit,iobase=0xf4,iosize=0x4
 #
-# The suite cell compares cemu's live transcript against the `cemu` line below;
-# the `qemu` line is what the reference card answered. Exit: debug-exit value 9
-# -> status 19 on both.
-cemu vga-rb 00012A2003FF4BF56760070380F910a00b00f06gY
+# The suite cell is a ref cell: cemu's live transcript must equal the `qemu` line.
+# Exit: debug-exit value 9 -> status 19 on both.
+cemu vga-rb 00012A2003FF4BF5676FF70380F910a00b00f06gY
 qemu vga-rb 00012A2003FF4BF5676FF70380F910a00b00f06gY
 
-**One field differs, and it is the deliberate one** — case `6`, `in 0x3BA` while
-the miscellaneous output register reads 0x67:
-
-  - QEMU answers `FF`. Its `vga_ioport_invalid` keeps the legacy chip's whole-half
-    mutual exclusion: with the colour/mono bit set for colour, the entire
-    0x3B0-0x3BF block is declared not decoded, so the read floats high.
-  - This card answers `00`, the real input-status-1 value at that raster instant.
-    IBM VGA TR puts only the CRTC pair on the IOCS16 chip-select line (3B4/3B5 vs
-    3D4/3D5) and holds the attribute controller, sequencer, DAC, graphics
-    controller and the feature/misc ports permanently decoded; 3BA is a status
-    mirror, not part of the gated pair. Registered in AGENTS.md §X's D17 as a
-    divergence taken on purpose, from the specification rather than either
-    reference implementation.
+**Both models agree on every field.** Case `6` (`in 0x3BA` while the
+miscellaneous output register reads 0x67) used to differ because this card
+answered `00` from a misreading of the IBM VGA TR: the text claimed IOCS16
+selected only the CRTC pair, but the register references (FreeVGA/VGAREGS) put
+the whole 0x3Bx/0x3Dx base under that bit and place Input Status 1 at 3BA/3DA
+accordingly, which is also what QEMU's `vga_ioport_invalid` gates. The
+divergence is withdrawn: with misc bit 0 set, 0x3B0-0x3BF is not decoded and
+floats high; 0x3C0-0x3CF (attribute controller, sequencer, DAC) always decodes,
+which is why the gate never dropped the firmware's 3C0/3C4/3C6 writes.
 
 Every other field agrees, including the two cases that used to be wrong:
 
@@ -33,11 +28,9 @@ Every other field agrees, including the two cases that used to be wrong:
     which is *input status 1*: an answer that depends on where the raster is at
     that instant, so the case was measuring the clock rather than the latch.
   - case `g` is the retrace property, printed as a judgement (Y = both phases
-    seen, N = one missing) rather than a count. Both models answer `Y`. Before
-    the raster status was derived from the CRTC registers this card answered `N`
-    with 0 of 200 samples high — a driver waiting for retrace times out on that,
-    which is why the case exists. The count itself is not in the transcript: it
-    depends on where in the frame the guest happens to poll, and a golden that
-    changes between runs pins nothing. The samples are spread by a ~12k-instruction
-    spin because 200 back-to-back reads land inside a fraction of one frame on
-    any model.
+    seen, N = one missing) rather than a count. Both models answer `Y`. The probe
+    reads 0x3DA until both phases have appeared (bounded at ~1.3M reads): the
+    correct vertical pulse is CR10..CR11's few lines (3 lines on this table,
+    ~0.7% of a frame), so a fixed 200-sample count can miss it and report N on a
+    card that pulses correctly. The count itself is not in the transcript: it
+    depends on where in the frame the guest happens to poll.

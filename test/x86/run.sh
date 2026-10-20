@@ -453,13 +453,12 @@ fi
 # sequencer and graphics write masks, the feature-control latch (read at 0x3CA --
 # reading 0x3DA answers input status 1, which is wherever the raster is at that
 # instant and therefore measures the clock rather than the latch), and whether the
-# retrace bit is observable at all to a polling guest (case g: 200 samples of
-# 0x3DA spread by a spin, printed as Y/N because both phases must appear -- a card
-# that never asserts retrace spins every wait-for-retrace loop to its timeout,
-# and this card measured 0 of 200 before the raster was derived from the CRTC
-# registers). lock cell: one field differs from QEMU by design, the 0x3BA decode
-# under IBM VGA TR's chip-select line (AGENTS.md §X D17); see the calibration file.
-probe_cell vga_readback 19 lock
+# retrace bit is observable at all to a polling guest (case g reads 0x3DA until
+# both phases have been seen, bounded at ~1.3M reads, printed as Y/N -- the
+# vertical pulse is only CR10..CR11's few lines, so a fixed 200-sample count can
+# miss it). ref cell: the whole transcript, including the 0x3BA decode under misc
+# bit 0, agrees with QEMU.
+probe_cell vga_readback 19 ref
 
 # The whole register file as the card answers it at boot
 # (test/x86/probe/vga_census.asm): 60 reads over CRTC/graphics/sequencer/attribute

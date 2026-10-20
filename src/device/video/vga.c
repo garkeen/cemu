@@ -258,29 +258,32 @@ void VgaRegister(Bus* bus, Bus* io, VgaDevice* d) {
 // programmed to scan, so every number below is read out of the register file
 // (IBM VGA Technical Reference, CRTC register set):
 //
-//   horizontal total      R0 + 5 character clocks, doubled when the sequencer
-//                         runs 9-dot character addressing (SR1 bit 3)
+//   horizontal total      R0 + 5 character clocks
 //   vertical total        (R6 | R7 bit0 as bit8 | R7 bit5 as bit9) + 2 lines
-//   vertical retrace      starts at (R16 | R7 bit2 as bit8 | R7 bit7 as bit9),
-//                         lasts R17 bits 3-0 + 1 lines
-//   horizontal retrace    starts at R4 plus a skew from R5 bits 6-5, lasts
-//                         R5 bits 4-0 + 1 character clocks
-//   character clock       8 or 9 dots, selected by miscellaneous output bit 0
-//   dot clock             the oscillator miscellaneous output bits 3-2 select
+//   vertical retrace      starts at CR10 (R7 bits 2/7 as bits 8/9); ends when
+//                         the low 4 bits of the line counter equal CR11 bits 3-0
+//   horizontal retrace    starts at CR4 + skew (CR5 bits 6-5); ends when the
+//                         low 5 bits of the character counter equal CR5 bits 4-0
+//   character clock       8 or 9 dots, selected by SR1 bit 0
+//   dot clock             the oscillator MISR bits 3-2 select; SR1 bit 3 halves it
 //
-// Bit 0 of the status ports is the blanking flag (set while the raster is not
-// drawing the visible area -- the polarity the CGA reference gives it), bit 3
-// the vertical retrace. The position comes from the emulated clock, which is
+// The end fields are counter values, not lengths (FreeVGA/VGAREGS: "retrace
+// ends when the last N bits of the counter equal this value"), which is why the
+// pulse is start..start+((end-start) mod 2^N), not start..start+end.
+//
+// Bit 0 of the status ports is set while either retrace is active, bit 3 during
+// vertical retrace. The position comes from the emulated clock, which is
 // instruction-paced under -icount, so a run stays reproducible while a guest
 // that polls the port still watches the flag move across a frame.
 enum {
   kNsPerSecond = 1000000000,
   kNsPerMicroSecond = 1000,
   kField2Bits = 0x03,        // the two-bit fields below (clock select, skew)
-  kField5Bits = 0x1f,        // R5 bits 4-0: horizontal retrace end
-  kField4Bits = 0x0f,        // R17 bits 3-0: vertical retrace length
-  kMsrDots8 = 1u << 0,       // 8 dot character clock (clear selects 9)
-  kMsrClockSelShift = 2,     // which oscillator the two bits above choose
+  kField5Bits = 0x1f,        // CR5 bits 4-0: horizontal retrace end counter
+  kField4Bits = 0x0f,        // CR11 bits 3-0: vertical retrace end counter
+  kSeqDots8 = 1u << 0,       // SR1 bit 0: 8-dot character clocks (clear = 9)
+  kSeqClockHalf = 1u << 3,   // SR1 bit 3: dot clock is the master clock / 2
+  kMsrClockSelShift = 2,     // MISR bits 3-2: which oscillator drives the dots
 };
 
 // The four clocks the miscellaneous output register can pick (IBM VGA: only the
@@ -305,42 +308,45 @@ static int VgaVerticalDisplayEnd(const VgaDevice* d) {
          ((d->cr[kCrtcOverflow] & 0x40) << 3);
 }
 
-static int VgaCharDots(const VgaDevice* d) { return (d->misc & kMsrDots8) ? 8 : 9; }
-
-static int VgaHorizontalTotal(const VgaDevice* d) {
-  const int clocking9 = (d->sr[kSeqClockMode] >> 3) & 1;
-  return (d->cr[kCrtcHorizontalTotal] + 5) << clocking9;
+static int VgaCharDots(const VgaDevice* d) {
+  return (d->sr[kSeqClockMode] & kSeqDots8) ? 8 : 9;
 }
+
+static int VgaHorizontalTotal(const VgaDevice* d) { return d->cr[kCrtcHorizontalTotal] + 5; }
 
 static void VgaUpdateStatus(VgaDevice* d, uint64_t now_us) {
   const int htotal = VgaHorizontalTotal(d);
   const int frame_lines = VgaVerticalTotal(d) + 2;
   const int vstart = VgaVerticalRetraceStart(d);
-  const int vend = vstart + (d->cr[kCrtcVerticalRetraceEnd] & kField4Bits) + 1;
+  const int vlen = ((d->cr[kCrtcVerticalRetraceEnd] & kField4Bits) - vstart) & kField4Bits;
   const int hstart = d->cr[kCrtcStartHorizontalRetrace] +
                      ((d->cr[kCrtcEndHorizontalRetrace] >> 5) & kField2Bits);
-  const int hend = hstart + (d->cr[kCrtcEndHorizontalRetrace] & kField5Bits) + 1;
+  const int hlen = ((d->cr[kCrtcEndHorizontalRetrace] & kField5Bits) - hstart) & kField5Bits;
   const int clock_sel = (d->misc >> kMsrClockSelShift) & kField2Bits;
-  const int char_hz = kVgaDotClockHz[clock_sel] / VgaCharDots(d);
+  const int half = (d->sr[kSeqClockMode] & kSeqClockHalf) ? 2 : 1;
+  const int char_hz = kVgaDotClockHz[clock_sel] / VgaCharDots(d) / half;
   const int frame_chars = frame_lines * htotal;
   // The bits the raster cannot decide stay as they were; only the two the frame
   // geometry defines are recomputed.
   uint8_t val = (uint8_t)(d->st01 & (uint8_t) ~(kStatusVsync | kStatusDisplayEnable));
-  if (frame_chars > 0 && char_hz > 0) {
+  if (frame_chars > 0 && char_hz > 0 && vstart < frame_lines && hstart < htotal) {
     const int64_t ns_per_char = kNsPerSecond / char_hz;
     const int64_t now_ns = (int64_t)now_us * kNsPerMicroSecond;
     const int char_in_frame = (int)((now_ns / ns_per_char) % frame_chars);
     const int line = char_in_frame / htotal;
-    if (line >= vstart && line <= vend) {
+    const int hpos = char_in_frame % htotal;
+    const int vrel = line >= vstart ? line - vstart : line + frame_lines - vstart;
+    const int hrel = hpos >= hstart ? hpos - hstart : hpos + htotal - hstart;
+    if (vrel <= vlen) {
       val = (uint8_t)(val | kStatusVsync | kStatusDisplayEnable);  // vertical retrace
-    } else if (char_in_frame % htotal >= hstart && char_in_frame % htotal <= hend) {
+    } else if (hrel <= hlen) {
       val = (uint8_t)(val | kStatusDisplayEnable);  // horizontal retrace
     }
   } else {
-    // Nothing to scan from -- the state before the CRTC is programmed, where the
-    // registers give the raster no frame to sit in. Alternating the two flags is
-    // what such a card reads like to a guest that polls the port.
-    val = (uint8_t)(d->st01 ^ (kStatusVsync | kStatusDisplayEnable));
+    // The CRTC's reset registers always describe a frame; this is reachable only
+    // if a guest programs registers that name none. Leave the latched flags
+    // alone rather than inventing a phase for a raster that does not exist.
+    val = d->st01;
   }
   d->st01 = val;
 }
@@ -503,26 +509,22 @@ static const uint8_t kGfxWriteMask[16] = {0x0f, 0x0f, 0x0f, 0x1f, 0x03, 0x7b, 0x
                                           0x0f, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
                                           0x00, 0x00};
 
-// Which CRTC address pair answers. IBM VGA Technical Reference: miscellaneous
-// output bit 0 (IOCS16) is the CRTC's chip-select line and moves only the CRTC
-// registers -- 0x3B4/0x3B5 when clear, 0x3D4/0x3D5 when set. Every other port in
-// the block decodes regardless of it: the attribute controller (0x3C0/0x3C1),
-// the sequencer (0x3C4/0x3C5), the feature and misc registers (0x3C2/0x3CA/
-// 0x3CC), the DAC (0x3C6-0x3C9), the graphics controller (0x3CE/0x3CF) and the
-// CGA latches.
+// Miscellaneous output bit 0 (I/O address select) moves the two halves of the
+// register block: clear means the 0x3Bx half answers, set the 0x3Dx half.
+// FreeVGA and VGAREGS state it as the base address (3Dxh vs 3Bxh) and place
+// Input Status 1 at 3BA/3DA accordingly; QEMU's vga_ioport_invalid gates the
+// same two ranges (0x3B0-0x3BF in colour, 0x3D0-0x3DF in mono). The always-
+// decoded group is 0x3C0-0x3CF -- attribute controller, sequencer and DAC --
+// which is why that gate does not drop firmware's writes to 3C0/3C4/3C6.
 //
-// Both references model the older wiring instead, where the whole half switched:
-// QEMU's vga_ioport_invalid treats 0x3B0-0x3BF as invalid in colour mode and
-// 0x3D0-0x3DF as invalid in mono, v86 registers the two halves apart the same
-// way. That is the difference the register census shows: under QEMU a firmware
-// that reaches the attribute controller without first clearing IOCS16 has its
-// writes dropped, and the palette it programmed never lands. Here the TR wins;
-// registered in AGENTS.md §X so the divergence from the references is on purpose
-// and on the record.
+// The previous comment here read the IBM TR as selecting only the CRTC pair and
+// answered 3BA in colour mode; that reading is not supported by the register
+// references (and the census differential it cited came from a probe bug), so
+// the divergence is withdrawn and the whole-half model is restored.
 static int VgaPortDecoded(const VgaDevice* d, uint16_t port) {
   const int mono = (d->misc & kMiscColorEmulation) == 0;
-  if (port == 0x3b4 || port == 0x3b5) return mono;
-  if (port == 0x3d4 || port == 0x3d5) return !mono;
+  if (port >= 0x3b0 && port <= 0x3bf) return mono;
+  if (port >= 0x3d0 && port <= 0x3df) return !mono;
   return 1;
 }
 

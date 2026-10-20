@@ -129,40 +129,46 @@ start:
   OUTB 0x3c2, 0x62
   READ 'f', 0x3b4
 
-  ; g: is the retrace flag actually observable to a polling guest? 200 samples
-  ;    of 0x3DA in the colour half, each followed by a short spin, counting the
-  ;    ones with bit 3 set. The spin is the point: 200 back-to-back reads finish
-  ;    inside a fraction of one frame on any model, so they all land on the same
-  ;    raster position and the sample says nothing about whether the bit ever
-  ;    moves. Spread over a few frame times it does. What a driver's wait-for-
-  ;    retrace loop needs is exactly this: the bit rises AND falls. A card where
-  ;    it never rises (measured here before the raster was derived from the CRTC
-  ;    registers: 0 of 200) spins every such loop to its timeout; a card where it
-  ;    never falls hangs the same loop the other way. The transcript carries the
-  ;    judgement, not the count -- a count depends on where the raster happens to
-  ;    be when the guest polls, and a golden that differs between runs pins
+  ; g: is the retrace flag actually observable to a polling guest? Read 0x3DA
+  ;    until both phases (bit 3 set and clear) have been seen, bounded at
+  ;    ~1.3M reads. A fixed 200-sample count was the wrong instrument: the
+  ;    vertical pulse is CR10..CR11's few scan lines (3 lines, ~0.7% of a
+  ;    frame on the standard 80x25 table), so 200 samples can miss it while a
+  ;    card that pulses correctly answers N. The transcript carries the
+  ;    judgement, not the count -- a count depends on where the raster happens
+  ;    to be when the guest polls, and a golden that differs between runs pins
   ;    nothing. Y = both phases seen, N = one phase missing.
   mov al, 'g'
   call putc
-  xor bx, bx
-  mov cx, 200
   OUTB 0x3c2, 0x67             ; back to the colour half
-.l1:
+  xor bl, bl                   ; bit 3 seen set
+  xor bh, bh                   ; bit 3 seen clear
+  mov dx, 20                   ; 20 * 65535 reads spans many frame times
+.outer:
+  mov cx, 0xffff
+.poll:
   INB 0x3da
   test al, 0x08
-  jz .l2
-  inc bl
-.l2:
-  mov ax, 0x3000               ; spin: ~12k instructions between samples, so the
-.spin:
-  dec ax
-  jnz .spin                    ; 200 samples span several frame times
-  loop .l1
+  jz .low
+  mov bl, 1
+  jmp .check
+.low:
+  mov bh, 1
+.check:
+  test bl, bl
+  jz .next
+  test bh, bh
+  jnz .both
+.next:
+  loop .poll
+  dec dx
+  jnz .outer
+.both:
   mov al, 'N'
   test bl, bl
   jz g_done
-  cmp bl, 200
-  jae g_done
+  test bh, bh
+  jz g_done
   mov al, 'Y'
 g_done:
   call putc
