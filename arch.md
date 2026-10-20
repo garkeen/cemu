@@ -254,8 +254,10 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   **机器的 int10 由显卡的 option ROM 提供**：SeaBIOS 按 `CONFIG_NO_VGABIOS=0` 重建
   （SeaVGABIOS，38400 字节），主板用 `-vgabios` 把它作为 fw_cfg 文件 `vgaroms/vgabios.bin`
   交给固件，固件自己影子到 C0000。显卡另有 PCI function（`00:02.0` = `1234:1111`，
-  显示控制器类，片 30 之后补上）供固件与客人按 PCI 枚举它、并给线性帧缓冲提供 BAR0，
-  但它**不带扩展 ROM**（0x30 的 ROM 地址寄存器读回 0），ROM 仍走上面这条 fw_cfg 通路。验收见
+  显示控制器类，片 30 之后补上）供固件与客人按 PCI 枚举它、并给线性帧缓冲提供 BAR0；
+  Region 2 是 4KB MMIO（0x000-0x3FF 的 EDID 未建模，0x400-0x41F 1:1 映射
+  0x3C0-0x3DF 端口，按 QEMU 标准 VGA 规范），但它**不带扩展 ROM**（0x30 的 ROM
+  地址寄存器读回 0），ROM 仍走上面这条 fw_cfg 通路。验收见
   `test/x86/probe/vga_probe.asm`（int10 切 mode 3/0x10/0x04 后核对寄存器与平面寻址，
   QEMU `-vga std` 同一镜像同样通过）。剩余显示缺口见 AGENTS.md D17（链式 256 色只做
   寻址不渲染、无 VBE、渲染结果缺无头 dump 设施）。

@@ -33,7 +33,7 @@
 // scale from the model being compared against.
 //
 // Only the timer drives hardware. The PM1a registers read as no-event and their
-// writes are stored: no SCI is delivered and the power-off path is not
+// writes are discarded: no SCI is delivered and the power-off path is not
 // implemented — see 简化登记 D19.
 typedef struct Piix4PmDevice {
   PciDevice pci;

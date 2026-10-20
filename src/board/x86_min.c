@@ -452,12 +452,14 @@ static const char kVgaRomFileName[] = "vgaroms/vgabios.bin";
 //
 // It goes out as the fw_cfg romfile "etc/e820" -- the file SeaBIOS looks for
 // first, in qemu_preinit (src/fw/paravirt.c:565 qemu_early_e820), and the same
-// file QEMU publishes. Without it the firmware has to reconstruct the map by
-// itself, and it gets a different one: SeaBIOS deletes everything from 0xa0000
-// to the BIOS (src/malloc.c malloc_preinit calls e820_remove on that range) and
-// only puts the BIOS back, so the RAM gaps inside it come out as *nothing at
-// all* rather than as RAM. A guest that reads the map (DOS sizing itself upper
-// memory, int 15h AX=E820h) then sees less usable memory than the machine has.
+// file QEMU publishes. Without it the firmware reconstructs the map from the
+// chipset and the result is coarser: everything from 0xa0000 to the BIOS is
+// removed and only the BIOS is put back (src/malloc.c malloc_preinit), so a
+// guest that reads the map sees a different picture from the machine it is
+// running on. The entries here are QEMU's PC layout: conventional RAM ends at
+// the EBDA, the EBDA and the BIOS window are reserved, RAM resumes at 1MB. The
+// 0xa0000-0xeffff range (VGA aperture, option-ROM space) is a hole and is not
+// listed as RAM.
 //
 // The payload is the bare entry list: {u64 address, u64 length, u32 type},
 // little-endian, with the count taken from the file's length (paravirt.c:762,
@@ -468,8 +470,13 @@ enum {
   kE820Reserved = 2,
 };
 static const char kE820RomFileName[] = "etc/e820";
-static const uint64_t kVgaWindowEnd = 0xc0000;  // the display card's own window
-static const uint64_t kVgaBiosEnd = 0xe0000;    // where the option ROM area ends
+// The standard PC memory boundaries (SeaBIOS BUILD_LOWRAM_END and QEMU's
+// etc/e820): the EBDA starts at 0x9fc00 and runs to 0xa0000; the BIOS window
+// is 0xf0000-0xfffff.
+static const uint64_t kConventionalRamEnd = 0x9fc00;
+static const uint64_t kEbdaEnd = 0xa0000;
+static const uint64_t kBiosStart = 0xf0000;
+static const uint64_t kBiosEnd = 0x100000;
 
 static int PublishMemoryMap(FwCfgDevice* fwcfg, uint64_t ram_size) {
   struct E820Entry {
@@ -477,20 +484,20 @@ static int PublishMemoryMap(FwCfgDevice* fwcfg, uint64_t ram_size) {
     uint32_t type;
   } entries[8];
   int n = 0;
-  // Conventional memory ends short of the card's window, the way a PC's does
-  // once the 640K/1M boundary is respected (SeaBIOS BUILD_LOWRAM_END).
   entries[n].addr = 0;
-  entries[n].len = 0xa0000;
+  entries[n].len = kConventionalRamEnd;
   entries[n++].type = kE820Ram;
-  entries[n].addr = kVgaWindowEnd;
-  entries[n].len = kVgaBiosEnd - kVgaWindowEnd;
-  entries[n++].type = kE820Reserved;              // the option ROM area
-  entries[n].addr = 0xf0000;
-  entries[n].len = 0x10000;
+  entries[n].addr = kConventionalRamEnd;
+  entries[n].len = kEbdaEnd - kConventionalRamEnd;
+  entries[n++].type = kE820Reserved;              // the EBDA
+  entries[n].addr = kBiosStart;
+  entries[n].len = kBiosEnd - kBiosStart;
   entries[n++].type = kE820Reserved;              // the firmware itself
-  entries[n].addr = 0x100000;
-  entries[n].len = ram_size - 0x100000;
-  entries[n++].type = kE820Ram;
+  if (ram_size > kBiosEnd) {
+    entries[n].addr = kBiosEnd;
+    entries[n].len = ram_size - kBiosEnd;
+    entries[n++].type = kE820Ram;
+  }
 
   uint32_t bytes = (uint32_t)n * 20;
   uint8_t* buf = (uint8_t*)malloc(bytes);

@@ -84,7 +84,10 @@ static void PmMap(Piix4PmDevice* d) {
   uint32_t reg = (uint32_t)d->pci.config[kCfgPmBase] |
                  ((uint32_t)d->pci.config[kCfgPmBase + 1] << 8);
   uint16_t base = (uint16_t)(reg & ~(uint32_t)(kPmBlockSize - 1));
-  int on = (d->pmregmisc & kPmIoSpaceEnable) && (reg & kPmBaseIoIndicator);
+  // A zero base cannot name a window: PMBASE bit 0 selects I/O space and bits
+  // 6:1 are reserved, but the address field must be non-zero for the block to
+  // decode (otherwise enabling it would shadow the DMA controller at 0x0000).
+  int on = (d->pmregmisc & kPmIoSpaceEnable) && (reg & kPmBaseIoIndicator) && base != 0;
   d->base = on ? base : 0;
   if (on)
     BusRelocateRegion(d->io, &kPmOps, d, base, kPmBlockSize);
@@ -133,9 +136,14 @@ void Piix4PmInit(Piix4PmDevice* d, uint8_t bus, uint8_t dev) {
 void Piix4PmSetIoBus(Piix4PmDevice* d, Bus* io) { d->io = io; }
 
 // A reset puts the block back to unprogrammed and off, which is how the chip
-// starts: nothing is decoded until firmware names the base and enables it.
+// starts: nothing is decoded until firmware names the base and enables it. The
+// vendor base register itself returns to its reset value too (0); leaving the
+// old address there would make the next enumeration read back a base the chip
+// is not decoding.
 void Piix4PmReset(Piix4PmDevice* d) {
   FillIdentity(d);
+  d->pci.config[kCfgPmBase] = 0;
+  d->pci.config[kCfgPmBase + 1] = 0;
   d->pci.config[kCfgPmRegMisc] = 0;
   d->pmregmisc = 0;
   d->base = 0;
