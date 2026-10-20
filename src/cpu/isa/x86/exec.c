@@ -123,7 +123,7 @@ static void wr32(uint64_t lin, uint32_t v) { bus_store(lin, 4, v); }
 // LENi is a code; these are the sizes it names. The 8-byte entry is kept even
 // though this machine is 32-bit because QEMU/KVM honour it there and the kvm
 // debug test arms DR1 with LEN=11 (AGENTS.md 附录's adjudication).
-const uint32_t kDrLenBytes[kDrLenCount] = {1, 2, 4, 8};
+static const uint32_t kDrLenBytes[kDrLenCount] = {1, 2, 4, 8};
 
 // Breakpoint i is enabled by DR7.Li/Gi (bits 2i..2i+1) and matches by its
 // R/W field: 00 execute (LEN must be 00), 01 data writes, 10 I/O ports,
@@ -138,8 +138,8 @@ static int dr_len_code(int i) { return (int)((s->dr[7] >> (kDr7LenBase + 4 * i))
 // completes (SDM vol.3 17.3.1), so the match only records DR6.Bn here and
 // step.c delivers. Reads match only the read/write encoding.
 static void WatchData(uint64_t lin, int size, int write) {
-  if (!(s->dr[7] & kDr7AnyLocal)) return;
-  for (int i = 0; i < 4; i++) {
+  if (!(s->dr[7] & kDr7AnyEnable)) return;
+  for (int i = 0; i < kDrCount; i++) {
     if (!dr_enabled(i)) continue;
     int rw = dr_rw(i);
     if (rw == kDr7RwExec || rw == kDr7RwIo) continue;  // not data breakpoints
@@ -155,8 +155,8 @@ static void WatchData(uint64_t lin, int size, int write) {
 // Like data watchpoints this is a trap, recorded for post-instruction
 // delivery.
 static void IoBpHit(uint16_t port) {
-  if (!(s->dr[7] & kDr7AnyLocal)) return;
-  for (int i = 0; i < 4; i++) {
+  if (!(s->dr[7] & kDr7AnyEnable)) return;
+  for (int i = 0; i < kDrCount; i++) {
     if (!dr_enabled(i) || dr_rw(i) != kDr7RwIo) continue;
     int lenc = dr_len_code(i);
     int len = lenc == 0 ? 1 : lenc == 2 ? 4 : 0;
@@ -212,7 +212,7 @@ int x86_gdb_set_watch(CpuState* c, uint64_t addr, uint32_t len, int kind) {
   for (int i = 0; i < kDrLenCount; i++)
     if (kDrLenBytes[i] == len) lenc = i;
   if (lenc < 0 || (addr & (len - 1)) != 0) return -1;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < kDrCount; i++) {
     if (dr_enabled(i)) continue;
     DrWrite(i, (uint32_t)addr);
     uint32_t v = s->dr[7];
@@ -230,10 +230,15 @@ int x86_gdb_set_watch(CpuState* c, uint64_t addr, uint32_t len, int kind) {
 }
 
 int x86_gdb_clear_watch(CpuState* c, int slot) {
-  if (slot < 0 || slot >= 4) return -1;
+  if (slot < 0 || slot >= kDrCount) return -1;
   cpu = c;
   s = (x86_state*)cpu->priv;
   fl = &s->fl;
+  // The guest may have reprogrammed this slot since the stub armed it (MOV
+  // DRn revokes the ownership below). Clearing it then would disable a
+  // watchpoint the guest owns, so report "already gone" and leave the register
+  // file alone; the stub drops its table entry either way.
+  if (!(s->gdb_watch_mask & (1u << slot))) return -1;
   uint32_t v = s->dr[7];
   v &= ~(uint32_t)((3u << (2 * slot + kDr7LBase)) | (3u << (kDr7RwBase + 4 * slot)) |
                    (3u << (kDr7LenBase + 4 * slot)));
@@ -2526,6 +2531,14 @@ static void run_op2(uint8_t op2) {
         s->r[d.rm].e = s->dr[drn];
       } else {
         DrWrite(drn, s->r[d.rm].e);
+        // The guest has taken the register. Ownership follows the register,
+        // not the stub's table: a hit in a slot the guest has rewritten must
+        // vector as the guest's own watchpoint (and a later RSP `z` must not
+        // disable it). Writing DR7 revokes every slot it enabled.
+        if (drn == 7)
+          s->gdb_watch_mask = 0;
+        else if (drn < 4)
+          s->gdb_watch_mask &= ~(1u << drn);
       }
       break;
     }

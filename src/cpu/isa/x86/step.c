@@ -103,6 +103,8 @@ void x86_step(CpuState* c) {
   // the instruction, from the segment it leaves the CPU in (see the commit).
   fr->rec.pc = cpu->pc;
   fr->rec.dnpc = cpu->pc;
+  fr->rec.pc_lin = s->base[cs_i] + fr->rec.pc;
+  fr->rec.dnpc_lin = fr->rec.pc_lin;
   fr->rec.raw_len = 0;
   fr->rec.len = 0;
   fr->rec.mnemonic = NULL;
@@ -168,6 +170,8 @@ void x86_step(CpuState* c) {
     cpu->wait = 0;
     fr->rec.pc = cpu->pc;
     fr->rec.dnpc = cpu->pc;
+    fr->rec.pc_lin = s->base[cs_i] + fr->rec.pc;
+    fr->rec.dnpc_lin = fr->rec.pc_lin;
     fr->rec.raw_len = 0;
     fr->rec.mnemonic = "intr";
     delivering_vec = vec;
@@ -201,6 +205,10 @@ void x86_step(CpuState* c) {
   // the CPU walks off into whatever happens to sit at the bottom of RAM).
   if (!((s->cr0 & kCr0Pe) && s->dbit[cs_i])) cpu->pc &= 0xffff;
   fr->rec.dnpc = cpu->pc;
+  // The next instruction lives in the segment the CPU is in after the step
+  // (a far jump changed CS), so its linear address uses that base. This is
+  // what makes `->` the same address as the next row's `pc=`.
+  fr->rec.dnpc_lin = s->base[cs_i] + cpu->pc;
   // RF clears after the instruction it protected completed successfully —
   // unless this instruction itself loaded an EFLAGS image (iret/popf/task
   // switch), whose RF is the authoritative one (SDM vol.3 17.3.1).

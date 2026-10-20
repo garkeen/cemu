@@ -22,8 +22,15 @@
 // ============================================================================
 
 // Per-instruction record, purely for observability (trace/state/mem rows).
+// pc/dnpc are the ISA's own program-counter values (x86: offsets within CS).
+// pc_lin/dnpc_lin are the same two addresses in the linear space gdb and the
+// memory packets use; an ISA whose committed pc is already linear leaves them
+// equal to pc/dnpc, and one with a gdb_pc hook fills them at fetch and commit
+// (x86: CS base at fetch + pc, then the post-instruction CS base + dnpc). The
+// event table's PC column and its `->` are one chain, so both come from here.
 typedef struct insn_rec {
   uint64_t pc, dnpc;
+  uint64_t pc_lin, dnpc_lin;
   uint8_t len;
   uint8_t raw[8];
   uint8_t raw_len;

@@ -638,15 +638,19 @@ static void RowBeginBare(Table* t, char kind) {
   TableRowCell(t, "");
 }
 
-// The address this step is fetching from. Real-mode x86 keeps that separate from
-// the committed pc (cpu->pc is EIP; the fetch address is CS base + EIP), and
-// every other tool names a code location by the fetch address — gdb's $pc in
-// QEMU's stub, QEMU's -d exec block lines, and the breakpoints the stub accepts
-// (see isa_ops.gdb_pc). Printing the offset here made a watch row impossible to
-// turn into a breakpoint or into a disassembly address whenever CS had a non-zero
-// base, so the PC column carries the fetch address.
+// The address this step is fetching from, in the linear space gdb and the
+// memory packets name. An ISA with a gdb_pc hook records the fetch-time linear
+// address in rec.pc_lin (x86: the CS base before the instruction ran, which is
+// not the base after a far jump); one without one is already linear.
 static uint64_t FramePc(frame* f) {
-  return f->isa->gdb_pc ? f->isa->gdb_pc(f->cpu) : f->rec.pc;
+  return f->isa->gdb_pc ? f->rec.pc_lin : f->rec.pc;
+}
+
+// The next instruction's linear address, recorded at commit in the segment the
+// CPU is in after the step. This must be the same convention as FramePc, or
+// one row's `->` would not be the next row's `pc=`.
+static uint64_t FrameDnpc(frame* f) {
+  return f->isa->gdb_pc ? f->rec.dnpc_lin : f->rec.dnpc;
 }
 
 static void RowBegin(Table* t, char kind, frame* f) {
@@ -702,7 +706,7 @@ void DebugInsn(frame* f) {
       for (int i = 0; i < f->rec.raw_len && i < 8; i++)
         n += snprintf(line + n, sizeof(line) - (size_t)n, " %02x", f->rec.raw[i]);
       n += snprintf(line + n, sizeof(line) - (size_t)n, " %s -> %016llx\n",
-                    f->rec.mnemonic ? f->rec.mnemonic : "?", (unsigned long long)f->rec.dnpc);
+                    f->rec.mnemonic ? f->rec.mnemonic : "?", (unsigned long long)FrameDnpc(f));
       if (DebugAccountOut((size_t)n)) HostWriteErr(line, (size_t)n);
     }
   }
@@ -710,7 +714,7 @@ void DebugInsn(frame* f) {
     if (AllowTrace(kDbgTraceTable, f->cpu->inst_count)) {
       RowBegin(g_tbl, 'I', f);
       char det[48];
-      snprintf(det, sizeof(det), "-> %016llx", (unsigned long long)f->rec.dnpc);
+      snprintf(det, sizeof(det), "-> %016llx", (unsigned long long)FrameDnpc(f));
       TableRowCell(g_tbl, det);
       CellFlags(g_tbl, f);
       TableRowEnd(g_tbl);
@@ -735,7 +739,7 @@ void DebugTrap(frame* f) {
   const char* cn = f->isa->cause_name ? f->isa->cause_name(f->trap.cause) : NULL;
   snprintf(det, sizeof(det), "%s=%llu tval=%016llx -> %016llx", cn ? cn : "cause",
            (unsigned long long)f->trap.cause, (unsigned long long)f->trap.tval,
-           (unsigned long long)f->rec.dnpc);
+           (unsigned long long)FrameDnpc(f));
   TableRowCell(g_tbl, det);
   CellFlags(g_tbl, f);
   TableRowEnd(g_tbl);

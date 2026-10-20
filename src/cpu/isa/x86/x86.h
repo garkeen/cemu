@@ -42,15 +42,14 @@ enum {
 // each use: Li at bit 2i, R/Wi at [17:16+4i], LENi at [19:18+4i] (SDM vol.3
 // figure 17-3). The stride is 4 because one breakpoint owns two 2-bit fields.
 enum {
-  kDr7LBase = 0, kDr7Stride = 4, kDr7RwBase = 16, kDr7LenBase = 18,
-  kDr7AnyLocal = 0xffu,  // the four Li bits together
+  kDr7LBase = 0, kDr7RwBase = 16, kDr7LenBase = 18,
+  kDr7AnyEnable = 0xffu,  // both enable bits (Li/Gi) of all four slots
   // The R/W encodings (SDM vol.3 17.2.4, table 17-2). There is no read-only
   // data breakpoint: 11 means read *or* write.
   kDr7RwExec = 0, kDr7RwWrite = 1, kDr7RwIo = 2, kDr7RwAccess = 3
 };
 // LENi is a code, not a byte count: 00/01/10/11 = 1/2/4/8 bytes.
-enum { kDrLenCount = 4 };
-extern const uint32_t kDrLenBytes[kDrLenCount];
+enum { kDrLenCount = 4, kDrCount = 4 };
 
 // CR0 flags (SDM vol.3 2.5). PE drives protected mode and PG the page
 // tables; WP makes supervisor stores honor read-only pages (486+; wired

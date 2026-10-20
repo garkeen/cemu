@@ -100,19 +100,38 @@ static int x86_gdb_write_regs(CpuState* cpu, const uint8_t* buf, int len) {
   x86_state* s = (x86_state*)cpu->priv;
   if (len < 16 * 4) return -1;
   const uint8_t* p = buf;
-  for (int i = 0; i < 8; i++) s->r[i].e = Le32Get(&p);
-  // gdb sends the linear address x86_gdb_pc reported; the committed pc holds
-  // the offset within CS (cpu/isa/x86/step.c fetches base[cs] + pc).
-  {
-    uint32_t lin = Le32Get(&p);
-    cpu->pc = (uint64_t)(lin - (uint32_t)s->base[cs_i]);
-  }
-  // The flags image never loads RF/VM (D14) and keeps bit 1 set (SDM).
-  s->fl.word = (Le32Get(&p) & ~0x30000u) | 2;
-  // Segment selectors follow QEMU's gdbstub: the visible value is stored,
-  // the descriptor caches are not re-walked (step.h hook comment).
+  uint32_t gpr[8];
+  for (int i = 0; i < 8; i++) gpr[i] = Le32Get(&p);
+  uint32_t lin = Le32Get(&p);
+  uint32_t flags = Le32Get(&p);
   static const int order[6] = {cs_i, ss_i, ds_i, es_i, fs_i, gs_i};
-  for (int i = 0; i < 6; i++) s->sreg[order[i]] = (uint16_t)Le32Get(&p);
+  uint16_t sel[6];
+  for (int i = 0; i < 6; i++) sel[i] = (uint16_t)Le32Get(&p);
+
+  for (int i = 0; i < 8; i++) s->r[i].e = gpr[i];
+  // The flags image never loads RF/VM (D14) and keeps bit 1 set (SDM).
+  s->fl.word = (flags & ~0x30000u) | 2;
+  // Segment selectors follow QEMU's gdbstub: the visible value is stored. In
+  // real mode the descriptor cache is not a table lookup -- base = selector
+  // << 4 (SDM vol.3 3.4.4) -- so it is synthesized here and a packet that
+  // changes CS actually moves the fetch. A protected-mode selector names a
+  // descriptor, which this stub does not re-walk (step.h hook comment); there
+  // the visible value is stored and the cached base stays. VM86 is not a
+  // synthesis case: the flags image never loads VM (D14), so a G packet cannot
+  // leave the CPU in VM86.
+  const int synth = !(s->cr0 & 1);
+  for (int i = 0; i < 6; i++) {
+    s->sreg[order[i]] = sel[i];
+    if (synth) {
+      s->base[order[i]] = (uint64_t)sel[i] << 4;
+      s->dbit[order[i]] = 0;
+    }
+  }
+  // gdb sends the linear address x86_gdb_pc reported; the conversion therefore
+  // runs after the selectors, so a packet that writes CS and EIP together uses
+  // the base the CPU will actually fetch from (the real-mode case this seam was
+  // added for), not the one it had before the packet.
+  cpu->pc = (uint64_t)(lin - (uint32_t)s->base[cs_i]);
   return 0;  // the x87 tail (if present) has no state to write into
 }
 
