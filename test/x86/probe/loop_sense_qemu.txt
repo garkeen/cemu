@@ -1,0 +1,33 @@
+# Dual run of test/x86/probe/loop_sense.asm, 2026-10-15, same 512-byte boot sector
+# on both models:
+#
+#   cemu  --machine x86 --isa x86 loop_sense.bin
+#   qemu-system-i386 -drive file=loop_sense.bin,format=raw,if=ide,index=0 -boot c \
+#       -display none -serial file:... -no-reboot \
+#       -device isa-debug-exit,iobase=0xf4,iosize=0x4
+#
+# The suite cell compares cemu's live transcript against both lines; they are the
+# same string. Exit: debug-exit value 7 -> status 15 on both.
+cemu loop-sense a000203 b000046 c000116 d000082 e000046 f000046
+qemu loop-sense a000203 b000046 c000116 d000082 e000046 f000046
+
+Per case: label, CX as four hex, then the captured flags byte.
+
+  a  `stc; mov cx,1; inc cx`          -> CX=0002 with ZF=0 and CF still set:
+     SDM vol.2 "The CF flag is not affected" by INC/DEC.
+  b  `clc; mov cx,1; dec cx`          -> CX=0000 with ZF=1 and CF still clear.
+  c  the kernel's blank-skip shape (`lodsb / cmp / jz / cmp / loope`) over "  xz"
+  d  the same scan with LOOPNE and an `inc si` **between** the compare and the
+     loop — so ZF comes from INC, not from the CMPSB: the loop runs its full count
+     and exits on CX=0 (flags 0x82, SF set). This is the case that a "LOOP reads
+     the flags of the instruction before it" model cannot tell apart.
+  e  `mov cx,1; loop`                 -> falls through with CX=0000; LOOP leaves
+     the flags as it found them.
+  f  `xor cx,cx; jcxz`                -> taken, CX=0000 (the test is at the
+     address size).
+
+These five plus INC/DEC are the entire inner loop of the WIN.INI canonicalizer in
+the Windows 1.01 kernel, which is why the probe exists in this shape rather than
+as a general flag-truth table: the claim under test was that a loop instruction
+mis-setting a flag would send that parser down a different branch, and both models
+answer every case identically.

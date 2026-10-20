@@ -1,7 +1,552 @@
 # cemu 当前状态（progress.md）
 
+## 阶段 4 片 36：还账 —— 回归两套、四个探针接线、gdb 硬件观察点（D6）、win101 第一次带答案的起底（2026-10-16）
+
+片 35 记下四笔欠账，这一片把它们做完。**每一笔都以实测收尾，没有一条靠推理**。
+
+### 一、回归两套（片 35 提交时没跑，这笔最危险，先还）
+
+`bash test/riscv64/run.sh` → **136 passed / 0 failed**；`bash test/x86/run.sh` →
+**27 passed / 0 failed**（接进四个新探针之后的数）。第一次跑 x86 时新加的四格全
+FAIL，原因在格本身而不是机器：cemu 的 `[info]` 行与客人的串口输出落在**同一行**
+（两边都不自带换行），`grep -m1 <marker>` 取到的是整行，于是与校准文件里的纯抄本
+不等。改的是格（`probe_cell` 从 marker 处切出抄本），不是机器 —— 这类"判据自己
+错了"的事在下面第二条里还有一起更大的。
+
+### 二、四个探针接进套件，并因此撤回一条已登记为"实测"的证据
+
+新 helper `probe_cell <stem> <status> <ref|lock>`（`test/x86/run.sh`）：抄本探针不
+自我判定，判定是比较；校准文件 `probe/<stem>_qemu.txt` 用两行机器可读的
+`cemu …` / `qemu …` 装两个模型各自的答复，周围是散文。
+
+- `ref`（`rep_sense` status 13、`loop_sense` status 15）：两行相同，客人答复必须等于
+  参考答复。
+- `lock`（`vga_readback` status 19、`vga_census` status 23）：本机答复核自己的记录行，
+  与参考不同的字段写在文件里而不是塞进一份静默的例外表。
+
+**接线时发现探针自己有一处错，且错到推翻片 34/35 登记的一条"实测"**：
+`vga_census.asm` 用 `in al, 0x3da` 复位属性控制器触发器，而 `in al, imm8` 只有
+8 位端口形式，0x3DA 被静默截成 **0xDA**（nasm 当场警告 "byte data exceeds bounds"）。
+两个模型都没复位触发器，于是属性那一路读回的是索引锁存器而不是寄存器 ——
+**先前记的"census 实测 13 个属性控制器读回差异"是探针的错，不是卡的差异**。改成
+DX 形式后重跑双模型：60 个读回里**只有 CR14/CR15 不同**（cemu 00/00 对 QEMU 02/80），
+而这两个是固件自己打印字符数留下的**光标位置**（片 30 早就这么判过），18 个 AR
+读回与 QEMU 逐字节相同。AGENTS.md §X 的 D17 里那句话已按此改写，并把这条分歧的
+真实形状换成 `vga_readback` 的 case 6。
+
+`vga_readback` 另改两处才谈得上"能钉东西"：
+
+1. case 9 原先读 0x3DA —— 那是 input status 1，答的是"此刻光栅在哪"，量的是时钟
+   不是锁存器；改读 0x3CA（feature control 读口，IBM VGA TR），两边都答 `10`。
+2. case g 的回扫普查：原先 200 次**背靠背**读并打印计数，既不确定也说明不了问题
+   （200 次读落在一帧的几微秒里，任何模型都只会落在同一相位）。现在每次读之间插
+   ~12k 指令的自旋，样本摊到若干帧时间上，且抄本里只留判定 `Y`/`N`（两相都出现过
+   才算 Y）。实测：**cemu 与 QEMU 都答 Y**；片 35 之前本机是 0/200（永不回扫），
+   这正是那条改动要防的东西。计数不进抄本 —— 会随运行漂移的字段做不了基线。
+
+### 三、D6：gdb 的硬件观察点接上了，且是被实测逼出来的设计
+
+三个 ISA 中性接缝（`cpu/step.h`）：`gdb_set_watch` / `gdb_clear_watch` /
+`gdb_watch_hits`。x86 侧落在 **CPU 自己的 DR0-DR7**（`x86_gdb_set_watch` 走
+`DrWrite`，保留位规则与客人 `mov DRn` 同一条路），**没有第二个匹配器**：长度必须是
+LEN 编码的 1/2/4/8，地址必须按长度对齐（SDM vol.3 17.2），RSP 的 kind 2→R/W=01、
+4→R/W=11；**kind 3（只读）在 DR7 里没有编码**，直接拒（回空包 = RSP 的"不支持"），
+不偷偷放宽成"读写"——那会在客人从没要求过的存储上停住。riscv 三个接缝留 NULL
+（trigger 模块与 RSP 之间那条通道仍在 D6）。
+
+第一次实测（`-s -S` 挂 `rep_zero.bin`，`watch *(int*)0x8100`）证明 Z2 装进去了
+（gdb 说 `Hardware watchpoint 1`），但会话**没有停**：服务端日志里探针的横幅一行
+一行刷个不停 —— 观察点命中以 #DB 投递，而裸引导扇区的 IVT 全零，于是三重故障、
+复位、再命中、再复位。stub 原有的规则"自由运行的客机自己承担自己的故障"（照
+QEMU）在这里是错的：**调试器要求的观察点不是客机的故障**。于是加
+`x86_state.gdb_watch_mask`（哪几个槽是 stub 装的）与每步一清的 `watch_hits`：命中
+仍记进 DR6（17.3.1），但**报给 stub、不投递**；客人自己编程的断点与 TF/任务切换
+陷阱照旧投递。`StopCb` 因此多一条停机理由。
+
+第二次实测（同一脚本）：
+
+```
+Hardware watchpoint 1: *(int *)0x8100
+Program received signal SIGTRAP, Trace/breakpoint trap.
+0x00007d74 in ?? ()
+$1 = 170                      ; 0xAA —— 停下的就是写进 DST 那个 canary 的存储
+横幅计数 1                    ; 不再有复位环
+```
+
+`vCont?` 改为如实回答 `vCont;c;s`（解析分支只有这两个动作，所以不 advertise `t`/`r`）。
+复位会清 DR7 与归属掩码（17.2），gdb 之前装的观察点随之失效 —— 这条缺口记在 D6。
+
+### 四、win101 第一次带答案的起底（12M 指令，`mark` + `watch=0x449:2:w` + debugcon）
+
+片 35 欠的三问全有答案，其中两问把片 35 的假设打回：
+
+1. **`Using pmtimer, ioport 0xb008`** —— PIIX4 PM function 交付之后固件的微秒时基
+   真的换到了 PM timer 上；BAR0 也按 16MB 落了位：
+   `PCI: map device bdf=00:02.0 bar 0, addr fd000000, size 01000000 [prefmem]`。
+2. **`Removing mode` 一条都没有**。firmware.md 里那条推理（本机 ROM 是
+   `CONFIG_VGA_STANDARD_VGA` 构建、`# CONFIG_VGA_BOCHS is not set`，
+   `vgahw.h:55 bochsvga_setup()` 被编掉）实测成立 —— **"卡的显存答复经过 ROM 模式表
+   影响客人"这条链在本机构建下不存在**，片 35 追它的那轮是追了一条不能成立的链。
+3. **谁把 mode 3 写回 BDA**：`w 449:1 <- 3` 的 PC 是**线性 0xC108A**，
+   `26 88 1e 49 04` = `mov es:[0x449], bl` —— 那是 SeaVGABIOS 自己在处理
+   `int 10 AX=0003` 时写的，是**结果不是原因**；另有一条 `<- 0` 来自线性 0x1FB4B6A
+   （客体内核侧）。
+4. **客人的 int 10 模式请求总共只有三条**：`ax=0006`（DS=0DC0）与 `ax=0003` 两条
+   （一条 DS=0DC0、一条 DS=0000），**从头到尾没有 `ax=0010`**。同一份 ROM 在 QEMU
+   上会走到 `set VGA mode 10`。所以分歧确实落在"客人自己的选择"上（片 30 的结论
+   不变），但现在有了它周围的行：`gatecall` 直方图里 int 10 的绝大多数是
+   `ax=0eXX`（电传打印），`int=1a ax=0000/0001`（RTC 读时间与闹钟）、
+   `int=11 ax=0000`（设备字）、`int=15 ax=c000/c009/c0ff`（系统配置块，含
+   AX=C009 的 EGA/VGA 信息指针）都出现过。
+5. **新的、还没排除的一条**：`gateret … cf=1 at=0c54:03e9` 连续 15 条，AX 恒为
+   `0006`（DOS 的"内存块无效"），BX 从 0x13 递减到 0x05、CX 递增 —— 有一个
+   CS=0C54 的模块在**逐个句柄走 MCB 链并失败**；另有 CS=9DBD 发出的
+   `int=21 AH=48h` 请求 BX=`936C`（0x936C 段 ≈ 603KB，常规内存里不可能满足）。
+   片 30 把"帧缓冲申请"列为候选、片 33 补记写它"实测否掉"，而这次录到的是**带行号
+   的失败现场**，与当年那次否证的证据不同一码事 —— 下一手应该从这里进。
+
+12M 指令处客人刚退到文本模式，FatalExit 还在更远处（本次抄本里没有它）。
+
+### 五、验证与仍欠
+
+`-Wall -Wextra` 零告警；`--target check` 依赖边 ok；riscv **136/0**、x86 **27/0**；
+gdb 观察点用 `build/watch_probe.gdb`（仓外临时件，不入仓）实测停住。**没做的**：
+观察点没有进套件的自动化格（本次是人跑 gdb 验的，脚本要落到 `test/x86/` 需要一个
+自带 #DB 处理程序的客机件 + gdb 在场才跳，记在下片）；win101 **仍未修**；
+D6 余 riscv 接缝与"只读编码"两处缺口。
+
+## 阶段 4 片 35：观测补全（线性 PC、BIOS 调用参数与返回值、无帧行的时钟）、总线可重定位窗口、PIIX4 PM function（固件时基换源）、显卡三处（光栅、片选、显存）（2026-10-15）
+
+工作区里这一轮的东西比一片大，先把清单与**证据状态**写清楚：代码已构建通过，
+回归与 win101 **都还没复跑**（用户令：本轮不许跑）。
+
+### 一、观测面（§九.1 的正例：这一轮的误判全都靠补设施收回来，不是靠手推）
+
+1. **`isa_ops.gdb_pc` 接缝**（`cpu/step.h`）。x86 实模式的 `cpu->pc` 是 EIP，取指地址
+   是 CS base + EIP；此前事件行、`trace:line` 与 gdb 的 `$pc` 打的都是段内偏移，而
+   gdb 的内存包（m/M）与断点匹配读的是线性空间——两边口径不一致，我因此在
+   `0df9:1b05`（线性 0xfa95）与 `0xfa74`（偏移 0x1ae4）之间反复找错地方。现在
+   x86 交线性地址、riscv 留 NULL（提交 pc 本来就是线性的），stub 的 `BpHit` 与
+   `g/R` 包都走同一个函数；**断点因此能在实模式命中**（QEMU 的软断点靠往客机内存
+   patch 0xCC，本机不 patch）。
+2. **`gatecall`/`gateret` 补齐参数与返回值**（`debug.h` 的 `DbgCallArgs`）。
+   只带 AX 的一行说不出客人要了多少：AH=48h 的容量在 BX、AH=3Dh 的文件名在 DS:DX、
+   AH=0Ah 的缓冲在 ES:DX；返回值也不止 AX（int 10h AH=0Fh 的页号在 BH、DOS AH=45h
+   的重复句柄在 AX），失败位一律在 CF。DETAIL 列随之从 41 加宽到 **88**。
+3. **无帧行有了时刻**：`DebugSetClock(&cpu.inst_count)`（`board/run.c` 装），K 行的
+   PC 列打的是已退休指令数。此前两行 mark 之间无法排序，也无法把看到的一行变成
+   下一轮的检查点；现在 `inst=N` 就能用 `--max-inst=N` 重跑到同一刻，会话收尾再按
+   `dump=` 把客机状态取回。
+
+### 二、总线：窗口能搬、能关（`bus/bus.c`）
+
+`BusRelocateRegion` / `BusRemoveRegion`。BAR 驱动的设备的译码位置由固件编程决定，
+而且**会被改**（SeaBIOS 的 `fw/pciinit.c` 在复位路径上再跑一遍）；BAR 写 0 按
+PCI spec §6.2.5.1 就是不译码。没有这两条，PM 块只能钉在复位时的地址上。
+
+### 三、PIIX4 PM function：本机能供上的最后一个芯片组功能（`device/misc/piix4pm.c`，新）
+
+`8086:7113`，`00:01.3`，class `0x0680`，revision 3——与 QEMU `-machine pc` 的
+`info pci` 同一身份。**它没有标准 BAR**：32 字节的 PM 块坐在厂商基址寄存器
+PIIX_PMBASE(0x40) 指的地方，由 PIIX_PMREGMISC(0x80) bit0 打开，所以配置写回调里
+重新定位译码（这正是上面第二条的用场）。块里只有 +0x08 的 PM timer 有内容：
+32 位自由计数，3.579545MHz（32.768kHz × 109.2，ACPI 定的速率，也是 SeaBIOS
+`src/hw/timer.c` 的 `PMTIMER_HZ`）。
+
+**为什么这条重要**：SeaBIOS 在 `pmtimer_setup` 里把**整个微秒时基**换到 PM timer 上
+（日志出现 `Using pmtimer, ioport 0x...`）。此前本机供不上这个函数，固件拿 8254 计时
+——与时被对拍的模型差一个**时钟源**、也差一个**分辨率**，于是所有固件侧等待（软盘
+超时、键盘与串口等待、INT 15h AH=86h、它排队走的 timer list）按不同的比例走。
+这条与 `-icount` 不是一回事：`-icount` 换的是指令与虚拟时钟的节奏，换不掉固件选哪个
+计数器当时基。**未验证**：需要一次起底确认 `Using pmtimer` 现在出现了。
+
+PM1a 状态/事件恒读 0、写入丢弃，不投 SCI、没有关机/睡眠路径，SMBus 与 ACPI 表未做
+——D19 已按此收窄。
+
+### 四、显卡四处
+
+1. **光栅状态按寄存器推**（`VgaUpdateStatus`）：HTotal（R0+5，按 SR1 的 8/9 点时钟位移）、
+   VerticalTotal（R4|R7|R9 的高位）、垂直回扫起点 R10 与长度 R15、水平回扫 R16+(R17>>5)&3
+   与 R17 低 5 位、点时钟按 MISR 的时钟选择与 8/9 点。实测此前 200 次采样里回扫位
+   cemu **0 次为真**、QEMU **100 次**，本机现在与寄存器一致。**但**：改宽之后客人的
+   行为一点没变，所以这条**不是** win101 的原因（见第六节）。闪烁与光标相位仍取墙钟
+   的场倍数周期，D17 保留这条。
+2. **片选线按 IBM VGA TR**（`VgaPortDecoded`）：IOCS16（MSR bit0）只是 CRTC 那一对
+   （3B4/3B5 与 3D4/3D5）的片选线，属性控制器 3C0/3C1、序列器 3C4/3C5、DAC 3C6-3C9、
+   GC 3CE/3CF、feature/misc 恒译码。QEMU 的 `vga_ioport_invalid` 与 v86 都沿用老芯片的
+   **整半区互斥**模型（彩色模式下 3B0-3BF 整块作废），照它做会把固件对 3C0/3C4/3C6 的
+   写丢掉——`test/x86/probe/vga_census.asm` 实测到的 13 处属性控制器读回差异就来自这个
+   分歧。**本机从 TR，这条是有意与参考实现不同**，已登记 D17。
+3. **DISPI 的边界**（片 34 的延续，工作区内已并入）：索引只在指向真实寄存器时才接受，
+   未知 id 不改寄存器（QEMU 实测），字节访问不触及寄存器组。
+4. **卡的显存 256KB → 16MB**（`kVgaVramSize`，BAR0 与 `VIDEO_MEMORY_64K` 同源）。
+   顺带让孔径的一种形状不再越界：GR6 为 mapping 1（A0000-BFFFF）且非奇偶时，
+   0xB0000 以上的写算到 `off*4+plane`，最大 0x7FFFF——在 256KB 数组外，落进同一个结构体的
+   渲染缓冲 `fb`；读写同源，所以 `vga_aperture.asm` 的"两模型逐字节相同"其实是在
+   未定义行为上通过的。现在数组覆盖到 16MB，这条变成有定义行为（vga.h 记录了平面交织
+   布局的最宽形状 512KB）。
+
+**这条的因果链目前没有证据**，必须先记下来免得下一轮再追：SeaVGABIOS 里**唯一**按显存
+校验模式表的代码是 `vgasrc/bochsvga.c:371` 的 `Removing mode %x`，其入口 `vgahw.h:55` 的
+`bochsvga_setup()` 在本机的固件构建（`CONFIG_VGA_STANDARD_VGA=y`、
+`# CONFIG_VGA_BOCHS is not set`）里被编掉——**本机这份 ROM 不会读 `VIDEO_MEMORY_64K`，
+也不会因为卡报小显存而剪模式**。而 QEMU 自带的 `vgabios-stdvga.bin` 是 Bochs 适配器
+构建，会打印那行。所以先前记的"cemu 剪 100..113、QEMU 只剪 19a..19e"要么出自 QEMU 一侧
+的日志，要么出自 片 33 那次打开 `VGA_BOCHS` 的实验（那次固件报的正是 `size 0 MB`）。
+**下一手必须先确认这句日志出自哪一侧。**
+
+### 五、新探针四个（都是自足的，§七），双跑各带 `*_qemu.txt`
+
+- `rep_sense.asm`：按原始字节 `db 0xf2,0xa6` 让两个模型各自解码，逐字节同
+  （`100021200000300020400011500030600000`，退出码 13=13）。**它否掉的是我自己上一轮的
+  假设**"F2/F3 反了"——真按那个改就是引入 bug。
+- `loop_sense.asm`：LOOP/LOOPE/LOOPNE/JCXZ 与 INC/DEC 保 CF 的契约，逐字节同（15=15）。
+- `vga_readback.asm`：16 个端口的读回形状 + 200 次回扫位普查。
+- `vga_census.asm`：CR/GC/SR/AR 全表清点 + 4 个确定性用例（索引 08 写 5A 读回 1A、
+  CR14/CR15 读回 12/34、3C1 夹在索引与数据之间读回 21、control 读回 25）。
+
+**欠账：这四个都没接进 `test/x86/run.sh`**，下一片必须接，否则这些判据只在我脑子里。
+
+### 六、已经实测排除的候选（本轮的减法，全部有双跑或自证）
+
+CPU 指令语义（rep/loop 两组探针逐字节同）；时序（`-icount shift=12` 下失败路径一致）；
+ROM 构建（同一份 ROM 装进两边，QEMU 仍进 `set VGA mode 10`）；盘与 FAT（字节相同）、
+WIN.INI 读路径、DOS FIND-FIRST 缓存；composer 模块只是回退路径不是故障现场；
+FONTDIR 记录数 13 vs 1、11 vs 0；`int 21 AX=4300/3D00` 错 2 → Change Disk 对话框；
+把 `FONTS.FON` 放进盘里 FatalExit 就消失（可见失败是模式决定的**下游**）。
+片 30/33 那批同样已排除 XMS、`int 15h` 内存查询、e820、UMB、BDA 内存字段。
+
+**撤回报过的两条**（记在这里，防止下一轮再报一次）：
+「bug 在 cemu 的显卡响应」——只能说两张卡的答复不同，没说清它就是 FatalExit 的原因；
+「`jb` / `mov ah,0xc0` 那类标志算错」——是我把段内偏移当线性地址做的归一化错，不是 CPU 错。
+
+### 七、验证状态与下一步
+
+已跑：**构建 `-Wall -Wextra` 零告警**；`cmake --build build --target check` 依赖边 ok；
+`vga_dispi` 单格探针过（第 3 步现在断言 `0x0100`，rc=11）。
+**未跑**（用户令）：`bash test/x86/run.sh`、`bash test/riscv64/run.sh`、win101 复跑。
+
+下一手只有一条能定案：一次 win101 起底，同时看
+`CEMU_DEBUG="mark,watch=0x449:2:w"` 与 debugcon(0x402) 抄本——
+(a) `Using pmtimer` 出现了没有，(b) `Removing mode` 出自哪一侧，
+(c) 谁把 mode 3 写回 BDA 的 0x449。三问都有答案之后才谈"修好了"。
+另欠：四个探针进 run.sh；D6（`Z2/Z3/Z4` 接到 DR0-DR7 或 `watch=`，`vCont?` 如实回答）。
+文档已同步：AGENTS.md §十（gate 行的新形状、DETAIL 88、PC 列两条语义）、§X 新增 D6
+（gdb 硬件观察点，此前被 3.5 提前销账）、D17（16MB 卡与片选线分歧）、D19（PM 函数收窄）；
+arch.md 阶段 3.5 与阶段 4 的清单；firmware.md（`CONFIG_VGA_BOCHS` 的后果、PM timer 换源）；
+README.md 现状（验收 4 未过）。
+
+## 阶段 4 片 34：清点片 33 之后的四个无记录提交，退回一处、修掉三处（2026-10-15）
+
+片 33（`eb83ea0`）之后连着四个提交**没有片号、没有 progress.md 记录**，是同一批修
+win101 的产物。逐个核内容，结论是：它们对 bug 一无所获（每一步都被自己的实测否掉，
+这点记录得诚实），但**其中两处改错了机器**，而且改错的方式是"引用一个参考实现说了什
+么，而那个参考并不这么说"——正是 §五 要防的那类事。
+
+- `1e34fc9` 新建 `tools/qemu_debugcon.ps1`，`6f0ec60` 又把它删掉（它引导镜像、属仓外
+  工具，§七 本来就不许进仓）。一对自我撤销的功，净效果只剩 §十 里被改了两遍的文档。
+- `fc00822` 给显示卡加 PCI function。**留着**：它顺手修的三个配置空间错误（class 码
+  按字节写、不存在的 BAR 写后读回 0、64 位 BAR 高半参与 sizing）是真语义；本轮的探针
+  还在 QEMU 上证实了它选的 identity（`00:02.0` = `1234:1111`）与参考一致。
+- `499e667` 的 DISPI 寄存器对留着，它的**闪烁/光标相位改动退回**。
+
+**退回的那处**。`blink_tick` 原本取 `now / kBlinkTickUs`，是个单调计数器；改动把它换成
+`(raster_line / 16) & 1`，于是：
+
+1. 消费者 `VgaRenderText` 用 `blink_tick & 1` 作闪烁相、**`(blink_tick >> 1) & 1` 作光标
+   相**——一个只有 0/1 的值，bit1 恒 0，光标从此不再随闪烁隐藏（功能回归，不是风格问题）；
+2. 注释说"16 行是标准文本闪烁单元，70Hz 下约 1.875Hz"——算术不成立：`raster_line` 是
+   扫描行，除以 16 就是一个字符行，翻转周期 2 字符行 ≈ 5.6Hz；
+3. 相位取"轮询那一刻光栅在哪"，是**取样**不是**计数**，会停在同一相也可能倒退——片 32
+   花一整片把"宿主快慢决定客人可见状态"赶出去，这里又请回来了；
+4. `kBlinkTickUs` 当场成了没人用的宏（§四）。
+
+现在 `VgaUpdateStatus` 回到 `void`，`blink_tick` 回到单调计数，并在原处留下为什么必须是
+单调计数器的注脚。闪烁相位跟实际场序这件事重新登记回 D17。
+
+**修掉的三处 DISPI**。
+
+1. **越界读写**。`dispi[d->dispi_index & 0x0f]`，而 `dispi` 只有 `kDispiRegCount = 11` 项，
+   索引 11..15 可达；`VgaDevice` 里紧跟在这个数组后面的正是 `PciDevice pci`——任何客人
+   两条 `outw`（先 `0x1CE ← 0x0f`，再 `0x1CF ← 任意`）就能写坏卡的 PCI 配置空间。现在索引
+   只在指向真实寄存器时才接受（`bochsvga.h:15-25` 一共命名 11 个），寄存器访问收进
+   `DispiReg()` 一扇门，不再有裸下标。
+2. **两处伪参考引用**。`0x1CE` 写入路径里"bit 7 选窄编码（QEMU 的 0x1ce case）"——仓内
+   无 QEMU 源码可查，SeaBIOS 也只写 0..10，删除；"未知 id 会把 `vbe_id` 置成
+   ID_UNKNOWN（读回 0xffff）"——**这条被 QEMU 当场证伪**：写 `0x1234` 后读回的是它已经
+   持有的 `0xB0C0`，也就是未知 id 不改寄存器。本机照参考改，并留注脚说明为什么"清成
+   0xffff"会让卡通过自己的握手之后再失忆（`bochsvga.c:309-313` 是先写 ID0 再比读回）。
+3. **注释与实现不符**。`vga.h` 写"字节访问仍然可用，触及低半"，而 8 位路径根本没有这两个
+   端口：字节读走 `default` 回高、字节写落空。改成事实，并把这条（连同"DISPI 的
+   ENABLE/XRES/YRES/BPP 只存不切模式、线性帧缓冲不由 DISPI 编程"）登记进 §X 的 D17。
+
+**新探针 `test/x86/probe/vga_dispi.asm`**（512 字节引导扇区，自足，不借固件，§七）。六步：
+ROM 的 id 握手 → 未知 id 不改寄存器 → `VIDEO_MEMORY_64K` 只读且报本机显存 256KB → **越界
+索引攻击**（`0x0f` 与 `0x8f` 两种旧代码都收的形状）→ 从 `0xCF8/0xCFC` 读回 `00:02.0` 的
+vendor/device 证明配置空间没被碰 → 真实寄存器仍能存（边界不是一拒了之）。失败行带步号。
+
+**双跑**（同一个二进制）：cemu 六步全过；`qemu-system-i386 -vga std` **停在第 3 步**——它
+报的是自己那块卡的 16MB（`256`），不是本机 256KB（`4`），是卡的属性差异而不是应答分歧，
+其余五步逐条一致，包括第 4 步的边界与第 5 步的 PCI identity。记录在
+`test/x86/probe/vga_dispi_qemu.txt`（`.gitignore` 里给 `*_qemu.txt` 开了例外，它原本被
+`*.txt` 这条抓调试落盘的规则一起吞掉——这正是这类证据一直没进仓的原因）。
+这条探针钉得住这两处，是分别实测的：HEAD 的代码（两处都在）**停在第 2 步**（未知 id 的
+应答先撞上）；把 id 那处单独修好、越界留着，**停在第 4 步**（越界攻击那步）；两处都改对
+才 `vga-dispi ok`。也就是说第 2 步与第 4 步各自就是这两处偏差的判据，不是靠后面的步骤兜。
+
+**验证**：`-Wall -Wextra` 零告警；`--target check` 依赖边 ok；回归 riscv **136 passed**、
+x86 **23 passed**（含新增这格），0 failed。§七 的格数从写错的 21 改成 23。§十 的 mark
+名录补上了 `gatecall`/`gateret`（片 33 一直没登记）。
+
+**没做的**：上一轮工作区里那版"trace 行打印线性地址 + 中枢挂全局帧"整批退回，没有重做
+（`state` 流与 trace 行仍是段内偏移，链是自洽的）；DISPI 切模式与 VBE 线性帧缓冲仍未实现
+（D17）；**win101 仍未修**。下一步不必再补观测：`CEMU_DEBUG="watch=0x449:2:w"`（BDA 的
+当前视频模式字节）现成就指名"谁写回了 mode 3"，那条指令就是分歧现场。
+
+## 片 33 补记：ROM 不同是**对拍的杂质，不是 win101 的原因**（2026-10-02）
+
+片 33 提交时我下了个结论："win101 在 cemu 上不进桌面不是 cemu 的 bug，是两个模型跑的
+option ROM 是 SeaBIOS Kconfig 里同一个 choice 的两个互斥项"。**用跨模型实验把这个结论
+推翻了。**
+
+**实验**：给 cemu 的 `out/vgabios.bin` 加上 PCI ROM 头（固件侧 `CONFIG_VGA_PCI=y`，
+不动 `VGA_STANDARD_VGA` 的适配器选择；不加这个头 QEMU 的 PCI VGA 根本不加载它，
+因为 `CONFIG_VGA_PCI=0` 时固件不产 0x55AA 的扩展 ROM 头），装进 QEMU 的
+`share/vgabios-stdvga.bin`，同一份 bios.bin、同一张软盘：
+
+```
+Start SeaVGABIOS (version 1.17.0-20260927_160822-LAPTOP-OOBCNUK9)   ← cemu 自己那份
+set VGA mode 3
+Booting from Floppy...
+set VGA mode 6
+set VGA mode 10
+screendump = 672,015 B = 640x350 桌面
+```
+
+**同一个 ROM、同一个镜像、同一个 bios.bin：QEMU 进桌面，cemu 退回 mode 3。**
+
+⇒ **分歧在机器上，不在固件构建上。** ROM 不同仍然是对拍必须先核的前提（不核就不知道
+自己在比什么），但它不是原因。AGENTS.md §十 那条已按此改写。
+
+**由此，剩下的机器级差异只有这几条**（都是实测的、还没被单独证伪的）：
+
+1. **显示卡没有 PCI function**（QEMU 是 `00:02.0 id=8086:100e`，16MB BAR；
+   cemu `PCI: No VGA devices found`）。注意 `CONFIG_VGA_PCI` 关着时**固件**不去读
+   BAR，但客人可以自己枚举 —— Windows 1.01 早于 PCI，这条存疑。
+2. **显存 256KB vs 16MB**。要生效得固件带 DISPI（`VGA_BOCHS`），而那会把适配器从
+   IBM VGA 换成 QEMU 味；实测打开后固件报 `size 0 MB` 并剪掉 84 个扩展模式，
+   **但 win101 仍进不了 mode 0x10**，所以这条也不成立。
+3. **QEMU 有 IDE 光驱与硬盘，cemu 只有一个软驱**（QEMU 抄本里
+   `DVD/CD [ata1-0: QEMU DVD-ROM]` 与 `Booting from Hard Disk... / Boot failed`，
+   cemu 直接 `Searching bootorder for: HALT`）。客人的驱动器探测调用只有 cemu 侧能看
+   （`gatecall`/`gateret`），QEMU 侧拿不到，**无法比较**。
+
+**没变的结论**：VGA 卡本身被三个通道证明干净（寄存器文件 60/62、孔径、整段端口对话
+4964 写 + 441 读逐字节相同）；XMS、`int 15h` 内存查询、帧缓冲申请、e820 地图、
+UMB 大小、BDA 内存字段全部实测否掉；VBE 缺失本身也否掉（打开后结果不变）。
+
+## 阶段 4 片 33：`gatecall`/`gateret` —— 客人的 BIOS 调用带上了服务号与返回值（2026-10-02）
+
+片 32 之后的死结是**观测**：win101 全程 21112 次 BIOS 调用，`gate` 行只有向量与门目标，
+看不到客人要的是哪个服务、拿到了什么。`trace` 一次窗口只装 9.5 万条指令，而待查区间是
+20 万条，扫 4 个窗口全落空。所以给 mark 加了**软件 INT 的两半**（`debug.h`
+`DebugGateCall`，与 `DebugVgaIo` 同理单开一行 —— `DebugMark` 的两个数装不下）：
+
+- `gatecall a=0x<AX> b=0x<调用者 CS:IP>`：进门时的 AX（服务号在 AH），只对**软件 INT n**
+  发 —— 外部中断与 CPU 抛的异常里 AX 和返回值无关
+- `gateret a=0x<AX> b=0x<调用者 CS:IP> cf=<CF>`：IRET 那刻的 AX 与 CF（每个 BIOS/DOS
+  服务都用 CF 报失败）
+
+两半靠**调用者 CS:IP** 对齐，不靠顺序，因此夹在中间的硬件中断挪不动配对。发射点：
+`do_int` 的实模式与保护模式两条路径，IRET 的实模式路径与 `pm_iret` 的正常返回路径。
+
+**为什么 QEMU 没有这一行**：`-d int` 打印向量与 EAX，但整块在 `if (cr0 & PE)` 里且只在入口
+触发（`target/i386/tcg/seg_helper.c` 的 `do_interrupt_all`）—— **实模式一条不出**，而且
+没有返回值。所以这不是抄 QEMU，是补一个两个模型都给不出的缺口；跨模型对拍要另走
+`dump=` / `pmemsave` 比客人内存。
+
+**13888 次软件 INT 全拿到了。三个假设因此被测死（不是猜死）：**
+
+1. **XMS 根本没被用**。32 次 `int 2Fh` 全是 `AX=0x11xx`（DOS 取驱动器参数）与
+   `AX=0xae00`，**没有一个 `AH=43xx`**。"客人申请 UMB 失败"不成立。
+2. **`int 15h` 全程 3 个不同的服务**：`AH=C0h`（系统配置表）3 次、`AH=41h` 1 次。
+   **没有 `AH=88h`、没有 `AH=E801h`、没有 `AH=E820h`。** 逐个核对 SeaBIOS 的实现
+   （`system.c` `handle_15c0` 返回 ES:BX=BIOS_CONFIG_TABLE + `set_code_success`；
+   `AH=41h` 落到 `handle_15XX` → `RET_EUNSUPPORTED`=0x86），**回答都是对的**。
+   ⇒ 客人**没有做过任何一次内存大小协商**。
+3. **客人没申请过大的内存**。9 次 `int 21h AH=48h`，最大一次是 230 段（3680 字节）；
+   6 次返回 AX=0008（DOS 错误 08 = 内存不足），但其中 `AL=00` 那次**在 DOS 5.0+ 本来
+   就是非法请求、必返回 0008**（我在拿到数据后一度把它当成"申请全部内存被拒"的证据，
+   那是过度解读，已作废）。**framebuffer 448000 字节 = 7000 段的那次调用压根没出现。**
+
+⇒ **BDA 0x413 = 639 KB 是对的**（`post.c` `bda_init` 写 `ebda_seg/64`，EBDA 在 0x9FC0）。
+
+**⇒ 定案修正：分歧比原先想的更早。** 客人不是在内存上碰壁才退到 mode 6 —— 它**根本没走到
+需要内存的那一步**。`AH=C0h` 返回的 BIOS_CONFIG_TABLE 里内存字节若是 0xFF，规格要求
+再调 `AH=E801h`，而它没调。这一步之后的取舍才是分歧现场，而那一段的观测我还没有。
+
+**没验到的**：13888 次里 102 次（0.7%）无配对的 `gateret` —— 多半是跑满 12M 指令时正卡在
+一次调用里，或是等键的服务（`int 16h AH=10h/20h AL=00` 是**阻塞**等键）。`pm_iret` 的
+vm86 / NT / 返回-vm86 三条路径不发 `gateret`（那是模式/任务切换，不是"某个服务在回答"）。
+回归套件本轮未跑（未授权）。
+
+## 阶段 4 片 32：`-icount` 把虚拟时钟从"宿主快慢"里拿出来（2026-10-02）
+
+win101 的分歧查到最后，怀疑对象落在**时间**上：`i8254.c` 的 PIT 跑在 `HostTimerNow()`
+（宿主单调钟）上，于是客人的 tick 数是宿主跑多快的函数。三次**完全相同**的命令给出
+**IRQ0 = 127 / 121 / 120**，`int 16h` 之类下游调用数同步漂移。AGENTS.md §八说"指令 =
+状态转移"，那么边沿的**数量**就必须是执行量的函数，不能是宿主性能的函数。
+
+于是按 QEMU 的写法加了 `-icount shift=N`（一条退休指令 = `1<<N` 纳秒虚拟时间），**默认
+不开**（默认仍是墙钟 = 真机速率），两条并存 —— 和 QEMU 的 `-icount` 一样是产品决策，
+不是 bug 修复。
+
+**实现照 QEMU 的时钟切分（`include/qemu/timer.h`）**，`src/host/time_win.c` 变成两个时基
+加一个偏移：
+
+| | 语义 | 挂的东西 |
+|---|---|---|
+| `HostTimerNow()` | 模拟时钟。默认墙钟，`-icount` 下按退休指令推进 | 所有设备：PIT、APIC timer、CLINT mtime、VGA retrace、UART 字符超时、CMOS 周期中断 |
+| `HostTimeRealtime()` | 宿主墙钟，**既不被 `-icount` 动也不被 `--skip-idle` 拨** | MC146818 时间寄存器、窗口重绘节流、输入轮询节流 |
+| `g_warp_us` | 模拟时钟上的偏移 | `--skip-idle` 把停住的 CPU 拨到下一个设备 deadline |
+
+切出第二个时基是被这个功能**逼出来的**，不是设计洁癖：那三处量的是**宿主**时间。QEMU 的
+MC146818 时间寄存器同样挂在 `QEMU_CLOCK_REALTIME`（"should be used only for stuff which
+does not change the virtual machine state"）；而节流器问的是"离上次 syscall 过了多久"，
+`-icount` 拨它会让窗口不再节流。
+
+配套三处：
+- `run.c` 退休一条指令后 `HostTimerIcountAdvance()`；`-icount` 下**强制**走拨时钟那条路
+  （`sleep=off` 语义相反：QEMU 停住就不给时间。停住又不拨 = 虚拟时钟永不走 → 唤醒它的
+  中断永远不来）。
+- `HostSleepMs()` 在 `-icount` 下把这段等待按申请的时长记到虚拟时钟上 —— 只有 x86 主板有
+  `next_event_us`，riscv 那边停住时没有 deadline 可跳，不记账就死等。这一条是 `-icount`
+  运行唯一**不可复现**的口子，QEMU 的 `icount_start_warp_timer()` 留的是同一个洞。
+- `-icount` 挂在建机之前：机器构造与镜像装载的时间不能算进客人的钟。
+
+**验到的（x86，win101 与 vga_cga 探针）**：
+- `-icount shift=10` 连跑三次，`CEMU_DEBUG=state` 的**状态流逐字节相同**（sha256 一致）；
+  墙钟模式下同一条命令每次不同 —— 这就是 AGENTS.md §九第 6 条要的"能当对拍基准"。
+- IRQ0：`-icount` 下 **153 / 153 / 153**，墙钟下 129 / 130。确定性成立。
+
+**⇒ 但它不是 win101 的原因，这条假设被自己的实验否掉了。** 回头查我那些 QEMU 脚本，
+用的正是 `-icount shift=10,sleep=off`（`qemu_trace.ps1:10/14`）。cemu 补上 `-icount
+shift=10` 后跑 win101，模式序列仍是 **`3,6,3`**，与墙钟模式一样。**同样的每指令虚拟时间，
+两个模型仍然分歧 ⇒ tick 速率不是原因。**（之前拿"cemu 127 tick vs QEMU 224 tick"作对照
+也是错的：DOS 会在跑到一半时重编程 PIT 通道 0，两边的计数根本不在同一个指令区间上。）
+
+**没验到的**：riscv 的 WFI 路径只按代码推演（`next_event_us == NULL` → 落到
+`HostSleepMs` → 记账），**没有实际跑过** —— 仓里没有已构建的 riscv 映像，回归套件未获
+授权运行。回归套件本轮也没跑（未授权）。
+
+## 阶段 4 片 30：卡的端口文件与孔径双跑逐字节相同 —— win101 的分歧**不在 VGA**（2026-10-02）
+
+用户要求"用 QEMU 调试"，于是不再靠渲染结果反推，而是**把两个模型各自与客人
+（win101）的完整对话录下来逐字节比**。为此在调试中枢加了常驻项 **`vga-io`**（§十），
+它对应 QEMU 给自家测试用的 `vga_std_read_io` / `vga_std_write_io` trace 事件：读与写
+各一行（`vga-io rd|wr port=0x3d5 val=0x28`），默认关、可 budget/skip。**没有这一项就
+没法把两个模型按"一次访问一次访问"对齐**——写流看不出客人在哪一步换了主意。
+
+**测到的四件事，全部是客观的**：
+
+1. **POST 之后的寄存器文件**：新探针 `vga_post.asm`（512 字节引导扇区，打印 SR/GR/AR/CR
+   全部寄存器，每行自带 `<组><索引>=<值>` 标签，故与 SeaBIOS 打到 COM1 的日志交错也还能
+   正则抠出来）。**62 个寄存器里 60 个逐字节相同**；唯二不同是 **CRTC R14/R15**
+   （cemu 00/a0 vs QEMU 03/70），而这两个是 `stdvga.c:301 stdvga_set_cursor_pos` 写的
+   **光标位置**，不是卡的配置 —— 固件打印的字符数不同留下的痕迹，**不是 bug**。
+   （这一版探针换掉了前几版：`lodsb` 当索引用、`puthex8` 改 DX 导致 `out` 打到串口、
+   `mov dx` 插在 `call puthex8` 之前而非循环体开头——三个都是探针自己的错，读回全 0。）
+2. **完整端口文件**：win101 一次实跑，cemu 6074 行 / QEMU 33546 行（读+写）。归一化后
+   **逐字节相同的有 4964 个写 token 与 441 个带索引的读 token**（DAC 3075 个 token
+   也逐字节相同）。唯一分叉在序列末尾，且分叉那一行正是**客人请求的差别**：
+   `AR10=0x0c`（文本）对 `AR10=0x01`（图形）。
+3. **孔径**：`vga_aperture.asm`（新探针，字节/字双写、奇偶地址、字符单元）读回结果
+   两个模型**逐字节相同**。
+4. **POST 文本模式一致**：QEMU 的 trace 证明客人**在 QEMU 上也编程了 mode 6**
+   （CRTC R9=0xC1/R18=0x8F），先前"QEMU 从不进 mode 6"的结论作废；差别只在最后一步。
+5. **客人请求的模式（这才是真正的分叉）**：`stdvgamodes.c` 的 `vga_modes[]` 里有 **mode 0x10**
+   （`MM_PLANAR 640×350×4`，`crtc_0f`/`actl_10`/`grdc_0d`，misc=**0xa3**），而 QEMU 的
+   trace 里第三个 CRTC 段 misc 正是 0xa3、AR10=0x01、AR12=0x0f —— **逐项对得上 mode 0x10**。
+   而 cemu 的固件日志是 `set VGA mode 6` → `set VGA mode 3`，**客人根本没请求过 0x10**。
+   ⇒ 两个模型都是 `POST mode 3 → mode 6`；QEMU 接着 `mode 0x10`（进桌面），
+   cemu 直接 `mode 3`（退回 DOS 文本）。**分歧在客人自己的驱动选择，不在 int10 也不在卡。**
+6. **BDA 视频态两边各自自洽**：cemu 末态 `0x449`=0x03、`0x44A`=80、`0x44C`=0x1000、
+   `0x484`=0x18（25 行）、`0x485`=0x10（16 点字高）—— 全是 80×25 文本的正确值；
+   QEMU 末态 `0x449`=0x10、`0x44C`=0x8000。**两边都没坏，只是落在了不同模式上。**
+
+**⇒ 定案：win101 的分歧不在 VGA 卡。** 寄存器文件、孔径、整个端口文件三个通道全部逐字节
+相同，客人却在最后一步要了不同的模式 —— **它读到的东西不在卡上**。剩余候选（下一手）：
+**int 15h AH=88h/E820h 的回答**（Windows 1.01 的显示驱动要为 640×350×16 分配 448000 字节
+帧缓冲，失败就退到单色 —— 这正好解释"为什么最后落在 mode 6"）、**A20 门**、
+**PIT/IRQ0 时序**、以及 DOS 层（`INT 21h AH=4Dh` 之前它已经放弃）。
+
+## 阶段 4 片 29（续）：win101 的模式序列（2026-10-02）
+
 本文是原 任务与计划.md 的状态部分，按轮次记录。架构与路线图见 arch.md；
 开发铁律见 AGENTS.md。最近的记录在最上。
+
+## 阶段 4 片 29：VGA 图形通路钉上（vga_paint 自足探针）+ win101 的模式序列量出来了（2026-10-02）
+
+**卡侧改了五处**（前四处有参考或手册背书，第五处是台账）：
+
+1. **fb 行距**（工作区里遗留的改动）：渲染按 `kVgaFbWidth`（800）步长写行，而显示通道
+   公布的是 `fb_width`（当前模式的宽度，如 640）——`fbdump` 与显示窗口按公布宽度逐行读，
+   于是每行错位。改为按 `p->width` 步长，注释写清"渲染步长与公布宽度必须是同一个数"。
+2. **`planes == 1` 不再等同于 CGA 模式 6**：原判据 `cga_mono = p->planes == 1` 把 VGA
+   原生的单平面模式（0x0F 的 640×350、0x11 的 640×480）也拉进 CGA 旁路，颜色与消隐由
+   0x3D8/0x3D9 闩锁决定。改判据为 CGA 形状本身：移位 1（模式 4/5 的 2bpp 打包）或
+   双扫描且每行两行（模式 6 的 640×200，R9=0xC1）。参考：QEMU `vga_draw_line4` 对一切
+   平面模式走 `update_palette16`（AR0-AR15→DAC），单平面模式也从那里取色。
+3. **图形模式下 `multi_scan` 只认 R9 bit 7**：旧值 `R9 & 0x1f` 会让图形模式把每行重复
+   最多 16 次（win101 第一次取样的瞬态状态 R9=0x4F 就吃了 16 倍）。IBM VGA TR 3.1a 只把
+   R9.4-0 的含义给字符行，故图形路径不重复；QEMU 那里相反且自带"XXX: is it correct?"，
+   按 AGENTS.md §五以手册裁决，注释里写明分歧。
+4. **寄存器写掩码改用 QEMU 的 `sr_mask`/`gr_mask`**（原表 SR1 0x3b vs 0x3d、SR3 0x1f vs
+   0x3f、SR4 0x0f vs 0x0e、GR5 0x7f vs 0x7b，且 SR7 原表全丢而 QEMU 存）。这不是洁癖：
+   识别卡片的客人写全 1 再读回（Windows 1.01 的显示驱动就是），掩码不同就等于本机答的是
+   另一张卡。
+5. **`getenv("CEMU_VGA_DUMP")` 一次性探针删除**（AGENTS.md §九.1），换成常驻观测：
+   `CEMU_DEBUG=mark` 的 `vga-mode`（宽/高）、`vga-shapes`（图形位、chain4、odd/even、
+   双扫描、移位、平面使能、起始偏移）、`vga-timing`（R9/R18/R7 与 R13/GR6/GR5）三行，
+   只在画面变化时发一次（`VgaDevice.marked_*`）。
+
+**新探针 `test/x86/probe/vga_paint.asm`（无固件）补回被删 `vga` 格的图形通路覆盖**：自己
+按 SeaBIOS 的 mode 0x10 表编程（sequ_0e/crtc_0f/actl_10/grdc_0d + 运行期行偏移
+R13=40），用**写模式 2 逐像素字节**刷一张标尺（左右边缘、奇数行的 8-15 列、
+(row>>1)&1 的 16-23 列、第 100 行整行色 15、第 300 行整行色 3），并把自己画的
+plane 字节读回打一行报告。**"一个像素字节四个平面字节 = 一个 dword"这条是本轮最要紧的
+认知**：QEMU `vga_draw_line4` 每个像素字节读一个 dword、每平面取一个 lane，而孔径的
+标准锁存写路径把客人地址当**平面偏移**、用 SR2 选平面 —— 所以驱动是"每个像素字节写一个
+字节、让写模式 2 把颜色摊到四个平面"，不是"四个连续地址各写一个平面字节"。先前怀疑的
+"孔径平面寻址错位"不成立（tiny386 那段 `addr & 3` 是 chain4 分支，本机与之逐字相同）。
+`test/x86/run.sh` 新增 `vga-paint` 格（判据 = rc=11 + 那行报告逐字相同）。
+
+**回归**：x86 **22 passed / 0 failed**（原 21 + 新格）、riscv64 **136/0**、依赖边 ok、
+构建零告警。QEMU 双跑（`-kernel vga_paint.elf -vga std`）的报告行逐字相同。
+
+**win101 首次在本轮实跑（用户授权，12M 指令，`--max-inst` 自收尾）——"set VGA mode 3"
+与"三个 logo"都有了答案**（`CEMU_DEBUG=mark,screen`）：
+
+* 模式序列（`vga-mode` 行）= POST 文本 720×400 →（软盘引导、DOS 起来之后）**640×400
+  图形，`planes=1`，R9=0x4F 后 0xC1，R18=0x8F，R13=0x28，GR5=0x00，GR6=0x0D** → 回
+  720×400 文本 → `A>` 提示符。**12M 指令内客人一次也没进 640×350**。
+* 那组寄存器与 SeaBIOS `vgasrc/stdvgamodes.c` 的 **mode 0x06 表逐项相同**
+  （crtc_06 的 R9=0xC1/R18=0x8F/R7=0x1f/R1=0x4f，actl_06 的 AR12=0x01，grdc_06 的
+  GR6=0x0D 即 B8000 窗口）。而且 `regs=` 显示切模式时 `cs=0xdc0`（DOS/Win 自己的代码），
+  **不经 int10**：客人自己编程了这张卡。
+* ⇒ **三个 logo 的成因**：客人是在 CGA 640×200 单平面模式下画 splash，它把位图按 640×350
+  的假设往一块 640×200（8000 字节/200 源行）的缓冲里写，本机把这块缓冲原样显示（几何、
+  平面、调色板都经 vga_paint 逐项钉过），于是位图在 200 行里绕回来看见两份 + 一份截断
+  的 —— 就是用户看到的"3 个副本"。**不是渲染错位**。
+* ⇒ **"卡在 set VGA mode 3"**：那行是 SeaVGABIOS `vgasrc/vgabios.c:264` 的
+  `dprintf(1, "set VGA mode %x\n", mode)`（经 0x402 debugcon，`x86_min.c:96`），含义只有
+  一条：客人最后一次 int10 AH=00 要的是 mode 3（80×25 文本）。合起来即 **Windows 画完
+  splash → 退回 DOS 文本 → 停在 `A>`，SeaBIOS 在 `src/kbd.c` 的等键循环**（机器没死锁）。
+* **仍未定案**：客人为什么在 splash 之后不装 EGA 640×350×16（QEMU 上同一镜像能到桌面）。
+  下一手：在这两次模式切换处开 `trace:line` 窗口（`skip`/`budget`），读它在退回文本前
+  检查了什么；候选是它读回某个寄存器/状态端口（0x3DA 垂直回扫、0x3CC）得到的答案与
+  QEMU 不同，或它对 640×350×16 那 112000 字节的窗口要求（GR6=A0000 只有 64KB）自己
+  放弃。
 
 ## 阶段 4 片 28：两个自足探针补回被删格的覆盖 —— vga_core 接线、fdc_dma 收敛并双跑（2026-09-30）
 
@@ -1954,4 +2499,7 @@ gp）；位段类 bug 用 llvm-objdump 对照 cemu trace 的 raw/dnpc 即可裁�
 ## git 惯例
 
 main 分支单线性，每轮工作一个检查点（git log 见历史）。test/ 只入库
-源与脚本（*.txt 对拍捕获、rc.*/probe.* 中间产物清除过一轮）。
+源与脚本（*.txt 对拍捕获、rc.*/probe.* 中间产物清除过一轮）。例外：
+`test/x86/probe/*_qemu.txt` 入库——那不是捕获，是**参考模型对同一个二进制答了什么**
+的记录（探针格的注释按名字引它），只有几行；`.gitignore` 里为它单开了一条
+`!`，因为全局的 `*.txt` 把这类记录一起吞掉过（三份写好就一直躺在盘上加不进版本库）。

@@ -1,0 +1,3 @@
+fdc-dma pos=01000102
+fdc-dma ok
+

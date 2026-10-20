@@ -133,9 +133,12 @@ static int FromBcd(int v) { return ((v >> 4) & 0xf) * 10 + (v & 0xf); }
 // ---- the clock --------------------------------------------------------------
 
 // Seconds since 1970-01-01 (UTC): the host wall clock plus the bias the
-// guest's last write asked for.
+// guest's last write asked for. The MC146818 keeps real time — it goes on
+// counting while the processor is stopped, and no emulator time base
+// (-icount, --skip-idle) has any business moving it (QEMU gives these
+// registers QEMU_CLOCK_REALTIME, hw/rtc/mc146818.c).
 static int64_t CmosEpoch(const struct CmosState* st) {
-  return HostTimerNow() / 1000000 + st->bias_sec;
+  return HostTimeRealtime() / 1000000 + st->bias_sec;
 }
 
 // The stored time registers decoded into seconds since the epoch: that is what

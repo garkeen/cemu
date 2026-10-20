@@ -19,6 +19,7 @@
 #include "device/misc/i440fx.h"
 #include "device/misc/pci.h"
 #include "device/misc/piix3.h"
+#include "device/misc/piix4pm.h"
 #include "device/misc/port92.h"
 #include "device/misc/testdev.h"
 #include "device/storage/fdc.h"
@@ -116,6 +117,11 @@ static const uint64_t kBootSectorLoad = 0x7C00;
 // and PIIX3 datasheets; QEMU hw/pci-host/i440fx.c and hw/isa/piix3.c).
 static const uint8_t kHostBridgeDev = 0;
 static const uint8_t kPiixDev = 1;
+// The display adapter takes the next slot after the chipset devices, which is
+// where QEMU's PC puts it too (a VGA is a PCI function on that machine, not an
+// ISA card; vga.h's PCI section has why an ISA-only VGA is not the whole
+// machine).
+static const uint8_t kVgaDev = 2;
 static const uint8_t kPciBus0 = 0;
 
 // Every ISA IRQ wire in a PC/AT reaches two controllers — the 8259 pair and
@@ -147,6 +153,7 @@ typedef struct X86Board {
   IoapicDevice ioapic;
   Piix3BridgeDevice piix;
   IdeDevice ide;
+  Piix4PmDevice pm;
   // The floppy subsystem: the 8272 controller and the 8237 whose channel 2
   // carries its sector data. They are separate devices on a real PC (the
   // controller only raises DRQ; the DMA engine walks memory), so they are
@@ -439,6 +446,73 @@ static int LoadRom(X86Board* xm, const char* path) {
 // so the machine does not have to place it, and the card needs no PCI function.
 static const char kVgaRomFileName[] = "vgaroms/vgabios.bin";
 
+// The memory map this machine hands the firmware. It is the board's to publish
+// because it describes the board: where the RAM is, and which of the gaps in the
+// first megabyte the chipset's own devices answer for.
+//
+// It goes out as the fw_cfg romfile "etc/e820" -- the file SeaBIOS looks for
+// first, in qemu_preinit (src/fw/paravirt.c:565 qemu_early_e820), and the same
+// file QEMU publishes. Without it the firmware has to reconstruct the map by
+// itself, and it gets a different one: SeaBIOS deletes everything from 0xa0000
+// to the BIOS (src/malloc.c malloc_preinit calls e820_remove on that range) and
+// only puts the BIOS back, so the RAM gaps inside it come out as *nothing at
+// all* rather than as RAM. A guest that reads the map (DOS sizing itself upper
+// memory, int 15h AX=E820h) then sees less usable memory than the machine has.
+//
+// The payload is the bare entry list: {u64 address, u64 length, u32 type},
+// little-endian, with the count taken from the file's length (paravirt.c:762,
+// struct e820_reservation at :543). The legacy QEMU_CFG_E820_TABLE selector
+// carries reservations only, so it is not where a full map belongs.
+enum {
+  kE820Ram = 1,
+  kE820Reserved = 2,
+};
+static const char kE820RomFileName[] = "etc/e820";
+static const uint64_t kVgaWindowEnd = 0xc0000;  // the display card's own window
+static const uint64_t kVgaBiosEnd = 0xe0000;    // where the option ROM area ends
+
+static int PublishMemoryMap(FwCfgDevice* fwcfg, uint64_t ram_size) {
+  struct E820Entry {
+    uint64_t addr, len;
+    uint32_t type;
+  } entries[8];
+  int n = 0;
+  // Conventional memory ends short of the card's window, the way a PC's does
+  // once the 640K/1M boundary is respected (SeaBIOS BUILD_LOWRAM_END).
+  entries[n].addr = 0;
+  entries[n].len = 0xa0000;
+  entries[n++].type = kE820Ram;
+  entries[n].addr = kVgaWindowEnd;
+  entries[n].len = kVgaBiosEnd - kVgaWindowEnd;
+  entries[n++].type = kE820Reserved;              // the option ROM area
+  entries[n].addr = 0xf0000;
+  entries[n].len = 0x10000;
+  entries[n++].type = kE820Reserved;              // the firmware itself
+  entries[n].addr = 0x100000;
+  entries[n].len = ram_size - 0x100000;
+  entries[n++].type = kE820Ram;
+
+  uint32_t bytes = (uint32_t)n * 20;
+  uint8_t* buf = (uint8_t*)malloc(bytes);
+  if (!buf) return -1;
+  uint8_t* p = buf;
+  for (int i = 0; i < n; i++) {
+    for (int b = 0; b < 8; b++) p[b] = (uint8_t)(entries[i].addr >> (8 * b));
+    for (int b = 0; b < 8; b++) p[8 + b] = (uint8_t)(entries[i].len >> (8 * b));
+    for (int b = 0; b < 4; b++) p[16 + b] = (uint8_t)(entries[i].type >> (8 * b));
+    p += 20;
+  }
+  // The device keeps the pointer, not a copy, so the payload has to outlive the
+  // machine (the same reason the option ROM's bytes are not freed either).
+  if (FwCfgAddFile(fwcfg, kE820RomFileName, buf, bytes) != 0) {
+    free(buf);
+    return -1;
+  }
+  LogInfo("memory map: %d entries as the fw_cfg romfile %s (%llu MB)", n,
+          kE820RomFileName, (unsigned long long)(ram_size >> 20));
+  return 0;
+}
+
 static int LoadVgaRom(X86Board* xm, FwCfgDevice* fwcfg, const char* path) {
   HostFile* f = HostFileOpenRead(path);
   if (!f) {
@@ -576,7 +650,11 @@ static void X86Reset(Board* m) {
   Uart16550Init(&xm->uart);
   PicInit(&xm->pic);
   PitInit(&xm->pit);
-  FwCfgInit(&xm->fwcfg);
+  // fw_cfg is a bus, not a device: reset clears the selector and the read
+  // offset, but the published entries describe the machine and outlive a reset
+  // (the option ROM in them is the same image after one). Only the cursor moves.
+  xm->fwcfg.selector = 0;
+  xm->fwcfg.offset = 0;
   LapicInit(&xm->lapic);
   IoapicInit(&xm->ioapic);
   VgaInit(&xm->vga);
@@ -595,7 +673,9 @@ static void X86Reset(Board* m) {
   PciAddDevice(&xm->pci, &xm->fx.pci);
   PciAddDevice(&xm->pci, &xm->piix.pci);
   PciAddDevice(&xm->pci, &xm->ide.pci);
+  PciAddDevice(&xm->pci, &xm->pm.pci);
   IdeReset(&xm->ide);
+  Piix4PmReset(&xm->pm);
   DebugExitBind(&xm->dexit, &m->cpu);
   WireDevices(xm);
   m->cpu.pc = m->entry;
@@ -661,6 +741,10 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   PicInit(pic);
   PitInit(pit);
   FwCfgInit(fwcfg);
+  if (PublishMemoryMap(fwcfg, ram_size) != 0) {
+    BoardDestroy(m);
+    return NULL;
+  }
   if (opts->vgabios_path && LoadVgaRom(xm, fwcfg, opts->vgabios_path) != 0) {
     BoardDestroy(m);
     return NULL;
@@ -668,6 +752,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   LapicInit(lapic);
   IoapicInit(&xm->ioapic);
   VgaInit(vga);
+  VgaPciInit(vga, &m->bus, kPciBus0, kVgaDev);
   I8042Init(kbd);
   Ps2KbdInit(&xm->ps2kbd);
   Ps2MouseInit(mouse);
@@ -681,6 +766,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   I440fxInit(&xm->fx, kPciBus0, kHostBridgeDev);
   Piix3BridgeInit(&xm->piix, kPciBus0, kPiixDev);
   IdeInit(ide, kPciBus0, kPiixDev);
+  Piix4PmInit(&xm->pm, kPciBus0, kPiixDev);
   if (opts->hda && IdeAttach(ide, 0, 0, opts->hda, kIdeMediaDisk) != 0) {
     LogError("cannot attach -hda image '%s'", opts->hda);
     BoardDestroy(m);
@@ -708,6 +794,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   PciAddDevice(&xm->pci, &xm->fx.pci);
   PciAddDevice(&xm->pci, &xm->piix.pci);
   PciAddDevice(&xm->pci, &ide->pci);
+  PciAddDevice(&xm->pci, &xm->pm.pci);
   BusAddRegion(&m->io, 0, kPortSpaceSize, &kUnclaimedPortOps, NULL);
   BusAddRegion(&m->io, kCom1Base, kCom1Size, &kUart16550Ops, uart);
   BusAddRegion(&m->io, kDebugExitPort, kDebugExitSize, &kDebugExitOps, dexit);
@@ -728,6 +815,11 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   PciRegister(&m->io, &xm->pci);
   Piix3Register(&m->io, &xm->piix);
   IdeRegister(&m->io, ide);
+  // The power-management function owns no fixed port: its 32-byte block appears
+  // where firmware points PIIX_PMBASE and only once firmware enables it, so all
+  // this hands over is the address space the block gets decoded in
+  // (device/misc/piix4pm.h).
+  Piix4PmSetIoBus(&xm->pm, &m->io);
   I8237Register(&m->io, &xm->dma);
   // The engine moves a transfer through system memory, so it needs the
   // address space the peripheral never touches.
@@ -740,6 +832,11 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   LapicRegister(&m->bus, lapic);
   IoapicRegister(&m->bus, &xm->ioapic);
   VgaRegister(&m->bus, &m->io, vga);
+  // The card is also a PCI function, so firmware and guests find a
+  // display-controller class device on the bus instead of only the ISA ports
+  // (VgaPciInit, device/video/vga.h). Registering the device is separate from
+  // wiring its interrupt lines -- a VGA raises none.
+  PciAddDevice(&xm->pci, &vga->pci);
 
   // Wiring, the way a PC/AT is wired: every ISA IRQ line reaches both
   // controllers (the 8259 pair and the I/O APIC's pins), the LAPIC is the

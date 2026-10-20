@@ -173,7 +173,7 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - 验收：kvm-unit-tests 32 位保护模式用例 + multiboot 平段内核开分页冒烟。
 - riscv 侧无新增语义（S 态/Sv39 阶段 2 已落地）。
 
-### 阶段 3.5：调试器与 GUI ✅（VGA 图形模式与 ramfb 按 D17 挪入阶段 4）
+### 阶段 3.5：调试器与 GUI ✅（x86 硬件观察点已接；riscv 侧与"只读"编码按 D6 在册；VGA 图形模式与 ramfb 按 D17 挪入阶段 4）
 三片独立可交付，顺序可调；显示通道是阶段 4 图形 OS 的硬前置。
 - 前置任务：exec.c 逐 case 填 insn_rec.mnemonic（名字级，SDM/手册指令名；
   语法级不做）。CEMU_DEBUG 事件表的 MNEMONIC 列在 case 入口即有值，
@@ -183,7 +183,19 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   riscv ramfb 随后——阶段 4 设备清单中的 CGA 在此提前消化。
 - 调试器内核：gdb 远程串行协议（RSP）over TCP（host/ 加 winsock），
   断点/单步/读写现场复用 raise 通道与 CEMU_DEBUG 基建。软件断点不依赖
-  D6；硬件断点（hbreak/watch → trigger 匹配语义）在此销账 D6。
+  D6；硬件断点已接：`hbreak`（Z1）与普通断点共用**按线性 PC 匹配**的断点表，
+  不往客机内存 patch 0xCC —— 为此 `isa_ops` 加了 `gdb_pc` 接缝（x86 交
+  CS base + EIP，riscv 留 NULL），否则实模式给 gdb 的是段内偏移，`x/i $pc`
+  反汇编取错字节、按 gdb 说得出的地址下的断点永不触发。
+  **`watch`/`awatch`（Z2/Z4）已接**：走 `isa_ops` 的三个新接缝
+  （`gdb_set_watch`/`gdb_clear_watch`/`gdb_watch_hits`）落到 CPU 自己的 DR0-DR7，
+  装一次只有一份匹配器；命中**报给 stub、不投递给客机**（`x86_state.gdb_watch_mask`
+  记下这四个槽里哪些是调试器装的）——否则一个没有 #DB 处理程序的裸引导扇区会把
+  这个陷阱变成三重故障和复位环，gdb 还没看到值客机就重启了（实测过一次）。
+  **`rwatch`（Z3）回空包**：DR7 的 R/W 字段没有"只读"编码（SDM vol.3 表 17-2），
+  本机不把它偷偷放宽成"读写"，gdb 因此退回自己的软件观察点；riscv 一侧三个接缝
+  留 NULL，trigger 模块与 RSP 之间那条通道记在 D6。`vCont?` 现在如实报
+  `vCont;c;s`（解析分支只认这两个动作，所以不 advertise `t`/`r`）。
 - 图形调试前端：依赖前两片，纯 RSP 客户端（寄存器/内存/断点/单步控制），
   不内置反汇编（反汇编一律外部工具——gdb/lldb
   attach 同一 stub 客户端侧反汇编，或 llvm-objdump 离线看镜像）。cemu
@@ -192,9 +204,12 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   图形 OS 显示前置就绪，衔接阶段 4。
 
 ### 阶段 4：设备全集与真实 OS（此后为纯设备/IO 阶段；进行中）
-- PC 设备模型全集（VGA 家族核、PS/2、PIC、PIT、UART、IDE/ATAPI、软盘 FDC+8237、LAPIC、IOAPIC）✅
-  —— 片 1–14 逐项落地，片 26 补软盘通路，片 27 补显示家族。余下的规格缺口（IOAPIC 的
-  NMI/SMI/INIT/ExtINT 交付模式、PIRQ 消费者、PM/ACPI、ATA LBA-48/multi-sector）按
+- PC 设备模型全集（VGA 家族核、PS/2、PIC、PIT、UART、IDE/ATAPI、软盘 FDC+8237、LAPIC、
+  IOAPIC、**PIIX4 PM function（ACPI PM timer）**）✅
+  —— 片 1–14 逐项落地，片 26 补软盘通路，片 27 补显示家族，片 35 补 PM function（固件的
+  微秒时基因此切到 PM timer，见 firmware.md）。余下的规格缺口（IOAPIC 的
+  NMI/SMI/INIT/ExtINT 交付模式、PIRQ 消费者、ACPI 的 SCI/关机路径与 ACPI 表、
+  ATA LBA-48/multi-sector）按
   AGENTS.md 第十节台账在册。
 - bin 路线：multiboot 等价的入口契约，xv6 去掉 bootasm.S/bootmain.c
   编为 .bin；SeaBIOS 路线：官方 bios.bin 映射内存顶端，复位 F000:FFF0
@@ -230,13 +245,17 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   基线是 **EGA 640×350** 下的 MS-DOS Executive 桌面（7 秒时截屏）。它给出两条硬前置：
   **软盘引导链**（8272 FDC + 8237 DMA 通道 2 + CMOS 软驱字节 + 引导 DL=0x00；片 26 交付）
   与**显示**。显示不按"CGA 图形 → EGA → VGA"三段各自成卡，而是**一个 VGA 家族核 +
-  CGA/EGA 兼容模式**（片 27 交付）：核提供 4 平面 256KB、0x3C0-0x3DF 四组寄存器
+  CGA/EGA 兼容模式**（片 27 交付）：核的显存 16MB（平面按 dword 交织存放，
+  0xA0000-BFFFF 孔径最宽的形状达 512KB；BAR0 与 DISPI `VIDEO_MEMORY_64K` 同源），
+  0x3C0-0x3DF 四组寄存器
   （CRTC/Sequencer/Graphics/Attribute）、平面/奇偶/链式寻址、256 色 DAC、CRTC 驱动的
   光栅状态；CGA 与 EGA 是它的兼容模式层 —— EGA 640×350 正是验收 4 要的那一层，CGA 的
   320×200/640×200 落在同一套寻址里。`cga.c` 已并入核（随卡删除，不留分支）。
   **机器的 int10 由显卡的 option ROM 提供**：SeaBIOS 按 `CONFIG_NO_VGABIOS=0` 重建
   （SeaVGABIOS，38400 字节），主板用 `-vgabios` 把它作为 fw_cfg 文件 `vgaroms/vgabios.bin`
-  交给固件，固件自己影子到 C0000——显卡因此不需要 PCI 身份。验收见
+  交给固件，固件自己影子到 C0000。显卡另有 PCI function（`00:02.0` = `1234:1111`，
+  显示控制器类，片 30 之后补上）供固件与客人按 PCI 枚举它、并给线性帧缓冲提供 BAR0，
+  但它**不带扩展 ROM**（0x30 的 ROM 地址寄存器读回 0），ROM 仍走上面这条 fw_cfg 通路。验收见
   `test/x86/probe/vga_probe.asm`（int10 切 mode 3/0x10/0x04 后核对寄存器与平面寻址，
   QEMU `-vga std` 同一镜像同样通过）。剩余显示缺口见 AGENTS.md D17（链式 256 色只做
   寻址不渲染、无 VBE、渲染结果缺无头 dump 设施）。

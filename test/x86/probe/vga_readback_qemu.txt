@@ -1,0 +1,43 @@
+# Dual run of test/x86/probe/vga_readback.asm, 2026-10-16, same 512-byte boot
+# sector on both models:
+#
+#   cemu  --machine x86 --isa x86 vga_readback.bin
+#   qemu-system-i386 -drive file=vga_readback.bin,format=raw,if=ide,index=0 -boot c \
+#       -display none -serial file:... -no-reboot \
+#       -device isa-debug-exit,iobase=0xf4,iosize=0x4
+#
+# The suite cell compares cemu's live transcript against the `cemu` line below;
+# the `qemu` line is what the reference card answered. Exit: debug-exit value 9
+# -> status 19 on both.
+cemu vga-rb 00012A2003FF4BF56760070380F910a00b00f06gY
+qemu vga-rb 00012A2003FF4BF5676FF70380F910a00b00f06gY
+
+**One field differs, and it is the deliberate one** — case `6`, `in 0x3BA` while
+the miscellaneous output register reads 0x67:
+
+  - QEMU answers `FF`. Its `vga_ioport_invalid` keeps the legacy chip's whole-half
+    mutual exclusion: with the colour/mono bit set for colour, the entire
+    0x3B0-0x3BF block is declared not decoded, so the read floats high.
+  - This card answers `00`, the real input-status-1 value at that raster instant.
+    IBM VGA TR puts only the CRTC pair on the IOCS16 chip-select line (3B4/3B5 vs
+    3D4/3D5) and holds the attribute controller, sequencer, DAC, graphics
+    controller and the feature/misc ports permanently decoded; 3BA is a status
+    mirror, not part of the gated pair. Registered in AGENTS.md §X's D17 as a
+    divergence taken on purpose, from the specification rather than either
+    reference implementation.
+
+Every other field agrees, including the two cases that used to be wrong:
+
+  - case `9` reads 0x3CA (feature control) and both answer `10` — written 0x11,
+    and bit 0 is not part of what the latch returns. It used to read 0x3DA here,
+    which is *input status 1*: an answer that depends on where the raster is at
+    that instant, so the case was measuring the clock rather than the latch.
+  - case `g` is the retrace property, printed as a judgement (Y = both phases
+    seen, N = one missing) rather than a count. Both models answer `Y`. Before
+    the raster status was derived from the CRTC registers this card answered `N`
+    with 0 of 200 samples high — a driver waiting for retrace times out on that,
+    which is why the case exists. The count itself is not in the transcript: it
+    depends on where in the frame the guest happens to poll, and a golden that
+    changes between runs pins nothing. The samples are spread by a ~12k-instruction
+    spin because 200 back-to-back reads land inside a fraction of one frame on
+    any model.

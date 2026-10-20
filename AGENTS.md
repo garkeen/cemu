@@ -118,7 +118,7 @@ ISA 头，`virt.c` 仅引 `platform.h`。
   `floppy` 与 `vga` 两格（`-bios ../seabios/out/bios.bin -vgabios ... -fda`）已从
   `test/x86/run.sh` 删除，覆盖改由两个自足探针承担（`vga_core` 直接写 0x3C4/0x3CE/
   0x3C0 与孔径；`fdc_dma` 自己下 8272A/8237 命令与 DMA 编程，都不借 SeaBIOS 的手），
-  x86 套件 21 格（13 单格 + kvm 7 镜像 + realmode 1）。
+  x86 套件 27 格（19 单格 + kvm 7 镜像 + realmode 1）。
 - 落盘体积：**任何**写入文件不得超过 5MB——测试对拍数据/捕获文件、
   CEMU_DEBUG 观测落盘（`2>file` 的 trace/state/mem/regs 等）一律算；
   超出即视为违规，须改用采样、截断或 CEMU_DEBUG `budget=` 抑制等
@@ -207,6 +207,12 @@ CEMU_DEBUG = item[,item...]
                             **地址按物理地址匹配**：x86 开分页后要看内核某个符号
                             必须先减去映射偏移（内核 .data 的 0xc02c0180 是物理
                             0x2c0180），写线性地址会一行都不出
+  vga-io                   客人对 VGA 卡寄存器文件的一次端口访问一行，读写各一行：
+                            `vga-io rd|wr port=0x3d5 val=0x28`。对应 QEMU 给自家测试用的
+                            vga_std_read_io / vga_std_write_io trace 事件——**两个模型之间
+                            唯一能把"客人的整段对话"逐访问对齐的通道**。寄存器的写流说明
+                            不到客人何时改了主意（那是读决定的），而渲染结果与寄存器文件
+                            都只能给出终点；这条给出的是过程。同 budget/skip。
   dump=ADDR:SIZE:FILE       会话结束时按**物理地址**取回一段客机内存并落盘
                             （可重复，上限 4 段、单段 5MB）。watch= 只说某地址
                             被碰过，说不了客机留在"没人再读的结构"里的东西——
@@ -234,11 +240,29 @@ CEMU_DEBUG = item[,item...]
                             pic0/pic1-imr|eoi|base ioapic lapic-irr|ack|eoi
                             lidt/lgdt gate(门描述符) hostkey kbd-byte kbd-irq
                             aux-byte aux-irq(IRQ12) hostmouse mouse-inj key-inj
+                            gatecall int=<向量> ax= bx= cx= dx= ds= es= at=<cs:ip>
+                            gateret ax= bx= cx= dx= cf= at=<cs:ip> —— 软件 INT n
+                            的两半。参数不止在 AX 里：AH=48h 的容量在 BX、AH=3Dh
+                            的文件名在 DS:DX、AH=0Ah 的缓冲在 ES:DX，只报 AX 的
+                            一行能说出"内存不够"却说不出客人要了多少；返回值也不
+                            止 AX：int 10h AH=0Fh 的页号在 BH，DOS AH=45h 的重复
+                            句柄在 AX，而 BIOS/DOS 一律用 CF 报败。两半按调用者
+                            CS:IP 配对，不靠顺序，所以夹在中间的硬件中断挪不动
+                            配对。只对软件中断发（外部中断与 CPU 抛的异常里 AX 与
+                            返回值无关）。QEMU 侧无对照物：它的 -d int 整块在
+                            `if (cr0 & PE)` 里且只在入口触发，实模式一条不出、
+                            也没有返回值（见 progress.md 片 33）
                             reset-req(设备请求机器复位)
                             fdc-cmd(原始命令字/解码值) fdc-res(结果相位) fdc-irq
                             fdc-rw fdc-xfer(实际搬运字节) dma-xfer(计数寄存器/
                             mode&lt;&lt;8|道号&lt;&lt;4|masked) dma-reg
                             hostserial hostbyte inputopen inputpoll
+                            vga-mode(宽,高) vga-shapes(AR10图形位|chain4<<1|
+                            odd_even<<2|双扫描<<3|移位<<4|平面<<6, 起始偏移)
+                            vga-timing(R9|R18<<8|R7<<16, R13|GR6<<8|GR5<<16)
+                            —— 显示卡只在**画面变化**时发这三行。客人自己编程
+                            卡时（本项目的 Windows 1.01 显示驱动就是不经 int10
+                            硬编码寄存器）靠它把整场启动的模式序列读出来
   mouse=DX:DY:BUTTONS[:WHEEL]@N
   key=SCAN[:EXT[:UP]]@N
                             合成宿主输入（探针作为客人按不了鼠标、也按不了键，
@@ -251,15 +275,25 @@ CEMU_DEBUG = item[,item...]
                             键盘交给 sink 的那个三元组。@N 必填：缺省的节奏
                             等于替调用方做决定
   screen                    无帧文本行：客机控制台镜像，**整行输出**（控制台一行
-                            80 列，事件表 DETAIL 只有 41，截断后读不了 call trace）
+                            80 列，套进事件表只剩列框，call trace 就读不出来了）
   utf8                      UTF-8 边框（默认 ASCII，Windows 代码页安全）
 ```
 
 - 输出走 stderr，`2>file` 留档；热路径零成本（发射点一个位测试，
   类别掩码 init 时解析一次）。
-- 事件表统一列 `KIND │ PC │ RAW │ MNEMONIC │ DETAIL │ FLAGS`，KIND：
+- 事件表统一列 `KIND │ PC │ RAW │ MNEMONIC │ DETAIL │ FLAGS`（DETAIL 宽 88：
+  一行 BIOS 调用要装下 `int/ax/bx/cx/dx/ds/es/at`，宽度不够就等于为它加宽了列
+  还是把它截了），KIND：
   I 指令 / L 读 / S 写 / T 陷阱 / B 设备 / W 观测点 / O IR 操作转储 / K 标记
   （K 与 screen 都是无帧行：K 走事件表，screen 走整行文本）。
+- **PC 列打的是取指地址（线性地址），不是段内偏移**：x86 实模式的 `cpu->pc` 是
+  EIP，别的工具（gdb 的 `$pc`、QEMU 的 `-d exec`、断点）都按 CS base + EIP 命名
+  代码位置，所以 `isa_ops.gdb_pc` 这一接缝把两者对上，观测行与断点、与 `x/i` 才
+  互相翻得动（riscv 的提交 pc 本来就是线性的，接缝留 NULL）。
+- **无帧行（K）的 PC 列打的是已退休指令数**，不是地址：mark/watch/gate 这类行没有
+  指令帧可依赖，此前它们不带任何时刻，两行之间无法排序、也无法在下一轮复现。板级
+  把 `inst_count` 交给中枢（`DebugSetClock`）后，看到的一行 `inst=N` 就能用
+  `--max-inst=N` 重跑到同一刻，会话收尾再按 `dump=` 把客机状态取回来。
 - 症状 → 命令配方速查：
 
 ```bash
@@ -298,6 +332,28 @@ CEMU_DEBUG="watch=0x2c0000:0x800:w" ./cemu.exe ... img 2> idt.txt
 CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 ```
 
+- **两模型同一条字节流的抓手是固件的 debugcon 口（0x402），不是 COM1。** SeaBIOS 的
+  `printf_debug` 同时写 0x402 与 COM1（`seabios/src/output.c` 的 `debug_putc`），
+  cemu 侧的 0x402 是 `src/device/misc/debugcon.c` 的 debugcon 设备（读回 0xE9，
+  固件靠它探测）。DOS 与 BIOS 打的任何消息两边都能逐字节比。
+  QEMU 侧的接法是 `-chardev file,id=dbg,path=X` 加
+  `-device isa-debugcon,iobase=0x402,chardev=dbg`；它的 `-debugcon file:X` **单用
+  录不到东西**（pc 机器自带的 `isa-debugcon` 是空 chardev）。另有两个坑：
+  `-monitor stdio` 的 stdin 管道一到 EOF 就让 QEMU 直接退出（什么都没引导），
+  `-icount sleep=off` 会把虚拟时钟在 `hlt` 上冻住、DOS 的空闲循环自锁。
+  **这属于仓外的对拍工具，不进仓**：套件里任何一格都不许引导固件/软盘/光盘镜像
+  （§七），所以别把它做成测试或提交进 `test/`、`tools/`。
+  连带一件对拍的前提：**VGA option ROM 也在这条通道里**，而两个模型默认跑的不是
+  同一个 ROM —— QEMU 加载它自己的 `share/vgabios-stdvga.bin`，与
+  `seabios/out/vgabios.bin` 不是同一个构建（版本串里写着，`VBE DISPI` 那些字符串
+  一个有没有就是判据）。`-fw_cfg name=opt/isa-vga/rom` 不生效、
+  `-global VGA.romfile=` 会把 ROM 顶掉到根本不跑；可行的接法是给 cemu 的
+  `out/vgabios.bin` 加上 PCI ROM 头（固件侧 `CONFIG_VGA_PCI=y`）再放进 QEMU 的
+  `share/vgabios-stdvga.bin`。**对拍之前先核这一条**，否则两边跑的不是同一个 ROM。
+  ⚠ **但 ROM 不同不等于原因**：2026-10-02 实测过，把 cemu 自己的 ROM 装进 QEMU
+  之后 QEMU 照样 `set VGA mode 10` 进 640×350 桌面，而 cemu 用同一个 ROM 退回
+  mode 3 —— 所以 win101 的分歧**在机器上，不在固件构建上**。见 progress.md 片 33。
+
 - 交互式调试器/REPL、反汇编器、GUI 输出立项为阶段 3.5（见 arch.md 阶段计划：
   gdb RSP stub / Win32 显示通道 / 图形调试前端；前端不内置反汇编，反汇编一律
   走外部工具）。在 3.5 落地前 CEMU_DEBUG 仍是唯一调试入口（mnemonic 由译码表给出）。
@@ -309,13 +365,15 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 
 | 编号 | 位置 | 缺失 | 参考出处 | 恢复阶段 | 状态 |
 |---|---|---|---|---|---|
+| D6 | gdbstub.c 硬件观察点 | **`Z3`（只读观察点）不实现，回空包**：x86 的 DR7 R/W 字段只有 写 / I/O / 读写 三种编码（SDM vol.3 表 17-2），没有"只读"，本机不把它偷偷放宽成"读写"（那会在客人从没要求过的存储上停住）；gdb 因此退回自己的软件观察点。riscv 侧 `gdb_set_watch/gdb_clear_watch/gdb_watch_hits` 三个接缝为 NULL，trigger 模块与 RSP 之间还没有那条通道。另外复位会清掉 DR7 与归属掩码（SDM vol.3 17.2），所以 guest 重启后 gdb 之前装的观察点全部失效，而 stub 的表不会主动收回 | RSP 规范 `Z/z` 包；SDM vol.3 17.2（DR7 的 R/W 编码）与 17.3.1（数据断点在指令完成后以 #DB 报告）；匹配走 CPU 自己的 DR0-DR7，见 `src/cpu/isa/x86/exec.c` 的 `x86_gdb_set_watch` | riscv 一侧把三个接缝接到 `cpu/isa/riscv64/trigger.c` 的 mcontrol 上；x86 一侧的"只读"没有恢复计划（编码里就没有） | 登记中 |
 | D7 | LR/SC 单核预留集 | 无多核冲突语义 | spike 单核同款；规格允许 SC 假失败 | 多核引入时 | 登记中 |
 | D11 | htif.c HTIF syscall（dev0/cmd0）报错退出 | 无 fesvr syscall 设备 | fesvr htif_t::handle_syscall | 阶段 5 cesdk | 登记中 |
 | D13 | x86 x87 FPU 与 RDTSC | **x87 FPU 未实现**：本机 CPUID 报 EDX.FPU = 0（无 FPU），因此 ESC 指令（D8-DF）按"无 FPU 处理器"语义执行——CR0.TS/EM 置位时先 #NM，否则解码 modrm 后当 NOP（tiny386 ESC() 同款；386SX/486SX 上 Linux 就是这么引导的）。**RDTSC 仍为显式 ud()**（0F 31） | intel SDM vol.2/vol.3（ESC 与 CR0.EM/TS 语义）；tiny386 i386.c 的 ESC() 宏；Linux arch/x86/boot/setup.S 的 FPU 探测（靠 ESC 为 NOP 判定"无 FPU"） | 真 FPU（含 RDTSC 与 CPUID 特性位）在需要 x87 算术的客户机出现时（Linux 用户态/浮点程序） | 登记中 |
-| D17 | vga.c 渲染与显示通道 | VGA 家族核本身已实现（4 平面 256KB、0x3C0-0x3DF 四组寄存器、平面/奇偶/链式寻址、写模式 0-3、读模式 0/1、256 色 DAC、文本与 16 色平面图形渲染、CRTC 驱动光栅状态），CGA/EGA 是它的兼容层；剩下的是：**链式 256 色（模式 13h）只做寻址不渲染**（渲染器只画文本、16 色平面与 CGA 4/5/6 的 2bpp/1bpp）；**无 VBE**（固件 CONFIG_VGA_VBE=0，int10 4F 不支持，无线框模式与线性帧缓冲）；**行比较/分屏（CRTC R18）与滚动的平滑滚动（panning）未实现**；**过扫描边框不渲染**、**CGA 复合 NTSC 伪色未做**；**光笔端口 0x3DB/0x3DC 未实现**（VGA 家族无此设备）；**闪烁/光标相位仍取墙钟的场倍数周期**，不跟随实际场相位 | IBM VGA Technical Reference；IBM CGA Technical Reference；FreeVGA；QEMU hw/display/vga.c 行为旁证 | 链式 256 色与 VBE 在需要 Mode X / 线性帧缓冲的客户机（win101 之上的图形软件）出现时；光栅精确时序在需要逐像素时序的软件（raster 技巧 demo）出现时再校准 | 登记中 |
-| D19 | PIIX3 芯片组、IDE 与 IOAPIC | IOAPIC 只投递 fixed 与 lowest-priority，**NMI/SMI/INIT/ExtINT 四种交付模式不投递**；PIIX3 ISA 桥的 PIRQ 路由字节 0x60-0x63 无消费者（IDE 跑兼容模式，没有 PCI 设备拉 INTx）；XBCS/PM/DMA 块未做；ATA 侧无 LBA-48 与 multi-sector（未实现的命令按规格 ABRT） | ATA/ATAPI-7 §6.3（未实现命令的应答就是 ABRT）；QEMU hw/isa/piix3.c、seabios src/fw/pciinit.c piix_isa_bridge_setup；IOAPIC 交付模式：82093AA datasheet §3.2.4；NMI 输入：SDM vol.3 §6.7 | NMI/SMI 交付模式要先给 CPU 加 NMI 输入（本机无 SMM、单 APIC、无 PIC→IOAPIC 通路）；PIRQ 需要真拉 INTx 的 PCI 设备；PM/ACPI 在需要挂起/电源管理时；LBA-48 在需要 >128 GiB 或客户机强制时 | 登记中 |
+| D17 | vga.c 渲染与显示通道 | VGA 家族核本身已实现（卡的显存 16MB：平面按 dword 交织存放，0xA0000-0xBFFFF 孔径最宽的形状（GR6 mapping 1、非奇偶）达 512KB，BAR0 与 DISPI `VIDEO_MEMORY_64K` 都由同一个 `kVgaVramSize` 派生、0x3C0-0x3DF 四组寄存器、平面/奇偶/链式寻址、写模式 0-3、读模式 0/1、256 色 DAC、文本与 16 色平面图形渲染、CRTC 驱动光栅状态、DISPI 寄存器对 0x1CE/0x1CF 的读写与边界、PCI function 00:02.0 与帧缓冲 BAR），CGA/EGA 是它的兼容层；剩下的是：**链式 256 色（模式 13h）只做寻址不渲染**（渲染器只画文本、16 色平面与 CGA 4/5/6 的 2bpp/1bpp）；**VBE 只有 DISPI 那道门**：ENABLE/XRES/YRES/BPP/X_OFFSET 等寄存器存而不切模式，线性帧缓冲是 PCI BAR 上的显存窗口、不由 DISPI 编程（所以客人经 VBE 切模式会读到写回的寄存器却看不到画面变）；**0x1CE/0x1CF 的字节访问不触及寄存器组**（走 8 位路径的 default：读回高、写无效；ROM 只用 outw/inw，bochsvga.c:75-81，故无客人受影响）；**行比较/分屏（CRTC R18）与滚动的平滑滚动（panning）未实现**；**过扫描边框不渲染**、**CGA 复合 NTSC 伪色未做**、**光笔端口 0x3DB/0x3DC 未实现**（VGA 家族无此设备）；**闪烁/光标相位仍取墙钟的场倍数周期**，不跟随实际场相位（0x3DA/0x3BA 的回扫位已改成按寄存器推出的光栅位置，闪烁与光标还没跟上） | IBM VGA Technical Reference；IBM CGA Technical Reference；FreeVGA；QEMU hw/display/vga.c 行为旁证；VBE/DISPI 寄存器定义与访问宽度见 seabios/vgasrc/bochsvga.h 与 vgasrc/bochsvga.c；未知 id 不予接受、越界索引不改指针这两条按 qemu-system-i386 -vga std 实测裁定（test/x86/probe/vga_dispi_qemu.txt） | 链式 256 色在需要 Mode X 的客户机出现时；DISPI 切模式在需要经 VBE 起图形界面的客户机出现时；NTSC 伪色待有可溯源的规范色表再做（QEMU 不建模，无参照即不实现，§一）；光栅精确时序在需要逐像素时序的软件（raster 技巧 demo）出现时再校准；**片选线与参考实现有意不同**：按 IBM VGA TR，IOCS16（MSR bit0）只是 CRTC 那一对（3B4/3B5 与 3D4/3D5）的片选线，属性控制器 3C0/3C1、序列器 3C4/3C5、DAC 3C6-3C9、GC 3CE/3CF、feature/misc 恒译码，而 QEMU 的 `vga_ioport_invalid` 与 v86 都沿用老芯片的整半区互斥模型（彩色模式下 3B0-3BF 整块作废）——实测到这条的具体形状是 `vga_readback.asm` 的 case 6（misc=0x67 时读 0x3BA：本机答真实的状态位，QEMU 答浮高的 0xFF）。注意一条撤回的旧证据：先前记的"census 实测 13 个属性控制器读回差异"是**探针自己的错**——`in al,0x3da` 编不出来（8 位立即数端口形式，0x3DA 被截成 0xDA），两边都没复位触发器；改成 DX 形式后 18 个 AR 读回与 QEMU 逐字节相同（test/x86/probe/vga_census_qemu.txt）；**输入状态 0（0x3C2 读）只报复位值**，光笔、开关感应、RAM 反馈三根线未建模 | 登记中 |
+| D19 | PIIX3 芯片组、IDE 与 IOAPIC | IOAPIC 只投递 fixed 与 lowest-priority，**NMI/SMI/INIT/ExtINT 四种交付模式不投递**；PIIX3 ISA 桥的 PIRQ 路由字节 0x60-0x63 无消费者（IDE 跑兼容模式，没有 PCI 设备拉 INTx）；XBCS 与 DMA 块未做；PM 函数已交付（8086:7113、00:01.3，PMBASE 编程后才译码的 32 字节块 + ACPI PM timer 3.579545MHz —— 固件 `pmtimer_setup` 由此把微秒时基从 8254 切到 PM timer），但**块里只有计时器有内容**：PM1a 状态/事件恒读 0、写入丢弃，**不投 SCI、没有关机/睡眠路径**，SMBus 与 ACPI 表（DSDT/FADT）未做；ATA 侧无 LBA-48 与 multi-sector（未实现的命令按规格 ABRT） | ATA/ATAPI-7 §6.3（未实现命令的应答就是 ABRT）；QEMU hw/isa/piix3.c、seabios src/fw/pciinit.c piix_isa_bridge_setup；IOAPIC 交付模式：82093AA datasheet §3.2.4；NMI 输入：SDM vol.3 §6.7 | NMI/SMI 交付模式要先给 CPU 加 NMI 输入（本机无 SMM、单 APIC、无 PIC→IOAPIC 通路）；PIRQ 需要真拉 INTx 的 PCI 设备；PM/ACPI 在需要挂起/电源管理时；LBA-48 在需要 >128 GiB 或客户机强制时 | 登记中 |
 | D21 | i8042.c 软驱数据线 | 8042 侧的软驱数据线（键盘控制器输出端口上那条给软驱控制器的数据线）没有建模；本机的软驱路径由 8272A + 8237 通道 2 承担，固件不经过这条线 | PC/AT Technical Reference（8042 输出端口）；IBM 8042 数据表 | 需要复现"经 8042 传盘"的硬件时 | 登记中 |
 | D32 | uart16550.c 接收侧 FIFO 语义 | `PushRx` 无视 FCR.FE 一直缓存 16 字节：实机 16550 在 FIFO 关闭时只保留 1 字节（RBR），后续字节按溢出丢弃并置 LSR.OE，本机不丢。后果：不开 FIFO 的客户机驱动在本机也能收全突发（sermouse 探针原先正是靠这处偏差通过的），在实机/QEMU 上会丢字节 | 16550D datasheet（FCR.FE、RBR 单字节与 OE）；QEMU hw/char/serial.c `serial_receive1` | 需要精确接收溢出语义的客户机出现时（sermouse 探针已改为开 FIFO，销账无阻塞） | 登记中 |
+| D33 | vga.c CRTC R17 的 CGA 兼容地址旋转 | R17 bit0/bit1 为 0 时，显示地址的 bit14/bit15 由扫描行的奇偶给出（CGA 模式 4/5/6 的两 bank 交错）。本机只定义了位含义（`kCrtcModeCgaCompat*`），渲染路径未用，因此 CGA 兼容模式画的是同一 bank 的数据 | IBM VGA TR 3.1a（CRTC mode control）；QEMU hw/display/vga.c vga_draw_graphic（`if (!(cr[0x17] & 1))` 用 `y1 & 1` 替换地址 bit14、`if (!(cr[0x17] & 2))` 用 `y1 & 2` 替换 bit15） | CGA 模式 4/5/6 的客户（DOS 里跑依赖两 bank 交错的老游戏）出现时；VGA 原生平面模式不受影响（mode 0x10/0x12 的 R17 = 0x85，bit0/bit1 均置位） | 登记中 |
 | E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中 |
 
 ## 附：关键行为裁决存档（修复时的先例依据）

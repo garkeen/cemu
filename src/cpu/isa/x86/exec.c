@@ -120,26 +120,31 @@ static void wr32(uint64_t lin, uint32_t v) { bus_store(lin, 4, v); }
 
 // ---- debug registers (SDM vol.3 ch.17) ---------------------------------------
 
+// LENi is a code; these are the sizes it names. The 8-byte entry is kept even
+// though this machine is 32-bit because QEMU/KVM honour it there and the kvm
+// debug test arms DR1 with LEN=11 (AGENTS.md 附录's adjudication).
+const uint32_t kDrLenBytes[kDrLenCount] = {1, 2, 4, 8};
+
 // Breakpoint i is enabled by DR7.Li/Gi (bits 2i..2i+1) and matches by its
 // R/W field: 00 execute (LEN must be 00), 01 data writes, 10 I/O ports,
 // 11 data read/write. The R/Wi fields sit at DR7[17:16+4i] and LENi at
 // DR7[19:18+4i] (SDM vol.3 figure 17-3; the kvm debug test's 0x00d0040a
 // arms DR1 write/8-byte only under this layout).
-static int dr_enabled(int i) { return (s->dr[7] >> (2 * i)) & 3; }
-static int dr_rw(int i) { return (int)((s->dr[7] >> (16 + 4 * i)) & 3); }
+static int dr_enabled(int i) { return (s->dr[7] >> (2 * i + kDr7LBase)) & 3; }
+static int dr_rw(int i) { return (int)((s->dr[7] >> (kDr7RwBase + 4 * i)) & 3); }
+static int dr_len_code(int i) { return (int)((s->dr[7] >> (kDr7LenBase + 4 * i)) & 3); }
 
 // Data watchpoints: the #DB is a trap delivered after the instruction
 // completes (SDM vol.3 17.3.1), so the match only records DR6.Bn here and
 // step.c delivers. Reads match only the read/write encoding.
 static void WatchData(uint64_t lin, int size, int write) {
-  if (!(s->dr[7] & 0xff)) return;
+  if (!(s->dr[7] & kDr7AnyLocal)) return;
   for (int i = 0; i < 4; i++) {
     if (!dr_enabled(i)) continue;
     int rw = dr_rw(i);
-    if (rw == 0 || rw == 2) continue;  // execute / I/O breakpoints don't match data
-    if (rw == 1 && !write) continue;
-    static const int kBytes[4] = {1, 2, 4, 8};
-    uint64_t lo = s->dr[i], hi = lo + kBytes[(s->dr[7] >> (18 + 4 * i)) & 3];
+    if (rw == kDr7RwExec || rw == kDr7RwIo) continue;  // not data breakpoints
+    if (rw == kDr7RwWrite && !write) continue;
+    uint64_t lo = s->dr[i], hi = lo + kDrLenBytes[dr_len_code(i)];
     // The trap fires when any byte of the access lies in the watch range.
     if (lin < hi && lo < lin + size) d.watch_hit |= 1u << i;
   }
@@ -150,10 +155,10 @@ static void WatchData(uint64_t lin, int size, int write) {
 // Like data watchpoints this is a trap, recorded for post-instruction
 // delivery.
 static void IoBpHit(uint16_t port) {
-  if (!(s->dr[7] & 0xff)) return;
+  if (!(s->dr[7] & kDr7AnyLocal)) return;
   for (int i = 0; i < 4; i++) {
-    if (!dr_enabled(i) || dr_rw(i) != 2) continue;
-    int lenc = (int)((s->dr[7] >> (18 + 4 * i)) & 3);
+    if (!dr_enabled(i) || dr_rw(i) != kDr7RwIo) continue;
+    int lenc = dr_len_code(i);
     int len = lenc == 0 ? 1 : lenc == 2 ? 4 : 0;
     if (len && port >= s->dr[i] && port < s->dr[i] + len) d.watch_hit |= 1u << i;
   }
@@ -181,6 +186,61 @@ static void DrWrite(int reg, uint32_t v) {
   } else {
     s->dr[reg] = v;
   }
+}
+
+// The gdb stub's door onto the same debug registers MOV DRn programs (SDM
+// vol.3 17.2), so an RSP `Z2`/`Z4` and a guest debugger's own watchpoint are one
+// machine state with one matcher, and the #DB that stops the session is the one
+// the CPU already raises. Representability is the encoding's, not ours to
+// stretch: gdb's write and access kinds are the 01 and 11 R/W encodings, a
+// *read-only* watchpoint has no encoding at all (11 means read OR write), the
+// size has to be one of the four LEN codes, and a data breakpoint must be
+// aligned to its size. Anything the encoding cannot say is refused here and
+// answered "unsupported" by the stub. DR7 goes through DrWrite so the reserved
+// bits obey the same rule as they do for a guest's own MOV.
+int x86_gdb_set_watch(CpuState* c, uint64_t addr, uint32_t len, int kind) {
+  cpu = c;
+  s = (x86_state*)cpu->priv;
+  fl = &s->fl;
+  // RSP kind 2 names a write watchpoint and 4 an access one. Kind 3 (read only)
+  // has no encoding in DR7's R/W field, so it is refused here rather than
+  // silently widened to "read or write" -- a widened watchpoint would stop the
+  // session on stores the guest never asked to trap on.
+  int rw = kind == 2 ? kDr7RwWrite : kind == 4 ? kDr7RwAccess : -1;
+  if (rw < 0) return -1;
+  int lenc = -1;
+  for (int i = 0; i < kDrLenCount; i++)
+    if (kDrLenBytes[i] == len) lenc = i;
+  if (lenc < 0 || (addr & (len - 1)) != 0) return -1;
+  for (int i = 0; i < 4; i++) {
+    if (dr_enabled(i)) continue;
+    DrWrite(i, (uint32_t)addr);
+    uint32_t v = s->dr[7];
+    v &= ~(uint32_t)((3u << (2 * i + kDr7LBase)) | (3u << (kDr7RwBase + 4 * i)) |
+                     (3u << (kDr7LenBase + 4 * i)));
+    // Only the local enable: the general bit means "survive a task switch"
+    // (SDM vol.3 17.2.3), and dr_enabled already matches on either.
+    v |= (uint32_t)(1u << (2 * i + kDr7LBase)) | (uint32_t)(rw << (kDr7RwBase + 4 * i)) |
+         (uint32_t)(lenc << (kDr7LenBase + 4 * i));
+    DrWrite(7, v);
+    s->gdb_watch_mask |= 1u << i;  // step.c reports hits on this slot to the stub
+    return i;
+  }
+  return -1;  // all four debug registers are taken
+}
+
+int x86_gdb_clear_watch(CpuState* c, int slot) {
+  if (slot < 0 || slot >= 4) return -1;
+  cpu = c;
+  s = (x86_state*)cpu->priv;
+  fl = &s->fl;
+  uint32_t v = s->dr[7];
+  v &= ~(uint32_t)((3u << (2 * slot + kDr7LBase)) | (3u << (kDr7RwBase + 4 * slot)) |
+                   (3u << (kDr7LenBase + 4 * slot)));
+  DrWrite(7, v);
+  DrWrite(slot, 0);
+  s->gdb_watch_mask &= ~(1u << slot);
+  return 0;
 }
 
 // ---- protection faults (SDM vol.3 5.3 / vol.2 exception pages) ---------------
@@ -1020,6 +1080,19 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   eip = tss16 ? krd16(v.base + 0x0e) : krd32(v.base + 0x20);
 }
 
+// The registers a BIOS/DOS service reads as its arguments, handed to the hub in
+// its plain-integer form (debug.h DbgCallArgs). Emitted on both halves of a
+// software INT n: at the request these are the guest's parameters, at the IRET
+// they are whatever the handler left behind, which is the answer.
+static void GateArgs(DbgCallArgs* o) {
+  o->arg_ax = eax;
+  o->arg_bx = ebx;
+  o->arg_cx = ecx;
+  o->arg_dx = edx;
+  o->arg_ds = s->sreg[ds_i];
+  o->arg_es = s->sreg[es_i];
+}
+
 // Protected-mode IRET (SDM vol.2 IRET Operation). Four shapes: a return
 // within virtual-8086 mode (VM86 stays VM86 and pops only EIP/CS/EFLAGS), a
 // nested-task return (NT=1: the current TSS's back-link names the interrupted
@@ -1071,6 +1144,11 @@ static void pm_iret(void) {
   uint16_t sel = (uint16_t)stack_peek(w, w);
   uint32_t flv = stack_peek(w, 2 * (uint32_t)w);
   if (!d.w32) flv &= 0xffff;
+  // CF before the flags image below replaces it: this is the handler's verdict,
+  // which is where every BIOS/DOS service reports failure (debug.h
+  // DebugGateCall). IRET touches no general-purpose register, so AX still holds
+  // the answer the caller is about to branch on.
+  int cf = fl->cf;
 
   // RETURN-TO-VIRTUAL-8086-MODE: the interrupted procedure was a VM86 one and
   // this is a CPL-0 return, so the frame is the VM86 one a delivery pushed —
@@ -1139,6 +1217,14 @@ static void pm_iret(void) {
                         : (esp & 0xffff0000u) | (uint16_t)(esp + (uint32_t)w * 3);
   }
   eip = new_eip;
+  // The answer half, paired with the gatecall row that shares this caller's
+  // CS:IP (debug.h DebugGateCall). Everything has committed, so no fault can
+  // follow and leave the row describing a return that never happened.
+  if (DebugOn(kDbgMark)) {
+    DbgCallArgs a;
+    GateArgs(&a);
+    DebugGateRet(&a, cf, (sel << 16) | (new_eip & 0xffff));
+  }
 }
 
 // Far CALL/JMP through a call gate (SDM vol.3 5.8.4; cross-checked against
@@ -1334,6 +1420,22 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
     uint64_t tbl = s->idtr + (uint64_t)vec * 4;
     uint32_t off = krd16(tbl);
     uint32_t seg = krd16(tbl + 2);
+    // The IVT entry a guest's INT n actually lands on (the protected-mode path
+    // prints the same thing for its gate below). A real-mode guest's calls into
+    // the firmware are how it asks the machine what it is -- int 15h for memory,
+    // int 10h for video -- and the answers it acts on are invisible without this
+    // row: nothing else in the event stream records that a service was called,
+    // let alone which one (kDbgMark, the same note the gate path emits).
+    if (DebugOn(kDbgMark)) DebugMark("gate", vec, (int)(((seg << 16) | off) & 0xffffffff));
+    // The request half of the conversation (debug.h DebugGateCall): a real-mode
+    // guest's AH names the BIOS/DOS service it is asking for, and the IVT row
+    // above says nothing about which one that was. CS is still the caller's
+    // here -- seg_commit below is what switches it.
+    if (soft && DebugOn(kDbgMark)) {
+      DbgCallArgs a;
+      GateArgs(&a);
+      DebugGateCall(vec, &a, ((uint32_t)s->sreg[cs_i] << 16) | (ret_eip & 0xffff));
+    }
     kpush16(fl->word | 2);
     kpush16(s->sreg[cs_i]);
     kpush16((uint16_t)ret_eip);
@@ -1376,6 +1478,14 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
   // handler never runs, the difference between "delivered to the right stub"
   // and "delivered to the early default handler" is this one number (kDbgMark).
   if (DebugOn(kDbgMark)) DebugMark("gate", vec, (int)off);
+  // The request half of the conversation (debug.h DebugGateCall), software
+  // INT n only: on an external interrupt or an exception AX is not a service
+  // selector, and nothing is being asked for. CS is still the caller's here.
+  if (soft && DebugOn(kDbgMark)) {
+    DbgCallArgs a;
+    GateArgs(&a);
+    DebugGateCall(vec, &a, ((uint32_t)s->sreg[cs_i] << 16) | (ret_eip & 0xffff));
+  }
 
   // The gate's code segment (SDM vol.2 INT: table limits, executable,
   // DPL <= CPL, present — a faulting gate is never entered; the target may
@@ -4158,6 +4268,10 @@ void run_op(uint8_t op) {
       // Real mode: pop (E)IP, CS, (E)FLAGS. VM never loads; RF does (SDM
       // IRET Operation — the #DB handler re-arms RF through its image).
       // 16-bit form loads only the low half.
+      // CF before the flags image below replaces it: the handler's verdict
+      // (debug.h DebugGateCall). IRET pops no general-purpose register, so AX
+      // still holds the answer the caller branches on.
+      int cf = fl->cf;
       uint32_t new_eip = pop_w();
       uint16_t sel = (uint16_t)pop_w();
       uint32_t flv = pop_w();
@@ -4170,6 +4284,15 @@ void run_op(uint8_t op) {
         fl->word = (flv & ~(0x20000u)) | 2;
       else
         fl->word = (fl->word & 0xffff0000u) | ((flv & 0xffffu) | 2);
+      // The answer half of the conversation (debug.h DebugGateCall), paired
+      // with the gatecall row carrying this same caller CS:IP. Real mode is
+      // where a DOS guest's BIOS conversation happens, and it is the half of
+      // the return QEMU's -d int never prints.
+      if (DebugOn(kDbgMark)) {
+        DbgCallArgs a;
+        GateArgs(&a);
+        DebugGateRet(&a, cf, ((uint32_t)sel << 16) | (new_eip & 0xffff));
+      }
       break;
     }
     case 0xd0:
@@ -4518,6 +4641,10 @@ void x86_init(CpuState* c) {
   // bits read 1; DR7's bit 10 reads 1 and every breakpoint is disabled.
   st->dr[6] = kDr6Rsvd1;
   st->dr[7] = kDr7Rsvd1;
+  // A reset disables every breakpoint (SDM vol.3 17.2), the stub's with the
+  // guest's: the ownership mask goes with the registers it names.
+  st->gdb_watch_mask = 0;
+  st->watch_hits = 0;
   // IA32_APIC_BASE reset state (SDM vol.3 11.4.3): default base, APIC
   // enabled, BSP.
   st->msr_apic_base = 0xFEE00000ULL | 0x800ULL | 0x100ULL;

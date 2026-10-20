@@ -70,7 +70,13 @@ int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuStat
       // virtual-clock warp) or yield the host for a millisecond and let the
       // wait elapse in wall time. The fallback is not optional when no device
       // is due: only the host can produce a key press.
-      int64_t wake_us = (m->skip_idle && m->next_event_us) ? m->next_event_us(m) : 0;
+      // -icount takes the jump unconditionally: its clock only moves through
+      // retired instructions, so letting a halt wait out in wall time would
+      // advance no virtual time and the interrupt meant to wake it would never
+      // arrive (QEMU advances the icount deadline across a halt for the same
+      // reason).
+      int warp_idle = m->skip_idle || HostTimerIcountOn();
+      int64_t wake_us = (warp_idle && m->next_event_us) ? m->next_event_us(m) : 0;
       if (wake_us > 0)
         HostTimerWarp(wake_us);
       else
@@ -86,6 +92,7 @@ int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuStat
       continue;
     }
     m->cpu.inst_count++;
+    HostTimerIcountAdvance();
     if (m->reset_pending) {
       // A device asked for a machine reset (port 0x92 bit 0, RCR 0xCF9, the
       // keyboard controller's 0xFE): the guest restarts at the reset vector,
@@ -111,6 +118,7 @@ void BoardRun(Board* m, uint64_t max_inst) {
   // open-bus noise.
   DebugSetMemReader(DebugReadPhys, &m->bus);
   DebugSetFbReader(DebugFbInfo, DebugFbPixels, m);
+  DebugSetClock(&m->cpu.inst_count);
   DebugInit();
   if (m->gdb) {
     // The stub owns run control: sessions (attach/step/continue) alternate

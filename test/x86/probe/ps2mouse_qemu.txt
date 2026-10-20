@@ -1,0 +1,2 @@
+cmd=41 st=000250 unk=ff auxoff=01 irr=10 pkt=09000000290af601
+ps2mouse ok

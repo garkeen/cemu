@@ -28,6 +28,11 @@ void ClintInit(ClintDevice* c, uint64_t timebase_hz) {
   c->host0 = (uint64_t)HostTimerNow();
 }
 
+// mtime counts in the machine's timebase units, scaled from the emulated clock
+// HostTimerNow() reports: host wall time by default, a declared per-instruction
+// rate under -icount, in which case a mtimecmp the guest programs elapses after
+// exactly that many instructions. host0/mtime0 anchor the pair so the first
+// read is zero (QEMU virt: mtime is a free-running counter since reset).
 uint64_t ClintMtime(ClintDevice* c) {
   uint64_t host = (uint64_t)HostTimerNow();
   return c->mtime0 + (host - c->host0) * c->timebase_hz / 1000000;

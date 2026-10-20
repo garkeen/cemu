@@ -36,10 +36,13 @@ static const uint64_t kOutLimit = 5ULL * 1024 * 1024;
 static uint64_t g_out_bytes;
 static int g_limit_hit;
 
-// The one event table every category shares (AGENTS.md §X).
+// The one event table every category shares (AGENTS.md §X). DETAIL carries a
+// whole BIOS-call row ("gatecall int=21 ax=4800 bx=0400 cx=... at=9dbd:09de"),
+// so it is wide enough for the longest of them: a column that truncates the
+// field it was widened for is worse than a narrow one.
 static const TableColumn kEventCols[] = {
     {"KIND", 4, kTableLeft},      {"PC", 16, kTableRight},    {"RAW", 12, kTableLeft},
-    {"MNEMONIC", 19, kTableLeft}, {"DETAIL", 41, kTableLeft}, {"FLAGS", 6, kTableLeft},
+    {"MNEMONIC", 19, kTableLeft}, {"DETAIL", 88, kTableLeft}, {"FLAGS", 6, kTableLeft},
 };
 static Table* g_tbl;
 
@@ -199,6 +202,14 @@ void DebugSetFbReader(DebugFbInfoFn info, DebugFbPixelsFn pixels, void* ctx) {
   g_fb_pixels = pixels;
   g_fb_ctx = ctx;
 }
+
+// ---- the clock frameless rows print -----------------------------------------
+// The hub owns no CPU, so the board hands over the address of its retired
+// instruction counter (debug/debug.h). Installed before DebugInit, which is what
+// opens the session, so every row the session emits has a clock to read.
+static const uint64_t* g_inst;
+
+void DebugSetClock(const uint64_t* inst_count) { g_inst = inst_count; }
 
 static void AddFbDump(const char* spec) {
   if (g_nfbdump >= kMaxFbDumps) {
@@ -485,6 +496,8 @@ void DebugInit(void) {
       g_mask |= kDbgMark;
     else if (!strcmp(tok, "screen"))
       g_mask |= kDbgScreen;
+    else if (!strcmp(tok, "vga-io"))
+      g_mask |= kDbgVgaIo;
     else if (!strncmp(tok, "regs=", 5))
       g_regs_period = atoi(tok + 5);
     else if (!strncmp(tok, "watch=", 6))
@@ -507,7 +520,8 @@ void DebugInit(void) {
       LogError("debug: unknown CEMU_DEBUG item '%s'", tok);
   }
   if (g_mask &
-          (kDbgTraceTable | kDbgMem | kDbgTrap | kDbgBus | kDbgGdb | kDbgMark | kDbgScreen) ||
+          (kDbgTraceTable | kDbgMem | kDbgTrap | kDbgBus | kDbgGdb | kDbgMark |
+           kDbgScreen | kDbgVgaIo) ||
       g_nwatch) {
     g_tbl = TableOpen(kEventCols, 6, g_ascii, g_header_every);
     TableHeader(g_tbl);
@@ -608,14 +622,31 @@ static void CellFlags(Table* t, frame* f) {
 }
 
 // Rows emitted while fetch is still filling insn (the L lines of the fetch
-// itself) must not read insn fields — pass NULL and blank them.
+// itself) must not read insn fields — pass NULL and blank the raw/mnemonic
+// cells. The PC cell is not blank: a frameless row is only useful if it can be
+// placed on the guest's own clock, and `inst` is what makes a checkpoint
+// reproducible as --max-inst=<n> (whose session end then brings the guest state
+// back through dump=).
 static void RowBeginBare(Table* t, char kind) {
   TableRowBegin(t);
   char k[2] = {kind, 0};
   TableRowCell(t, k);
+  char pc[20];
+  snprintf(pc, sizeof(pc), "%016llx", (unsigned long long)*g_inst);
+  TableRowCell(t, pc);
   TableRowCell(t, "");
   TableRowCell(t, "");
-  TableRowCell(t, "");
+}
+
+// The address this step is fetching from. Real-mode x86 keeps that separate from
+// the committed pc (cpu->pc is EIP; the fetch address is CS base + EIP), and
+// every other tool names a code location by the fetch address — gdb's $pc in
+// QEMU's stub, QEMU's -d exec block lines, and the breakpoints the stub accepts
+// (see isa_ops.gdb_pc). Printing the offset here made a watch row impossible to
+// turn into a breakpoint or into a disassembly address whenever CS had a non-zero
+// base, so the PC column carries the fetch address.
+static uint64_t FramePc(frame* f) {
+  return f->isa->gdb_pc ? f->isa->gdb_pc(f->cpu) : f->rec.pc;
 }
 
 static void RowBegin(Table* t, char kind, frame* f) {
@@ -623,7 +654,7 @@ static void RowBegin(Table* t, char kind, frame* f) {
   char k[2] = {kind, 0};
   TableRowCell(t, k);
   char pc[20];
-  snprintf(pc, sizeof(pc), "%016llx", (unsigned long long)f->rec.pc);
+  snprintf(pc, sizeof(pc), "%016llx", (unsigned long long)FramePc(f));
   TableRowCell(t, pc);
   CellRaw(t, f);
   TableRowCell(t, f->rec.mnemonic ? f->rec.mnemonic : "");
@@ -667,7 +698,7 @@ void DebugInsn(frame* f) {
     // no table chrome. The skip window is in instructions (AllowTrace).
     if (AllowTrace(kDbgTraceLine, f->cpu->inst_count)) {
       char line[160];
-      int n = snprintf(line, sizeof(line), "pc=%016llx", (unsigned long long)f->rec.pc);
+      int n = snprintf(line, sizeof(line), "pc=%016llx", (unsigned long long)FramePc(f));
       for (int i = 0; i < f->rec.raw_len && i < 8; i++)
         n += snprintf(line + n, sizeof(line) - (size_t)n, " %02x", f->rec.raw[i]);
       n += snprintf(line + n, sizeof(line) - (size_t)n, " %s -> %016llx\n",
@@ -790,12 +821,67 @@ void DebugMark(const char* what, int a, int b) {
   TableRowEnd(g_tbl);
 }
 
+// See debug.h: a software INT n gets one frameless row per half, like every
+// other mark row but wider than DebugMark's two numbers, because a call's
+// parameters and its answer do not reduce to two. `caller` is (cs << 16) | ip,
+// the same packing the gate row uses for a vector's target, and it is the key
+// the two halves pair on.
+//
+// A software INT n's request row: which vector, and the registers the service
+// reads as its parameters. All of them, because which one matters is the
+// service's choice -- AH=48h takes its size in BX, AH=3Dh its filename in DS:DX
+// -- and a row carrying only AX can report "out of memory" without saying how
+// much was asked for, which is the question the guest came to answer.
+void DebugGateCall(uint32_t vec, const DbgCallArgs* a, uint32_t caller) {
+  if (!DebugOn(kDbgMark) || !Allow(kDbgMark)) return;
+  RowBeginBare(g_tbl, 'K');
+  char det[104];
+  snprintf(det, sizeof(det),
+           "gatecall int=%02x ax=%04x bx=%04x cx=%04x dx=%04x ds=%04x es=%04x at=%04x:%04x",
+           vec, a->arg_ax & 0xffff, a->arg_bx & 0xffff, a->arg_cx & 0xffff, a->arg_dx & 0xffff,
+           a->arg_ds & 0xffff, a->arg_es & 0xffff, (caller >> 16) & 0xffff, caller & 0xffff);
+  TableRowCell(g_tbl, det);
+  TableRowEnd(g_tbl);
+}
+
+// The answer half. BX/CX/DX are here because a handler returns through them too
+// (int 10h AH=0Fh answers the column count in AH and the page in BH; DOS
+// AH=45h answers with the duplicated handle in AX and AH=44h/0Dh uses BX); the
+// caller's segments are not, since a handler that changed them changed the
+// caller's context rather than answering anything.
+void DebugGateRet(const DbgCallArgs* a, int cf, uint32_t caller) {
+  if (!DebugOn(kDbgMark) || !Allow(kDbgMark)) return;
+  RowBeginBare(g_tbl, 'K');
+  char det[80];
+  snprintf(det, sizeof(det), "gateret ax=%04x bx=%04x cx=%04x dx=%04x cf=%d at=%04x:%04x",
+           a->arg_ax & 0xffff, a->arg_bx & 0xffff, a->arg_cx & 0xffff, a->arg_dx & 0xffff, cf,
+           (caller >> 16) & 0xffff, caller & 0xffff);
+  TableRowCell(g_tbl, det);
+  TableRowEnd(g_tbl);
+}
+
+// Guest port access to the card's register file (kDbgVgaIo). Both numbers are
+// hex: a port number and a register value are both read as masks and addresses,
+// and the trace this mirrors (QEMU's vga_std_read_io / vga_std_write_io) prints
+// them that way too -- so the two transcripts line up without a translation step.
+// The direction is in the row because a read and a write are different
+// questions: the write asks the card to change, the read asks it what it thinks.
+void DebugVgaIo(uint32_t port, uint32_t val, int is_read) {
+  if (!DebugOn(kDbgVgaIo) || !Allow(kDbgVgaIo)) return;
+  RowBeginBare(g_tbl, 'K');
+  char det[80];
+  snprintf(det, sizeof(det), "vga-io %s port=0x%03x val=0x%02x",
+           is_read ? "rd" : "wr", port, val & 0xff);
+  TableRowCell(g_tbl, det);
+  TableRowEnd(g_tbl);
+}
+
 // Frameless text row (kDbgScreen): a guest console line read back from the
 // video device. Linux prints only to VRAM (its `console=` came later), so the
 // text mirror is the only way to read its console without a display window.
-// A console line is up to 80 columns and the event table's DETAIL cell is 41
-// wide — a truncated mirror cannot carry a call trace or a panic — so this one
-// category prints whole lines instead of a table row.
+// A console line is 80 columns of the guest's own text, with nothing to put in
+// the table's PC/RAW/MNEMONIC/FLAGS cells, so this category prints whole lines
+// rather than a row of chrome around them.
 void DebugText(const char* kind, const char* text) {
   if (!DebugOn(kDbgScreen) || !Allow(kDbgScreen)) return;
   char line[160];

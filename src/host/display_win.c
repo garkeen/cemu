@@ -231,7 +231,10 @@ HostDisplay* HostDisplayOpen(const char* title, const DisplaySourceOps* ops, voi
 
 void HostDisplayPump(HostDisplay* d) {
   if (!d || d->closed) return;
-  int64_t now = HostTimerNow();
+  // Host time: this throttle exists so the run loop does not reach a syscall on
+  // every step, which is a question about how fast the host goes, not about how
+  // much emulated time the guest has used.
+  int64_t now = HostTimeRealtime();
   if (now < d->next_pump_us) return;
   d->next_pump_us = now + kPumpIntervalUs;
   MSG msg;

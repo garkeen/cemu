@@ -1,0 +1,27 @@
+# Dual run of test/x86/probe/rep_sense.asm, 2026-10-15, same 512-byte boot sector
+# on both models:
+#
+#   cemu  --machine x86 --isa x86 rep_sense.bin
+#   qemu-system-i386 -drive file=rep_sense.bin,format=raw,if=ide,index=0 -boot c \
+#       -display none -serial file:... -no-reboot \
+#       -device isa-debug-exit,iobase=0xf4,iosize=0x4
+#
+# The suite cell compares cemu's live transcript against both lines; they are the
+# same string, which is the whole point of the probe. Exit: debug-exit value 6
+# -> status 13 on both.
+cemu rep-sense 100021200000300020400011500030600000
+qemu rep-sense 100021200000300020400011500030600000
+
+What each case fixes (label, the counter left in CX as four hex, then why the loop
+stopped): F2 CMPSB stops on the first mismatch, F3 CMPSB stops on the first match,
+F3 SCASB finds the terminator, F2 SCASB finds a byte, and MOVS (the control) must
+not see a flag test at all.
+
+This file exists because the sense of the two prefixes was asserted from assembler
+conventions rather than measured, and the assertion was wrong: NASM assembles
+`repe cmpsb` to F3 A6, while a different tool disassembles those same bytes as
+`repne`. The probe therefore carries raw bytes (`db 0xf2,0xa6`) so the measurement
+is about the machine and not about a mnemonic spelling. A model that maps the two
+bytes onto the wrong senses terminates every name scan early or late — a control
+flow divergence in the guest, not a slow one — and that is exactly what it would
+have done had the earlier claim been "fixed".

@@ -31,6 +31,16 @@ typedef struct Bus {
 
 // Registers an MMIO device window (accesses go through ops->Read/Write).
 void BusAddRegion(Bus* bus, uint64_t base, uint64_t size, const DeviceOps* ops, void* dev);
+// Points an already-registered device window at a new address, adding one if the
+// device has none yet. A PCI device's I/O window lives where firmware programs
+// its BAR (PCI spec §6.2, and the base can be reprogrammed — seabios
+// src/fw/pciinit.c runs again on a reboot path), so a device whose window is
+// BAR-driven needs to move its decode rather than assume the one it started at.
+void BusRelocateRegion(Bus* bus, const DeviceOps* ops, void* dev, uint64_t base, uint64_t size);
+// Stops decoding a device window (the firmware disabled the device or zeroed its
+// BAR: PCI spec §6.2.5.1 leaves a BAR written with 0 decoding nothing). Returns 1
+// if the device had one.
+int BusRemoveRegion(Bus* bus, const DeviceOps* ops, void* dev);
 // Registers RAM with its host backing store for direct access.
 void BusAddRamRegion(Bus* bus, uint64_t base, uint64_t size, const DeviceOps* ops, void* dev,
                      uint8_t* host);

@@ -1,0 +1,2 @@
+vga-core ok
+

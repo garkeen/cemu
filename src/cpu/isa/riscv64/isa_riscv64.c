@@ -159,4 +159,9 @@ const isa_ops k_isa_riscv64 = {
     riscv_gdb_read_regs,
     riscv_gdb_write_regs,
     riscv_gdb_last_trap,
+    NULL,  // gdb_pc: the committed pc is already linear here (cpu/step.h)
+    NULL,  // gdb_set_watch / gdb_clear_watch / gdb_watch_hits: no RSP channel
+           // onto the trigger module yet (AGENTS.md 简化登记 D6)
+    NULL,
+    NULL,
 };

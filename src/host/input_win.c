@@ -133,9 +133,10 @@ void HostInputPoll(void) {
   }
   if (!g_serial && !g_key) return;
   // A 2 ms gate: the run loop steps millions of times a second and each poll
-  // that reaches the OS costs a syscall.
+  // that reaches the OS costs a syscall. Host time, not emulated time — the
+  // gate is about how often we ask the OS, not about the guest's clock.
   static int64_t next_us;
-  int64_t now = HostTimerNow();
+  int64_t now = HostTimeRealtime();
   if (now < next_us) return;
   next_us = now + 2000;
   for (;;) {

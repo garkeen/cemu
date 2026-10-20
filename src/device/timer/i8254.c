@@ -2,13 +2,16 @@
 //
 // Adapted from the QEMU i8254 model (Fabrice Bellard, MIT; tiny386 port) to
 // the cemu device model. Three 16-bit down-counters clocked at PIT_FREQ
-// (1.193182 MHz) derived from host wall-clock microseconds. Mode 2 and 3
-// produce periodic edges; channel 0's edge raises PIC IRQ0 (the periodic
+// (1.193182 MHz) derived from the microseconds HostTimerNow() reports. Mode 2
+// and 3 produce periodic edges; channel 0's edge raises PIC IRQ0 (the periodic
 // timer interrupt that wakes hlt and drives real-mode scheduler ticks).
 //
-// The host monotonic clock is HostTimerNow() microseconds; the machine poll
-// loop calls PitPoll() to let periods elapse in wall time even while the CPU
-// sleeps (mirroring the CLINT mtime poll on the riscv side).
+// HostTimerNow() is the emulated clock (host/host.h): host wall time by
+// default, a declared per-instruction rate under -icount. Either way the machine
+// poll loop calls PitPoll() once per step, so a period elapses even while the
+// CPU sleeps — and it lets exactly one edge per period boundary through since
+// the last delivery, so a step that covers several periods does not deliver a
+// burst (QEMU hw/timer/i8254.c pit_irq_timer, same contract).
 
 #include "device/timer/i8254.h"
 

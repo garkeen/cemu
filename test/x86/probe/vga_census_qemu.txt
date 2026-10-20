@@ -1,0 +1,40 @@
+# Dual run of test/x86/probe/vga_census.asm, 2026-10-16, same 512-byte boot
+# sector on both models:
+#
+#   cemu  --machine x86 --isa x86 vga_census.bin
+#   qemu-system-i386 -drive file=vga_census.bin,format=raw,if=ide,index=0 -boot c \
+#       -display none -serial file:... -no-reboot \
+#       -device isa-debug-exit,iobase=0xf4,iosize=0x4
+#
+# The suite cell compares cemu's live transcript against the `cemu` line below;
+# the `qemu` line is what the reference card answered for the same sector.
+# Exit: debug-exit value 11 -> status 23 on both.
+cemu census C005FC014FC0250C0382C0455C0581C06BFC071FC0800C094FC0A0DC0B0EC0C00C0D00C0E00C0F00C109CC118EG0000G0100G0200G0300G0400G0510G060EG070FG08FFG0900G0A00G0B00G0C00G0D00G0E00G0F00S0003S0100S0203S0300S0402S0500S0600S0700A0000A0101A0202A0303A0404A0505A0614A0707A0838A0939A0A3AA0B3BA0C3CA0D3DA0E3EA0F3FA100CA1100p1Aq12r34s21t25
+qemu census C005FC014FC0250C0382C0455C0581C06BFC071FC0800C094FC0A0DC0B0EC0C00C0D00C0E02C0F80C109CC118EG0000G0100G0200G0300G0400G0510G060EG070FG08FFG0900G0A00G0B00G0C00G0D00G0E00G0F00S0003S0100S0203S0300S0402S0500S0600S0700A0000A0101A0202A0303A0404A0505A0614A0707A0838A0939A0A3AA0B3BA0C3CA0D3DA0E3EA0F3FA100CA1100p1Aq12r34s21t25
+
+60 register reads walked (CRTC 0x00-0x11, graphics 0x00-0x0F, sequencer
+0x00-0x07, attribute 0x00-0x11) plus five deterministic cases. **Two fields
+differ, and neither is a card difference:**
+
+  - `C0E00` / `C0F00` against QEMU's `C0E02` / `C0F80` — CRTC R14/R15 are the
+    cursor *position*, written by the firmware's own text output
+    (`stdvga.c:301 stdvga_set_cursor_pos`). The two models printed different
+    numbers of characters before the guest started, so the cursor sits
+    elsewhere. Registered as not-a-bug in 片 30, and it is the same story here.
+  - Everything else is byte-identical, **including all 18 attribute-controller
+    reads.**
+
+That last line is a correction, and it is the reason this file exists in this
+shape. An earlier copy of this probe carried
+
+    in al, 0x3da                 ; reset the attribute flip-flop
+
+which NASM cannot encode — `in al, imm8` is the 8-bit port form, and the
+16-bit port silently truncates to 0xDA (nasm warns: "byte data exceeds bounds").
+The flip-flop was therefore never reset on either model, the attribute walk read
+the index latch instead of the registers, and the 13 "attribute controller
+read-back differences" recorded from it were a probe artifact, not evidence
+about the card. Fixed to the DX form, the walk agrees with the reference card on
+every ATC register. The decode-model difference this card *does* take from
+IBM VGA TR is measured in the sibling probe instead: see
+`vga_readback_qemu.txt`, one field.

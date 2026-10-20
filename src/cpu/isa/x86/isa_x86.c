@@ -64,12 +64,30 @@ static uint32_t Le32Get(const uint8_t** p) {
 // eflags, cs ss ds es fs gs — 16 registers, 4 bytes each — plus the x87
 // group gdb keeps in the same feature (st0-7 at 10 bytes, fctrl..fop at 4;
 // this machine has no FPU, D13, so those read as zeros and ignore writes).
+// The address gdb names the program counter by, and the address the stub
+// matches breakpoints against: CS's base plus the committed offset — the same
+// linear space its memory packets read (cpu/step.h gdb_pc). Reporting the
+// offset alone would make `x/i $pc` disassemble the wrong bytes and
+// `break *<linear>` never fire, which is exactly what a real-mode guest (BIOS
+// at F0000, DOS loaded high) needs.
+static uint64_t x86_gdb_pc(CpuState* cpu) {
+  x86_state* s = (x86_state*)cpu->priv;
+  return s->base[cs_i] + (uint32_t)cpu->pc;
+}
+
+// Which stub-installed watchpoints fired on the step that just committed
+// (cpu/step.h gdb_watch_hits). The bits are the DR6 B bits the trap carried, so
+// the stub can tell its own slots from ones the guest armed.
+static uint32_t x86_gdb_watch_hits(CpuState* cpu) {
+  return ((x86_state*)cpu->priv)->watch_hits;
+}
+
 static int x86_gdb_read_regs(CpuState* cpu, uint8_t* buf, int cap) {
   x86_state* s = (x86_state*)cpu->priv;
   if (cap < 16 * 4 + 8 * 10 + 8 * 4) return 0;
   uint8_t* p = buf;
   for (int i = 0; i < 8; i++) Le32Put(&p, s->r[i].e);
-  Le32Put(&p, (uint32_t)cpu->pc);
+  Le32Put(&p, (uint32_t)x86_gdb_pc(cpu));
   Le32Put(&p, s->fl.word);
   static const int order[6] = {cs_i, ss_i, ds_i, es_i, fs_i, gs_i};
   for (int i = 0; i < 6; i++) Le32Put(&p, s->sreg[order[i]]);
@@ -83,7 +101,12 @@ static int x86_gdb_write_regs(CpuState* cpu, const uint8_t* buf, int len) {
   if (len < 16 * 4) return -1;
   const uint8_t* p = buf;
   for (int i = 0; i < 8; i++) s->r[i].e = Le32Get(&p);
-  cpu->pc = Le32Get(&p);
+  // gdb sends the linear address x86_gdb_pc reported; the committed pc holds
+  // the offset within CS (cpu/isa/x86/step.c fetches base[cs] + pc).
+  {
+    uint32_t lin = Le32Get(&p);
+    cpu->pc = (uint64_t)(lin - (uint32_t)s->base[cs_i]);
+  }
   // The flags image never loads RF/VM (D14) and keeps bit 1 set (SDM).
   s->fl.word = (Le32Get(&p) & ~0x30000u) | 2;
   // Segment selectors follow QEMU's gdbstub: the visible value is stored,
@@ -115,4 +138,8 @@ const isa_ops k_isa_x86 = {
     x86_gdb_read_regs,
     x86_gdb_write_regs,
     x86_gdb_last_trap,
+    x86_gdb_pc,
+    x86_gdb_set_watch,
+    x86_gdb_clear_watch,
+    x86_gdb_watch_hits,
 };

@@ -28,6 +28,8 @@ typedef struct Args {
   uint64_t max_inst;
   int dump_regs;
   int skip_idle;  // --skip-idle: a halted CPU's idle time runs at full speed
+  int icount;         // -icount: the emulated clock is declared, not wall time
+  int icount_shift;   // log2 of the nanoseconds one retired instruction costs
   int gdb_port;  // -s / -gdb tcp::PORT; 0 = no stub
   int gdb_wait;  // -S: stopped until a client resumes (QEMU convention)
 } Args;
@@ -47,6 +49,9 @@ static void Usage(void) {
       "  --dump-regs       dump registers on any exit\n"
       "  --skip-idle       jump a halted CPU to the next device deadline\n"
       "                    instead of letting the wait elapse in host time\n"
+      "  -icount shift=N   charge 1<<N ns of emulated time to every retired\n"
+      "                    instruction, so timer edges are a function of the\n"
+      "                    instruction stream and a run reproduces exactly\n"
       "  -bios FILE        x86: map a firmware ROM image and reset into it\n"
       "  -hda FILE         x86: primary IDE master disk image\n"
       "  -hdb FILE         x86: primary IDE slave disk image\n"
@@ -94,6 +99,23 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       a->dump_regs = 1;
     else if (strcmp(arg, "--skip-idle") == 0)
       a->skip_idle = 1;
+    else if (strcmp(arg, "-icount") == 0) {
+      // QEMU's spelling (-icount shift=N: one retired instruction = 1<<N ns).
+      // The bound keeps HostTimerIcountAdvance's int64 ns accumulator in range:
+      // shift=30 charges 1.07e9 ns a step, so it holds to 8.6e9 instructions,
+      // and anything above 31 would bill over two seconds of virtual time per
+      // instruction. A malformed spec is an error, not a silent fallback to the
+      // wall clock — that would hand back the run we were asked to make
+      // deterministic.
+      const char* spec = argv[++i];
+      unsigned shift;
+      if (sscanf(spec, "shift=%u", &shift) != 1 || shift > 30) {
+        LogError("-icount expects shift=N with N in 0..30");
+        return -1;
+      }
+      a->icount = 1;
+      a->icount_shift = (int)shift;
+    }
     else if (strcmp(arg, "-display") == 0) {
       if (i + 1 >= argc) {
         LogError("-display expects a backend name");
@@ -153,6 +175,15 @@ int main(int argc, char** argv) {
     return kExitHostFailure;
   }
   if (a.log_file) LogInitFile(a.log_file);
+
+  // -icount goes in before the machine exists: the emulated clock must not
+  // advance while the machine is built or an image is loaded, or the time the
+  // guest sees would again depend on how long that took.
+  if (a.icount) {
+    HostTimerIcountEnable(a.icount_shift);
+    LogInfo("-icount shift=%d: one retired instruction = %llu ns of emulated time",
+            a.icount_shift, (unsigned long long)1 << a.icount_shift);
+  }
 
   // -mouse: which pointing device the host's pointer drives (the PC board is
   // the only one with a choice). An unknown name is an error, not a silent

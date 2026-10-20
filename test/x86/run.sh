@@ -45,6 +45,57 @@ else
   report_fail "cga: rc=$rc"
 fi
 
+# Transcript probe cell. These probes do not self-judge: they print what the
+# machine answered, and the judgement is the comparison. The calibration file
+# (probe/<stem>_qemu.txt) carries the same sector's transcript from each model as
+# two machine-readable lines, `cemu ...` and `qemu ...`, with the prose around
+# them explaining every field.
+#
+#   mode=ref   the two lines are equal and cemu's live output must equal them:
+#              the reference model pins the answer.
+#   mode=lock  the two lines differ at fields this card takes from the spec
+#              instead of from the reference (AGENTS.md §X's D17); cemu's live
+#              output must equal *its* line, so any change in the card's answers
+#              is caught, and the divergence stays on the record instead of in a
+#              silent exception list.
+#
+# Leading/trailing blanks are trimmed on both sides: the guest's own lines carry
+# the spacing it prints, and a golden must not fail because of one.
+probe_cell() {
+  local stem=$1 status=$2 mode=$3
+  local bin="$dir/probe/$stem.bin" cal="$dir/probe/${stem}_qemu.txt"
+  if [ ! -f "$bin" ] && command -v nasm > /dev/null 2>&1; then
+    nasm -f bin -o "$bin" "$dir/probe/$stem.asm"
+  fi
+  if [ ! -f "$bin" ] || [ ! -f "$cal" ]; then
+    echo "SKIP ($stem: needs nasm and the calibration file $cal)"
+    return
+  fi
+  out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$bin" 2>&1)
+  local rc=$?
+  local want_c want_q got tok
+  want_c=$(sed -n 's/^cemu[[:space:]]\(.*\)$/\1/p' "$cal" | head -1 | sed 's/[[:space:]]*$//')
+  want_q=$(sed -n 's/^qemu[[:space:]]\(.*\)$/\1/p' "$cal" | head -1 | sed 's/[[:space:]]*$//')
+  # The host's own [info] lines and the guest's serial output can land on one
+  # line (neither ends with a newline of its own), so the transcript is cut out
+  # from its marker rather than taken as a whole line.
+  tok=${want_c%% *}
+  got=$(printf '%s\n' "$out" | grep -m1 -- "$tok" | sed "s/.*$tok/$tok/" | sed 's/[[:space:]]*$//')
+  local want="$want_c"
+  [ "$mode" = ref ] && want="$want_q"
+  if [ "$rc" -eq "$status" ] && [ -n "$got" ] && [ "$got" = "$want" ]; then
+    if [ "$mode" = ref ] && [ "$want_c" != "$want_q" ]; then
+      fail=$((fail + 1))
+      report_fail "$stem: calibration says the models must agree, but they do not"
+      return
+    fi
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "$stem: rc=$rc want rc=$status; transcript got='$got' want='$want'"
+  fi
+}
+
 # REP-prefixed string ops with (E)CX = 0 (test/x86/probe/rep_zero.asm): the
 # prefix's counter test stands in front of the loop body (SDM vol.2 REP
 # prefix), so a zero counter means no operation at all. libc-style memcpy
@@ -69,6 +120,27 @@ if [ -f "$repbin" ]; then
 else
   echo "SKIP (rep-zero: no nasm and no prebuilt probe bin)"
 fi
+
+# The sense of the two repeat prefixes, measured from raw bytes
+# (test/x86/probe/rep_sense.asm). F2/REPNZ repeats while ZF=0 and F3/REPZ while
+# ZF=1, and CMPS/SCAS are the only instructions that read them; a model that maps
+# the bytes onto the wrong senses ends every name scan one byte early or late,
+# which is a control-flow divergence in a DOS guest, not a slow one. The probe
+# carries `db 0xf2,0xa6` rather than a mnemonic because assembler conventions for
+# the spelling are exactly what was under investigation -- and were wrong here
+# once (see probe/rep_sense_qemu.txt). MOVS is the control: no flag test may
+# reach it. ref cell: both models answer the same transcript.
+probe_cell rep_sense 13 ref
+
+# LOOP/LOOPE/LOOPNE/JCXZ and the INC/DEC flag contract
+# (test/x86/probe/loop_sense.asm): SDM vol.2 fixes that INC/DEC leave CF and set
+# SF/ZF/AF/PF/OF, that the counter is decremented before the test, and that JCXZ
+# tests at the address size. Case d is the one a wrong model cannot hide: an
+# `inc si` sits between the compare and the LOOPNE, so the ZF the loop reads is
+# INC's, and the scan runs to its full count. These five instructions are the
+# whole inner loop of the Windows 1.01 kernel's WIN.INI canonicalizer, which is
+# why the case list is shaped like that parser. ref cell: identical transcripts.
+probe_cell loop_sense 15 ref
 
 # IRQ0 delivery to a spinning guest (test/x86/probe/pit_irq.asm): the probe
 # builds an IDT, remaps the 8259 pair, programs 8254 channel 0 for 100 Hz,
@@ -317,6 +389,101 @@ if [ -f "$vgacoreelf" ]; then
   fi
 else
   echo "SKIP (vga-core: no nasm and no prebuilt probe elf)"
+fi
+
+# DISPI, VBE's index/data pair at 0x1CE/0x1CF (test/x86/probe/vga_dispi.asm).
+# What it pins is the register file's bound: `dispi[11]` sits directly in front
+# of the card's PciDevice, so an index naming no register turned a write to the
+# data port into a write into PCI config space -- two outw's from any guest. The
+# probe attacks with 0x0f and 0x8f, then reads 00:02.0's vendor/device back
+# through 0xCF8/0xCFC, and closes by showing a register that does exist still
+# stores (so the bound cannot be satisfied by refusing everything). It also
+# carries the ROM's own handshake (bochsvga.c:309-313) and the read-only
+# VIDEO_MEMORY_64K.
+#
+# Dual run: the same binary on qemu-system-i386 -vga std agrees on every step,
+# once the card is given the memory the reference card reports (16MB -- BAR0 and
+# DISPI VIDEO_MEMORY_64K both come from kVgaVramSize). The capture in
+# test/x86/probe/vga_dispi_qemu.txt was made while this card still reported
+# 256KB, and also records that step 2's answer is what sent the reference-claim
+# this file used to carry back to the reference.
+dispibin="$dir/probe/vga_dispi.bin"
+if [ ! -f "$dispibin" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f bin -o "$dispibin" "$dir/probe/vga_dispi.asm"
+fi
+if [ -f "$dispibin" ]; then
+  out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$dispibin" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'vga-dispi ok'; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "vga-dispi: rc=$rc"
+  fi
+else
+  echo "SKIP (vga-dispi: no nasm and no prebuilt probe bin)"
+fi
+
+# The register file's read-back shapes (test/x86/probe/vga_readback.asm): the
+# attribute index latch and the flip-flop, the CRTC index latch width, the
+# sequencer and graphics write masks, the feature-control latch (read at 0x3CA --
+# reading 0x3DA answers input status 1, which is wherever the raster is at that
+# instant and therefore measures the clock rather than the latch), and whether the
+# retrace bit is observable at all to a polling guest (case g: 200 samples of
+# 0x3DA spread by a spin, printed as Y/N because both phases must appear -- a card
+# that never asserts retrace spins every wait-for-retrace loop to its timeout,
+# and this card measured 0 of 200 before the raster was derived from the CRTC
+# registers). lock cell: one field differs from QEMU by design, the 0x3BA decode
+# under IBM VGA TR's chip-select line (AGENTS.md §X D17); see the calibration file.
+probe_cell vga_readback 19 lock
+
+# The whole register file as the card answers it at boot
+# (test/x86/probe/vga_census.asm): 60 reads over CRTC/graphics/sequencer/attribute
+# plus five deterministic cases, so a divergence names the register rather than
+# the symptom -- this is the byte block SeaVGABIOS turns into the "EGA/VGA
+# information" that int 10 AX=1000/1001 returns, and a display driver decides its
+# mode from those bytes. lock cell: every field matches QEMU except CR14/CR15,
+# which are the cursor position the firmware left behind. The file also records
+# why the earlier "13 attribute-controller differences" reading was retracted:
+# `in al,0x3da` does not encode, so the flip-flop was never reset on either model.
+probe_cell vga_census 23 lock
+
+# The graphics picture the register file describes (test/x86/probe/vga_paint.asm).
+# No firmware: the multiboot probe programs SeaBIOS's own mode 0x10 tables
+# (sequ_0e/crtc_0f/actl_10/grdc_0d plus the run-time line offset), paints through
+# the aperture with write mode 2 -- one byte per pixel byte, the graphics
+# controller expanding the colour across the planes, which is the shape the
+# card's latched write path serves (QEMU's vga_draw_line4 reads one dword per
+# pixel byte) -- and reports what the card reads back: the register file it
+# holds and the plane bytes of five painted pixel bytes. The picture itself is
+# judged host-side and headless against the ruler the probe paints: cemu's
+# CEMU_DEBUG=fbdump=vga_paint.ppm (640x350; entry 15 white at both edges,
+# entry 15 in pixels 8-15 on odd rows, entry 15 in pixels 16-23 where
+# (row >> 1) & 1, row 100 all entry 15, row 300 all entry 3) against QEMU's
+# `screendump` of the same image.
+#
+# Dual run: qemu-system-i386 -machine pc -m 32 -kernel vga_paint.elf -vga std
+# -display none -no-reboot -serial file:vga_paint_qemu.txt prints the same
+# transcript, byte for byte.
+vgapaintelf="$dir/probe/vga_paint.elf"
+if [ ! -f "$vgapaintelf" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f elf32 -o "$dir/probe/vga_paint.o" "$dir/probe/vga_paint.asm" &&
+    ld.lld -m elf_i386 -T "$dir/probe/vga_paint.ld" -o "$vgapaintelf" \
+      "$dir/probe/vga_paint.o"
+fi
+if [ -f "$vgapaintelf" ]; then
+  out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$vgapaintelf" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 11 ] &&
+     echo "$out" | grep -q 'cr00,01,09,13=5f,4f,40,28,12=5d,1f ar10,12=01,0f sr2,4=0f,06 gr5=02 p0=ffffffff r1p0=ff,ff,ff r100p0=ff,ff,ff' &&
+     echo "$out" | grep -q 'vga-paint ok'; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "vga-paint: rc=$rc"
+  fi
+else
+  echo "SKIP (vga-paint: no nasm and no prebuilt probe elf)"
 fi
 
 # Floppy controller + 8237 channel 2, guest-driven (test/x86/probe/fdc_dma.asm).

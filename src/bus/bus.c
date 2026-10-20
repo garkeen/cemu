@@ -19,6 +19,28 @@ void BusAddRamRegion(Bus* bus, uint64_t base, uint64_t size, const DeviceOps* op
   bus->regions[bus->count - 1].host = host;
 }
 
+void BusRelocateRegion(Bus* bus, const DeviceOps* ops, void* dev, uint64_t base, uint64_t size) {
+  for (int i = 0; i < bus->count; i++) {
+    if (bus->regions[i].ops == ops && bus->regions[i].dev == dev) {
+      bus->regions[i].base = base;
+      bus->regions[i].size = size;
+      return;
+    }
+  }
+  BusAddRegion(bus, base, size, ops, dev);
+}
+
+int BusRemoveRegion(Bus* bus, const DeviceOps* ops, void* dev) {
+  for (int i = 0; i < bus->count; i++) {
+    if (bus->regions[i].ops == ops && bus->regions[i].dev == dev) {
+      for (int j = i + 1; j < bus->count; j++) bus->regions[j - 1] = bus->regions[j];
+      bus->count--;
+      return 1;
+    }
+  }
+  return 0;
+}
+
 // Overlapping regions resolve to the smallest match, so a narrow device window
 // takes precedence over the RAM backing it sits inside.
 static BusRegion* FindRegion(Bus* bus, uint64_t addr, int len) {

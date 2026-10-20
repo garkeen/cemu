@@ -55,6 +55,13 @@ ROM 窗口底部留给 option ROM 的空间**，是本树最硬的约束（见�
   `HARDWARE_IRQ`、`PCIBIOS`/`PNPBIOS`/`OPTIONROMS`、`PMM`、`BOOT`/`KEYBOARD`/`MOUSE`、
   `ACPI`/`SMBIOS`/`MPTABLE`/`PIRTABLE`、`MALLOC_UPPERMEMORY`、`RELOCATE_INIT`、
   `THREADS`、`QEMU`/`QEMU_HARDWARE`、`DEBUG_IO`。
+- `CONFIG_PMTIMER=y`（默认就开着，但**此前本机没有产生它的设备**）：固件的微秒时基在
+  `src/hw/timer.c pmtimer_setup()` 里切到 ACPI PM timer（3.579545MHz），前提是 PCI 上
+  找得到 PIIX4 的 PM function（`src/fw/pciinit.c piix4_pm_config_setup` 编 PMBASE 并用
+  PIIX_PMREGMISC bit0 打开那 32 字节块）。本机现在供得上这个函数（`device/misc/piix4pm.c`），
+  于是引导日志里会出现 `Using pmtimer, ioport 0x...`；**在此之前固件是拿 8254 计时**——
+  与时被对拍的模型差一个时钟源、也差一个分辨率，所有固件侧等待（软盘超时、键盘与串口
+  等待、INT 15h AH=86h、它排队走的 timer list）都按不同的比例走。这条属于机器，不属于配置。
 
 **关**（本机根本没有这些设备；关掉既省体积，也省掉 POST 里对不存在控制器的探测）：
 
@@ -63,7 +70,16 @@ ROM 窗口底部留给 option ROM 的空间**，是本树最硬的约束（见�
   `SDCARD`、`AHCI`、`FLASH_FLOPPY`（QEMU 的 flash 软驱）、`TCGBIOS`（TPM）、`XEN`、`LPT`、
   `BOOTSPLASH`（连带 jpeg/bmp）
 - `CONFIG_VGA_VBE`（线性帧缓冲与线框模式不做，登记在 AGENTS.md D17）、
-  `CONFIG_VGA_PCI`（本机显卡没有 PCI 身份，option ROM 走 fw_cfg 的 `vgaroms/` 通路）
+  `CONFIG_VGA_PCI`（显卡**有** PCI function `00:02.0` = `1234:1111`，但它不带扩展 ROM
+  ——vga.c 把 ROM 地址寄存器 0x30 做成读回 0，option ROM 仍由 fw_cfg 的 `vgaroms/`
+  通路交给客机；关掉这条只是让固件不去 PCI ROM BAR 里找它，也不让固件替 ROM 排 BAR，
+  客人自己枚举 PCI 不受影响）
+- `# CONFIG_VGA_BOCHS is not set` 的连带后果，值得单独记一笔： SeaVGABIOS 里**唯一**
+  按显存校验模式表的代码是 `vgasrc/bochsvga.c:371` 的 `Removing mode %x`，而它的入口
+  `vgahw.h:55 bochsvga_setup()` 在这个配置下被编掉。**本机这份 ROM 因此不会读
+  DISPI 的 `VIDEO_MEMORY_64K`，也不会因为卡报的显存小而剪模式**。任何"卡的显存答复
+  经过 ROM 的模式表影响客人"的推理链，都必须先在一次实跑里确认这句日志出自哪一侧
+  （QEMU 自带的 `vgabios-stdvga.bin` 是 Bochs 适配器构建，会打印它；我们这份不会）。
 
 **`CONFIG_ROM_SIZE=0`（自动）**：布局照旧把 SeaBIOS 压在 ROM 窗口上部，**底部那段是留给
 option ROM 的槽**。这就是固件内容必须瘦身的原委：官方 bios 内容从 0xD3FE0 起（底部约 80KB），

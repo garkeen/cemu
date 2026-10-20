@@ -16,6 +16,9 @@ build/
 *.txt
 # ...but the build definition is source, not capture output
 !CMakeLists.txt
+# ...and the dual-run records beside the probes are the probe's own evidence
+# (what the reference model answered for the same binary; see probe/*_qemu.txt)
+!test/x86/probe/*_qemu.txt
 
 # Editor / OS junk
 .vscode/
@@ -26,3 +29,5 @@ Desktop.ini
 
 # Smoke-probe products (the source stays; test/x86/probe/*.asm builds them)
 /test/x86/probe/*.bin
+# ...and the 1.44MB floppy images the boot-sector probes build into
+/test/x86/probe/*.img

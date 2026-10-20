@@ -137,9 +137,9 @@ enum {
   kStatusVsync = 1u << 3,
 };
 
-// Feature control register: bit 4 is the 0x3DA write path, bit 0 the 0x3CA
-// read path (IBM VGA).
-enum { kFeatureBit4 = 1u << 4, kFeatureBit0 = 1u << 0 };
+// Feature control register: bit 4 is the 0x3DA write path (the read path at
+// 0x3CA gives it back); the register holds nothing else (IBM VGA).
+enum { kFeatureBit4 = 1u << 4 };
 
 // The aperture: 0xA0000-0xBFFFF is one decode. Which part of it answers is the
 // graphics controller's memory map mode (GR6 bits 3-2), applied inside the
@@ -245,28 +245,52 @@ void VgaRegister(Bus* bus, Bus* io, VgaDevice* d) {
   // miscellaneous output register's colour bit decides which one answers
   // (QEMU vga_ioport_read/write guard the two ranges with the same test).
   BusAddRegion(io, 0x3b0, 0x30, &kVgaPortOps, d);
+  // DISPI is a second block of its own: the option ROM's VBE probe must answer
+  // whatever half of the register file is currently decoded, so it cannot live
+  // inside the 0x3B0-0x3DF range. It is four bytes rather than two because the
+  // bus requires a whole access to fit one region, and the ROM's inw at 0x1CF
+  // covers 0x1CF-0x1D0.
+  BusAddRegion(io, kDispiIndexPort, kDispiPortCount, &kVgaPortOps, d);
 }
 
 // --- raster status ------------------------------------------------------------
-// The CRTC's own numbers drive the status bits (IBM VGA CRTC register
-// definitions: horizontal total = R0 + 5 character clocks, vertical total =
-// R6 + 2 scan lines with R7's bits 0/5 as bits 8/9, vertical retrace start =
-// R16 with R7's bits 2/7 as bits 8/9, retrace end = R17 bits 3-0, display end =
-// R18 with R7's bits 1/6 as bits 8/9). One character clock is 8 or 9 dots of
-// the 25.175MHz dot clock (SR1 bit 0), so the frame period is derived from the
-// mode the guest programmed — the raster the guest polls, not a fixed model.
+// The two status ports report where the raster is inside the frame the CRTC is
+// programmed to scan, so every number below is read out of the register file
+// (IBM VGA Technical Reference, CRTC register set):
+//
+//   horizontal total      R0 + 5 character clocks, doubled when the sequencer
+//                         runs 9-dot character addressing (SR1 bit 3)
+//   vertical total        (R6 | R7 bit0 as bit8 | R7 bit5 as bit9) + 2 lines
+//   vertical retrace      starts at (R16 | R7 bit2 as bit8 | R7 bit7 as bit9),
+//                         lasts R17 bits 3-0 + 1 lines
+//   horizontal retrace    starts at R4 plus a skew from R5 bits 6-5, lasts
+//                         R5 bits 4-0 + 1 character clocks
+//   character clock       8 or 9 dots, selected by miscellaneous output bit 0
+//   dot clock             the oscillator miscellaneous output bits 3-2 select
+//
+// Bit 0 of the status ports is the blanking flag (set while the raster is not
+// drawing the visible area -- the polarity the CGA reference gives it), bit 3
+// the vertical retrace. The position comes from the emulated clock, which is
+// instruction-paced under -icount, so a run stays reproducible while a guest
+// that polls the port still watches the flag move across a frame.
 enum {
-  kDotClockKhz = 25175,  // the VGA's 25.175MHz pixel clock
+  kNsPerSecond = 1000000000,
+  kNsPerMicroSecond = 1000,
+  kField2Bits = 0x03,        // the two-bit fields below (clock select, skew)
+  kField5Bits = 0x1f,        // R5 bits 4-0: horizontal retrace end
+  kField4Bits = 0x0f,        // R17 bits 3-0: vertical retrace length
+  kMsrDots8 = 1u << 0,       // 8 dot character clock (clear selects 9)
+  kMsrClockSelShift = 2,     // which oscillator the two bits above choose
 };
+
+// The four clocks the miscellaneous output register can pick (IBM VGA: only the
+// 25.175MHz and 28.322MHz crystals are fitted; the two remaining selections
+// repeat one of them).
+static const int kVgaDotClockHz[4] = {25175000, 28322000, 25175000, 25175000};
 
 static int VgaVerticalTotal(const VgaDevice* d) {
   return d->cr[kCrtcVerticalTotal] | ((d->cr[kCrtcOverflow] & 0x01) << 8) |
          ((d->cr[kCrtcOverflow] & 0x20) << 4);
-}
-
-static int VgaVerticalDisplayEnd(const VgaDevice* d) {
-  return d->cr[kCrtcVerticalDisplayEnd] | ((d->cr[kCrtcOverflow] & 0x02) << 7) |
-         ((d->cr[kCrtcOverflow] & 0x40) << 3);
 }
 
 static int VgaVerticalRetraceStart(const VgaDevice* d) {
@@ -274,32 +298,51 @@ static int VgaVerticalRetraceStart(const VgaDevice* d) {
          ((d->cr[kCrtcOverflow] & 0x80) << 2);
 }
 
-static int VgaCharDots(const VgaDevice* d) { return (d->sr[kSeqClockMode] & 1) ? 8 : 9; }
+// The last line the CRTC draws before blanking: R18 with R7's bits 1 and 6 as
+// bits 8 and 9 (IBM VGA). The rendered picture is cut at this line.
+static int VgaVerticalDisplayEnd(const VgaDevice* d) {
+  return d->cr[kCrtcVerticalDisplayEnd] | ((d->cr[kCrtcOverflow] & 0x02) << 7) |
+         ((d->cr[kCrtcOverflow] & 0x40) << 3);
+}
 
-// Latches the raster bits both status ports report. Bit 0 of both is the
-// blanking flag (1 while the raster is outside the visible area, which is the
-// polarity the CGA reference gives it) and bit 3 is vertical retrace.
-static void VgaUpdateStatus(VgaDevice* d, uint64_t now) {
-  const int dots = VgaCharDots(d);
-  const int line_dots = (d->cr[kCrtcHorizontalTotal] + 5) * dots;
-  const int total_lines = VgaVerticalTotal(d) + 2;
-  const int visible_lines = VgaVerticalDisplayEnd(d) + 1;
-  const int visible_dots = (d->cr[kCrtcHorizontalDisplayEnd] + 1) * dots;
-  const int frame_dots = line_dots * total_lines;
-  // Frame period in microseconds at the dot clock above, then the position
-  // inside it: the same dot count back, so the two steps cannot disagree.
-  const int frame_us = (int)((int64_t)frame_dots * 1000 / kDotClockKhz);
-  uint64_t t = frame_us > 0 ? (uint64_t)(now % (uint64_t)frame_us) : 0;
-  const int pos = (int)(t * kDotClockKhz / 1000);  // dots into the frame
-  const int line = pos / line_dots;
-  const int dot = pos % line_dots;
-  const int retrace_start = VgaVerticalRetraceStart(d);
-  const int retrace_end = d->cr[kCrtcVerticalRetraceEnd] & 0x0f;
-  int vsync = line >= retrace_start || line <= retrace_end;
-  int blanking = !(line < visible_lines && dot < visible_dots);
-  uint8_t st = (uint8_t)((vsync ? kStatusVsync : 0) | (blanking ? kStatusDisplayEnable : 0));
-  d->st01 = st;
-  d->st00 = (uint8_t)(st | (d->feature & kFeatureBit0 ? 0x10 : 0));
+static int VgaCharDots(const VgaDevice* d) { return (d->misc & kMsrDots8) ? 8 : 9; }
+
+static int VgaHorizontalTotal(const VgaDevice* d) {
+  const int clocking9 = (d->sr[kSeqClockMode] >> 3) & 1;
+  return (d->cr[kCrtcHorizontalTotal] + 5) << clocking9;
+}
+
+static void VgaUpdateStatus(VgaDevice* d, uint64_t now_us) {
+  const int htotal = VgaHorizontalTotal(d);
+  const int frame_lines = VgaVerticalTotal(d) + 2;
+  const int vstart = VgaVerticalRetraceStart(d);
+  const int vend = vstart + (d->cr[kCrtcVerticalRetraceEnd] & kField4Bits) + 1;
+  const int hstart = d->cr[kCrtcStartHorizontalRetrace] +
+                     ((d->cr[kCrtcEndHorizontalRetrace] >> 5) & kField2Bits);
+  const int hend = hstart + (d->cr[kCrtcEndHorizontalRetrace] & kField5Bits) + 1;
+  const int clock_sel = (d->misc >> kMsrClockSelShift) & kField2Bits;
+  const int char_hz = kVgaDotClockHz[clock_sel] / VgaCharDots(d);
+  const int frame_chars = frame_lines * htotal;
+  // The bits the raster cannot decide stay as they were; only the two the frame
+  // geometry defines are recomputed.
+  uint8_t val = (uint8_t)(d->st01 & (uint8_t) ~(kStatusVsync | kStatusDisplayEnable));
+  if (frame_chars > 0 && char_hz > 0) {
+    const int64_t ns_per_char = kNsPerSecond / char_hz;
+    const int64_t now_ns = (int64_t)now_us * kNsPerMicroSecond;
+    const int char_in_frame = (int)((now_ns / ns_per_char) % frame_chars);
+    const int line = char_in_frame / htotal;
+    if (line >= vstart && line <= vend) {
+      val = (uint8_t)(val | kStatusVsync | kStatusDisplayEnable);  // vertical retrace
+    } else if (char_in_frame % htotal >= hstart && char_in_frame % htotal <= hend) {
+      val = (uint8_t)(val | kStatusDisplayEnable);  // horizontal retrace
+    }
+  } else {
+    // Nothing to scan from -- the state before the CRTC is programmed, where the
+    // registers give the raster no frame to sit in. Alternating the two flags is
+    // what such a card reads like to a guest that polls the port.
+    val = (uint8_t)(d->st01 ^ (kStatusVsync | kStatusDisplayEnable));
+  }
+  d->st01 = val;
 }
 
 // --- colour -------------------------------------------------------------------
@@ -359,25 +402,147 @@ enum {
   kPortStatus1 = 0x3da,
 };
 
+// --- DISPI (VBE's register pair) -------------------------------------------------
+// The index/data ports sit outside the 0x3B0-0x3DF block, so VgaPortDecoded's
+// monochrome/colour gate never sees them and they always answer: the block this
+// file registers them in is separate, and the option ROM's probe must not depend
+// on which half of the register file is currently decoded.
+//
+// A word access is one register, not two byte lanes: the ROM addresses DISPI
+// with outw/inw (bochsvga.c:75-81 issues `outw reg, 0x1CE` then `inw val, 0x1CF`),
+// so 0x1CE selects a register and 0x1CF is that register -- 16 bits, because the
+// ids alone (0xB0C0) do not fit in a byte.
+//
+// Two registers do not read back what was written, and both matter:
+//   - ID answers with the id the option ROM last wrote, which is the probe
+//     itself (bochsvga.c writes VBE_DISPI_ID0 then reads it back)
+//   - VIDEO_MEMORY_64K is read-only and reports the card's actual video memory
+//     in 64KB units; the firmware turns it into the framebuffer size it
+//     advertises and drops the extended modes that do not fit (bochsvga.c:347,
+//     :370).
+static int DispiKnownId(uint16_t v) { return v >= 0xb0c0 && v <= 0xb0c5; }
+
+// The register file the index points into. bochsvga.h:15-25 names exactly
+// kDispiRegCount registers, ID (0x0) through VIDEO_MEMORY_64K (0xa). Two of them
+// answer from their own fields and the other nine are stored here; an index
+// naming none of these addresses nothing. Returning a slot for it would hand the
+// data port an address past the end of `dispi`, which sits directly in front of
+// the PCI config space in VgaDevice -- one out-of-range index write and a guest
+// would be editing the card's configuration space through 0x1CF.
+static uint16_t* DispiReg(VgaDevice* d) {
+  switch (d->dispi_index) {
+    case kDispiXres:
+    case kDispiYres:
+    case kDispiBpp:
+    case kDispiEnable:
+    case kDispiBank:
+    case kDispiVirtWidth:
+    case kDispiVirtHeight:
+    case kDispiXOffset:
+    case kDispiYOffset:
+      return &d->dispi[d->dispi_index];
+    default:
+      return NULL;
+  }
+}
+
+static uint16_t VgaDispiReadReg(VgaDevice* d) {
+  switch (d->dispi_index) {
+    case kDispiId:
+      return d->dispi_id;
+    case kDispiVideoMemory64K:
+      return (uint16_t)(kVgaVramSize / 65536);
+    default:
+      break;
+  }
+  const uint16_t* slot = DispiReg(d);
+  return slot ? *slot : 0xffff;
+}
+
+static void VgaDispiWriteReg(VgaDevice* d, uint16_t val) {
+  switch (d->dispi_index) {
+    case kDispiId:
+      // Only the six ids are accepted, and an id outside them changes nothing:
+      // the register keeps the last id the card was given. Measured against the
+      // reference (qemu-system-i386 -vga std answers a write of 0x1234 by
+      // reading back the 0xB0C0 it already held), and it is the reading that
+      // makes the ROM's probe mean something -- bochsvga.c:309-313 writes ID0
+      // and compares, so a card that zeroed its id on a stray write would fail
+      // its own handshake.
+      if (DispiKnownId(val)) d->dispi_id = val;
+      return;
+    case kDispiVideoMemory64K:
+      return;  // read-only: the video memory is the card's, not the guest's
+    default:
+      break;
+  }
+  uint16_t* slot = DispiReg(d);
+  if (!slot) return;  // the index names no register, so nothing is written
+  if (d->dispi_index == kDispiEnable) {
+    // ENABLE is a byte of flags and two of its bits are not state: GET-CAPS is a
+    // strobe the ROM sets to read the capabilities and then restores
+    // (bochsvga.c:357, :360), and NOCLEAR is not part of what a read answers
+    // with. Echoing either would make this card report an ENABLE the guest never
+    // asked for.
+    *slot = (uint16_t)(val & ~(kDispiGetCaps | kDispiNoClearMem) & 0xff);
+    return;
+  }
+  *slot = val;
+}
+
 // Reserved bits read back as zero: each register keeps only the bits the chip
-// implements (QEMU's sr_mask/gr_mask tables; the attribute controller masks
-// its own in the write path).
-static const uint8_t kSeqWriteMask[8] = {0x03, 0x3b, 0x0f, 0x1f, 0x0f, 0x00, 0x00, 0x00};
-static const uint8_t kGfxWriteMask[16] = {0x0f, 0x0f, 0x0f, 0x1f, 0x03, 0x7f, 0x0f,
+// implements. The bit lists are QEMU's sr_mask / gr_mask (hw/display/vga.c),
+// the behavioural cross-check for this register file -- and they are not
+// cosmetic: a guest that identifies the card (Windows 1.01's display driver
+// among them) writes all ones and reads back, so a mask that keeps a bit QEMU
+// drops, or drops a bit QEMU keeps, makes this card answer a different card
+// than the reference does. The attribute controller masks its own in the write
+// path (QEMU's vga_ioport_write does the same per register).
+static const uint8_t kSeqWriteMask[8] = {0x03, 0x3d, 0x0f, 0x3f, 0x0e, 0x00, 0x00, 0xff};
+static const uint8_t kGfxWriteMask[16] = {0x0f, 0x0f, 0x0f, 0x1f, 0x03, 0x7b, 0x0f,
                                           0x0f, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
                                           0x00, 0x00};
 
-// The colour and monochrome halves of the port block are mutually exclusive:
-// only the half the miscellaneous output register selects answers, and the
-// other floats high (QEMU guards the two ranges with this same test).
+// Which CRTC address pair answers. IBM VGA Technical Reference: miscellaneous
+// output bit 0 (IOCS16) is the CRTC's chip-select line and moves only the CRTC
+// registers -- 0x3B4/0x3B5 when clear, 0x3D4/0x3D5 when set. Every other port in
+// the block decodes regardless of it: the attribute controller (0x3C0/0x3C1),
+// the sequencer (0x3C4/0x3C5), the feature and misc registers (0x3C2/0x3CA/
+// 0x3CC), the DAC (0x3C6-0x3C9), the graphics controller (0x3CE/0x3CF) and the
+// CGA latches.
+//
+// Both references model the older wiring instead, where the whole half switched:
+// QEMU's vga_ioport_invalid treats 0x3B0-0x3BF as invalid in colour mode and
+// 0x3D0-0x3DF as invalid in mono, v86 registers the two halves apart the same
+// way. That is the difference the register census shows: under QEMU a firmware
+// that reaches the attribute controller without first clearing IOCS16 has its
+// writes dropped, and the palette it programmed never lands. Here the TR wins;
+// registered in AGENTS.md §X so the divergence from the references is on purpose
+// and on the record.
 static int VgaPortDecoded(const VgaDevice* d, uint16_t port) {
-  if (port >= 0x3b0 && port <= 0x3bf) return (d->misc & kMiscColorEmulation) ? 0 : 1;
-  if (port >= 0x3d0 && port <= 0x3df) return (d->misc & kMiscColorEmulation) ? 1 : 0;
+  const int mono = (d->misc & kMiscColorEmulation) == 0;
+  if (port == 0x3b4 || port == 0x3b5) return mono;
+  if (port == 0x3d4 || port == 0x3d5) return !mono;
   return 1;
 }
 
+// The register file's answer to a read: the decode gate is above, so this is
+// reached only for a port the card is currently decoding.
+static uint8_t VgaPortReadReg(VgaDevice* d, uint16_t port);
+
 static uint8_t VgaPortRead8(VgaDevice* d, uint16_t port) {
   if (!VgaPortDecoded(d, port)) return 0xff;
+  uint8_t v = VgaPortReadReg(d, port);
+  // A read returns a value rather than changing state, but it is what the guest
+  // then *decides* on -- so a transcript of port writes alone cannot explain a
+  // guest that programs the card differently. The read row goes to the same
+  // category as the write row: between them they are the guest's whole
+  // conversation with the register file, in order.
+  if (DebugOn(kDbgVgaIo)) DebugVgaIo(port, v, /*is_read=*/1);
+  return v;
+}
+
+static uint8_t VgaPortReadReg(VgaDevice* d, uint16_t port) {
   switch (port) {
     case kPortAttribute:  // the index, while the flip-flop is clear
       return d->ar_flip_flop == 0 ? d->ar_index : 0;
@@ -386,7 +551,9 @@ static uint8_t VgaPortRead8(VgaDevice* d, uint16_t port) {
       return i < kAttrCount ? d->ar[i] : 0;
     }
     case kPortStatus0:
-      VgaUpdateStatus(d, (uint64_t)HostTimerNow());
+      // Input status 0 carries the light-pen and switch-sense inputs and the RAM
+      // feedback, none of which this card has lines for: the reset value is all
+      // there is to report (AGENTS.md §X, D17).
       return d->st00;
     case kPortSeqIndex:
       return d->sr_index;
@@ -432,6 +599,7 @@ static uint8_t VgaPortRead8(VgaDevice* d, uint16_t port) {
 
 static void VgaPortWrite8(VgaDevice* d, uint16_t port, uint8_t val) {
   if (!VgaPortDecoded(d, port)) return;
+  if (DebugOn(kDbgVgaIo)) DebugVgaIo(port, val, /*is_read=*/0);
   switch (port) {
     case kPortAttribute:  // index while the flip-flop is clear, data while set
       if (d->ar_flip_flop == 0) {
@@ -489,7 +657,9 @@ static void VgaPortWrite8(VgaDevice* d, uint16_t port, uint8_t val) {
       break;
     case kPortCrtcMonoIndex:
     case kPortCrtcIndex:
-      d->cr_index = val & 0x1f;  // the CRTC's index latch is 5 bits
+      // The address register is 8 bits wide; the register set is R0-R24, so a
+      // larger value names nothing and the data path ignores it (IBM VGA).
+      d->cr_index = val;
       return;
     case kPortCrtcMonoData:
     case kPortCrtcData:
@@ -521,8 +691,23 @@ static void VgaPortWrite8(VgaDevice* d, uint16_t port, uint8_t val) {
 // The card's ports are byte-wide; a 16- or 32-bit cycle drives the byte lanes
 // in turn (QEMU's VGA portio does the same), because that is how ISA/VLB
 // software programs the index/data pairs (`outw` to 0x3C4 sets index and data).
+//
+// DISPI is the exception: it is a word register bank, and the ROM addresses it
+// with outw/inw (bochsvga.c:75-81), so a word there is one register rather than
+// two byte lanes. The two lanes past 0x1CF are region padding, not registers --
+// see kDispiPortCount -- and answer the way the block's other undefined ports
+// do. A byte access to either DISPI port reaches the byte path, which has no
+// case for them: it reads high and writes nothing (registered in AGENTS.md §X's
+// D17, since a byte-addressing guest would not drive the card).
 static uint64_t VgaPortRead(void* dev, uint64_t addr, int size) {
   VgaDevice* d = (VgaDevice*)dev;
+  if (size >= 2 && addr >= kDispiIndexPort && addr < kDispiIndexPort + kDispiPortCount) {
+    uint16_t v = addr == kDispiIndexPort
+                     ? d->dispi_index
+                     : (addr == kDispiDataPort ? VgaDispiReadReg(d) : 0xffff);
+    if (DebugOn(kDbgVgaIo)) DebugVgaIo((uint16_t)addr, v, /*is_read=*/1);
+    return v;
+  }
   uint64_t v = 0;
   for (int i = 0; i < size; i++)
     v |= (uint64_t)VgaPortRead8(d, (uint16_t)(addr + (uint64_t)i)) << (8 * i);
@@ -531,6 +716,20 @@ static uint64_t VgaPortRead(void* dev, uint64_t addr, int size) {
 
 static void VgaPortWrite(void* dev, uint64_t addr, int size, uint64_t val) {
   VgaDevice* d = (VgaDevice*)dev;
+  if (size >= 2 && addr >= kDispiIndexPort && addr < kDispiIndexPort + kDispiPortCount) {
+    uint16_t v = (uint16_t)val;
+    if (addr == kDispiIndexPort) {
+      // The index has to name one of the register file's kDispiRegCount
+      // registers (bochsvga.h:15-25). An index naming none leaves the register
+      // the card already pointed at, which is what keeps the data port from
+      // ever addressing a slot the file does not have.
+      if (v < kDispiRegCount) d->dispi_index = (uint8_t)v;
+    } else if (addr == kDispiDataPort) {
+      VgaDispiWriteReg(d, v);
+    }
+    if (DebugOn(kDbgVgaIo)) DebugVgaIo((uint16_t)addr, v, /*is_read=*/0);
+    return;
+  }
   for (int i = 0; i < size; i++)
     VgaPortWrite8(d, (uint16_t)(addr + (uint64_t)i), (uint8_t)(val >> (8 * i)));
 }
@@ -654,13 +853,18 @@ static uint8_t VgaMemRead8(VgaDevice* d, uint32_t addr) {
   if (d->gr[kGfxMode] & kGfxModeOddEven) return d->vram[VgaOddEvenOffset(d, off)];
   d->latch = ((const uint32_t*)d->vram)[off];  // every read latches all planes
   if (d->gr[kGfxMode] & kGfxModeRead) {
-    // Read mode 1: compare the latched planes with the colour-compare value
-    // under the colour-don't-care mask and report a 1 where they differ.
-    uint32_t ret = (d->latch ^ kPlaneExpand[d->gr[kGfxColorCompare] & 0x0f]) &
-                   kPlaneExpand[d->gr[kGfxColorDontCare] & 0x0f];
-    ret |= ret >> 16;
-    ret |= ret >> 8;
-    return (uint8_t)~ret;
+    // Read mode 1: the colour compare. The read map select names the plane, and
+    // that plane's byte is compared with the colour compare value under the
+    // colour don't-care mask: the read answers 0xff when every cared-for bit
+    // matches and 0x00 when any of them differs (IBM VGA Technical Reference
+    // "Read Mode 1"; QEMU's vga_mem_readb case 0x08 does the same in one line:
+    // ~(compare ^ plane_byte) & dont_care). Comparing all four planes at once
+    // and folding the answers together would answer about planes the guest did
+    // not ask for, and the probe vga_ops.asm pins it (its rdm1 line).
+    const uint32_t plane_byte = (d->latch >> (8 * (d->gr[kGfxReadMapSelect] & 3))) & 0xff;
+    const uint32_t compare = d->gr[kGfxColorCompare] & 0xff;
+    const uint32_t dont_care = d->gr[kGfxColorDontCare] & 0xff;
+    return (uint8_t)~((plane_byte ^ compare) & dont_care);
   }
   // Read mode 0: the plane the read-map-select register names.
   return (uint8_t)(d->latch >> (8 * (d->gr[kGfxReadMapSelect] & 3)));
@@ -684,6 +888,174 @@ static void VgaMemWrite(void* dev, uint64_t addr, int size, uint64_t val) {
 }
 
 const DeviceOps kVgaMemOps = {"vga-vram", VgaMemRead, VgaMemWrite};
+
+// --- the PCI function -------------------------------------------------------------
+// The framebuffer BAR is a plain window onto the video memory: a guest that has
+// programmed a display start address through the CRTC reaches its pixels here
+// without the graphics controller's rotate/mask/logic stages, which is what makes
+// it a *linear* framebuffer (QEMU maps vga.vram straight onto the BAR when the
+// card offers VGA_RAM_LFB, hw/display/vga-pci.c's vga_pci_realize +
+// vga_init; the register-block BAR is the I/O side of the same function).
+//
+// The window is the card's real video memory, so the BAR is exactly as large as
+// the memory is: the DISPI VIDEO_MEMORY_64K register reports the same number, and
+// firmware that sizes a linear framebuffer against one is not told a size the
+// card cannot back. Both come from kVgaVramSize in vga.h, whose comment records
+// the paired measurements that fixed it at 16MB (the option ROM sizes the mode
+// table against this number, so a card that reports less loses modes the
+// reference machine keeps).
+static uint64_t VgaLfbRead(void* dev, uint64_t addr, int size) {
+  VgaDevice* d = (VgaDevice*)dev;
+  uint64_t off = addr - d->lfb_base;
+  uint64_t v = 0;
+  for (int i = 0; i < size; i++)
+    v |= (uint64_t)d->vram[(off + (uint64_t)i) & (kVgaVramSize - 1)] << (8 * i);
+  return v;
+}
+
+static void VgaLfbWrite(void* dev, uint64_t addr, int size, uint64_t val) {
+  VgaDevice* d = (VgaDevice*)dev;
+  uint64_t off = addr - d->lfb_base;
+  for (int i = 0; i < size; i++)
+    d->vram[(off + (uint64_t)i) & (kVgaVramSize - 1)] = (uint8_t)(val >> (8 * i));
+  d->dirty = 1;
+}
+
+static const DeviceOps kVgaLfbOps = {"vga-lfb", VgaLfbRead, VgaLfbWrite};
+
+static void VgaPut16(uint8_t* p, uint16_t v) {
+  p[0] = (uint8_t)(v & 0xff);
+  p[1] = (uint8_t)(v >> 8);
+}
+
+static void VgaPut32(uint8_t* p, uint32_t v) {
+  VgaPut16(p, (uint16_t)(v & 0xffff));
+  VgaPut16(p + 2, (uint16_t)(v >> 16));
+}
+
+// BAR size decoding, the same rule ide.c's MaskBar uses (PCI spec §6.2.5.1):
+// the address bits below a BAR's window are read-only zero, so firmware's
+// probe -- write all ones, read back -- sees the window size and alignment.
+// Without this every BAR answers "4GiB" and the resource allocator places the
+// windows anywhere. `io` is the read-only type bit the BAR carries: bit 0 set for
+// an I/O window, clear for a memory one (ide.c's BARs are all I/O, so its mask
+// hardcodes the set bit).
+static void VgaMaskBar(uint8_t* cfg, uint32_t size, uint32_t io) {
+  uint32_t v = (uint32_t)cfg[0] | ((uint32_t)cfg[1] << 8) | ((uint32_t)cfg[2] << 16) |
+               ((uint32_t)cfg[3] << 24);
+  v = (v & ~(size - 1)) | io;
+  cfg[0] = (uint8_t)v;
+  cfg[1] = (uint8_t)(v >> 8);
+  cfg[2] = (uint8_t)(v >> 16);
+  cfg[3] = (uint8_t)(v >> 24);
+}
+
+// A field that does not exist on this function reads back zero however it is
+// written: the BAR slots between the two real ones, and the expansion-ROM
+// address register (this function serves no expansion ROM -- the machine hands
+// the option ROM to the guest through its own window, so there is no ROM image
+// for the enable bit at 0x30 to point at). Firmware sizes every slot it finds
+// non-empty, so a slot left writable would claim a window the card does not
+// decode; SeaBIOS's size probe would read all ones, take that as a 16-byte
+// window, round it up to its minimum and allocate four of them (its
+// pci_bios_get_bar + the PCI_DEVICE_MEM_MIN floor in pci_bios_check_devices,
+// fw/pciinit.c).
+static void VgaZeroField(uint8_t* cfg) {
+  cfg[0] = 0;
+  cfg[1] = 0;
+  cfg[2] = 0;
+  cfg[3] = 0;
+}
+
+// A 64-bit memory BAR occupies two slots and its low half is written first, so
+// the window is placed when that low dword lands on a non-zero address. QEMU
+// answers the same pair the same way (hw/pci/pci.c pci_default_write_config).
+static void VgaBarWritten(VgaDevice* d, uint32_t base) {
+  if (base == 0 || base == d->lfb_base) {
+    d->lfb_base = base;
+    return;
+  }
+  d->lfb_base = base;
+  if (d->mem_bus) BusAddRegion(d->mem_bus, base, kVgaVramSize, &kVgaLfbOps, d);
+}
+
+static void VgaConfigWritten(void* ctx, uint8_t off, uint8_t val) {
+  VgaDevice* d = (VgaDevice*)ctx;
+  (void)val;
+  switch (off & (uint8_t)~3u) {
+    case kCfgBar0: {
+      uint32_t base = (uint32_t)d->pci.config[kCfgBar0] |
+                      ((uint32_t)d->pci.config[kCfgBar0 + 1] << 8) |
+                      ((uint32_t)d->pci.config[kCfgBar0 + 2] << 16) |
+                      ((uint32_t)d->pci.config[kCfgBar0 + 3] << 24);
+      // bits 2-3 are the read-only type field: 10 = 64-bit, 08 = prefetchable.
+      VgaMaskBar(&d->pci.config[kCfgBar0], kVgaVramSize, kBarType64Prefetch);
+      // The window sits where the pair points, which for a video memory this
+      // size is always the low 4GB, but the high dword is read so the base is
+      // the address the pair actually names.
+      uint32_t high = (uint32_t)d->pci.config[kCfgBar1] |
+                      ((uint32_t)d->pci.config[kCfgBar1 + 1] << 8) |
+                      ((uint32_t)d->pci.config[kCfgBar1 + 2] << 16) |
+                      ((uint32_t)d->pci.config[kCfgBar1 + 3] << 24);
+      VgaBarWritten(d, (((uint64_t)high << 32) | base) & ~(uint64_t)(kVgaVramSize - 1));
+      break;
+    }
+    case kCfgBar2:
+      VgaMaskBar(&d->pci.config[kCfgBar2], kVgaBarIoSize, kBarTypeIo);
+      break;
+    case kCfgBar1:
+      // The upper half of the 64-bit BAR0 is a plain address register with no
+      // read-only type bits, so it keeps whatever was written -- which is what
+      // makes a size probe on it read all ones, and the pair then sizes as one
+      // 64-bit window (QEMU masks only the low half for the same reason,
+      // hw/pci/pci.c pci_default_write_config).
+      break;
+    case kCfgBar3:
+    case kCfgBar4:
+    case kCfgBar5:
+    case kCfgBar6:
+    case kCfgExpRomBase:
+      VgaZeroField(&d->pci.config[off & (uint8_t)~3u]);
+      break;
+    default:
+      break;
+  }
+}
+
+void VgaPciInit(VgaDevice* d, Bus* mem_bus, uint8_t bus, uint8_t dev) {
+  memset(&d->pci, 0, sizeof(d->pci));
+  d->pci.bus = bus;
+  d->pci.dev = dev;
+  d->pci.func = 0;
+  VgaPut16(&d->pci.config[kCfgVendor], kPciVendorStdVga);
+  VgaPut16(&d->pci.config[kCfgDevice], kPciDeviceStdVga);
+  d->pci.config[kCfgRevision] = 0x02;
+  d->pci.config[kCfgProgIf] = 0x00;
+  // The class code is two single bytes -- subclass then base class -- and the
+  // pair is what a class search matches (SeaBIOS builds its pci->class from the
+  // dword at PCI_CLASS_REVISION and compares 0x0300, hw/pci_ids.h
+  // PCI_CLASS_DISPLAY_VGA; hw/pcidevice.c:65-66). Writing it as a 16-bit word
+  // would spill the class byte into the latency-timer field above it and the
+  // device would enumerate but match no class search at all.
+  d->pci.config[kCfgSubClass] = 0x00;  // VGA controller
+  d->pci.config[kCfgClass] = 0x03;     // display controller
+  d->pci.config[kCfgHeaderType] = 0;  // single function, type 0 header
+  // BAR0: 64-bit prefetchable memory, low dword (bits 2-3 are read-only type
+  // bits: 10 = 64-bit, 08 = prefetchable). BAR2: I/O space. The register block
+  // is on the I/O bus at its fixed addresses either way, so the I/O BAR is the
+  // window a PCI-aware guest reads, not a second copy of the ports.
+  VgaPut32(&d->pci.config[kCfgBar0], 0x0000000c);
+  VgaPut32(&d->pci.config[kCfgBar2], 0x00000001);
+  VgaPut16(&d->pci.config[kCfgSubsystemVendor], kPciVendorStdVga);
+  VgaPut16(&d->pci.config[kCfgSubsystemId], kPciDeviceStdVga);
+  // A display adapter raises no interrupt (PCI spec §6.2.5.2: pin 0 means the
+  // device has no interrupt pin), and QEMU's stdvga likewise leaves it zero.
+  d->pci.config[kCfgInterruptPin] = 0;
+  d->pci.written = VgaConfigWritten;
+  d->pci.ctx = d;
+  d->mem_bus = mem_bus;
+  d->lfb_base = 0;
+}
 
 // --- rendering -------------------------------------------------------------------
 // The picture is derived from the register file every time it changes, the way
@@ -712,9 +1084,14 @@ static void VgaComputePicture(const VgaDevice* d, VgaPicture* p) {
   if (p->graphics) {
     p->width = (d->cr[kCrtcHorizontalDisplayEnd] + 1) * 8;
     p->height = display_end + 1;
-    // CRTC R9: bit 7 doubles every row (the 200-to-400 line conversion), the
-    // low bits repeat each VRAM row that many extra times.
-    p->multi_scan = (d->cr[kCrtcMaxScanLine] & 0x80) ? 1 : (d->cr[kCrtcMaxScanLine] & 0x1f);
+    // CRTC R9: bit 7 doubles every row (the 200-to-400 line conversion). The
+    // field's low bits (R9.4-0) are the text mode character height -- IBM VGA
+    // TR 3.1a gives the maximum scan line meaning only for character rows -- so
+    // a graphics picture must not repeat rows on it. (QEMU's vga_draw_graphic
+    // does repeat on it, `multi_scan = ((R9 & 0x1f) + 1 << double) - 1`, with
+    // an "XXX: is it correct?" of its own; AGENTS.md §五 settles a reference
+    // disagreement with the manual, and the manual is on this side.)
+    p->multi_scan = (d->cr[kCrtcMaxScanLine] & 0x80) ? 1 : 0;
   } else {
     p->cols = d->cr[kCrtcHorizontalDisplayEnd] + 1;
     p->rows = (display_end + 1) / p->cell_height;
@@ -739,11 +1116,15 @@ static void VgaRenderText(VgaDevice* d, const VgaPicture* p, uint32_t blink_tick
   const int cursor_shown = !(d->cr[kCrtcCursorStart] & 0x20) && !(blink && ((blink_tick >> 1) & 1));
   const int cursor_first = d->cr[kCrtcCursorStart] & 0x1f;
   const int cursor_last = d->cr[kCrtcCursorEnd] & 0x1f;
+  // The row pitch is the width the display channel publishes, not the CRTC's
+  // raw width: the buffer is kVgaFbWidth wide and a wider mode is clipped, so
+  // walking it at p->width would shear the picture and write past the array.
+  const int stride = d->fb_width;
   for (int row = 0; row < p->rows; row++) {
     for (int col = 0; col < p->cols; col++) {
       const int off = p->start + row * p->line_bytes + col;
       const int px = col * p->cell_width;
-      if (px >= kVgaFbWidth) break;
+      if (px >= stride) break;
       // In the odd/even layout a cell is one plane offset: the character in
       // plane 0 and its attribute in plane 1.
       const uint16_t ch_attr = (uint16_t)(d->vram[off * 4] | (d->vram[off * 4 + 1] << 8));
@@ -759,18 +1140,18 @@ static void VgaRenderText(VgaDevice* d, const VgaPicture* p, uint32_t blink_tick
                        ch >= 0xb0 && ch <= 0xdf;
       for (int line = 0; line < p->cell_height; line++) {
         const int y = row * p->cell_height + line;
-        if (y >= p->height || y >= kVgaFbHeight) break;
+        if (y >= d->fb_height) break;
         const uint8_t bits = d->vram[glyph + line * 4];
-        uint32_t* out = &d->fb[(size_t)y * kVgaFbWidth + px];
+        uint32_t* out = &d->fb[(size_t)y * stride + px];
         const uint32_t fg_color = AttrColor(d, fg);
         const uint32_t bg_color = AttrColor(d, bg);
-        for (int dot = 0; dot < p->cell_width && px + dot < kVgaFbWidth; dot++) {
+        for (int dot = 0; dot < p->cell_width && px + dot < stride; dot++) {
           int on = dot < 8 ? (bits >> (7 - dot)) & 1 : (dup9 ? bits & 1 : 0);
           out[dot] = on ? fg_color : bg_color;
         }
         if (cursor_shown && row * p->line_bytes + col == cursor_cell && line >= cursor_first &&
             line <= cursor_last) {
-          for (int dot = 0; dot < p->cell_width && px + dot < kVgaFbWidth; dot++)
+          for (int dot = 0; dot < p->cell_width && px + dot < stride; dot++)
             out[dot] = fg_color;
         }
       }
@@ -783,22 +1164,34 @@ static void VgaRenderGraphics(VgaDevice* d, const VgaPicture* p) {
   // one bit from each enabled plane at the same bit position, and the CGA's
   // packed 2bpp shape (shift control 1, modes 4/5), where a byte holds four
   // pixels and even/odd bytes alternate between plane 0 and plane 1 (IBM CGA
-  // Technical Reference; the same packing QEMU's planar loop walks). The CGA
-  // shapes also honour the 0x3D8 video-enable latch and the 0x3D9 colour latch,
-  // whose background, palette and intensity bits select the attribute-palette
-  // entries the CGA colours map to — the values the BIOS's own CGA-mode tables
-  // encode, so a guest that leaves the latches alone sees the standard colours.
+  // Technical Reference; the same packing QEMU's vga_draw_line2 walks). The
+  // four plane bytes of one pixel byte are one dword of the interleaved planes
+  // (QEMU's vga_draw_line4 reads exactly that: one dword per pixel byte, the
+  // lane per plane), which is what the aperture's standard latched write path
+  // produces: the guest's address is the plane offset and SR2 says which
+  // planes the byte reaches, so a driver paints with write mode 2 (or with the
+  // set/reset pipeline) one byte per pixel byte.
   const int cga_colors = p->shift_control == 1;
-  const int cga_mono = p->planes == 1;  // mode 6: one plane, two colours
+  // The CGA latches (0x3D8/0x3D9) drive the colours only in the shapes the CGA
+  // itself defines: the packed two-bit modes 4/5, and the double-scanned
+  // one-bit 640x200 shape of mode 6 (IBM CGA Technical Reference: the colour
+  // register picks the ink and the background of those modes). A VGA-native
+  // mode that enables a single plane -- mode 0x0F's 640x350 and mode 0x11's
+  // 640x480 monochrome -- takes its two colours from AR0/AR1 like any other
+  // planar mode (QEMU's vga_draw_line4 goes through update_palette16 for every
+  // planar mode; the CGA latches are not consulted there), so keying the CGA
+  // path off "one plane enabled" would mis-colour those two modes.
+  const int cga_mono = !cga_colors && p->multi_scan == 1 && p->cell_height == 2;
   const int cga = cga_colors || cga_mono;
   const int blank = cga && !(d->cga_mode & kCgaModeVideoEnable);
   const int intensity = (d->cga_color & 0x10) ? 8 : 0;
   const int palette_base = (d->cga_color & 0x20) ? 3 : 2;
-  for (int y = 0; y < p->height && y < kVgaFbHeight; y++) {
+  const int stride = d->fb_width;
+  for (int y = 0; y < d->fb_height; y++) {
     const int row = y / (p->multi_scan + 1);
     const uint32_t base = (uint32_t)(p->start + row * p->line_bytes);
-    uint32_t* out = &d->fb[(size_t)y * kVgaFbWidth];
-    for (int x = 0; x < p->width && x < kVgaFbWidth; x++) {
+    uint32_t* out = &d->fb[(size_t)y * stride];
+    for (int x = 0; x < stride; x++) {
       if (blank) {
         out[x] = 0;
         continue;
@@ -866,14 +1259,72 @@ static void ScreenMirror(VgaDevice* d, const VgaPicture* p) {
 // same approximation the CGA slice used (registered in D17).
 enum { kBlinkTickUs = 133 * 1000, kRenderIntervalUs = 4000 };
 
+// --- the mode report (CEMU_DEBUG=mark, AGENTS.md §十) -------------------------
+// A guest that goes wrong on a display shows it in the register file, not in an
+// instruction: which mode it asked for, and what the card ended up describing.
+// This emits three frameless rows per *change* of picture, so a boot's whole
+// mode sequence reads as a list: the geometry, the shapes that decide how the
+// picture is read (in the bit layout below), and the timing registers it came
+// from.
+enum {
+  kVgaMarkGraphics = 1 << 0,   // AR10 bit 0: graphics rather than text
+  kVgaMarkChain4 = 1 << 1,     // SR4 bit 3
+  kVgaMarkOddEven = 1 << 2,    // GR5 bit 4 (the text layout)
+  kVgaMarkDoubleScan = 1 << 3, // CRTC R9 bit 7
+  kVgaMarkShift = 3 << 4,      // GR5 bits 6-5: the pixel packing
+  kVgaMarkPlanes = 0xf << 6,   // AR12: the colour plane enable
+};
+static void VgaMarkMode(VgaDevice* d, const VgaPicture* p) {
+  // Only on a change: a guest that leaves the mode alone must not fill the log.
+  const int flags = (p->graphics ? kVgaMarkGraphics : 0) |
+                    (p->chain4 ? kVgaMarkChain4 : 0) | (p->odd_even ? kVgaMarkOddEven : 0) |
+                    (p->multi_scan ? kVgaMarkDoubleScan : 0) |
+                    ((p->shift_control << 4) & kVgaMarkShift) |
+                    ((p->planes << 6) & kVgaMarkPlanes);
+  if (flags == d->marked_flags && p->width == d->marked_width &&
+      p->height == d->marked_height)
+    return;
+  d->marked_flags = flags;
+  d->marked_width = p->width;
+  d->marked_height = p->height;
+  DebugMark("vga-mode", p->width, p->height);
+  DebugMark("vga-shapes", flags, (unsigned)p->start);
+  // The timing registers the picture above came from, so a guest that programs
+  // the card itself (Windows 1.01's EGA driver does not go through int10) can
+  // be compared against a mode table entry: a = R9 (max scan line) with R18
+  // (display end) and R7 (overflow) above it, b = R13 (the line offset) with
+  // GR6 (memory mode) and GR5 (write/read mode) above it.
+  DebugMark("vga-timing", d->cr[kCrtcMaxScanLine] | (d->cr[kCrtcVerticalDisplayEnd] << 8) |
+                               (d->cr[kCrtcOverflow] << 16),
+            d->cr[kCrtcOffset] | (d->gr[kGfxMisc] << 8) | (d->gr[kGfxMode] << 16));
+}
+
 void VgaPoll(VgaDevice* d) {
   const uint64_t now = (uint64_t)HostTimerNow();
   VgaUpdateStatus(d, now);
+  // A monotone host-clock tick, deliberately: bit 0 is the blink phase and
+  // bit 1 the cursor's slower one (VgaRenderText reads both), so the count has
+  // to keep advancing. Deriving either bit from where the raster happens to be
+  // at poll time makes the phase a sample rather than a counter -- it can stand
+  // still or go backwards, and bit 1 of a one-bit value is always zero, which
+  // would leave the cursor permanently shown.
   const uint32_t blink_tick = (uint32_t)(now / kBlinkTickUs);
-  if (!d->dirty && blink_tick == d->rendered_blink_tick) return;
-  if (now - d->last_render_us < kRenderIntervalUs) return;  // batch guest writes
+  // The mode report runs before the render gate, not after it: the gate batches
+  // guest writes into one render every kRenderIntervalUs, so a mode the guest
+  // programs and abandons within one interval (a driver that sets a mode, does
+  // not like what it reads back and restores the old one) would leave no trace
+  // at all in the sequence the report exists to show. Poll runs every step, so
+  // every register change is seen; the render stays batched.
   VgaPicture p;
   VgaComputePicture(d, &p);
+  VgaMarkMode(d, &p);
+  if (!d->dirty && blink_tick == d->rendered_blink_tick) return;
+  if (now - d->last_render_us < kRenderIntervalUs) return;  // batch guest writes
+  // The framebuffer holds the current picture's own rows back to back: the
+  // display channel publishes fb_width x fb_height and fbdump writes that many
+  // pixels per row, so a render that walked the buffer at a different stride
+  // would shear every row of both. Both numbers below are the same picture
+  // width, clamped to the buffer's maximum the same way.
   d->fb_width = p.width < kVgaFbWidth ? p.width : kVgaFbWidth;
   d->fb_height = p.height < kVgaFbHeight ? p.height : kVgaFbHeight;
   if (p.graphics)

@@ -24,11 +24,35 @@ void HostFileClose(HostFile* f);
 void HostWriteOut(const char* buf, size_t n);
 void HostWriteErr(const char* buf, size_t n);
 
-// Monotonic host clock in microseconds since an arbitrary epoch (QPC). This is
-// the time base every device's period is measured against (PIT counters, APIC
-// timer, CLINT mtime).
+// The emulated clock, in microseconds: the time base every device's period is
+// measured against (PIT counters, APIC timer, CLINT mtime, the VGA retrace).
+// Host wall time plus any --skip-idle warp, unless -icount replaced the wall
+// clock with a declared per-instruction rate (HostTimerIcountEnable).
 int64_t HostTimerNow(void);
+// The host's own wall clock, for the three things that measure host time rather
+// than emulated time: the MC146818 time-of-day, the window's repaint throttle,
+// the input poll throttle. Neither -icount nor --skip-idle may move it — the
+// MC146818 keeps real time while the guest does not, and a host-side throttle
+// that skipped ahead would stop throttling (QEMU's QEMU_CLOCK_REALTIME, which
+// hw/rtc/mc146818.c uses for the time-of-day registers).
+int64_t HostTimeRealtime(void);
+// -icount shift=N (QEMU's spelling): declare that one retired instruction
+// accounts for 1<<shift nanoseconds of emulated time, so the emulated clock is
+// a function of the executed instruction stream and a run reproduces exactly
+// instead of depending on how fast the host happened to be. Enabled before the
+// machine runs; the run loop calls Advance() once per retired instruction.
+// Halting therefore costs no emulated time, so a halted CPU must be jumped to
+// the next device deadline rather than waited out (QEMU advances its icount
+// deadline across a halt for the same reason).
+void HostTimerIcountEnable(int shift);
+// 1 while the emulated clock is instruction-driven rather than wall-driven.
+int HostTimerIcountOn(void);
+// Charges one retired instruction to the emulated clock; a no-op unless
+// -icount is on.
+void HostTimerIcountAdvance(void);
 // Yields the CPU; used while a guest sleeps waiting for a timer interrupt.
+// Under -icount the wait is also charged to the emulated clock, since a halt
+// that advances nothing would leave the guest with a clock that never moves.
 void HostSleepMs(int ms);
 // Advances the clock HostTimerNow() reports by us microseconds, i.e. makes
 // emulated time jump forward without host time passing. The run loop uses it

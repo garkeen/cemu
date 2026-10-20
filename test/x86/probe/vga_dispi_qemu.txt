@@ -1,0 +1,31 @@
+vga-dispi FAIL step=3
+
+Dual run of test/x86/probe/vga_dispi.asm, 2026-10-15, same binary on both models
+(step 3 of that binary still expected this card's then-256KB; see the last
+paragraph for what changed after this capture):
+
+  cemu  --machine x86 --isa x86 vga_dispi.bin                        -> vga-dispi ok
+  qemu-system-i386 -drive file=vga_dispi.bin,format=raw,if=ide,index=0 \
+      -boot c -vga std -display none -serial stdio -no-reboot \
+      -device isa-debug-exit,iobase=0xf4,iosize=0x4                  -> vga-dispi FAIL step=3
+
+Steps 1, 2, 4, 5 and 6 agree byte for byte, and two of them are the reason this
+file exists:
+
+  - step 2: QEMU answers a write of an id outside the six by keeping the id it
+    already held (it does NOT clear it to 0xffff). cemu cleared it, and the
+    "QEMU sets vbe_id to VBE_DISPI_ID_UNKNOWN on a miss" note that justified
+    that was wrong -- measured here, fixed in vga.c's VgaDispiWriteReg.
+  - step 4: QEMU refuses an index that names no register, so the data port can
+    never address a slot the register file does not have. cemu masked the index
+    into range instead and ran off the end of dispi[] into the PCI config space.
+
+QEMU stops at step 3 because of what the two cards are, not how they answer:
+VIDEO_MEMORY_64K reports the card's own video memory, and this probe was written
+when cemu's card had 256KB (4) against QEMU's stdvga 16MB (256). The reference
+number is not only QEMU's default but what its own firmware measures -- SeaBIOS
+sizes 00:02.0's BAR0 on qemu-system-i386 -vga std to "size 01000000 [prefmem]"
+-- and the option ROM builds its mode table against it, so the 256KB card lost
+the VBE graphics modes (SeaVGABIOS printed "Removing mode 100..113" under cemu
+and only "19a..19e" under QEMU). cemu's card now has 16MB, BAR0 and the DISPI
+register both derived from kVgaVramSize, and step 3 asserts 0x0100.

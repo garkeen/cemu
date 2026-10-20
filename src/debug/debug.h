@@ -23,7 +23,8 @@ enum {
   kDbgGdb = 1 << 8,         // gdb stub protocol packets (tx/rx)
   kDbgMark = 1 << 9,        // frameless notes: irq lines, host input
   kDbgScreen = 1 << 10,     // text-screen mirror rows (console with no serial)
-  kDbgAny = 0x7ff,
+  kDbgVgaIo = 1 << 11,      // guest port writes into the video card
+  kDbgAny = 0xfff,
 };
 
 int DebugOn(uint32_t cat);
@@ -60,6 +61,48 @@ void DebugGdbNote(const char* note);
 // interrupt-line transitions, host input — have no instruction frame to report.
 // a/b are the two numbers the call site wants in the detail cell.
 void DebugMark(const char* what, int a, int b);
+
+// The argument registers of a BIOS/DOS service call, in the hub's plain-integer
+// form: the hub knows no ISA's register file (AGENTS.md §七's forbidden
+// dependency edges). Plain integers are also why the type exists at all -- the
+// parameters are not all in AX. AH=48h takes its size in BX, AH=3Dh its filename
+// in DS:DX, AH=0Ah its buffer in ES:DX, so a row carrying only AX could report
+// "out of memory" without saying how much was asked for.
+//
+// The fields carry an `arg_` prefix rather than the register's own name because
+// an x86 interpreter spells those as macros (cpu/isa/x86/exec.h: `ax`, `bx`,
+// `cx`, `dx`), and a member named `ax` could not be written from there.
+typedef struct DbgCallArgs {
+  uint32_t arg_ax, arg_bx, arg_cx, arg_dx, arg_ds, arg_es;
+} DbgCallArgs;
+
+// A guest's software INT n is a call with a request and an answer, and the two
+// halves are separate rows: the request knows the vector (the instruction had it
+// in hand), the answer does not (by then the handler is four pops deep). Both
+// are keyed by the caller's CS:IP, so the halves line up by address and not by
+// bookkeeping -- an interrupt that lands between them cannot shift the pairing.
+// AH names the service on the way in (SDM vol.1 5.1 INT n) and every one of
+// these services reports failure in CF, which is why the answer row carries it.
+//
+// QEMU has no row for this: its -d int prints the vector and EAX, but the whole
+// block sits inside `if (cr0 & PE)` and fires only on entry
+// (target/i386/tcg/seg_helper.c do_interrupt_all), so a real-mode guest's DOS
+// conversation has no QEMU-side channel at all. Emitted only for software INT n:
+// on an external interrupt or a CPU-raised exception, AX is unrelated to what
+// the handler returns.
+void DebugGateCall(uint32_t vec, const DbgCallArgs* a, uint32_t caller);
+void DebugGateRet(const DbgCallArgs* a, int cf, uint32_t caller);
+
+// Guest port access to the video card's register file (kDbgVgaIo), one row per
+// direction. A guest programs the card entirely through these ports, so the
+// *sequence* of accesses is what a second model's card has to be compared
+// against: the register file read back afterwards says which mode was reached,
+// but not which register answered differently on the way there -- and it is the
+// reads the guest *decided* on, so a write-only transcript cannot explain a
+// guest that then programs the card differently. QEMU offers the same channel to
+// its own tests as the vga_std_read_io / vga_std_write_io trace events; without
+// this row the two models cannot be lined up access for access.
+void DebugVgaIo(uint32_t port, uint32_t val, int is_read);
 
 // ---- synthetic host input (mouse=, key=) -----------------------------------
 // A guest-driven test can reach everything the guest can program, but not the
@@ -126,6 +169,17 @@ void DebugSetMemReader(DebugMemReadFn read, void* ctx);
 typedef int (*DebugFbInfoFn)(void* ctx, int* w, int* h);
 typedef const uint32_t* (*DebugFbPixelsFn)(void* ctx);
 void DebugSetFbReader(DebugFbInfoFn info, DebugFbPixelsFn pixels, void* ctx);
+
+// ---- the clock frameless rows print ----------------------------------------
+// A `mark`/`watch`/`gate` row has no instruction frame, and used to carry no time
+// at all: two such rows could not be ordered against the guest's clock, and a
+// row seen in one run could not be turned into a checkpoint in the next. The
+// board installs its retired-instruction counter here and every frameless row
+// prints it in the PC column — the role QEMU's trace stamp
+// ("<seq>@<virtual time>") plays in its own log. The point is reproducibility:
+// a row at inst=N can be re-run as `--max-inst=N`, and the session end then
+// brings the guest's state back through dump=.
+void DebugSetClock(const uint64_t* inst_count);
 
 // Halt/exit: the final regs table + session summary (always, once debug is
 // active at all).

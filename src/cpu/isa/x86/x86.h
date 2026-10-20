@@ -38,6 +38,19 @@ enum {
   kDr6Rsvd1 = 0xffff0ff0u,
   kDr7Le = 1u << 8, kDr7Ge = 1u << 9, kDr7Gd = 1u << 13, kDr7Rsvd1 = 0x400u
 };
+// DR7's per-breakpoint fields, as positions rather than as shifts written at
+// each use: Li at bit 2i, R/Wi at [17:16+4i], LENi at [19:18+4i] (SDM vol.3
+// figure 17-3). The stride is 4 because one breakpoint owns two 2-bit fields.
+enum {
+  kDr7LBase = 0, kDr7Stride = 4, kDr7RwBase = 16, kDr7LenBase = 18,
+  kDr7AnyLocal = 0xffu,  // the four Li bits together
+  // The R/W encodings (SDM vol.3 17.2.4, table 17-2). There is no read-only
+  // data breakpoint: 11 means read *or* write.
+  kDr7RwExec = 0, kDr7RwWrite = 1, kDr7RwIo = 2, kDr7RwAccess = 3
+};
+// LENi is a code, not a byte count: 00/01/10/11 = 1/2/4/8 bytes.
+enum { kDrLenCount = 4 };
+extern const uint32_t kDrLenBytes[kDrLenCount];
 
 // CR0 flags (SDM vol.3 2.5). PE drives protected mode and PG the page
 // tables; WP makes supervisor stores honor read-only pages (486+; wired
@@ -125,6 +138,14 @@ typedef struct x86_state {
   uint64_t ldtr_base; // LDT descriptor cache: TI=1 selector lookups and
   uint32_t ldtr_limit;  // VERR/VERW/LAR/LSL read through it
   uint32_t dr[8];
+  // Which of the four debug registers the gdb stub holds (one bit per slot, set
+  // by x86_gdb_set_watch and cleared by x86_gdb_clear_watch), and the slot bits
+  // that fired on the step now committing. The distinction is ownership, not a
+  // second matcher: a watchpoint the debugger armed is reported to the debugger
+  // and not vectored as a guest fault; ones the guest programmed for itself
+  // vector normally (step.c's debug-trap block).
+  uint32_t gdb_watch_mask;
+  uint32_t watch_hits;
   int bt_pending;    // the incoming task's TSS.T: deliver #DB before its
                      // first instruction (SDM vol.3 7.2.1)
   int a20;           // A20 gate line state: bit 20 of every physical address is
@@ -143,5 +164,11 @@ void x86_init(CpuState* cpu);
 void x86_step(CpuState* cpu);
 void x86_dump_regs(const CpuState* cpu);
 void x86_set_intr(CpuState* cpu, int level);
+// The debug-register door the gdb stub's hardware watchpoints use (exec.c's
+// debug-register section): installing through MOV DRn and through RSP is the same
+// machine state, so there is one matcher and one #DB. A slot index comes back so
+// the caller removes exactly what it put in; -1 means the encoding cannot say it.
+int x86_gdb_set_watch(CpuState* cpu, uint64_t addr, uint32_t len, int kind);
+int x86_gdb_clear_watch(CpuState* cpu, int slot);
 
 #endif

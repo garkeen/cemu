@@ -24,7 +24,19 @@
 enum {
   kPacketMax = 4096,       // matches the qSupported PacketSize we advertise
   kMaxBreakpoints = 64,
+  kMaxWatchpoints = 4,     // the x86 debug registers DR0-DR3 (SDM vol.3 17.2)
 };
+
+// What one RSP watchpoint request became: the debug register the ISA handed
+// back, and the request that owns it, so `z2/z4` removes exactly what `Z2/Z4`
+// installed (gdb identifies a watchpoint by kind, address and length, not by a
+// slot number).
+typedef struct GdbWatch {
+  uint64_t addr;
+  uint32_t len;
+  int kind;
+  int slot;
+} GdbWatch;
 
 struct GdbStub {
   Board* board;
@@ -33,6 +45,8 @@ struct GdbStub {
   int wait;  // -S: block before the first step until a client resumes
   uint64_t bps[kMaxBreakpoints];
   int nbps;
+  GdbWatch watches[kMaxWatchpoints];
+  int nwatches;
   int steps_left;        // single-step quota in the current batch
   uint8_t pending[256];  // bytes read while running that were not 0x03
   int npending;
@@ -276,6 +290,25 @@ static int BpHit(GdbStub* g, uint64_t pc) {
   return 0;
 }
 
+// The address a breakpoint names: the linear one the ISA reports and the
+// memory packets use (cpu/step.h gdb_pc). An ISA without a translation to do
+// (riscv: the committed pc is already linear) leaves the hook NULL.
+static uint64_t StubPc(GdbStub* g, CpuState* cpu) {
+  const isa_ops* isa = g->board->isa;
+  return isa->gdb_pc ? isa->gdb_pc(cpu) : cpu->pc;
+}
+
+// Takes a watchpoint back out of the processor and out of the table that names
+// it. gdb removes by kind/address/length, so the slot is looked up rather than
+// passed in, and the table closes its hole because a later removal has to find
+// its own slot.
+static void WatchRemove(GdbStub* g, int i) {
+  const isa_ops* isa = g->board->isa;
+  isa->gdb_clear_watch(&g->board->cpu, g->watches[i].slot);
+  for (int j = i + 1; j < g->nwatches; j++) g->watches[j - 1] = g->watches[j];
+  g->nwatches--;
+}
+
 // The per-step callback BoardRunSteps invokes after every committed step.
 // Post-commit is the right observation point: the committed pc is the NEXT
 // instruction, so a match stops before that instruction executes — the
@@ -295,7 +328,21 @@ static int StopCb(void* ctx, CpuState* cpu) {
       return 1;
     }
   }
-  if (BpHit(g, cpu->pc)) {
+  // A watchpoint the stub armed stops the session even while the guest runs
+  // free: what fired is the debugger's request, not a fault of the guest's own
+  // (cpu/step.h gdb_watch_hits, and cpu/isa/x86/step.c's debug-trap block for why
+  // the trap reaches no guest handler). This is the one reason besides a
+  // breakpoint that a free-running batch stops for.
+  if (g->nwatches && isa->gdb_watch_hits) {
+    uint32_t hits = isa->gdb_watch_hits(cpu);
+    for (int i = 0; i < g->nwatches; i++)
+      if (hits & (1u << g->watches[i].slot)) {
+        g->stop_sig = 5;  // SIGTRAP, RSP's stop signal for a watchpoint
+        DebugGdbNote("stop: watchpoint");
+        return 1;
+      }
+  }
+  if (BpHit(g, StubPc(g, cpu))) {
     g->stop_sig = 5;
     DebugGdbNote("stop: breakpoint");
     return 1;
@@ -437,25 +484,83 @@ static int Session(GdbStub* g) {
       }
       case 'Z':
       case 'z': {
-        // Z(kind),addr,len — kinds 0 (software) and 1 (hardware) share the
-        // pc-match list (no memory patching); kinds 2-4 (watchpoints) are
-        // not implemented yet and answer empty.
-        if (pkt[1] != '0' && pkt[1] != '1') {
+        // Z(kind),addr,len and z(kind),addr,len (RSP's breakpoint/watchpoint
+        // packets).
+        //
+        // Kinds 0 (software) and 1 (hardware execute) share the pc-match list and
+        // nothing is ever written into the guest. That is deliberate: QEMU's
+        // software breakpoint patches a 0xCC into the code, so the guest runs
+        // bytes it would not run unattended -- measured while chasing win101,
+        // where the patch itself changed the instruction stream being compared.
+        //
+        // Kinds 2/3/4 (write / read / access) go through the ISA's debug-register
+        // door, so the CPU's own #DB is what stops the session and there is no
+        // second matcher to keep in step with it. The ISA answers -1 for whatever
+        // its encoding cannot express -- on x86 a read-only watchpoint, because
+        // DR7's R/W field has write, I/O and read-or-write but no read-only
+        // (SDM vol.3 table 17-2) -- and an empty packet is how RSP says
+        // "unsupported". gdb then uses its own software watchpoints rather than
+        // being handed one that also fires on stores it never asked for.
+        //
+        // The hit stops the session instead of being vectored (StopCb reads the
+        // ISA's report): QEMU does the same for its own watchpoints, and the
+        // alternative is unusable -- a bare boot sector has no #DB handler, so a
+        // vectored trap is a triple fault and a reset loop before gdb sees the
+        // value. Watchpoints the guest programmed for itself are untouched here:
+        // those still vector, because they are the guest's own machine state.
+        int kind = pkt[1] - '0';
+        const isa_ops* isa = g->board->isa;
+        const char* p;
+        uint64_t addr = HexU64(pkt + 3, &p);
+        uint32_t len = (uint32_t)HexU64(p + 1, &p);
+        if (kind < 0 || kind > 4) {
           PktSend(g, "");
           break;
         }
-        const char* p;
-        uint64_t addr = HexU64(pkt + 3, &p);
-        if (pkt[0] == 'Z') {
-          if (g->nbps < kMaxBreakpoints) g->bps[g->nbps++] = addr;
-          PktSend(g, "OK");
-        } else {
-          int w = 0;
-          for (int i = 0; i < g->nbps; i++)
-            if (g->bps[i] != addr) g->bps[w++] = g->bps[i];
-          g->nbps = w;
-          PktSend(g, "OK");
+        if (kind <= 1) {
+          if (pkt[0] == 'Z') {
+            if (g->nbps < kMaxBreakpoints) g->bps[g->nbps++] = addr;
+            PktSend(g, "OK");
+          } else {
+            int w = 0;
+            for (int i = 0; i < g->nbps; i++)
+              if (g->bps[i] != addr) g->bps[w++] = g->bps[i];
+            g->nbps = w;
+            PktSend(g, "OK");
+          }
+          break;
         }
+        if (!isa->gdb_set_watch) {
+          PktSend(g, "");  // this ISA has no debug registers to hang it on
+          break;
+        }
+        if (pkt[0] == 'Z') {
+          int slot = g->nwatches < kMaxWatchpoints
+                         ? isa->gdb_set_watch(&g->board->cpu, addr, len, kind)
+                         : -1;
+          if (slot < 0) {
+            PktSend(g, "");
+            break;
+          }
+          g->watches[g->nwatches].addr = addr;
+          g->watches[g->nwatches].len = len;
+          g->watches[g->nwatches].kind = kind;
+          g->watches[g->nwatches].slot = slot;
+          g->nwatches++;
+          PktSend(g, "OK");
+          break;
+        }
+        int at = -1;
+        for (int i = 0; i < g->nwatches; i++)
+          if (g->watches[i].kind == kind && g->watches[i].addr == addr &&
+              g->watches[i].len == len)
+            at = i;
+        if (at < 0) {
+          PktSend(g, "E01");  // RSP's "error removing" for something not installed
+          break;
+        }
+        WatchRemove(g, at);
+        PktSend(g, "OK");
         break;
       }
       case 'D':  // detach: the guest runs free
@@ -510,7 +615,11 @@ static int Session(GdbStub* g) {
         break;
       case 'v':
         if (strcmp(pkt, "vCont?") == 0) {
-          PktSend(g, "");  // no vCont: gdb falls back to c/s
+          // Named truthfully: this stub resumes with continue or with one
+          // single-step. No `t` is offered because the branch below has no
+          // vCont;t path to honour, and no `r`/per-thread actions because there is
+          // one state to run; gdb keeps sending the c/s it already sends.
+          PktSend(g, "vCont;c;s");
         } else if (strncmp(pkt, "vCont;", 6) == 0) {
           DoRun(g, pkt[6] == 's' ? 1 : 0);  // vCont;c / vCont;s (one action)
         } else {

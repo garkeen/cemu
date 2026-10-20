@@ -91,6 +91,9 @@ void x86_step(CpuState* c) {
   s->intr_inhibit = 0;
 
   memset(&g, 0, sizeof(g));
+  // The watchpoint report the stub reads after the step (cpu/step.h): per step,
+  // so a hit reported once cannot be reported again.
+  s->watch_hits = 0;
   d.seg = -1;
   // Default sizes come from the CS D-bit (SDM: operand and address default
   // together in a code segment); prefixes then flip either one.
@@ -217,7 +220,19 @@ void x86_step(CpuState* c) {
   uint32_t dr6set = d.watch_hit;
   if (s->bt_pending) dr6set |= kDr6Bt;
   if (tf0) dr6set |= kDr6Bs;
-  if (s->bt_pending || (!d.delivered && (d.watch_hit || tf0))) {
+  // A watchpoint the gdb stub armed is the debugger's, not the guest's: DR6
+  // records the hit (SDM vol.3 17.3.1) but the trap is not vectored. The stub
+  // sits outside the machine and asked for the hit; vectoring it instead hands a
+  // bare boot sector -- no IDT, no #DB handler -- a triple fault that reset-loops
+  // before the stub can report anything (measured here: the probe's own banner
+  // scrolling forever while gdb waited for a stop). Watchpoints the guest armed
+  // for itself, the task-switch trap and single-step all still vector.
+  uint32_t stub_hits = d.watch_hit & s->gdb_watch_mask;
+  if (stub_hits) {
+    s->watch_hits = stub_hits;
+    s->dr[6] |= stub_hits;  // recorded whether or not it vectors: the hit happened
+  }
+  if (s->bt_pending || (!d.delivered && ((d.watch_hit & ~stub_hits) || tf0))) {
     s->dr[6] |= dr6set;
     s->bt_pending = 0;
     cpu->wait = 0;  // a #DB after hlt wakes the processor
