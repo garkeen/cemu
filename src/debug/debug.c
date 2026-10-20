@@ -97,6 +97,58 @@ static void* g_mem_ctx;
 // repo writes, so an oversized region is refused rather than truncated.
 static const uint64_t kDumpLimit = 5ULL * 1024 * 1024;
 
+// ---- PC checkpoints (pcshot=ADDR[:COUNT]) ----------------------------------
+// state= and trace= are indexed by retired-instruction count; REP loops eat a
+// window's budget and timer I/O moves the count between runs, so neither can
+// name "the state at this PC". The gdb stub can stop by linear PC but runs the
+// whole boot through its per-step callback (several times slower than the
+// interpreter). This item keeps the match in the ordinary fast path: after the
+// commit, the frame's next linear PC is compared against the checkpoint, and
+// the canonical state row is printed when the guest is about to execute that
+// address. That is the boundary a QEMU gdb breakpoint stops on, so the two
+// states compare field for field (AGENTS.md §十).
+enum { kMaxPcShots = 8 };
+static struct {
+  uint64_t addr;
+  uint64_t max;
+  uint64_t hits;
+} g_pcshot[kMaxPcShots];
+static int g_npcshot;
+
+// pcshot=ADDR[:COUNT]; ADDR is a C literal, COUNT defaults to 1.
+static void AddPcShot(const char* spec) {
+  if (g_npcshot >= kMaxPcShots) {
+    LogError("debug: too many pcshots, dropping '%s'", spec);
+    return;
+  }
+  const char* colon = strchr(spec, ':');
+  size_t alen = colon ? (size_t)(colon - spec) : strlen(spec);
+  char addr_text[32];
+  if (alen == 0 || alen >= sizeof(addr_text)) {
+    LogError("debug: pcshot expects ADDR[:COUNT] ('%s')", spec);
+    return;
+  }
+  memcpy(addr_text, spec, alen);
+  addr_text[alen] = 0;
+  uint64_t addr = 0, max = 1;
+  if (!ParseUint(addr_text, &addr)) {
+    LogError("debug: pcshot address '%s' is not a number", addr_text);
+    return;
+  }
+  if (colon && !ParseUint(colon + 1, &max)) {
+    LogError("debug: pcshot count '%s' is not a number", colon + 1);
+    return;
+  }
+  if (max == 0) {
+    LogError("debug: pcshot count must be at least 1 ('%s')", spec);
+    return;
+  }
+  g_pcshot[g_npcshot].addr = addr;
+  g_pcshot[g_npcshot].max = max;
+  g_pcshot[g_npcshot].hits = 0;
+  g_npcshot++;
+}
+
 void DebugSetMemReader(DebugMemReadFn read, void* ctx) {
   g_mem_read = read;
   g_mem_ctx = ctx;
@@ -506,6 +558,10 @@ void DebugInit(void) {
       AddDump(tok + 5);
     else if (!strncmp(tok, "fbdump=", 7))
       AddFbDump(tok + 7);
+    else if (!strncmp(tok, "pcshot=", 7)) {
+      AddPcShot(tok + 7);
+      g_mask |= kDbgPcShot;
+    }
     else if (!strncmp(tok, "mouse=", 6))
       AddMouseInjection(tok + 6);
     else if (!strncmp(tok, "key=", 4))
@@ -725,6 +781,25 @@ void DebugInsn(frame* f) {
   // suppressed. It used to bypass both, which is how one `state,skip=N` run
   // printed the whole stream and ran into the 5MB output cap.
   if ((g_mask & kDbgState) && Allow(kDbgState)) StateRow(f);
+  // PC checkpoints are the PC-indexed counterpart of the state window: match
+  // the boundary the commit lands on (next linear PC), then print the same
+  // canonical row, so a gdb stop at that address in the reference model has a
+  // field-for-field counterpart here. Not budgeted: a checkpoint is a fixed
+  // number of rows chosen by the caller, and the hard output cap still holds.
+  if (g_mask & kDbgPcShot) {
+    uint64_t next = FrameDnpc(f);
+    for (int i = 0; i < g_npcshot; i++) {
+      if (g_pcshot[i].hits < g_pcshot[i].max && g_pcshot[i].addr == next) {
+        char mark[64];
+        g_pcshot[i].hits++;
+        int n = snprintf(mark, sizeof(mark), "P @lin=%016llx hit=%llu\n",
+                         (unsigned long long)next,
+                         (unsigned long long)g_pcshot[i].hits);
+        if (DebugAccountOut((size_t)n)) HostWriteErr(mark, (size_t)n);
+        StateRow(f);
+      }
+    }
+  }
   if (g_regs_period && (f->cpu->inst_count % (uint64_t)g_regs_period) == 0) {
     // Periodic register table reuses DumpRegs through a Frame-less path.
     f->isa->dump_regs(f->cpu);

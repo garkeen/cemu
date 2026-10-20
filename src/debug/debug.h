@@ -24,7 +24,8 @@ enum {
   kDbgMark = 1 << 9,        // frameless notes: irq lines, host input
   kDbgScreen = 1 << 10,     // text-screen mirror rows (console with no serial)
   kDbgVgaIo = 1 << 11,      // guest port writes into the video card
-  kDbgAny = 0xfff,
+  kDbgPcShot = 1 << 12,     // canonical state row at a linear PC checkpoint
+  kDbgAny = 0x1fff,
 };
 
 int DebugOn(uint32_t cat);
@@ -189,8 +190,13 @@ void DebugSessionEnd(const struct frame* f, const char* stop_reason);
 //   trace[:line|table][=N], state, mem[:ld|st], trap, bus, regs=N,
 //   watch=ADDR:SIZE[:r|w|rw] (repeatable), dump=ADDR:SIZE:FILE (repeatable),
 //   fbdump=FILE (repeatable, binary PPM of the display card's picture),
-//   budget=N (per-category cap), skip=N (per-category silent window before
-//   printing), utf8. Addresses are physical.
+//   pcshot=ADDR[:COUNT] (repeatable; state row when the next linear PC is
+//   ADDR), budget=N (per-category cap), skip=N (per-category silent window
+//   before printing), utf8. Addresses are physical except pcshot's, which is
+//   the linear PC the ISA's gdb_pc reports; that is the address a QEMU gdb
+//   breakpoint names, so a checkpoint can be compared across the two models
+//   without an instruction-count window (which REP loops and timer drift make
+//   unusable).
 
 // Session output cap (bytes). All debug writes (table rows, state stream,
 // line trace, session summary) are accounted here; once the cap is hit,

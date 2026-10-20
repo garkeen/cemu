@@ -1,5 +1,61 @@
 # cemu 当前状态（progress.md）
 
+## win101 定位进展与 pcshot 设施（2026-10-20）
+
+### 新观测设施 `pcshot=ADDR[:COUNT]`
+
+`state`/`trace` 按退休指令数开窗：REP 循环会吃掉窗口预算，定时器 I/O 又会让
+指令数在两次运行间漂移；gdb 断点虽按线性 PC 停，但从复位跑完整启动要走每步
+回调（约慢 5 倍，一次 7M 指令的启动要 8 分钟以上）。新设施把匹配放在普通快
+路径：提交后比较下一条指令的线性 PC，命中即打印规范 state 行（外加
+`P @lin=... hit=N` 标记）。命中点是"即将执行 ADDR"的边界，与 QEMU gdb 在
+ADDR 设断点停住的边界相同。可重复，上限 8 条；ADDR 按 C 字面量解析，COUNT
+默认 1。实现见 `src/debug/debug.c`（`AddPcShot` + `DebugInsn`），语法写进
+AGENTS.md §十。
+
+验证：构建零告警；`bash test/x86/run.sh` 28/0；`bash test/riscv64/run.sh`
+136/0；`cmake --build build --target check` 依赖边 ok。自测在 win101 的
+`0x1F7AB` 抓到失败 LocalReAlloc 前的完整现场（`S @pc=3B37 dnpc=3B3B`，
+cs=1bc7 ds=es=97dd，edi=df9），与 gdb 的 PRE 现场一致。
+
+**已知限制**：可移动段（如 GDI seg2）的运行基址在两次运行间会变（gdb 下在
+`0x9DA3`，快跑在别处），定点应优先选固定段（KERNEL `0xDF9`），或用当前运行
+的实际基址。
+
+### 已确认的失败链
+
+- 同一份 SeaBIOS/SeaVGABIOS 下 QEMU 进 mode 10，cemu 在 mode 6 之后退回 mode 3；
+  去掉 `-icount` 仍然失败，虚拟时钟不是根因。
+- WIN.INI 的读取（2292 字节）与文件逐字节相同；到 7.0M 时内存里的 WIN.INI
+  仍完整；镜像上的 WIN.INI 在多次运行后仍与原始一致（写回路径没有破坏文件）。
+- cemu 的 GDI 对象表没有建立；随后它把堆头 `DS:0x400` 当成对象描述符，对从未
+  分配的句柄 `0xDF9` 做 LocalReAlloc（块指针 0），写坏 `DS:6`，触发 KERNEL
+  堆守卫 FatalExit（`0x6d57f4` = inst 7165428）。
+- QEMU 的字体装载调用会在 `9DA3:01D8` 正常返回（AX=2，文件未找到）；先前
+  cemu "不返回" 的结论是 gdb 从复位跑太慢、超时截断造成的误判，作废。
+
+### 跨模型定点对拍
+
+- KERNEL 固定段 `0xDF9` 的配置解析入口，线性 `0x12718`：cemu 与 QEMU 的
+  `eax/ecx/edx/ebx/esp/ebp/esi/edi/ds/es/cs` 逐字段相同
+  （`eax=83b ecx=8f4 ebx=5 esi=edi=0 ds=es=9f09`）。INI 解析的起点一致。
+- QEMU 的 KERNEL 读 API 入口 `0x450F` 被同一个调用连续命中 6 次，调用者是
+  GDI seg2 `0x9DA3:0x008A`，参数固定为
+  `GetProfileString("windows","nullport","none",…)`（`DS:0xC0/0xC8/0xD1`，
+  长度 0x28）。这不是字体循环，而是 GDI 每个设备/实例初始化里的 null-port
+  查询；QEMU 把这个 GDI seg2 初始化函数（`0x0`：内部 `0x69 → 0x5A → 8 字节
+  → 显示驱动调用`）重复了 6 次以上，cemu 只做一次。
+- cemu 的 LocalAlloc 序列是 `0x69 → 8 → 0x100`（KERNEL ord5），QEMU 前 10 次
+  ord5 调用全是 `0x69`、没有 8 字节分配；说明两边在 GDI `0x162D`（`0x5A`
+  分配）这条路径上的分支/返回值不同。这是当前最窄的待验证点，不是结论。
+
+### 尚未定案
+
+具体是哪条 cemu 指令/哪个设备响应让 GDI seg2 的每设备初始化只跑一轮，仍未
+证明。下一步：静态解析 GDI `0x162D` 对应的 KERNEL 导入，在固定 KERNEL 入口
+用 `pcshot` 与 QEMU 比较该调用的返回值和后续分支。没有源码修复，本轮只新增
+了 `pcshot` 观测设施与本节记录。
+
 ## 阶段 4 片 30–36 重做：五组提交（2026-10-20）
 
 用户裁决：片 30 起（win101 调试期）的部分提交违背"参考实现当蓝本、具体代码服从
