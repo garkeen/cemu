@@ -657,7 +657,13 @@ static void X86Reset(Board* m) {
   xm->fwcfg.offset = 0;
   LapicInit(&xm->lapic);
   IoapicInit(&xm->ioapic);
+  // The card's programmed BAR windows have to leave the bus before VgaInit
+  // wipes the device that remembers where they are; the PCI function is then
+  // rebuilt and re-enumerated below, so a reset drops the decode but not the
+  // device itself.
+  VgaPciDetach(&xm->vga);
   VgaInit(&xm->vga);
+  VgaPciInit(&xm->vga, &m->bus, kPciBus0, kVgaDev);
   I8042Init(&xm->kbd);
   Ps2KbdInit(&xm->ps2kbd);
   Ps2MouseInit(&xm->mouse);
@@ -674,6 +680,7 @@ static void X86Reset(Board* m) {
   PciAddDevice(&xm->pci, &xm->piix.pci);
   PciAddDevice(&xm->pci, &xm->ide.pci);
   PciAddDevice(&xm->pci, &xm->pm.pci);
+  PciAddDevice(&xm->pci, &xm->vga.pci);
   IdeReset(&xm->ide);
   Piix4PmReset(&xm->pm);
   DebugExitBind(&xm->dexit, &m->cpu);

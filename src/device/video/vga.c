@@ -923,6 +923,54 @@ static void VgaLfbWrite(void* dev, uint64_t addr, int size, uint64_t val) {
 
 static const DeviceOps kVgaLfbOps = {"vga-lfb", VgaLfbRead, VgaLfbWrite};
 
+// Region 2 of QEMU's standard-VGA function is a 4KB MMIO bar (the standard-VGA
+// specification): 0x000-0x3ff is the EDID blob, 0x400-0x41f are the VGA ports
+// 0x3c0-0x3df remapped 1:1. This machine has no EDID model, so those reads
+// answer open bus; the port window drives the same register file the fixed
+// ports do, including the vga-io transcript. A word/dword access drives its
+// byte lanes in turn, like the fixed I/O path.
+static uint64_t VgaBar2Read(void* dev, uint64_t addr, int size) {
+  VgaDevice* d = (VgaDevice*)dev;
+  uint64_t off = addr - d->bar2_base;
+  uint64_t v = 0;
+  for (int i = 0; i < size; i++) {
+    uint64_t o = off + (uint64_t)i;
+    uint8_t b = 0xff;
+    if (o >= kVgaBar2PortBase && o < kVgaBar2PortBase + kVgaBar2PortCount)
+      b = VgaPortRead8(d, (uint16_t)(kVgaBar2FirstPort + (o - kVgaBar2PortBase)));
+    v |= (uint64_t)b << (8 * i);
+  }
+  return v;
+}
+
+static void VgaBar2Write(void* dev, uint64_t addr, int size, uint64_t val) {
+  VgaDevice* d = (VgaDevice*)dev;
+  uint64_t off = addr - d->bar2_base;
+  for (int i = 0; i < size; i++) {
+    uint64_t o = off + (uint64_t)i;
+    if (o >= kVgaBar2PortBase && o < kVgaBar2PortBase + kVgaBar2PortCount)
+      VgaPortWrite8(d, (uint16_t)(kVgaBar2FirstPort + (o - kVgaBar2PortBase)),
+                    (uint8_t)(val >> (8 * i)));
+  }
+}
+
+static const DeviceOps kVgaBar2Ops = {"vga-bar2", VgaBar2Read, VgaBar2Write};
+
+// Called before VgaInit wipes the device: the bus pointer and the programmed
+// window addresses live in the device, so the decode has to come off while it
+// still knows where it was put. A loop because the window can have been moved
+// more than once (each move must have removed its predecessor, but a reset is
+// also the place where a leaked one is cleaned up).
+void VgaPciDetach(VgaDevice* d) {
+  if (!d->mem_bus) return;
+  while (BusRemoveRegion(d->mem_bus, &kVgaLfbOps, d)) {
+  }
+  while (BusRemoveRegion(d->mem_bus, &kVgaBar2Ops, d)) {
+  }
+  d->lfb_base = 0;
+  d->bar2_base = 0;
+}
+
 static void VgaPut16(uint8_t* p, uint16_t v) {
   p[0] = (uint8_t)(v & 0xff);
   p[1] = (uint8_t)(v >> 8);
@@ -937,13 +985,12 @@ static void VgaPut32(uint8_t* p, uint32_t v) {
 // the address bits below a BAR's window are read-only zero, so firmware's
 // probe -- write all ones, read back -- sees the window size and alignment.
 // Without this every BAR answers "4GiB" and the resource allocator places the
-// windows anywhere. `io` is the read-only type bit the BAR carries: bit 0 set for
-// an I/O window, clear for a memory one (ide.c's BARs are all I/O, so its mask
-// hardcodes the set bit).
-static void VgaMaskBar(uint8_t* cfg, uint32_t size, uint32_t io) {
+// windows anywhere. `type` is the read-only encoding the BAR carries in bits
+// 3:0 (memory prefetch type, or 0 for the plain MMIO BAR2).
+static void VgaMaskBar(uint8_t* cfg, uint32_t size, uint32_t type) {
   uint32_t v = (uint32_t)cfg[0] | ((uint32_t)cfg[1] << 8) | ((uint32_t)cfg[2] << 16) |
                ((uint32_t)cfg[3] << 24);
-  v = (v & ~(size - 1)) | io;
+  v = (v & ~(size - 1)) | type;
   cfg[0] = (uint8_t)v;
   cfg[1] = (uint8_t)(v >> 8);
   cfg[2] = (uint8_t)(v >> 16);
@@ -967,53 +1014,69 @@ static void VgaZeroField(uint8_t* cfg) {
   cfg[3] = 0;
 }
 
-// A 64-bit memory BAR occupies two slots and its low half is written first, so
-// the window is placed when that low dword lands on a non-zero address. QEMU
-// answers the same pair the same way (hw/pci/pci.c pci_default_write_config).
-static void VgaBarWritten(VgaDevice* d, uint32_t base) {
-  if (base == 0 || base == d->lfb_base) {
+static uint32_t VgaConfig32(const VgaDevice* d, int off) {
+  return (uint32_t)d->pci.config[off] | ((uint32_t)d->pci.config[off + 1] << 8) |
+         ((uint32_t)d->pci.config[off + 2] << 16) |
+         ((uint32_t)d->pci.config[off + 3] << 24);
+}
+
+// A BAR write moves the decode. The old window has to come off first: firmware
+// sizes a BAR by writing all ones and restoring the address, so a mapping that
+// merely adds would leave a phantom window at the sizing address, and a BAR
+// written with 0 must decode nothing (PCI spec §6.2.5.1).
+static void VgaBarWritten(VgaDevice* d, uint64_t base) {
+  if (!d->mem_bus) {
     d->lfb_base = base;
     return;
   }
+  while (BusRemoveRegion(d->mem_bus, &kVgaLfbOps, d)) {
+  }
   d->lfb_base = base;
-  if (d->mem_bus) BusAddRegion(d->mem_bus, base, kVgaVramSize, &kVgaLfbOps, d);
+  if (base) BusAddRegion(d->mem_bus, base, kVgaVramSize, &kVgaLfbOps, d);
+}
+
+static void VgaBar2Written(VgaDevice* d, uint32_t base) {
+  if (!d->mem_bus) {
+    d->bar2_base = base;
+    return;
+  }
+  while (BusRemoveRegion(d->mem_bus, &kVgaBar2Ops, d)) {
+  }
+  d->bar2_base = base;
+  if (base) BusAddRegion(d->mem_bus, base, kVgaBar2Size, &kVgaBar2Ops, d);
+}
+
+// BAR0 is a single 32-bit address register (QEMU registers it with
+// PCI_BASE_ADDRESS_MEM_PREFETCH, not the TYPE_64 flag). The low dword is
+// re-masked on every write because the type bits are read-only (PCI spec
+// §6.2.5.2) and a size probe writes all ones over them.
+static void VgaLfbBarWritten(VgaDevice* d) {
+  VgaMaskBar(&d->pci.config[kCfgBar0], kVgaVramSize, kBarTypePrefetch);
+  uint32_t base = VgaConfig32(d, kCfgBar0) & ~(uint32_t)(kVgaVramSize - 1);
+  VgaBarWritten(d, base);
 }
 
 static void VgaConfigWritten(void* ctx, uint8_t off, uint8_t val) {
   VgaDevice* d = (VgaDevice*)ctx;
   (void)val;
   switch (off & (uint8_t)~3u) {
-    case kCfgBar0: {
-      uint32_t base = (uint32_t)d->pci.config[kCfgBar0] |
-                      ((uint32_t)d->pci.config[kCfgBar0 + 1] << 8) |
-                      ((uint32_t)d->pci.config[kCfgBar0 + 2] << 16) |
-                      ((uint32_t)d->pci.config[kCfgBar0 + 3] << 24);
-      // bits 2-3 are the read-only type field: 10 = 64-bit, 08 = prefetchable.
-      VgaMaskBar(&d->pci.config[kCfgBar0], kVgaVramSize, kBarType64Prefetch);
-      // The window sits where the pair points, which for a video memory this
-      // size is always the low 4GB, but the high dword is read so the base is
-      // the address the pair actually names.
-      uint32_t high = (uint32_t)d->pci.config[kCfgBar1] |
-                      ((uint32_t)d->pci.config[kCfgBar1 + 1] << 8) |
-                      ((uint32_t)d->pci.config[kCfgBar1 + 2] << 16) |
-                      ((uint32_t)d->pci.config[kCfgBar1 + 3] << 24);
-      VgaBarWritten(d, (((uint64_t)high << 32) | base) & ~(uint64_t)(kVgaVramSize - 1));
+    case kCfgBar0:
+      VgaLfbBarWritten(d);
+      break;
+    case kCfgBar2: {
+      // Region 2 is a 32-bit, non-prefetchable MMIO bar: its type bits are 00
+      // (QEMU standard-VGA specification). Masking with type=0 keeps it a
+      // memory bar; the old code declared an I/O bar and never mapped it.
+      VgaMaskBar(&d->pci.config[kCfgBar2], kVgaBar2Size, 0);
+      uint32_t base = VgaConfig32(d, kCfgBar2) & ~(uint32_t)(kVgaBar2Size - 1);
+      VgaBar2Written(d, base);
       break;
     }
-    case kCfgBar2:
-      VgaMaskBar(&d->pci.config[kCfgBar2], kVgaBarIoSize, kBarTypeIo);
-      break;
     case kCfgBar1:
-      // The upper half of the 64-bit BAR0 is a plain address register with no
-      // read-only type bits, so it keeps whatever was written -- which is what
-      // makes a size probe on it read all ones, and the pair then sizes as one
-      // 64-bit window (QEMU masks only the low half for the same reason,
-      // hw/pci/pci.c pci_default_write_config).
-      break;
     case kCfgBar3:
     case kCfgBar4:
     case kCfgBar5:
-    case kCfgBar6:
+    case kCfgCardBusCis:
     case kCfgExpRomBase:
       VgaZeroField(&d->pci.config[off & (uint8_t)~3u]);
       break;
@@ -1029,7 +1092,7 @@ void VgaPciInit(VgaDevice* d, Bus* mem_bus, uint8_t bus, uint8_t dev) {
   d->pci.func = 0;
   VgaPut16(&d->pci.config[kCfgVendor], kPciVendorStdVga);
   VgaPut16(&d->pci.config[kCfgDevice], kPciDeviceStdVga);
-  d->pci.config[kCfgRevision] = 0x02;
+  d->pci.config[kCfgRevision] = kVgaPciRevision;
   d->pci.config[kCfgProgIf] = 0x00;
   // The class code is two single bytes -- subclass then base class -- and the
   // pair is what a class search matches (SeaBIOS builds its pci->class from the
@@ -1040,12 +1103,14 @@ void VgaPciInit(VgaDevice* d, Bus* mem_bus, uint8_t bus, uint8_t dev) {
   d->pci.config[kCfgSubClass] = 0x00;  // VGA controller
   d->pci.config[kCfgClass] = 0x03;     // display controller
   d->pci.config[kCfgHeaderType] = 0;  // single function, type 0 header
-  // BAR0: 64-bit prefetchable memory, low dword (bits 2-3 are read-only type
-  // bits: 10 = 64-bit, 08 = prefetchable). BAR2: I/O space. The register block
-  // is on the I/O bus at its fixed addresses either way, so the I/O BAR is the
-  // window a PCI-aware guest reads, not a second copy of the ports.
-  VgaPut32(&d->pci.config[kCfgBar0], 0x0000000c);
-  VgaPut32(&d->pci.config[kCfgBar2], 0x00000001);
+  // BAR0: 32-bit prefetchable memory (the type bits live in the low dword;
+  // QEMU registers the same BAR with PCI_BASE_ADDRESS_MEM_PREFETCH only).
+  // BAR2: a 32-bit, non-prefetchable 4KB MMIO bar -- QEMU's standard-VGA
+  // specification puts the EDID blob at 0x000-0x3ff and the VGA ports
+  // 0x3c0-0x3df remapped at 0x400-0x41f. BAR0 reads its type bits (0x8),
+  // BAR2 reads 0; neither window decodes until firmware writes an address.
+  VgaPut32(&d->pci.config[kCfgBar0], kBarTypePrefetch);
+  VgaPut32(&d->pci.config[kCfgBar2], 0);
   VgaPut16(&d->pci.config[kCfgSubsystemVendor], kPciVendorStdVga);
   VgaPut16(&d->pci.config[kCfgSubsystemId], kPciDeviceStdVga);
   // A display adapter raises no interrupt (PCI spec §6.2.5.2: pin 0 means the
@@ -1055,6 +1120,7 @@ void VgaPciInit(VgaDevice* d, Bus* mem_bus, uint8_t bus, uint8_t dev) {
   d->pci.ctx = d;
   d->mem_bus = mem_bus;
   d->lfb_base = 0;
+  d->bar2_base = 0;
 }
 
 // --- rendering -------------------------------------------------------------------

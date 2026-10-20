@@ -424,6 +424,30 @@ else
   echo "SKIP (vga-dispi: no nasm and no prebuilt probe bin)"
 fi
 
+# The VGA function's PCI BAR identity (test/x86/probe/vga_bar.asm): Region 2
+# must size as a 4KB *memory* BAR (an I/O BAR would end in ...001) and Region 0
+# as a 16MB 32-bit prefetchable memory BAR (...008; QEMU registers it with
+# PCI_BASE_ADDRESS_MEM_PREFETCH only). Both models answer `vga-bar ok`; the
+# probe self-judges through the sizing protocol. The BAR window itself is not
+# exercised here -- a real-mode guest cannot reach the high address firmware
+# assigns -- so VgaBarWritten's remove-on-move path stays a code-review item.
+vgabarbin="$dir/probe/vga_bar.bin"
+if [ ! -f "$vgabarbin" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f bin -o "$vgabarbin" "$dir/probe/vga_bar.asm"
+fi
+if [ -f "$vgabarbin" ]; then
+  out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$vgabarbin" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'vga-bar ok'; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "vga-bar: rc=$rc"
+  fi
+else
+  echo "SKIP (vga-bar: no nasm and no prebuilt probe bin)"
+fi
+
 # The register file's read-back shapes (test/x86/probe/vga_readback.asm): the
 # attribute index latch and the flip-flop, the CRTC index latch width, the
 # sequencer and graphics write masks, the feature-control latch (read at 0x3CA --

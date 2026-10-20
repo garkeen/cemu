@@ -111,7 +111,7 @@ enum {
 enum {
   kPciVendorStdVga = 0x1234,
   kPciDeviceStdVga = 0x1111,
-  kPciClassDisplay = 0x0300,
+  kVgaPciRevision = 0x02,  // what QEMU's stdvga reports
 };
 // Configuration-space byte offsets (PCI spec §6.2, type 0 header).
 enum {
@@ -124,12 +124,17 @@ enum {
   kCfgClass = 0x0b,
   kCfgHeaderType = 0x0e,
   kCfgBar0 = 0x10,
-  kCfgBar1 = 0x14,   // upper half of the 64-bit BAR0
+  // BAR1 is an absent slot: BAR0 is a 32-bit prefetchable memory BAR (QEMU's
+  // pci_register_bar flags are PCI_BASE_ADDRESS_MEM_PREFETCH only), so this is
+  // not the upper half of a 64-bit pair. It reads/writes zero like BAR3-BAR5.
+  kCfgBar1 = 0x14,
   kCfgBar2 = 0x18,
   kCfgBar3 = 0x1c,
   kCfgBar4 = 0x20,
   kCfgBar5 = 0x24,
-  kCfgBar6 = 0x28,
+  // 0x28 is the CardBus CIS pointer in a type-0 header (PCI spec §6.2.1), not
+  // a sixth BAR; it stays read-only zero like the absent BAR slots.
+  kCfgCardBusCis = 0x28,
   kCfgSubsystemVendor = 0x2c,
   kCfgSubsystemId = 0x2e,
   kCfgExpRomBase = 0x30,
@@ -137,18 +142,25 @@ enum {
   kCfgInterruptPin = 0x3d,
 };
 enum {
-  kVgaBarIoSize = 0x1000,   // the register block, DISPI pair and all
-  kVgaBarIoFirst = 0x300,   // the VGA registers start here inside the window
+  // QEMU's standard-VGA specification: PCI Region 2 is a 4096-byte *MMIO* bar
+  // (not an I/O bar). The first 1KB is the EDID blob; 0x400-0x41f are VGA
+  // ports 0x3c0-0x3df remapped 1:1. EDID is not modelled (reads answer open
+  // bus, registered in AGENTS.md §X D17), the port window is.
+  kVgaBar2Size = 0x1000,
+  kVgaBar2EdidSize = 0x400,
+  kVgaBar2PortBase = 0x400,
+  kVgaBar2PortCount = 0x20,
+  kVgaBar2FirstPort = 0x3c0,
 };
 // A BAR's read-only type field (bits 2-1 for memory, bit 0 for I/O; PCI spec
-// §6.2.5.2's type encoding and Table 7-7).
+// §6.2.5.2's type encoding and Table 7-7). QEMU registers this card's BAR0 with
+// PCI_BASE_ADDRESS_MEM_PREFETCH only: 32-bit prefetchable, not 64-bit.
 enum {
-  kBarTypeIo = 0x1,          // I/O space
-  kBarType64Prefetch = 0xc,  // 64-bit memory, prefetchable: bits 3-2 = 11, bit 1 = 0
+  kBarTypePrefetch = 0x8,  // 32-bit memory, prefetchable
 };
 
 typedef struct VgaDevice {
-  // The 256KB of video memory as four planes, laid out dword-interleaved the
+  // The card's video memory as four planes, laid out dword-interleaved the
   // way the graphics controller reaches them: vram[offset * 4 + plane] is
   // plane `plane` at offset. The read latch holds the four plane bytes the
   // last fetch read; read mode 1 and write modes 1-3 act on it.
@@ -220,6 +232,9 @@ typedef struct VgaDevice {
   PciDevice pci;
   Bus* mem_bus;
   uint64_t lfb_base;
+  // The programmed Region-2 MMIO window (QEMU standard VGA: 4KB at 0x000 EDID,
+  // 0x400-0x41f VGA ports). 0 = not programmed.
+  uint32_t bar2_base;
 } VgaDevice;
 
 void VgaInit(VgaDevice* d);
@@ -228,6 +243,11 @@ void VgaInit(VgaDevice* d);
 // and PciAddDevice; without it the card is an ISA device only (VgaPciInit,
 // vga.h's PCI section for why that is not the whole machine).
 void VgaPciInit(VgaDevice* d, Bus* mem_bus, uint8_t bus, uint8_t dev);
+// Takes the card's programmed BAR windows back off the bus without touching the
+// PCI configuration. A machine reset calls this before VgaInit wipes the device
+// (the bus pointer lives in the device), then VgaPciInit rebuilds the function
+// and the board re-enumerates it: a reset drops the decode but not the device.
+void VgaPciDetach(VgaDevice* d);
 // Maps the three memory windows on the memory bus (on top of RAM: the bus
 // resolves the smaller window first) and the card's port block at
 // 0x3B0-0x3DF (0x3B0-0x3BF and 0x3D0-0x3DF are one decode on a VGA: the
