@@ -1638,7 +1638,7 @@ static uint32_t shl(uint32_t v, uint32_t cnt, int size) {
   uint32_t width = (uint32_t)size * 8;
   uint32_t r = cnt >= width ? 0 : (v << cnt) & vmask(size);
   fl->cf = cnt < width && (v >> (width - cnt)) & 1;
-  fl->of = ((r & vmsb(size)) != 0) ^ ((v & (vmsb(size) >> 1)) != 0);
+  if (cnt == 1) fl->of = ((r & vmsb(size)) != 0) ^ (fl->cf != 0);
   fl->af = 0;
   szp(r, size);
   return r;
@@ -1660,7 +1660,10 @@ static uint32_t sar(uint32_t v, uint32_t cnt, int size) {
   uint32_t width = (uint32_t)size * 8;
   uint32_t fill = (v & vmsb(size)) ? vmask(size) : 0;
   uint32_t r = cnt >= width ? fill : ((v >> cnt) | (fill << (width - cnt))) & vmask(size);
-  fl->cf = ((cnt >= width ? v : v >> (cnt - 1)) & vmsb(size)) != 0;
+  // CF is the last bit shifted out (v >> (cnt-1)), not the sign bit of the
+  // shifted value; only the cnt >= width case is undefined and takes the sign.
+  fl->cf = cnt >= width ? ((v & vmsb(size)) != 0) : ((v >> (cnt - 1)) & 1);
+  if (cnt == 1) fl->of = 0;
   fl->af = 0;
   szp(r, size);
   return r;
@@ -1672,7 +1675,8 @@ static uint32_t rol(uint32_t v, uint32_t cnt, int size) {
   uint32_t k = cnt % width;
   uint32_t r = ((v << k) | (v >> (width - k))) & vmask(size);
   fl->cf = r & 1;
-  fl->of = ((r & vmsb(size)) != 0) ^ ((r & (vmsb(size) >> 1)) != 0);
+  // SDM ROL: for a 1-bit rotate OF = MSB(DEST) XOR CF after the rotate.
+  if (cnt == 1) fl->of = ((r & vmsb(size)) != 0) ^ (fl->cf != 0);
   return r;
 }
 
@@ -2246,7 +2250,10 @@ static void das(void) {
 
 static void aaa(void) {
   if ((al & 0xf) > 9 || fl->af) {
-    ax += 0x106;
+    // SDM AAA: AL and AH are adjusted separately; the AL carry is discarded,
+    // so "AX += 0x106" would add an extra 1 to AH when AL overflows.
+    al = (uint8_t)(al + 6);
+    ah += 1;
     fl->af = 1;
     fl->cf = 1;
   } else {
@@ -2258,7 +2265,8 @@ static void aaa(void) {
 
 static void aas(void) {
   if ((al & 0xf) > 9 || fl->af) {
-    ax -= 6;
+    // SDM AAS: likewise, the AL borrow is discarded and AH is decremented once.
+    al = (uint8_t)(al - 6);
     ah -= 1;
     fl->af = 1;
     fl->cf = 1;
@@ -3733,6 +3741,24 @@ void run_op(uint8_t op) {
         cx = pop16();
         ax = pop16();
       }
+      break;
+    }
+    case 0x62: {  // bound r, m16&16 / m32&32 (SDM vol.2 BOUND; #BR)
+      fr->rec.mnemonic = "bound";
+      modrm();
+      if (!d.is_mem) ud();  // mod=3 has no memory operand and is #UD
+      int size = d.w32 ? 4 : 2;
+      seg_use(d.mseg, d.moff, size, 0);
+      WatchData(d.mlin, size, 0);
+      uint32_t lo = d.w32 ? rd32(d.mlin) : rd16(d.mlin);
+      uint64_t hi_lin = d.mlin + (uint64_t)size;
+      seg_use(d.mseg, d.moff + (uint32_t)size, size, 0);
+      WatchData(hi_lin, size, 0);
+      uint32_t hi = d.w32 ? rd32(hi_lin) : rd16(hi_lin);
+      uint32_t v = d.w32 ? reg32() : reg16();
+      // The hardware checks the bounds as unsigned values (80286/80386 real
+      // mode corpus; array-index semantics), not as signed integers.
+      if (v < lo || v > hi) raise_(fr, vec_br, 0);
       break;
     }
     case 0x63: {  // arpl: raise r/m's RPL to the register's (SDM vol.2,
