@@ -30,10 +30,24 @@ cemu 与 QEMU 双跑同为 `addr16 464F4E0000 4445`、退出码 11。回归：
 `cmake --build build --target check` 依赖边 ok。
 
 win101 复跑：不再触发 FatalExit，字体管理器入口参数与 QEMU 相同
-（`DS:0x0486`），15M/20M 指令时停在 640×350 的 mode 10 桌面
-（`build/win_fixed20.ppm`）。**遗留**：窗口布局/颜色正确，但文字被画成
-彩色块（QEMU 基线 `build/windows/s1.png` 是干净文本）；字体位图或显示
-驱动的文字展开路径仍有分歧，下一步单独定位。
+（`DS:0x0486`）；进一步核对，GDI 的字体全局量在 `0x1CD8A` 处与 QEMU 逐项
+相同（`0x12E=2`、`0x130=1`、`0x486=0x2772`、`0x650=0xFFFF`），字体装载已经
+一致。此时桌面窗口布局/颜色正确，但文字被画成彩色横条。
+
+### 桌面文字：GR8 是逐像素掩码，不是平面选择（同日）
+
+`src/device/video/vga.c` 的 `VgaMemWrite8` 在写模式 0/2 里把 GR8 当成平面
+选择：`bit_mask = kPlaneExpand[GR8 & 0x0f]`，随后再 `|= <<8/<<16`，任何非零
+GR8 都会展开成 `0xffffffff`。Windows 1.01 的显示驱动正是把字形位图放进
+GR8 做掩码（写模式 0），于是每个字形字节都整字节落盘，文字变成横条。
+参考 QEMU/tiny386 的 `vga_mem_writeb`：GR8 是 8 位逐像素掩码，直接作为
+`bit_mask` 再按字节复制到四个平面；写模式 3 的 `GR8 & data` 本来就是 8 位，
+所以只有模式 0/2 错。修复为 `bit_mask = d->gr[kGfxBitMask]`。
+
+验收：15M 指令的 win101 帧缓冲（`build/win_textfix.ppm`）与 QEMU 同分辨率
+基线 `build/windows/s2.ppm` 逐像素比较，仅模式行上 54 个交替像素不同
+（装饰性横线的亮/暗相位），其余 223,946 像素完全相同；修复前有 21,971 个
+像素不同。x86 29/0、riscv64 136/0、依赖边 ok。
 
 ## win101 定位进展与 pcshot 设施（2026-10-20）
 

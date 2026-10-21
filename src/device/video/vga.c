@@ -806,7 +806,7 @@ static void VgaMemWrite8(VgaDevice* d, uint32_t addr, uint8_t val) {
       goto write_planes;
     case 2:  // write mode 2: the value's low nibble expands across the planes
       data = kPlaneExpand[val & 0x0f];
-      bit_mask = kPlaneExpand[d->gr[kGfxBitMask] & 0x0f];
+      bit_mask = d->gr[kGfxBitMask];
       break;
     case 3: {  // write mode 3: set/reset data, bit mask from the value
       uint32_t v = (uint32_t)(((val >> rot) | (val << (8 - rot))) & 0xff);
@@ -820,7 +820,7 @@ static void VgaMemWrite8(VgaDevice* d, uint32_t addr, uint8_t val) {
       v |= v << 16;
       uint32_t set_mask = kPlaneExpand[d->gr[kGfxEnableSetReset] & 0x0f];
       data = (v & ~set_mask) | (kPlaneExpand[d->gr[kGfxSetReset]] & set_mask);
-      bit_mask = kPlaneExpand[d->gr[kGfxBitMask] & 0x0f];
+      bit_mask = d->gr[kGfxBitMask];
       break;
     }
   }
