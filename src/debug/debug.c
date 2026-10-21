@@ -790,11 +790,12 @@ void DebugInsn(frame* f) {
     uint64_t next = FrameDnpc(f);
     for (int i = 0; i < g_npcshot; i++) {
       if (g_pcshot[i].hits < g_pcshot[i].max && g_pcshot[i].addr == next) {
-        char mark[64];
+        char mark[96];
         g_pcshot[i].hits++;
-        int n = snprintf(mark, sizeof(mark), "P @lin=%016llx hit=%llu\n",
+        int n = snprintf(mark, sizeof(mark), "P @lin=%016llx hit=%llu inst=%llu\n",
                          (unsigned long long)next,
-                         (unsigned long long)g_pcshot[i].hits);
+                         (unsigned long long)g_pcshot[i].hits,
+                         (unsigned long long)f->cpu->inst_count);
         if (DebugAccountOut((size_t)n)) HostWriteErr(mark, (size_t)n);
         StateRow(f);
       }

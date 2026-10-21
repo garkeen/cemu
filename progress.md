@@ -45,9 +45,11 @@ cs=1bc7 ds=es=97dd，edi=df9），与 gdb 的 PRE 现场一致。
   长度 0x28）。这不是字体循环，而是 GDI 每个设备/实例初始化里的 null-port
   查询；QEMU 把这个 GDI seg2 初始化函数（`0x0`：内部 `0x69 → 0x5A → 8 字节
   → 显示驱动调用`）重复了 6 次以上，cemu 只做一次。
-- cemu 的 LocalAlloc 序列是 `0x69 → 8 → 0x100`（KERNEL ord5），QEMU 前 10 次
-  ord5 调用全是 `0x69`、没有 8 字节分配；说明两边在 GDI `0x162D`（`0x5A`
-  分配）这条路径上的分支/返回值不同。这是当前最窄的待验证点，不是结论。
+- cemu 的 LocalAlloc 序列是 `0x69 → 8 → 0x100`（KERNEL ord5）。早先记的
+  “QEMU 前 10 次 ord5 全是 0x69、没有 8 字节分配”**已撤回**：QEMU 在
+  GDI seg2 `0x01C7` 同样以 `AX=0x42E` 完成 8 字节分配。那次 0x69 连发是
+  模块入口重试循环的一轮（GlobalAlloc 0x5A 在该轮失败）造成的采样窗口，
+  不是模型差异。
 
 ### 尚未定案
 
@@ -55,6 +57,40 @@ cs=1bc7 ds=es=97dd，edi=df9），与 gdb 的 PRE 现场一致。
 证明。下一步：静态解析 GDI `0x162D` 对应的 KERNEL 导入，在固定 KERNEL 入口
 用 `pcshot` 与 QEMU 比较该调用的返回值和后续分支。没有源码修复，本轮只新增
 了 `pcshot` 观测设施与本节记录。
+
+### 续查：字体记录缺失与 0x9A07 拷贝（2026-10-20 晚）
+
+`pcshot` 标记补了 `inst=N`（本步提交后的退休指令数），可把某个命中点用
+`--max-inst=N` 精确复现后再 `dump=` 取回当时仍驻留的可移动段；AGENTS.md §十
+已同步。win101 的全部复跑都在 `timeout` 内，观测产物均小于 5MB。
+
+已证实的 cemu 路径（全部用 pcshot/watch/dump 取证，未手推）：
+
+- GDI seg2 `0x0195`（由 KERNEL `0x2426` 的模块入口调用链反复调用）先
+  `LocalAlloc(0x69)`（句柄 `0x42A`），再经 `0x162D` thunk 做
+  `GlobalAlloc(0x5A)`（返回 `0x26`），再 `LocalAlloc(8)`（`0x42E`），
+  然后 `call 0x1B25:0x048C`，参数是 DS `0x0122` 的 `"FONTS.FON"`。
+- 该调用内部打开 `A:\FONTS.FON`：两边都返回 DOS 错误 2（未找到）。
+- 打开失败后，cemu 在字体管理器里拿到的“字体记录指针”是 `DS:0x0005`
+  （其值为 `0x0400`，即本地堆头/空闲链），QEMU 同一判断点拿到的是
+  `DS:0x0486`（其值 `0x2772`，一个已分配的字体块）。QEMU 的句柄表
+  `0x432..0x486` 指向 `0x2732..0x2A76` 的成串 0x1C 字节块；cemu 这些句柄
+  全是空闲链。cemu 全程只有 3 次 LocalAlloc（0x69/8/0x100），逐字体记录
+  的分配在 cemu 里完全没有发生。
+- `0x69` 块本身在两边都被 KERNEL 堆搬到 `0x2A9E`（句柄 `0x42A` 不变，
+  `xchg [bx],ax` 在 inst 7,070,741），所以“块被搬走”不是分歧点。
+- cemu 随后走 `0x3A8C` 合并路径：`LocalReAlloc(hMem=0xDF9, cbNew=max(ax,0x1E),
+  flags=2)` 返回 `AX=CX=0x4B0`，但 `[DS:0xDF9]=0`；`rep movsb` 的源长度
+  `[DS:0x298E]=0x9A07`，于是从 DS:0x298E 向 DS:0 复制 39,431 字节，覆盖整个
+  DGROUP（含堆头/DS:6），定时器里的堆检查在 inst ≈7,165,428 触发 FatalExit。
+  QEMU 走 `0x3B9D` 追加路径，逐字体记录处理，不触发合并。
+- QEMU 侧的 `GlobalAlloc(0x5A)` 在不同运行间会时成时败（一次 36 连
+  LocalAlloc(0x69) 全是重试；另一次成功并走到 `LocalAlloc(8)` 返回 `0x42E`），
+  与 cemu 的确定性 `-icount` 跑法不同，说明全局堆/时序在两次运行间并不等价，
+  不能直接拿单次 QEMU 轨迹当唯一基线。
+
+下一步：定位 WIN.INI `[fonts]` 枚举为何在 cemu 中不产生逐字体记录（KERNEL
+配置数据或字体管理器的枚举循环），再回到“哪条指令/哪个设备响应使它不同”。
 
 ## 阶段 4 片 30–36 重做：五组提交（2026-10-20）
 
