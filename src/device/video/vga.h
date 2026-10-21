@@ -58,10 +58,11 @@ enum {
   // 256KB card makes SeaVGABIOS print "Removing mode 100..113" and the VBE mode
   // list the guest sees stops matching the reference machine's.
   kVgaVramSize = 16 * 1024 * 1024,
-  // Widest picture this renderer draws. Wider modes are clipped rather than
-  // overrunning the buffer (AGENTS.md 简化登记 D17).
-  kVgaFbWidth = 800,
-  kVgaFbHeight = 600,
+  // Widest picture this renderer draws: the VBE limits the option ROM
+  // advertises (seabios vgasrc/bochsvga.h VBE_DISPI_MAX_XRES/YRES), so a mode
+  // the card's DISPI accepts is also a mode the framebuffer can hold.
+  kVgaFbWidth = 2560,
+  kVgaFbHeight = 1600,
   // The text mirror's grid: enough for 132x60 (the largest text mode the CRTC
   // registers can describe here); the mirror prints the current mode's grid.
   kVgaMirrorCols = 132,
@@ -143,11 +144,10 @@ enum {
 };
 enum {
   // QEMU's standard-VGA specification: PCI Region 2 is a 4096-byte *MMIO* bar
-  // (not an I/O bar). The first 1KB is the EDID blob; 0x400-0x41f are VGA
-  // ports 0x3c0-0x3df remapped 1:1. EDID is not modelled (reads answer open
-  // bus, registered in AGENTS.md §X D17), the port window is.
+  // (not an I/O bar). The first 1KB is the EDID blob (this card answers the two
+  // valid 128-byte blocks); 0x400-0x41f are VGA ports 0x3c0-0x3df remapped
+  // 1:1.
   kVgaBar2Size = 0x1000,
-  kVgaBar2EdidSize = 0x400,
   kVgaBar2PortBase = 0x400,
   kVgaBar2PortCount = 0x20,
   kVgaBar2FirstPort = 0x3c0,
@@ -218,14 +218,21 @@ typedef struct VgaDevice {
   //
   // The registers are 16 bits wide because the ROM reaches them with outw/inw
   // and the ids alone (0xB0C0) do not fit in a byte. A byte access does not
-  // reach them: the byte path has no case for these two ports, so it reads high
-  // and writes nothing (registered in AGENTS.md §X's D17). Nothing indexes
+  // reach them: QEMU's x86 VBE portio list declares both ports at access size
+  // 2, so the byte path reads high and writes nothing. Nothing indexes
   // `dispi` by a raw position either -- vga.c's DispiReg is the only door, and
   // the index is bounded on the way in, because an out-of-range slot here lands
   // in the PCI config space just below.
   uint8_t dispi_index;   // the register the data port addresses
   uint16_t dispi_id;     // the id last written; the read answers with it
   uint16_t dispi[kDispiRegCount];
+  // The VBE picture the DISPI registers describe: the line pitch and start
+  // address are derived from VIRT_WIDTH/X_OFFSET/Y_OFFSET (QEMU's
+  // vbe_fixup_regs), in bytes and dwords respectively, and the bank register
+  // moves a 64KB window inside the aperture (QEMU's bank_offset).
+  uint32_t vbe_line_bytes;
+  uint32_t vbe_start;
+  uint32_t bank_offset;
   // The PCI function, and the memory bus its framebuffer BAR is mapped on when
   // firmware (or a guest) programs the address. lfb_base is the address last
   // programmed, so a second write to the same BAR does not map it twice.

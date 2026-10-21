@@ -62,6 +62,10 @@ enum {
   kAtapiBlockSize = 2048,
   kMaxBlockSize = kAtapiBlockSize,
   kAtapiCdbSize = 12,  // 12-byte packets (IDENTIFY PACKET DEVICE word 0 bit 5 = 0)
+  // READ/WRITE MULTIPLE move a block of this many 512-byte sectors per DRQ
+  // round (ATA/ATAPI-7 §8.10); IDENTIFY word 47 advertises the limit.
+  kMaxMultipleSectors = 16,
+  kMaxTransferBytes = kMaxMultipleSectors * kAtaBlockSize,
 };
 
 // Media kinds for IdeAttach.
@@ -100,6 +104,9 @@ typedef struct IdeDrive {
   // reset wakes it (§8.12).
   uint8_t power;
   int sleeping;
+  // READ/WRITE MULTIPLE's block size in sectors, set by SET MULTIPLE (§8.10).
+  // 0 disables multiple mode, and a READ/WRITE MULTIPLE then aborts.
+  uint8_t multiple;
 } IdeDrive;
 
 typedef struct IdeDevice IdeDevice;
@@ -116,6 +123,14 @@ typedef struct IdeChannel {
   uint8_t lba_low;
   uint8_t lba_mid;
   uint8_t lba_high;
+  // LBA-48 writes the six address bytes and the two count bytes through the
+  // same four registers: the low half first, the high half immediately before
+  // the command (ATA/ATAPI-7 §6.2.2). The previous value of each register is
+  // therefore the low half when an EXT command arrives.
+  uint8_t prev_count;
+  uint8_t prev_lba_low;
+  uint8_t prev_lba_mid;
+  uint8_t prev_lba_high;
   uint8_t head;
   uint8_t feature;  // the feature register: the argument SET FEATURES reads
   int selected;     // the bay the device/head register picked
@@ -138,6 +153,7 @@ typedef struct IdeChannel {
                    // device's byte count limit register value for ATAPI
   int refill;      // the buffer is reloaded at every block boundary — a medium
                    // transfer, as opposed to a reply that already sits in it
+  int multi;       // sectors per DRQ round for READ/WRITE MULTIPLE (0 = plain)
   int irq_pending;  // a completion to report (masked by devctrl nIEN)
   // Bus-master DMA (PIIX3 "Bus Master IDE"): the two registers the host
   // programs, the descriptor table it points at, and the engine's own start
@@ -145,7 +161,7 @@ typedef struct IdeChannel {
   uint8_t bmdma_cmd;
   uint8_t bmdma_status;
   uint32_t bmdma_prd;
-  uint8_t buf[kMaxBlockSize];
+  uint8_t buf[kMaxTransferBytes];
 } IdeChannel;
 
 struct IdeDevice {

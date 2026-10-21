@@ -74,11 +74,48 @@ probe_cell() {
   out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$bin" 2>&1)
   local rc=$?
   local want_c want_q got tok
-  want_c=$(sed -n 's/^cemu[[:space:]]\(.*\)$/\1/p' "$cal" | head -1 | sed 's/[[:space:]]*$//')
-  want_q=$(sed -n 's/^qemu[[:space:]]\(.*\)$/\1/p' "$cal" | head -1 | sed 's/[[:space:]]*$//')
-  # The host's own [info] lines and the guest's serial output can land on one
-  # line (neither ends with a newline of its own), so the transcript is cut out
-  # from its marker rather than taken as a whole line.
+  want_c=$(awk '/^cemu /{sub(/^cemu /,""); print; exit}' "$cal" | sed 's/[[:space:]]*$//')
+  want_q=$(awk '/^qemu /{sub(/^qemu /,""); print; exit}' "$cal" | sed 's/[[:space:]]*$//')
+  tok=${want_c%% *}
+  got=$(printf '%s\n' "$out" | grep -m1 -- "$tok" | sed "s/.*$tok/$tok/" | sed 's/[[:space:]]*$//')
+  local want="$want_c"
+  [ "$mode" = ref ] && want="$want_q"
+  if [ "$rc" -eq "$status" ] && [ -n "$got" ] && [ "$got" = "$want" ]; then
+    if [ "$mode" = ref ] && [ "$want_c" != "$want_q" ]; then
+      fail=$((fail + 1))
+      report_fail "$stem: calibration says the models must agree, but they do not"
+      return
+    fi
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "$stem: rc=$rc want rc=$status; transcript got='$got' want='$want'"
+  fi
+}
+
+# Multiboot ELF cell: same transcript contract as probe_cell, with the
+# nasm -f elf32 + ld.lld build the pm-suite probes use. The calibration file
+# carries the cemu and QEMU lines; mode=lock records a divergence settled by
+# the manual (the prose in the file says why).
+elf_cell() {
+  local stem=$1 status=$2 mode=$3
+  local elf="$dir/probe/$stem.elf" cal="$dir/probe/${stem}_qemu.txt"
+  if [ ! -f "$elf" ] && command -v nasm > /dev/null 2>&1 &&
+     command -v ld.lld > /dev/null 2>&1; then
+    local ld="$dir/probe/$stem.ld"
+    [ -f "$ld" ] || ld="$dir/probe/vbe_mode.ld"
+    nasm -f elf32 -o "$dir/probe/$stem.o" "$dir/probe/$stem.asm" &&
+      ld.lld -m elf_i386 -T "$ld" -o "$elf" "$dir/probe/$stem.o"
+  fi
+  if [ ! -f "$elf" ] || [ ! -f "$cal" ]; then
+    echo "SKIP ($stem: needs nasm/ld.lld and the calibration file $cal)"
+    return
+  fi
+  out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$elf" 2>&1)
+  local rc=$?
+  local want_c want_q got tok
+  want_c=$(awk '/^cemu /{sub(/^cemu /,""); print; exit}' "$cal" | sed 's/[[:space:]]*$//')
+  want_q=$(awk '/^qemu /{sub(/^qemu /,""); print; exit}' "$cal" | sed 's/[[:space:]]*$//')
   tok=${want_c%% *}
   got=$(printf '%s\n' "$out" | grep -m1 -- "$tok" | sed "s/.*$tok/$tok/" | sed 's/[[:space:]]*$//')
   local want="$want_c"
@@ -534,6 +571,57 @@ if [ -f "$vgapaintelf" ]; then
 else
   echo "SKIP (vga-paint: no nasm and no prebuilt probe elf)"
 fi
+
+# VBE mode programming through DISPI (test/x86/probe/vbe_mode.asm): the
+# sanitized geometry registers, chain-4/bank aperture, and the packed
+# 16/24/32bpp pixel bytes. Dual run is byte-identical on the shared checks;
+# GETCAPS maxima diverge (QEMU 11 16000x12000 vs the ROM's 2560x1600) and the
+# calibration file records both.
+elf_cell vbe_mode 11 ref
+
+# Split screen and horizontal pel panning (test/x86/probe/vga_split.asm):
+# vga_paint's ruler with R18=175 and AR13=2. cemu's fbdump shows the split at
+# displayed row 276 and the two-pixel shift; QEMU accepts the same registers.
+elf_cell vga_split 11 ref
+
+# ATA LBA-48 and READ MULTIPLE (test/x86/probe/ata_multi.asm): the probe is its
+# own 1KiB disk (sector 1 is the fixture), attached as the primary master from
+# a temporary copy so the boot image stays read-only. IDENTIFY fields,
+# SET MULTIPLE, one two-sector DRQ block, and the 48-bit high-then-low task
+# file sequence. Dual run is byte-identical.
+atabin="$dir/probe/ata_multi.bin"
+if [ ! -f "$atabin" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f bin -o "$atabin" "$dir/probe/ata_multi.asm"
+fi
+if [ -f "$atabin" ] && command -v mktemp > /dev/null 2>&1; then
+  ata_tmp=$(mktemp -d "${TMPDIR:-/tmp}/cemu-ata.XXXXXX" 2>/dev/null || true)
+  ataimg="$ata_tmp/ata_multi.img"
+  if [ -n "$ata_tmp" ] && cp "$atabin" "$ataimg"; then
+    out=$(timeout 30 "$CEMU" --machine x86 --isa x86 -hda "$ataimg" "$atabin" 2>&1)
+    rc=$?
+    if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'ata-multi ok'; then
+      pass=$((pass + 1))
+    else
+      fail=$((fail + 1))
+      report_fail "ata-multi: rc=$rc"
+    fi
+  else
+    echo "SKIP (ata-multi: missing mktemp/cp)"
+  fi
+  [ -n "$ata_tmp" ] && rm -rf "$ata_tmp"
+else
+  echo "SKIP (ata-multi: no nasm and no prebuilt probe bin)"
+fi
+
+# PIIX4 PM1a fixed events, SCI and S5 (test/x86/probe/pm_sci.asm). Lock cell:
+# ACPI 4.8's GBL_RLS behavior is implemented here and QEMU stores the bit
+# instead; the calibration file records the divergence.
+elf_cell pm_sci 0 lock
+
+# I/O APIC NMI delivery (test/x86/probe/nmi_ioapic.asm), PIT IRQ0 -> I/O APIC
+# pin 0 -> NMI. Lock cell: QEMU 11 accepts the entry but does not raise the
+# CPU NMI flag in this configuration; cemu follows 82093AA §3.2.4.
+elf_cell nmi_ioapic 11 lock
 
 # Floppy controller + 8237 channel 2, guest-driven (test/x86/probe/fdc_dma.asm).
 # No firmware and no BIOS: the multiboot probe issues the 8272A commands and

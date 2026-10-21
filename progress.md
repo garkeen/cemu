@@ -1,35 +1,94 @@
 # cemu 当前状态（progress.md）
 
-## 16 位单步语料全量与 SDM 裁决（2026-10-21）
+## D17/D19 落地：VBE、链式 256、EDID、行比较/平移、ATA LBA-48/multi、PM/SCI、IOAPIC NMI（2026-10-21）
 
-在 `/tmp` 写了一个 cemu 外部原生 runner（链接 cemu 的 CPU/bus/mem，不进仓），
-用测试期望的机器模型：16MB 平铺 RAM、无 VGA/ROM 孔洞、开放总线 I/O、
-A20 关、20 位回绕、不注入中断。z86 的 300 个 8088 + 13 个 80286 JSON
-共 **301,300 例，4.8 秒**跑完：**295,176 通过，6,124 失败，80286 1300/1300
-全过**。失败分类与 SDM 裁决：
+### VGA / D17
 
-- **已修真 bug**：`SAR` 的 CF 应为最后移出位、count=1 时 OF=0；
-  `SHL` count=1 的 OF 应为 `MSB(DEST) XOR CF`；`ROL` count=1 的 OF 同样应
-  为 `MSB(DEST) XOR CF`（原实现用 MSB XOR MSB-1）；`AAA`/`AAS` 的 AL 与
-  AH 必须分开调整，原 `AX ± 0x106` / `AX-=6; AH-=1` 在 AL 进位/借位时会
-  多改 AH；`BOUND`（0x62）原来直接 #UD，已补上并按 286 硬件语料裁定为
-  无符号边界比较。
-- **非 bug（8088-only/未定义/未定义标志）**：`54` PUSH SP 的 8086 递减语义、
-  `8C/8E` 的 sreg 4/5 别名、`C0/C1` 的 8088 未定义（286 的 C0/C1 全过）、
-  `FF.6/FF.7` 的 8086/非法编码；共约 5,018 例。`D2.4/D3.4` 的 66 例是
-  count ≥ 位宽时 SDM 明示未定义的 CF。
-- **SDM 与 8088 硬件分歧，不改**：`RCR` 的 SDM 公式与实现一致（8088 硬件
-  差 965 例）；`DAA` 4 例、`DAS` 20 例按 SDM/既有 DAS 实机先例；`IDIV` 39
-  例的 cemu 商/余数符合 SDM，8088 语料在负商前的期望值自相矛盾；`AAM 0`
-  8 例是未定义/异常路径；`A5/AB/CC` 4 例是 8088 字符串/中断边角。
-- 运行器自身的“REP 才循环、自跳转只单步”已修正，消除 E1/E2 等假失败。
-- **80186 程序测试**（64KB 程序，F000:FFF0 启动，比较内存前 N 字节）：
-  16 个中 10 过、6 个失败；按 SDM/186-vs-386 逐项核对均非 cemu 语义 bug：
-  `bcdcnv` 差异只在 AAA/AAS 的未定义 PF/ZF（结果字一致）；`bitwise`/
-  `control` 是 386 POPF 载入 IOPL/NT（186 保留位）；`shifts` 是 count>1
-  时未定义的 OF；`mul` 是 MUL 未定义的 PF/ZF/SF/AF（CF/OF 与结果一致）；
-  `div` 是 386 #DE 保存 IP_THIS，186 测试期望 IP_AFTER。
-- 回归：x86 套件 **31/0**；以上源码修复未提交，runner/fixtures 只在 `/tmp`。
+- **VBE 与 DISPI**：`dispi` 不再只是存寄存器。写入 XRES/YRES/BPP/VIRT_WIDTH/
+  X_OFFSET/Y_OFFSET 时按 QEMU `vbe_fixup_regs` 收紧（8 对齐、2560×1600 上限、
+  行宽/容量/偏移），再按 `vbe_update_vgaregs` 写 GR6 map 1、CR17 低两位、CR13、
+  R1/R18/R7，并把 GR5 置 shift control 2；ENABLE 的 0→1 重置虚拟尺寸、按
+  NOCLEAR 清屏；BANK 把 64KB 窗口滑到 `bank<<16`；GETCAPS 返回本卡的最大值。
+  渲染器按 DISPI 的 bpp 读 chain-4 线性字节：8bpp 走 256 色 DAC，15/16/24/32bpp
+  按小端像素解码；4bpp 仍是四平面。`VgaMemoryChain4`/`VgaMemoryPlaneMask`
+  跟随 VBE 的影子状态（QEMU 的 `sr_vbe`），否则 DISPI 只改寄存器而 SR4 仍是
+  文本模式，客人写入会落进 odd/even 的错误平面（探针第一次跑出来的正是
+  `[11,22,00,33,44,00]`）。帧缓冲上限从 800×600 提到 VBE 的 2560×1600。
+  DISPI 字节访问保持“不触及寄存器组”：QEMU 的 x86 VBE portio 只声明访问
+  大小 2，D17 里那条不是缺口，已从台账删除。
+- **链式 256 色**：shift control 2 的 mode 13h/VBE packed 图现在真的渲染，
+  地址是 `plane_offset*4 + x` 的线性字节；`AR13` 的 pel 平移与 CGA 地址位
+  在这条路径上同样生效。
+- **EDID**：BAR2 偏移 0 返回 256 字节（基础块 + DTA 扩展），是
+  `qemu_edid_generate` 对默认 1280×800 监视器生成的两块，从 QEMU 11 实测
+  （`test/x86/probe/edid_dump.asm`）并逐字节校验；两块的 checksum 都为 0。
+  QEMU 映射的 384 字节里第三块是未初始化数据，不属于 EDID，本卡读 0xff。
+- **行比较/分屏**：R18 加 R7 bit4、R9 bit6 组成 10 位比较值；图形在
+  `y == line_compare` 后把行基址清零，文本在字符行跨过比较行后清零；AR10
+  bit5（pel split）在分屏后关掉平移。
+- **闪烁/光标相位**：不再用固定 133ms 的墙钟 tick。场周期由 CRTC 的 H total、
+  V total、点时钟、字符时钟和 SR1 分频算出；属性闪烁每 32 场、光标每 16 场
+  翻转，位 0/1 仍分别是两个相位。QEMU 的固定毫秒常数只作对照。
+- **验收**：`vbe_mode` 探针（DISPI 寄存器、chain-4、bank、16/24/32bpp 像素）
+  cemu 与 QEMU 都过；1024×768×32 的 fbdump 与 QEMU screendump **逐字节相同**。
+  `vga_split` 探针把 640×350 的 R18 设为 175、AR13 设为 2；cemu fbdump 在
+  第 276 行看到 VRAM 第 100 行的整行白色、第 300 行蓝色不再出现、每行左移
+  两个像素。QEMU 11 的 screendump 对这组探针（包括未改的 vga_paint）返回
+  640×480 控制台面，故图像对照只做了 cemu 自身基线。
+- **win101**：同一 BIOS/vgabios/软盘的 fbdump 与既有 `build/windows/s2.ppm`、
+  `s3.ppm` 逐字节相同（640×350 桌面），显示改动没有回归。
+
+### ATA / D19
+
+- 命令集补 **READ/WRITE SECTORS EXT (0x24/0x34)**、**READ/WRITE DMA EXT
+  (0x25/0x35)**、**FLUSH CACHE EXT (0xEA)**、**READ/WRITE MULTIPLE
+  (0xC4/0xC5)**、**SET MULTIPLE (0xC6)**。IDENTIFY 补 word 47（0x8000|16）、
+  word 59（0x100|当前值）、word 83/86 bit10（LBA-48 支持/启用）、word
+  100..103（48 位容量），word 80 改为 ATA-6。
+- 48 位任务文件的顺序按 libata/QEMU 实测修正：**高字节先写、低字节后写**；
+  通道保存 prev_* 影子，命令到达时当前值是低半、prev 是高半。原实现按低先
+  高后取，QEMU 双跑直接读到 LBA 0x1000000。
+- READ/WRITE MULTIPLE 的每轮 DRQ 搬 `multiple` 个扇区（上限 16），缓冲区
+  扩到 8KB；每轮结束中断一次，最后一条命令结束再中断一次。QEMU 的 identify
+  数据是缓存的，SET MULTIPLE 后仍回旧的 word 59；探针因此不重新 IDENTIFY，
+  用下一条 READ MULTIPLE 证明设置生效。
+- **验收**：`ata_multi` 探针把自身 1KiB 镜像同时当启动盘和主盘（第二扇区是
+  夹具），检查 IDENTIFY、SET MULTIPLE、两扇区 READ MULTIPLE、LBA 1 的
+  48 位 READ EXT；cemu 与 QEMU 都输出 `ata-multi ok`。
+
+### PM / D19
+
+- PIIX4 PM 块（PMBASE 0x40 + PMREGMISC 0x80）现在实现 PM1_STS（W1C）、
+  PM1_EN、PM1_CNT（SCI_EN、GBL_RLS、SLP_TYP/SLP_EN）、PM 定时器溢出事件、
+  SCI IRQ9 和 S5 关机（板级 `RequestShutdown` 让会话以 0 退出）。S3/S4 没有
+  唤醒路径，仍留在台账。
+- GBL_RLS 按 ACPI 4.8 实现为写-only 动作：置 GBL_STS、读回 0、SCI_EN 保留
+  时拉 SCI。QEMU 11 把该位原样存下且不置 GBL_STS，探针因此在 QEMU 的 step 2
+  失败；`pm_sci` 是 lock 格，台账与 calibration 记录了这一分歧。
+- **验收**：`pm_sci` 在 cemu 中检查 reset 值、GBL_STS、IRQ9（8259 从片 IRR
+  bit1，ELCR 电平）、清事件后 IRR 下降，最后写 S5；输出 `pm-sci ok` 且退出码 0。
+
+### IOAPIC / D19
+
+- 82093AA 的 NMI 交付模式现在真的投递：IOAPIC `deliver_nmi` → 板级匹配
+  destination → `CpuState.set_nmi`；x86 step 在指令边界采样 NMI（不受 IF
+  影响），置 `nmi_blocked`，IRET 清除后允许下一次。向量 2 走外部中断帧。
+  ExtINT 不再由 APIC 复制投递：同一条 ISA 线已经进 8259，PIC 通路就是它的
+  投递路径。SMI/INIT 仍无本机硬件。
+- **验收**：`nmi_ioapic` 探针建 GDT/IDT、启用 LAPIC、把 I/O APIC pin0（PIT
+  IRQ0）设为 NMI、屏蔽 8259、清楚 IF 后自旋；NMI handler 写标志后 iret。
+  cemu 输出 `nmi-ok`。QEMU 11 接受 NMI 表项（`info pic` 显示 pin0 NMI、
+  `info lapic` 显示 LAPIC 已启用、IRQ 统计有 403 次 PIT 投递）但不置 CPU 的
+  NMI 标志，探针为 lock 格。
+
+### 回归与台账
+
+- `bash test/x86/run.sh`：**36 passed / 0 failed**（新增 vbe_mode、vga_split、
+  ata_multi、pm_sci、nmi_ioapic 五格）；`cmake --build build --target check`
+  依赖边 ok；win101 桌面帧与旧基线逐字节相同。
+- AGENTS.md §X 的 D17/D19 已改为剩余缺口：D17 只剩 R17 bit5 地址回绕、
+  过扫描边框、CGA 复合 NTSC 伪色；D19 只剩 IOAPIC SMI/INIT、PIRQ、XBCS、
+  SMBus 与 PM S3/S4。ACPI 表由 SeaBIOS 生成，不再算芯片组模型的缺口。
 
 ## 16 位寻址全矩阵与 16 位测试资产审计（2026-10-21）
 
@@ -67,20 +126,6 @@ A20 关、20 位回绕、不注入中断。z86 的 300 个 8088 + 13 个 80286 J
   `16-bit smsw reg` 检查。
 - 结论：v86 没有可直接利用的完整 16 位指令套件；可用的 realmode 部分已在
   套件里，寻址缺口由上面两格补上。
-
-**互联网上的完整 oracle（待接入）**
-
-- `SingleStepTests/80386` 的 `v1_ex_real_mode`：MIT（数据公有领域），硬件
-  生成，941 个文件（406 个基础 opcode × 操作数/地址前缀组合，约 175 万次
-  执行），每例给出 initial/final 寄存器与 RAM，执行到 HALT 后比较；覆盖
-  `01`/`6601`/`6701`/`676601` 等 16/32 位前缀变体，且目标是 386 核，比
-  `SingleStepTests/80286`（326 种形式、约 150 万次、仅 286 语义）更贴合
-  cemu。
-- 数据总量数百 MB（80386 仓库约 579MB，326/941 个 gzip 文件），不能按仓内
-  “单文件 ≤5MB、测试自足”规则整包入库。MOO→JSON 转换器已验证可解析
-  386E 样本（`moo2json_generic.py`，Cpu type: 386E）。
-- 接入方式（外部 calibration 跑全套 / 仓内只放按 opcode 形式的精选 fixture）
-  尚未决定，因此没有把外部数据放进 `test/`。
 
 ## VGA CGA 模式 4/5/6 的 bank 地址旋转（D33，2026-10-21）
 

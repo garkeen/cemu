@@ -4304,6 +4304,7 @@ void run_op(uint8_t op) {
       fr->rec.mnemonic = "iret";
       if (s->cr0 & 1) {
         pm_iret();  // SDM vol.2 IRET: the gate-return rules apply
+        s->nmi_blocked = 0;  // the NMI handler has returned (SDM vol.3 6.7.1)
         break;
       }
       // Real mode: pop (E)IP, CS, (E)FLAGS. VM never loads; RF does (SDM
@@ -4334,6 +4335,7 @@ void run_op(uint8_t op) {
         GateArgs(&a);
         DebugGateRet(&a, cf, ((uint32_t)sel << 16) | (new_eip & 0xffff));
       }
+      s->nmi_blocked = 0;  // the NMI handler has returned (SDM vol.3 6.7.1)
       break;
     }
     case 0xd0:
@@ -4644,6 +4646,16 @@ void x86_set_intr(CpuState* c, int level) {
   if (level) c->wait = 0;
 }
 
+// NMI is edge-triggered and not maskable by IF (SDM vol.3 6.7): the request is
+// latched until the processor takes it. While an NMI is being serviced a
+// second one is held (the pin's request is latched, not discarded) and taken
+// after the handler's IRET clears the block.
+void x86_set_nmi(CpuState* c) {
+  x86_state* st = (x86_state*)c->priv;
+  st->nmi_pending = 1;
+  c->wait = 0;
+}
+
 // ---- reset / boot ----------------------------------------------------------------
 
 // Multiboot header magic the loader scans for (Multiboot 0.6.96 §3.1.1);
@@ -4691,6 +4703,7 @@ void x86_init(CpuState* c) {
   st->msr_apic_base = 0xFEE00000ULL | 0x800ULL | 0x100ULL;
   c->set_irq = x86_set_irq_line;
   c->set_a20 = x86_set_a20_line;
+  c->set_nmi = x86_set_nmi;
   // The gate starts open (the reasoning lives in port92.h): every image cemu
   // accepts is handed flat memory above 1 MiB and never expects the alias.
   st->a20 = 1;

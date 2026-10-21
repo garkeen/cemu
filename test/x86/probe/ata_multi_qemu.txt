@@ -1,0 +1,20 @@
+Dual run of test/x86/probe/ata_multi.asm, 2026-10-21. The same 1KiB image is
+the boot medium and the primary-master disk (the second sector is the fixture):
+
+  cemu --machine x86 --isa x86 -hda <copy> ata_multi.bin  -> ata-multi ok
+  qemu-system-i386 -drive file=<copy>,format=raw,if=ide,index=0 -boot c \
+      -display none -serial stdio -no-reboot \
+      -device isa-debug-exit,iobase=0xf4,iosize=0x4       -> ata-multi ok
+
+Both models advertise LBA-48 (IDENTIFY words 83/86 bit 10, words 100..103),
+the multiple block (word 47; the probe masks the low byte because QEMU sets
+bit 15), accept SET MULTIPLE 2, read two sectors in one READ MULTIPLE DRQ
+block, and decode the 48-bit task-file sequence (high bytes first, then low)
+for READ SECTORS EXT at LBA 1.
+
+The probe does not re-IDENTIFY after SET MULTIPLE: QEMU caches identify data
+and keeps answering the old word 59, while cemu rebuilds it from the current
+setting. The next READ MULTIPLE is the behavior both models share.
+
+cemu ata-multi ok
+qemu ata-multi ok

@@ -279,6 +279,16 @@ static void OnIoapicDeliver(void* ctx, int dest, int logical, int vector, int tr
 }
 
 // An end of interrupt retires the I/O APIC pin whose vector was in service.
+// An I/O APIC entry in NMI delivery mode: the destination APIC's processor
+// takes vector 2 through its NMI pin, independent of IF and the APIC's own
+// enable state (82093AA §3.2.4).
+static void OnIoapicNmi(void* ctx, int dest, int logical) {
+  X86Board* xm = (X86Board*)ctx;
+  int match = logical ? (dest & LapicLogicalMask(&xm->lapic)) : (dest == LapicId(&xm->lapic));
+  if (DebugOn(kDbgMark)) DebugMark("ioapic-nmi", dest, match);
+  if (match && xm->base.cpu.set_nmi) xm->base.cpu.set_nmi(&xm->base.cpu);
+}
+
 static void OnLapicEoi(void* ctx, int vector) {
   X86Board* xm = (X86Board*)ctx;
   IoapicEoi(&xm->ioapic, vector);
@@ -576,6 +586,8 @@ static void X86Poll(Board* m) {
   // The RTC's periodic rate and its once-a-second update/alarm comparison are
   // wall-clock sources too (PitPoll's contract).
   CmosPoll(&xm->cmos);
+  // The PM timer's 32-bit overflow is a fixed ACPI event (PM1_STS bit 0).
+  Piix4PmPoll(&xm->pm);
 }
 
 // The next moment a device wakes the processor on its own: the PC's two
@@ -598,6 +610,16 @@ static void RequestReset(void* ctx) {
   X86Board* xm = (X86Board*)ctx;
   xm->base.reset_pending = 1;
   if (DebugOn(kDbgMark)) DebugMark("reset-req", 0, 0);
+}
+
+// ACPI S5 (PM1_CNT's SLP_EN with SLP_TYP=5): the guest has asked the machine
+// to power off. The CPU stops at the end of the instruction that wrote the
+// register; the session's exit code stays 0.
+static void RequestShutdown(void* ctx) {
+  X86Board* xm = (X86Board*)ctx;
+  xm->base.cpu.halted = kCpuExited;
+  xm->base.cpu.exit_code = 0;
+  if (DebugOn(kDbgMark)) DebugMark("shutdown", 0, 0);
 }
 
 // The machine's wiring: which sink each device's line reaches, and which
@@ -624,6 +646,9 @@ static void WireDevices(X86Board* xm) {
   IdeSetIrqSink(&xm->ide, OnIsaIrq, &xm->irqbus);
   Uart16550SetIrqSink(&xm->uart, OnCom1Irq, &xm->irqbus);
   CmosSetIrqSink(&xm->cmos, OnIsaIrq, &xm->irqbus);
+  // PIIX4 PM's SCI is IRQ9; S5 ends the session (RequestShutdown).
+  Piix4PmSetIrqSink(&xm->pm, OnIsaIrq, &xm->irqbus);
+  Piix4PmSetShutdownSink(&xm->pm, RequestShutdown, xm);
   // The floppy controller's IRQ6 into the same fan-out, and channel 2 of the
   // DMA engine for its sector data.
   FdcSetIrqSink(&xm->fdc, OnIsaIrq, &xm->irqbus);
@@ -632,6 +657,7 @@ static void WireDevices(X86Board* xm) {
   // do, so it reaches both controllers through the same fan-out.
   TestDevSetIrqSink(&xm->testdev, OnIsaIrq, &xm->irqbus);
   IoapicSetDeliverSink(&xm->ioapic, OnIoapicDeliver, xm);
+  IoapicSetNmiSink(&xm->ioapic, OnIoapicNmi, xm);
   I8042SetA20Sink(&xm->kbd, OnA20, &m->cpu);
   Port92SetA20Sink(&xm->port92, OnA20, &m->cpu);
   // The three ways a guest can reboot the machine on a PC (D18): port 0x92's

@@ -1,0 +1,21 @@
+Dual run of test/x86/probe/vbe_mode.asm, 2026-10-21, same ELF on both models:
+
+  cemu --machine x86 --isa x86 vbe_mode.elf            -> vbe-mode ok
+  qemu-system-i386 -machine pc -m 32 -kernel vbe_mode.elf -vga std \
+      -display none -no-reboot -serial stdio \
+      -device isa-debug-exit,iobase=0xf4,iosize=0x4    -> vbe-mode ok
+
+The shared checks are DISPI's sanitized 320x200x8 / 640x480x16 /
+800x600x24 / 1024x768x32 registers, GR6 map 1, CR17 bits 0/1, GR5 shift 2,
+chain-4 bytes through the aperture, BANK moving the 64KB window, the
+clear-on-enable at 24bpp, and the pixel bytes of the packed depths. The
+rendered 1024x768x32 frame was dumped from both models and is byte-identical
+(CEMU_DEBUG=fbdump vs the monitor's screendump).
+
+Not checked by the probe: DISPI GETCAPS maxima. QEMU 11 answers 16000x12000
+(hw/display/bochs-vbe.h in that tree); this card answers the 2560x1600 its
+own option ROM advertises and its framebuffer holds (seabios
+vgasrc/bochsvga.h). The ID reset value is VBE_DISPI_ID5 in both models.
+
+cemu vbe-mode ok
+qemu vbe-mode ok

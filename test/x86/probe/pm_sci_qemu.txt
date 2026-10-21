@@ -1,0 +1,19 @@
+Dual run of test/x86/probe/pm_sci.asm, 2026-10-21:
+
+  cemu --machine x86 --isa x86 pm_sci.elf                -> pm-sci ok, exits 0
+  qemu-system-i386 -machine pc -m 32 -kernel pm_sci.elf -vga std \
+      -display none -no-reboot -serial stdio              -> pm-sci FAIL step=2
+
+Where they agree: PMBASE at 00:01.3 offset 0x40 and PMREGMISC 0x80 decode the
+32-byte block, PM1_STS/EN/CNT reset, PM1_STS W1C, PM1_EN, SCI_EN, the SCI on
+IRQ9 and S5 power-off. QEMU's PM timer also starts with TMR_STS set; the probe
+clears the fixed-event bits before checking the reset state.
+
+The divergence is GBL_RLS: ACPI 4.8 makes PM1_CNT bit 2 a write-only release
+action that sets GBL_STS (bit 5) and reads back 0. cemu implements that; QEMU
+stores the bit and leaves GBL_STS clear, so the probe's GBL event check fails
+there. The probe is a lock cell: cemu is pinned to the manual's behavior, and
+the QEMU divergence is recorded here rather than silently accepted.
+
+cemu pm-sci ok
+qemu pm-sci FAIL step=2

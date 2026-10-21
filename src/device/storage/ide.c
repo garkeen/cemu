@@ -58,13 +58,21 @@ enum {
 // Device control register bits (§7.10.10 device control).
 enum { kDevCtrlNien = 0x02, kDevCtrlSrst = 0x04, kDevCtrlHd15 = 0x08 };
 
-// The ATA command set a disk implements (ATA-4). The extended (LBA-48) and
-// queued commands are not implemented and abort, which is how a drive answers a
-// command it does not support (§6.3 command protocol).
+// The ATA command set a disk implements (ATA-6 for the extended commands the
+// images need). A command outside this table aborts, which is how a drive
+// answers one it does not support (§6.3 command protocol).
 enum {
   kCmdReadSectors = 0x20,
+  kCmdReadSectorsExt = 0x24,
+  kCmdReadDmaExt = 0x25,
   kCmdWriteSectors = 0x30,
+  kCmdWriteSectorsExt = 0x34,
+  kCmdWriteDmaExt = 0x35,
   kCmdReadVerify = 0x40,
+  kCmdReadMultiple = 0xc4,
+  kCmdWriteMultiple = 0xc5,
+  kCmdSetMultiple = 0xc6,
+  kCmdFlushCacheExt = 0xea,
   kCmdInitializeParams = 0x91,
   kCmdReadDma = 0xc8,
   kCmdWriteDma = 0xca,
@@ -310,6 +318,7 @@ static void Abort(IdeChannel* ch, IdeDrive* dr) {
   ch->active = -1;
   ch->left = 0;
   ch->round = 0;
+  ch->multi = 0;
   ch->packet = 0;
   RaiseIrq(ch);
 }
@@ -327,6 +336,7 @@ static void AtapiError(IdeChannel* ch, int sense_key, int asc) {
   ch->active = -1;
   ch->left = 0;
   ch->round = 0;
+  ch->multi = 0;
   ch->packet = 0;
   RaiseIrq(ch);
 }
@@ -341,6 +351,7 @@ static void CmdOk(IdeChannel* ch) {
   ch->active = -1;
   ch->left = 0;
   ch->round = 0;
+  ch->multi = 0;
   ch->packet = 0;
   RaiseIrq(ch);
 }
@@ -381,6 +392,10 @@ static void ResetChannel(IdeChannel* ch) {
   ch->lba_low = 0;
   ch->lba_mid = 0;
   ch->lba_high = 0;
+  ch->prev_count = 0;
+  ch->prev_lba_low = 0;
+  ch->prev_lba_mid = 0;
+  ch->prev_lba_high = 0;
   ch->head = 0;
   for (int i = 0; i < kIdeDrivesPerChannel; i++) {
     IdeDrive* dr = &ch->drives[i];
@@ -390,6 +405,7 @@ static void ResetChannel(IdeChannel* ch) {
     // A reset spins a sleeping drive back up (§8.12).
     dr->power = kPowerActive;
     dr->sleeping = 0;
+    dr->multiple = 0;
     // An empty bay keeps answering zero: that is how firmware and xv6 tell a
     // bay with no drive from one with a drive that has not been selected yet.
     dr->status = dr->image ? kStatusReady : 0;
@@ -402,6 +418,7 @@ static void ResetChannel(IdeChannel* ch) {
   ch->left = 0;
   ch->round = 0;
   ch->used = 0;
+  ch->multi = 0;
   ch->refill = 0;
   ch->block_size = kAtaBlockSize;
   ch->limit = kAtaBlockSize;
@@ -428,8 +445,9 @@ static void PutAtaString(uint16_t* id, int first_word, int chars, const char* s)
 }
 
 // IDENTIFY DEVICE data (§7.10.2). Words left zero are the ones this drive
-// answers "not supported" to: 47/59 (R/W multiple), 88 (ultra DMA), 83 and
-// 100..103 (LBA-48 capacity), 93 bits other than the ones below.
+// answers "not supported" to: 88 (ultra DMA), 93 bits other than the ones
+// below. Words 47/59 and 83/86/100..103 advertise the multiple-mode and LBA-48
+// capabilities the command set implements.
 static void BuildIdentify(const IdeChannel* ch, int drive, uint16_t* id) {
   const IdeDrive* dr = &ch->drives[drive];
   memset(id, 0, kAtaBlockSize);
@@ -454,6 +472,10 @@ static void BuildIdentify(const IdeChannel* ch, int drive, uint16_t* id) {
   id[58] = (uint16_t)(chs_sectors >> 16);
   id[60] = (uint16_t)(dr->blocks & 0xffff);  // LBA-28 capacity, words 60..61
   id[61] = (uint16_t)((dr->blocks >> 16) & 0xffff);
+  // Word 47: the largest READ/WRITE MULTIPLE block the drive accepts; word 59
+  // is the current setting (0 until SET MULTIPLE enables it, §8.10).
+  id[47] = 0x8000 | kMaxMultipleSectors;  // bit 15: multiple mode supported
+  id[59] = dr->multiple ? (0x100 | dr->multiple) : 0;  // bit 8: setting valid
   // Words 63..68: the transfer modes on offer and their timings. Word 63 lists
   // the multiword DMA modes (bit i = mode i) and word 64 the advanced PIO
   // modes; 65/66 are the minimum and recommended multiword DMA cycle times and
@@ -466,8 +488,17 @@ static void BuildIdentify(const IdeChannel* ch, int drive, uint16_t* id) {
   id[66] = 0x0078;
   id[67] = 0x00f0;
   id[68] = 0x00f0;
-  // Word 80: the ATA revision this command set is — bit 4 = ATA-4.
-  id[80] = 0x0008;
+  // Word 80: the ATA revision this command set is — bit 5 = ATA-6, the
+  // revision that introduced LBA-48.
+  id[80] = 0x0020;
+  // Words 83/86: bit 10 of each says LBA-48 is supported / enabled. Words
+  // 100..103 carry the 48-bit capacity (the number of addressable sectors).
+  id[83] = 0x0400;
+  id[86] = 0x0400;
+  id[100] = (uint16_t)((uint64_t)dr->blocks & 0xffff);
+  id[101] = (uint16_t)(((uint64_t)dr->blocks >> 16) & 0xffff);
+  id[102] = (uint16_t)(((uint64_t)dr->blocks >> 32) & 0xffff);
+  id[103] = (uint16_t)(((uint64_t)dr->blocks >> 48) & 0xffff);
   // Word 93: hardware reset result. Bit 14 = device 0 detected, bit 13 = device
   // 1 detected, bit 0 always set. Bit 6 is the cable ID pin, which this board
   // does not wire, so it reads 0 — and that is also what keeps firmware
@@ -550,12 +581,52 @@ static int64_t CommandLba(const IdeChannel* ch, const IdeDrive* dr, int* ok) {
   return ((int64_t)cyl * dr->heads + head) * dr->sectors_per_track + (int64_t)(sector - 1);
 }
 
+// The LBA and count an EXT (LBA-48) command addresses. The host writes the
+// high-order byte of each register first and the low-order byte second
+// (libata's ata_tf_load does the same; QEMU's ide_ioport_write shifts the
+// current value into its hob_* shadow on every write), so the previous value of
+// each register holds the high half and the current value the low half. A
+// count of zero is 65536 sectors (§7.10.4).
+static uint32_t CommandCount48(const IdeChannel* ch) {
+  uint32_t n = (uint32_t)ch->count | ((uint32_t)ch->prev_count << 8);
+  return n ? n : 65536;
+}
+
+static int64_t CommandLba48(const IdeChannel* ch, int* ok) {
+  if (!(ch->head & 0x40)) {
+    *ok = 0;  // LBA-48 has no CHS form
+    return 0;
+  }
+  uint64_t lba = (uint64_t)ch->lba_low | ((uint64_t)ch->lba_mid << 8) |
+                 ((uint64_t)ch->lba_high << 16) | ((uint64_t)ch->prev_lba_low << 24) |
+                 ((uint64_t)ch->prev_lba_mid << 32) | ((uint64_t)ch->prev_lba_high << 40);
+  *ok = 1;
+  return (int64_t)lba;
+}
+
 // Begins a DRQ round: a medium transfer fills the buffer when it crosses a block
 // boundary, and the host is told how many bytes the round covers — one logical
 // block, the ATAPI byte count limit, or what the command has left, whichever is
 // smallest (§6.3 PIO data transfer; §9.6 PACKET). Returns -1 when the medium
 // cannot be read there.
 static int StartRound(IdeChannel* ch) {
+  if (ch->multi > 0) {
+    // READ/WRITE MULTIPLE: one DRQ round carries the drive's multiple block,
+    // or the sectors the command has left when that is shorter (§8.10). The
+    // buffer is large enough for the whole block, so a write can be committed
+    // when the round drains and a read is fetched once.
+    int64_t sectors = ch->left / kAtaBlockSize;
+    if (sectors > ch->multi) sectors = ch->multi;
+    const int bytes = (int)sectors * kAtaBlockSize;
+    ch->used = 0;
+    ch->round = bytes;
+    if (!ch->is_write && bytes > 0 &&
+        HostFileReadAt(ch->drives[ch->active].image, ch->lba * kAtaBlockSize, ch->buf,
+                       (size_t)bytes) != (size_t)bytes)
+      return -1;
+    if (!ch->dma) ch->drives[ch->active].status |= kStatusDrq;
+    return 0;
+  }
   if (ch->refill && !ch->is_write && ch->used == 0) {
     if (HostFileReadAt(ch->drives[ch->active].image, ch->lba * ch->block_size, ch->buf,
                        (size_t)ch->block_size) != (size_t)ch->block_size)
@@ -583,6 +654,7 @@ static void EndCommand(IdeChannel* ch) {
   dr->status &= (uint8_t)~kStatusDrq;
   ch->active = -1;
   ch->round = 0;
+  ch->multi = 0;
   RaiseIrq(ch);
 }
 
@@ -594,6 +666,29 @@ static void MoveBytes(IdeChannel* ch, int size) {
   ch->used += size;
   ch->left -= size;
   if (ch->round > 0) return;
+  if (ch->multi > 0) {
+    IdeDrive* dr = &ch->drives[ch->active];
+    if (ch->is_write &&
+        HostFileWriteAt(dr->image, ch->lba * kAtaBlockSize, ch->buf,
+                        (size_t)ch->used) != (size_t)ch->used) {
+      Abort(ch, dr);
+      return;
+    }
+    ch->lba += ch->used / kAtaBlockSize;
+    ch->used = 0;
+    if (ch->left > 0) {
+      if (StartRound(ch) != 0) {
+        MediumReadFailed(ch);
+        return;
+      }
+      // Every multiple block is a completed DRQ round, so every one interrupts
+      // (§8.10); the command's own completion interrupt follows at the end.
+      RaiseIrq(ch);
+      return;
+    }
+    EndCommand(ch);
+    return;
+  }
   if (ch->packet) {
     ch->packet = 0;
     ExecPacket(ch);
@@ -1308,6 +1403,7 @@ static void ExecCommand(IdeChannel* ch, uint8_t cmd) {
   ch->left = 0;
   ch->round = 0;
   ch->used = 0;
+  ch->multi = 0;
   if (!dr->image) {
     // No drive in the bay: nothing answers. The command write leaves the status
     // register at zero — that is the one register an empty bay never changes,
@@ -1426,6 +1522,79 @@ static void ExecCommand(IdeChannel* ch, uint8_t cmd) {
       RaiseIrq(ch);
       return;
     }
+    case kCmdReadSectorsExt:
+    case kCmdWriteSectorsExt:
+    case kCmdReadDmaExt:
+    case kCmdWriteDmaExt: {
+      int ok = 0;
+      int64_t lba = CommandLba48(ch, &ok);
+      uint32_t count = CommandCount48(ch);
+      if (!ok || lba < 0 || lba + (int64_t)count > dr->blocks) {
+        Abort(ch, dr);
+        return;
+      }
+      dr->error = 0;
+      dr->status = kStatusReady;
+      ch->active = drive;
+      ch->is_write = cmd == kCmdWriteSectorsExt || cmd == kCmdWriteDmaExt;
+      ch->refill = 1;
+      ch->block_size = kAtaBlockSize;
+      ch->limit = kAtaBlockSize;
+      ch->lba = lba;
+      ch->left = (int64_t)count * kAtaBlockSize;
+      ch->dma = cmd == kCmdReadDmaExt || cmd == kCmdWriteDmaExt;
+      if (StartRound(ch) != 0) {
+        MediumReadFailed(ch);
+        return;
+      }
+      RaiseIrq(ch);
+      return;
+    }
+    case kCmdReadMultiple:
+    case kCmdWriteMultiple: {
+      if (dr->multiple == 0) {
+        Abort(ch, dr);  // multiple mode is not enabled (§8.10)
+        return;
+      }
+      int ok = 0;
+      int64_t lba = CommandLba(ch, dr, &ok);
+      int count = ch->count ? ch->count : 256;
+      if (!ok || lba < 0 || lba + count > dr->blocks) {
+        Abort(ch, dr);
+        return;
+      }
+      dr->error = 0;
+      dr->status = kStatusReady;
+      ch->active = drive;
+      ch->is_write = cmd == kCmdWriteMultiple;
+      ch->refill = 0;
+      ch->block_size = kAtaBlockSize;
+      ch->limit = (int)dr->multiple * kAtaBlockSize;
+      ch->multi = dr->multiple;
+      ch->lba = lba;
+      ch->left = (int64_t)count * kAtaBlockSize;
+      ch->dma = 0;
+      if (StartRound(ch) != 0) {
+        MediumReadFailed(ch);
+        return;
+      }
+      RaiseIrq(ch);
+      return;
+    }
+    case kCmdSetMultiple: {
+      // SET MULTIPLE takes the block size in the sector count register; 0
+      // disables multiple mode, and a size above the drive's limit aborts
+      // (§8.10).
+      if (ch->count > kMaxMultipleSectors) {
+        Abort(ch, dr);
+        return;
+      }
+      dr->multiple = ch->count;
+      dr->error = 0;
+      dr->status = kStatusReady;
+      RaiseIrq(ch);
+      return;
+    }
     case kCmdReadVerify: {
       int ok = 0;
       int64_t lba = CommandLba(ch, dr, &ok);
@@ -1512,6 +1681,7 @@ static void ExecCommand(IdeChannel* ch, uint8_t cmd) {
       dr->status = kStatusBsy;
       return;
     case kCmdFlushCache:
+    case kCmdFlushCacheExt:
       // The medium is written through with every sector, so a flush is already
       // done: nothing to do but report success.
       dr->error = 0;
@@ -1566,15 +1736,19 @@ static void CmdWrite(void* dev, uint64_t addr, int size, uint64_t val) {
       ch->feature = (uint8_t)val;
       return;
     case kRegSectorCount:
+      ch->prev_count = ch->count;
       ch->count = (uint8_t)val;
       return;
     case kRegLbaLow:
+      ch->prev_lba_low = ch->lba_low;
       ch->lba_low = (uint8_t)val;
       return;
     case kRegLbaMid:
+      ch->prev_lba_mid = ch->lba_mid;
       ch->lba_mid = (uint8_t)val;
       return;
     case kRegLbaHigh:
+      ch->prev_lba_high = ch->lba_high;
       ch->lba_high = (uint8_t)val;
       return;
     case kRegDriveHead:

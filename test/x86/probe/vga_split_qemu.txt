@@ -1,0 +1,17 @@
+Dual run of test/x86/probe/vga_split.asm (vga_paint's 640x350 planar mode with
+R18=175, R9 bit 6 clear, AR13=2), 2026-10-21:
+
+  cemu --machine x86 --isa x86 vga_split.elf             -> vga-split ok
+  qemu-system-i386 -machine pc -m 32 -kernel vga_split.elf -vga std \
+      -display none -no-reboot -serial file:...          -> vga-split ok
+
+Both models accept the split and panning registers and pass the probe. The
+picture is judged in cemu by fbdump: the full white row painted at VRAM row
+100 appears at displayed row 276 (175 + 101), the blue row 300 does not, and
+every row is shifted by the two pel-panning pixels. QEMU 11's screendump with
+-display none/vnc reports its 640x480 console surface for this probe (also for
+the unmodified vga_paint), so the picture comparison is cemu's fbdump against
+the unmodified vga_paint frame plus the register semantics QEMU shares.
+
+cemu vga-split ok
+qemu vga-split ok

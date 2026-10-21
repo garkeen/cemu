@@ -42,6 +42,11 @@ typedef struct IoapicDevice {
   // can tell the two apart (SDM vol.3 11.5.8).
   void (*deliver)(void* ctx, int dest, int logical, int vector, int trigger);
   void* deliver_ctx;
+  // NMI delivery: the entry's vector is ignored; the destination APIC's
+  // processor takes vector 2 through its NMI pin (82093AA §3.2.4). The board
+  // matches the destination and calls the CPU's set_nmi hook.
+  void (*deliver_nmi)(void* ctx, int dest, int logical);
+  void* nmi_ctx;
 } IoapicDevice;
 
 void IoapicInit(IoapicDevice* d);
@@ -49,6 +54,8 @@ void IoapicRegister(Bus* bus, IoapicDevice* d);
 void IoapicSetDeliverSink(IoapicDevice* d,
                           void (*deliver)(void* ctx, int dest, int logical, int vector, int trigger),
                           void* ctx);
+void IoapicSetNmiSink(IoapicDevice* d, void (*deliver_nmi)(void* ctx, int dest, int logical),
+                      void* ctx);
 // An input pin changes level — the machine's device IRQ wires.
 void IoapicSetPin(IoapicDevice* d, int pin, int level);
 // An end-of-interrupt for a vector: retires the remote-IRR bit of the level

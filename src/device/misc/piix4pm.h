@@ -32,18 +32,35 @@
 // INT 15h AH=86h, the timer list it walks while it waits) runs at a different
 // scale from the model being compared against.
 //
-// Only the timer drives hardware. The PM1a registers read as no-event and their
-// writes are discarded: no SCI is delivered and the power-off path is not
-// implemented — see 简化登记 D19.
+// The PM1a block follows ACPI: +0x00 status (W1C), +0x02 enable, +0x04 control,
+// +0x08 the free-running PM timer. The enabled fixed event raises the SCI on
+// IRQ9 when control's SCI_EN is set, and SLP_EN with SLP_TYP=5 (S5) asks the
+// board to end the session — the two paths a guest exercises when it reads the
+// event block and shuts the machine down. S3/S4 have no wake path on this
+// machine and are not entered (简化登记 D19).
 typedef struct Piix4PmDevice {
   PciDevice pci;
   Bus* io;            // the I/O address space the block gets decoded in
   uint16_t base;      // the address PMBASE currently points at (0 = not programmed)
   uint8_t pmregmisc;  // bit 0 enables the block (seabios's "enable PM io space")
+  uint16_t pm1_sts;   // PM1_STS: fixed-event status, write-one-to-clear
+  uint16_t pm1_en;    // PM1_EN: which fixed events raise the SCI
+  uint16_t pm1_cnt;   // PM1_CNT: SCI_EN, GBL_RLS and the sleep-type fields
+  uint32_t last_timer;  // last 32-bit PM-timer sample, for the overflow event
+  // IRQ9 (the SCI) and the board's shutdown request; both are wiring, and a
+  // reset leaves them installed.
+  void (*set_sci)(void* ctx, int line, int level);
+  void* sci_ctx;
+  void (*request_shutdown)(void* ctx);
+  void* shutdown_ctx;
 } Piix4PmDevice;
 
 void Piix4PmInit(Piix4PmDevice* d, uint8_t bus, uint8_t dev);
 void Piix4PmSetIoBus(Piix4PmDevice* d, Bus* io);
+void Piix4PmSetIrqSink(Piix4PmDevice* d, void (*set_sci)(void* ctx, int line, int level),
+                       void* ctx);
+void Piix4PmSetShutdownSink(Piix4PmDevice* d, void (*request_shutdown)(void* ctx), void* ctx);
+void Piix4PmPoll(Piix4PmDevice* d);
 void Piix4PmReset(Piix4PmDevice* d);
 
 #endif

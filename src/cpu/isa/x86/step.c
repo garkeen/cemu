@@ -159,6 +159,27 @@ void x86_step(CpuState* c) {
     }
   }
 
+  // NMI is sampled between instructions like INTR but is not gated by IF, and
+  // an NMI already in service blocks another until the handler's IRET (SDM
+  // vol.3 6.7.1). It takes the vector-2 gate with an external-interrupt frame
+  // (no error code) and clears IF/TF on entry like any interrupt gate.
+  if (s->nmi_pending && !s->nmi_blocked) {
+    s->nmi_pending = 0;
+    s->nmi_blocked = 1;
+    cpu->wait = 0;
+    fr->rec.pc = cpu->pc;
+    fr->rec.dnpc = cpu->pc;
+    fr->rec.pc_lin = s->base[cs_i] + fr->rec.pc;
+    fr->rec.dnpc_lin = fr->rec.pc_lin;
+    fr->rec.raw_len = 0;
+    fr->rec.mnemonic = "nmi";
+    delivering_vec = vec_nmi;
+    do_int(vec_nmi, (uint32_t)cpu->pc, kIntExternal, 0);
+    delivering_vec = -1;
+    DebugInsn(fr);
+    return;
+  }
+
   // Hardware interrupts are sampled between instructions (after the landing
   // pad, so a fault during delivery escalates inside this step), when IF=1
   // and outside the SDM inhibit window (the instruction after STI/MOV SS/

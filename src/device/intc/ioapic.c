@@ -24,12 +24,12 @@ enum {
   // it and the delivery is the fixed one — the difference shows only with more
   // than one destination.
   kDeliveryLowest = 1,
-  // SMI, NMI, INIT and ExtINT are not delivered: SMI needs an SMM-capable
-  // processor and a SMI# line, NMI a processor NMI input, INIT a second APIC
-  // to reset, and ExtINT an INTA cycle answered by the 8259 pair rather than by
-  // the APIC. A uniprocessor PC with no SMM has none of those lines, and a
-  // guest that programs one of these modes is asking for hardware this machine
-  // does not have.
+  // SMI and INIT are not delivered: SMI needs an SMM-capable processor and a
+  // SMI# line, INIT a second APIC to reset. NMI goes to the destination
+  // processor's NMI pin through deliver_nmi. ExtINT names the 8259 pair that
+  // answers the INTA cycle; this machine's ISA lines reach the 8259 in
+  // parallel with the I/O APIC, so the PIC path already carries that request
+  // and the APIC does not deliver a second copy.
   kDeliverySmi = 2,
   kDeliveryNmi = 4,
   kDeliveryInit = 5,
@@ -66,12 +66,16 @@ static void SetPinLow(IoapicPin* p, uint32_t v) {
 static void Service(IoapicDevice* d, int pin) {
   IoapicPin* p = &d->pins[pin];
   if (p->mask) return;
-  if (p->delivery == kDeliverySmi || p->delivery == kDeliveryNmi ||
-      p->delivery == kDeliveryInit || p->delivery == kDeliveryExtInt) {
+  if (p->delivery == kDeliverySmi || p->delivery == kDeliveryInit) {
     // Hardware this machine does not have (see the mode list above): the pin
     // stays quiet rather than being delivered as something it is not.
     return;
   }
+  if (p->delivery == kDeliveryNmi) {
+    if (d->deliver_nmi) d->deliver_nmi(d->nmi_ctx, (int)p->dest, (int)p->dest_mode);
+    return;
+  }
+  if (p->delivery == kDeliveryExtInt) return;  // the 8259 path on the same wire
   if (p->trigger) p->remote_irr = 1;
   if (d->deliver)
     d->deliver(d->deliver_ctx, (int)p->dest, (int)p->dest_mode, (int)(p->vector & 0xff),
@@ -195,4 +199,10 @@ void IoapicSetDeliverSink(IoapicDevice* d,
                           void* ctx) {
   d->deliver = deliver;
   d->deliver_ctx = ctx;
+}
+
+void IoapicSetNmiSink(IoapicDevice* d, void (*deliver_nmi)(void* ctx, int dest, int logical),
+                      void* ctx) {
+  d->deliver_nmi = deliver_nmi;
+  d->nmi_ctx = ctx;
 }

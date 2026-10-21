@@ -49,6 +49,10 @@ typedef struct CpuState {
   // while it is low. Same shape as set_irq — installed by the CPU model's
   // init, called by the board. NULL for ISAs without a gate.
   void (*set_a20)(struct CpuState* cpu, int on);
+  // Non-maskable interrupt input (x86 NMI pin; the I/O APIC's NMI delivery
+  // mode is its only source on this machine). Same hook shape as set_irq;
+  // NULL for ISAs without one.
+  void (*set_nmi)(struct CpuState* cpu);
 } CpuState;
 
 #endif

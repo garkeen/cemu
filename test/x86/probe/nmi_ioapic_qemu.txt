@@ -1,0 +1,18 @@
+Dual run of test/x86/probe/nmi_ioapic.asm, 2026-10-21:
+
+  cemu --machine x86 --isa x86 nmi_ioapic.elf           -> nmi-ok, exit 11
+  qemu-system-i386 -machine pc -m 32 -kernel nmi_ioapic.elf -vga std \
+      -display none -no-reboot -serial stdio            -> nmi-FAIL
+
+The probe builds a GDT/IDT, enables the LAPIC, programs I/O APIC pin 0 (the
+PIT's IRQ0 wire) as NMI delivery to APIC 0, masks the 8259, starts the PIT at
+100Hz, clears IF and spins on a flag only the vector-2 handler writes. cemu
+delivers the NMI through the CPU's set_nmi hook (82093AA §3.2.4) and passes.
+
+QEMU 11 accepts the entry (`info pic` shows pin 0 NMI, `info lapic` shows the
+LAPIC enabled, IRQ statistics count 403 PIT deliveries) but the CPU's NMI flag
+never fires in this configuration; the probe reports nmi-FAIL. cemu follows
+the 82093AA delivery mode; the probe is a lock cell for that reason.
+
+cemu nmi-ok
+qemu nmi-FAIL
