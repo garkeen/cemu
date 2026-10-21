@@ -1,5 +1,40 @@
 # cemu 当前状态（progress.md）
 
+## win101 死机根因：16 位 ModRM 的 BP+SI/BP+DI 与 64K 回绕（2026-10-21）
+
+已定案并修复。`src/cpu/isa/x86/exec.c` 的 `modrm()` 在 16 位寻址下有两处
+结构错误（SDM vol.1 table 2-1；参照 tiny386 `modsib16`）：
+
+- `index[8]` 把 rm=2/3 写成 `-1`，于是 `[bp+si]`/`[bp+di]` 只算了 BP，SI/DI
+  被丢掉；
+- 16 位的有效地址 `off` 是 `uint32_t`，disp16 按无符号相加后没有 `& 0xffff`，
+  所以 `[bp+si-0x9C]` 的 BP+0xFF64 得到 0x10928，而不是回绕后的 0x0928；
+  `d.mlin = segment_base + off` 于是落在 64K 之外。
+
+这条指令正是 Windows 1.01 显示驱动把 `"FONTS.FON"` 解析成模块名时的存储：
+KERNEL 路径解析器 `0x23B` 把小写转大写、截断到 `.` 前，再用
+`88 82 64 FF`（`mov [bp+si-0x9C],al`）写进栈上的名字缓冲。cemu 把 5 个字符
+全部写到线性 `0x25D18`（`SS_base + 0x10928`），`SS:0x928` 始终是 0；于是
+KERNEL 的模块查找 `0x669` 拿空名字与各模块名比较，全部失败。对照点：显示驱动
+在 `0x9AFD:0x02C1` 调 KERNEL `0x1498` 后，QEMU 返回 `AX=0x1A67`（已加载的
+FONTS 模块段），cemu 返回 0 并转入从磁盘装载 `FONTS.FON` 的失败路径，`0x195`
+于是长期不返回，GDI 的每设备初始化只跑一轮。此前记录的
+`DS:0x650=0`、字体记录缺失、`0x3A8C` 合并与 `0x9A07` 拷贝都是这条下游链，
+不是独立根因。
+
+修复：`index` 表补回 rm=2/3 的 SI/DI，基址/索引取 16 位寄存器（`.x`），16 位
+有效地址在加段基址前 `& 0xffff`。新增自足探针
+`test/x86/probe/addr16.asm`（raw 编码 `88 82/83 64 FF` 与 disp8 形式），
+cemu 与 QEMU 双跑同为 `addr16 464F4E0000 4445`、退出码 11。回归：
+`bash test/x86/run.sh` 29/0（含新探针）、`bash test/riscv64/run.sh` 136/0、
+`cmake --build build --target check` 依赖边 ok。
+
+win101 复跑：不再触发 FatalExit，字体管理器入口参数与 QEMU 相同
+（`DS:0x0486`），15M/20M 指令时停在 640×350 的 mode 10 桌面
+（`build/win_fixed20.ppm`）。**遗留**：窗口布局/颜色正确，但文字被画成
+彩色块（QEMU 基线 `build/windows/s1.png` 是干净文本）；字体位图或显示
+驱动的文字展开路径仍有分歧，下一步单独定位。
+
 ## win101 定位进展与 pcshot 设施（2026-10-20）
 
 ### 新观测设施 `pcshot=ADDR[:COUNT]`

@@ -142,6 +142,15 @@ probe_cell rep_sense 13 ref
 # why the case list is shaped like that parser. ref cell: identical transcripts.
 probe_cell loop_sense 15 ref
 
+# 16-bit ModRM addressing (test/x86/probe/addr16.asm, SDM vol.1 table 2-1):
+# rm=2/3 are BP+SI/BP+DI, and the 16-bit effective offset wraps at 64K before
+# the segment base is added. The raw encoding 88 82 64 FF ([bp+si-0x9c],
+# disp16) is the Windows 1.01 display driver's font-name store; a model that
+# drops SI/DI or keeps the sum at 32 bits writes 64K past the parser's buffer,
+# the name stays empty, and the kernel never finds the FONTS module. ref cell:
+# both models print the five stored bytes and exit 5.
+probe_cell addr16 11 ref
+
 # IRQ0 delivery to a spinning guest (test/x86/probe/pit_irq.asm): the probe
 # builds an IDT, remaps the 8259 pair, programs 8254 channel 0 for 100 Hz,
 # unmasks IRQ0 and then busy-waits (deliberately no hlt) counting ticks. A

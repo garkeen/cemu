@@ -382,17 +382,19 @@ static void modrm(void) {
   d.m_esp_base = 0;
   uint32_t off = 0;
   if (!d.a32) {
-    // 16-bit addressing (table 2-1): base [+index] [+disp], [disp16].
+    // 16-bit addressing (SDM vol.1 table 2-1): BP+SI, BP+DI, SI, DI, BP or
+    // disp16. The sum wraps at 64K (tiny386 modsib16 masks with 0xffff).
     static const int base[8] = {ebx_i, ebx_i, ebp_i, ebp_i, esi_i, edi_i, ebp_i, ebx_i};
-    static const int index[8] = {esi_i, edi_i, -1, -1, -1, -1, -1, -1};
-    off = s->r[base[d.rm]].e;
-    if (index[d.rm] >= 0) off += s->r[index[d.rm]].e;
+    static const int index[8] = {esi_i, edi_i, esi_i, edi_i, -1, -1, -1, -1};
+    off = s->r[base[d.rm]].x;
+    if (index[d.rm] >= 0) off += s->r[index[d.rm]].x;
     if (d.mod == 1)
       off += (int8_t)fetch8();
     else if (d.mod == 2)
       off += fetch16();
     else if (d.rm == 6)
       off = fetch16();  // [disp16]: no base register
+    off &= 0xffff;
     if (d.mseg < 0 && (d.rm == 2 || d.rm == 3 || (d.rm == 6 && d.mod != 0))) d.mseg = ss_i;
   } else if (d.rm == 4) {
     // SIB (table 2-3): scale*index + base (+ disp). Index 4 = no index;
