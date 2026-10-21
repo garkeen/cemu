@@ -38,6 +38,12 @@ struct HostDisplay {
   int64_t next_pump_us;
   int closed;
   BITMAPINFO bi;
+  // Off-screen buffer for WM_PAINT: FillRect(black) followed by
+  // StretchDIBits directly on the window DC shows the black between the two
+  // calls, which reads as a full-screen flash on every published frame.
+  HDC back_dc;
+  HBITMAP back_bmp;
+  int back_w, back_h;
 };
 
 // The only blit path: the picture is scaled to the client area, preserving its
@@ -56,11 +62,30 @@ static void Blit(HostDisplay* d, HDC dc) {
   const int den = fit_width ? d->width : d->height;
   const int w = (int)((int64_t)d->width * num / den);
   const int h = (int)((int64_t)d->height * num / den);
+  if (d->back_w != cw || d->back_h != ch || !d->back_dc) {
+    if (d->back_dc) DeleteDC(d->back_dc);
+    if (d->back_bmp) DeleteObject(d->back_bmp);
+    d->back_dc = CreateCompatibleDC(dc);
+    d->back_bmp = CreateCompatibleBitmap(dc, cw, ch);
+    if (d->back_dc && d->back_bmp) {
+      SelectObject(d->back_dc, d->back_bmp);
+      d->back_w = cw;
+      d->back_h = ch;
+    } else {
+      if (d->back_dc) DeleteDC(d->back_dc);
+      if (d->back_bmp) DeleteObject(d->back_bmp);
+      d->back_dc = NULL;
+      d->back_bmp = NULL;
+      d->back_w = d->back_h = 0;
+    }
+  }
+  HDC target = d->back_dc ? d->back_dc : dc;
   HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
-  FillRect(dc, &rc, black);
-  SetStretchBltMode(dc, COLORONCOLOR);
-  StretchDIBits(dc, (cw - w) / 2, (ch - h) / 2, w, h, 0, 0, d->width, d->height,
+  FillRect(target, &rc, black);
+  SetStretchBltMode(target, COLORONCOLOR);
+  StretchDIBits(target, (cw - w) / 2, (ch - h) / 2, w, h, 0, 0, d->width, d->height,
                 d->ops->Framebuffer(d->dev), &d->bi, DIB_RGB_COLORS, SRCCOPY);
+  if (target != dc) BitBlt(dc, 0, 0, cw, ch, target, 0, 0, SRCCOPY);
   d->shown_version = d->ops->Version(d->dev);
 }
 
@@ -95,8 +120,10 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case WM_MOUSEMOVE: {
       if (!d->mouse_cb) return DefWindowProcA(hwnd, msg, wp, lp);
       int x = (int)(short)LOWORD(lp), y = (int)(short)HIWORD(lp);
+      // Win32 client coordinates grow downward; the PS/2 mouse reports Y
+      // positive upward, so the vertical delta is negated.
       if (d->mouse_valid)
-        d->mouse_cb(d->mouse_ctx, x - d->mouse_x, y - d->mouse_y, 0, d->mouse_buttons);
+        d->mouse_cb(d->mouse_ctx, x - d->mouse_x, d->mouse_y - y, 0, d->mouse_buttons);
       d->mouse_x = x;
       d->mouse_y = y;
       d->mouse_valid = 1;
@@ -268,5 +295,7 @@ void HostDisplaySetMouseSink(HostDisplay* d,
 void HostDisplayFree(HostDisplay* d) {
   if (!d) return;
   if (d->hwnd) DestroyWindow(d->hwnd);
+  if (d->back_dc) DeleteDC(d->back_dc);
+  if (d->back_bmp) DeleteObject(d->back_bmp);
   free(d);
 }
