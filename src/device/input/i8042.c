@@ -137,6 +137,24 @@ static void I8042SyncIrq(I8042Device* d) {
   }
 }
 
+// The controller's output buffer holds one byte. Reading it while more bytes
+// are queued loads the next byte into the buffer and raises the interrupt line
+// again; on the PC's edge-triggered IRQ1/IRQ12 that refill is a new request.
+// Holding the line high across a multi-byte transfer loses every byte after the
+// first: the BIOS/Windows mouse ISR reads one byte per interrupt, and QEMU
+// delivers one INT 0x74 per byte of the PS/2 report (three for one packet).
+static void I8042RefillEdge(I8042Device* d, int line) {
+  struct I8042State* st = d->st;
+  int* level = line == kI8042AuxIrq ? &st->irq12 : &st->irq1;
+  if (!*level || !d->set_irq) return;
+  *level = 0;
+  d->set_irq(d->irq_ctx, line, 0);
+  if (DebugOn(kDbgMark)) DebugMark(line == kI8042AuxIrq ? "aux-irq" : "kbd-irq", line, 0);
+  *level = 1;
+  d->set_irq(d->irq_ctx, line, 1);
+  if (DebugOn(kDbgMark)) DebugMark(line == kI8042AuxIrq ? "aux-irq" : "kbd-irq", line, 1);
+}
+
 static void I8042SyncA20(I8042Device* d) {
   // Output-port bit 1 is the A20 gate; the board decides what the line does.
   if (d->set_a20) d->set_a20(d->a20_ctx, (d->st->outport & kOutPortA20) ? 1 : 0);
@@ -260,12 +278,18 @@ static uint64_t I8042Read(void* dev, uint64_t addr, int size) {
   st->a2 = 0;
   if (QueueCount(&st->kbd) > 0) {
     uint8_t v = QueuePop(&st->kbd);
-    I8042SyncIrq(d);
+    if (QueueCount(&st->kbd) > 0)
+      I8042RefillEdge(d, kI8042KbdIrq);
+    else
+      I8042SyncIrq(d);
     return v;
   }
   if (QueueCount(&st->aux) > 0) {
     uint8_t v = QueuePop(&st->aux);
-    I8042SyncIrq(d);
+    if (QueueCount(&st->aux) > 0 && QueueCount(&st->kbd) == 0)
+      I8042RefillEdge(d, kI8042AuxIrq);
+    else
+      I8042SyncIrq(d);
     return v;
   }
   return st->last_data;

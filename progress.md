@@ -49,6 +49,31 @@ GR8 做掩码（写模式 0），于是每个字形字节都整字节落盘，�
 （装饰性横线的亮/暗相位），其余 223,946 像素完全相同；修复前有 21,971 个
 像素不同。x86 29/0、riscv64 136/0、依赖边 ok。
 
+## PS/2 鼠标：8042 必须逐字节投递 IRQ（2026-10-21）
+
+`-mouse ps2` 下鼠标包已经能进 8042，但 win101 的 Windows 指针不动。实测与
+QEMU 对照（`qemu-system-i386 -d int`，一次鼠标移动的 3 字节包）：
+
+- QEMU 投递 **3 次 INT 0x74**（PS/2 包每字节一次）；
+- cemu 只投递 1 次。`i8042.c` 把整包 3 字节一次排进 aux 队列，IRQ12 一直
+  保持高；PC 的 IRQ12 是边沿触发（PIIX3 ELCR2 被 SeaBIOS 写成 0x0C，只有
+  IRQ10/11 是 level，IRQ12 仍是 edge），所以后两个字节永远等不到新的中断。
+  Windows 的 INT 74 处理程序每次只从 0x60 读一个字节，于是包不完整。
+
+修复：`I8042Read` 读出一个字节时，如果同一队列还有下一字节，就把 IRQ 线
+拉低再拉高（输出缓冲重填产生的边沿），键盘和 aux 都适用。win101 复跑一个
+PS/2 包现在产生 `aux-irq 1 → 0 → 1` 两次重填加三次 `pic1-eoi`，与 QEMU 的
+3 次 INT 0x74 一致。
+
+但指针仍不动：Windows MOUSE 模块的 INT 74 处理程序在
+`test byte [cs:0x88],0xff; jz return` 处直接返回，`[0x88]` 为 0——驱动没有被
+ENABLE。这张镜像没有 DOS 鼠标驱动（AUTOEXEC 只有 WIN），Windows 的 MOUSE
+模块探测 INT 33h/串口/总线鼠标都失败，只装了中断入口而没有启用。给镜像副本
+加 `MOUSE.COM`（或经 Windows SETUP 选择鼠标）才能让驱动真正接管；这是 guest
+配置，不是 cemu 没抓到输入。串口路径也不要再建议 `-mouse serial`：本镜像的
+探测握手与 cemu 的 msmouse 只发不收不匹配，默认 PS/2 才走到上面这条已验证
+的硬件路径。
+
 ## win101 定位进展与 pcshot 设施（2026-10-20）
 
 ### 新观测设施 `pcshot=ADDR[:COUNT]`
