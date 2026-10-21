@@ -142,14 +142,31 @@ probe_cell rep_sense 13 ref
 # why the case list is shaped like that parser. ref cell: identical transcripts.
 probe_cell loop_sense 15 ref
 
-# 16-bit ModRM addressing (test/x86/probe/addr16.asm, SDM vol.1 table 2-1):
-# rm=2/3 are BP+SI/BP+DI, and the 16-bit effective offset wraps at 64K before
-# the segment base is added. The raw encoding 88 82 64 FF ([bp+si-0x9c],
-# disp16) is the Windows 1.01 display driver's font-name store; a model that
-# drops SI/DI or keeps the sum at 32 bits writes 64K past the parser's buffer,
-# the name stays empty, and the kernel never finds the FONTS module. ref cell:
-# both models print the five stored bytes and exit 5.
-probe_cell addr16 11 ref
+# The full 16-bit ModRM matrix (test/x86/probe/addr16_matrix.asm): the eight
+# r/m forms under mod=0/1/2, with DS and SS given different bases so the
+# default segment is part of every case. r/m 0,1,4,5,6(mod=0),7 must use DS;
+# r/m 2,3,6(mod=1/2) must use SS. The probe is self-contained (no firmware),
+# stores a unique marker through each EA and reads the expected segment at the
+# expected offset. ref cell: both models print one line and exit 5.
+probe_cell addr16_matrix 11 ref
+
+# The prefix and arithmetic edges (test/x86/probe/addr16_seg.asm): ES/DS/SS/CS
+# overrides on the same effective offset, sign-extended negative disp8 with DS
+# and SS defaults, the 64K wrap of BP+SI, BX+disp16 and BP+disp8, and the exact
+# Windows 1.01 encoding [bp+si-0x9c] with a negative disp16. The matrix above
+# pins the 24 table rows; this cell pins the prefix, the displacement sign and
+# the carry out of the 16-bit sum. ref cell: both models print one line and
+# exit 5.
+probe_cell addr16_seg 11 ref
+
+# Mode 6's aperture (test/x86/probe/vga_cga.asm): SeaBIOS's stdvgamodes shape
+# -- one plane, odd/even addressing, the window at 0xB8000, graphics mode --
+# programmed by the probe itself (no firmware). The probe fills 4KB a byte at a
+# time, then reads it back at the write addresses, at the other parity, and
+# after a word-at-a-time fill; a model that aliases parity differently or
+# splits word writes differently prints a different transcript. ref cell: both
+# models print the same line and exit 5 (status 11).
+probe_cell vga_cga 11 ref
 
 # IRQ0 delivery to a spinning guest (test/x86/probe/pit_irq.asm): the probe
 # builds an IDT, remaps the 8259 pair, programs 8254 channel 0 for 100 Hz,

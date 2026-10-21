@@ -47,13 +47,13 @@ enum {
   kCrtcCount = 0x19,  // R0-R24; the chip has no more registers
 };
 
-// CRTC mode control (R17) bits: the low two bits carry the CGA's row and
-// vertical-scan address bits, bit 5 wraps the address at 64KB and bit 6
-// selects byte (not word) addressing.
+// CRTC mode control (R17) bits read by the display address generator: the low
+// two bits carry the CGA's row and vertical-scan address bits, and bit 6
+// selects byte (not word) addressing. Bit 5 (64K address wrap) is not modeled;
+// QEMU's vga_draw_graphic does not read it either (D17).
 enum {
   kCrtcModeCgaCompat = 1u << 0,
   kCrtcModeCgaCompat80 = 1u << 1,
-  kCrtcModeAddressWrap = 1u << 5,
   kCrtcModeByteMode = 1u << 6,
 };
 
@@ -175,6 +175,7 @@ typedef struct VgaPicture {
   int line_bytes;     // plane offsets per scan line
   int start;          // first displayed plane offset (CRTC R12/R13)
   int planes;         // which planes the picture reads (AR12)
+  int crtc_mode;      // CRTC R17: CGA address bits and line advance
 } VgaPicture;
 
 static void VgaComputePicture(const VgaDevice* d, VgaPicture* p);
@@ -1146,6 +1147,7 @@ static void VgaComputePicture(const VgaDevice* d, VgaPicture* p) {
   p->cell_width = VgaCharDots(d);
   p->cell_height = (d->cr[kCrtcMaxScanLine] & 0x1f) + 1;
   p->start = (d->cr[kCrtcStartAddressHigh] << 8) | d->cr[kCrtcStartAddressLow];
+  p->crtc_mode = d->cr[kCrtcModeControl];
   // The CRTC's offset register counts words; a word is two plane offsets, which
   // is also one text cell (character + attribute) in the odd/even layout.
   p->line_bytes = d->cr[kCrtcOffset] << 1;
@@ -1255,9 +1257,23 @@ static void VgaRenderGraphics(VgaDevice* d, const VgaPicture* p) {
   const int intensity = (d->cga_color & 0x10) ? 8 : 0;
   const int palette_base = (d->cga_color & 0x20) ? 3 : 2;
   const int stride = d->fb_width;
+  // The display address generator, not a row index times a stride: CRTC R17
+  // bits 0/1 let the CGA-compatible shapes borrow address bits from the row
+  // counter and choose how often the offset advances (IBM VGA TR 3.1a; QEMU's
+  // vga_draw_graphic does the same on its linear address). A bit in that
+  // linear address is two places lower in this plane-offset space, so R17
+  // bit 6's 14/15 selection becomes 12/13.
+  int y1 = 0;
+  int multi_run = p->multi_scan;
+  uint32_t line_base = (uint32_t)p->start;
   for (int y = 0; y < d->fb_height; y++) {
-    const int row = y / (p->multi_scan + 1);
-    const uint32_t base = (uint32_t)(p->start + row * p->line_bytes);
+    uint32_t base = line_base;
+    if (!(p->crtc_mode & kCrtcModeCgaCompat)) {
+      const int shift = 12 + ((p->crtc_mode & kCrtcModeByteMode) ? 1 : 0);
+      base = (base & ~(1u << shift)) | ((uint32_t)(y1 & 1) << shift);
+    }
+    if (!(p->crtc_mode & kCrtcModeCgaCompat80))
+      base = (base & ~0x2000u) | ((uint32_t)(y1 & 2) << 12);
     uint32_t* out = &d->fb[(size_t)y * stride];
     for (int x = 0; x < stride; x++) {
       if (blank) {
@@ -1287,6 +1303,14 @@ static void VgaRenderGraphics(VgaDevice* d, const VgaPicture* p) {
       else
         index = value;  // the 16-colour planar picture: AR0-AR15
       out[x] = AttrColor(d, index);
+    }
+    if (multi_run) {
+      multi_run--;
+    } else {
+      const int mask = (p->crtc_mode & 3) ^ 3;
+      if ((y1 & mask) == mask) line_base += (uint32_t)p->line_bytes;
+      y1++;
+      multi_run = p->multi_scan;
     }
   }
 }

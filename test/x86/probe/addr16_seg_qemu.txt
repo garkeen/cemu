@@ -1,0 +1,20 @@
+# Dual run of test/x86/probe/addr16_seg.asm, 2026-10-21, the same 512-byte
+# boot sector on both models (no firmware; the probe sets up its own segments):
+#
+#   cemu --machine x86 --isa x86 addr16_seg.bin
+#   qemu-system-i386 -machine pc -m 32 \
+#       -drive file=addr16_seg.bin,format=raw,if=floppy -boot a \
+#       -display none -no-reboot \
+#       -chardev file,id=dbg,path=addr16_seg_qemu.txt \
+#       -device isa-debugcon,iobase=0x402,chardev=dbg \
+#       -device isa-debug-exit,iobase=0xf4,iosize=0x4
+#
+# Cases 1-4 put BP+SI and BX+SI at the same offset 0500 and vary only the
+# segment prefix (ES, DS, SS, CS); each marker is read from the selected
+# segment, so an ignored prefix reads zero. Cases 5-6 sign-extend a negative
+# disp8 (DS and SS defaults). Cases 7-9 drop the carry out of the 16-bit
+# effective-offset sum: BP+SI, BX+disp16 and BP+disp8 each wrap at 64K before
+# the segment base is added.
+# Exit: debug-exit 5 -> status 11 on both.
+cemu addr16s ok
+qemu addr16s ok

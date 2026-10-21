@@ -1,0 +1,22 @@
+# Dual run of test/x86/probe/addr16_matrix.asm, 2026-10-21, the same 512-byte
+# boot sector on both models (no firmware; the probe sets up its own segments):
+#
+#   cemu --machine x86 --isa x86 addr16_matrix.bin
+#   qemu-system-i386 -machine pc -m 32 \
+#       -drive file=addr16_matrix.bin,format=raw,if=floppy -boot a \
+#       -display none -no-reboot \
+#       -chardev file,id=dbg,path=addr16_matrix_qemu.txt \
+#       -device isa-debugcon,iobase=0x402,chardev=dbg \
+#       -device isa-debug-exit,iobase=0xf4,iosize=0x4
+#
+# The 24 cases are the eight r/m forms under mod=0/1/2 (SDM vol.1 table 2-1).
+# DS=0x1000, SS=0x2000 and ES=0x3000 have different bases and are cleared
+# first; each case stores a unique marker through the EA under test, then reads
+# the expected segment at the expected offset. The expected segment is DS for
+# r/m 0,1,4,5,6(mod=0),7 and SS for r/m 2,3,6(mod=1/2), so a model with a wrong
+# default segment or a wrong BP+SI/BP+DI sum reads zero instead of the marker.
+# The table runner reads its own records through CS, and the exit path prints
+# one line to the debugcon port.
+# Exit: debug-exit 5 -> status 11 on both.
+cemu addr16m ok
+qemu addr16m ok

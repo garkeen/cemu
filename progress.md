@@ -1,5 +1,79 @@
 # cemu 当前状态（progress.md）
 
+## 16 位寻址全矩阵与 16 位测试资产审计（2026-10-21）
+
+用户要求把 16 位寻址的 8 种 r/m × mod × 段默认组合全部钉住，并核查 v86
+是否有未利用完的 16 位套件。结论和落地如下。
+
+**新增两格（自足探针，无固件，debugcon 0x402 输出）**
+
+- `addr16_matrix`（`test/x86/probe/addr16_matrix.asm`）：SDM vol.1 table 2-1
+  的 8 种 r/m × mod=0/1/2，共 24 例。DS=0x1000、SS=0x2000、ES=0x3000 三个
+  不同基址，窗口先清零；每例用被测 EA 写唯一 marker，再从期望段/偏移用
+  `[seg:disp16]` 读回。默认段逐例校验：r/m 0,1,4,5,6(mod=0),7 用 DS，
+  r/m 2,3,6(mod=1/2) 用 SS。表驱动（`{code,offset,marker}` 六字节记录），
+  避免 24 例展开超过 512 字节引导扇区。QEMU 同 transcript（`addr16m ok`，
+  status 11），cemu 25,160 步。
+- `addr16_seg`（`test/x86/probe/addr16_seg.asm`）：ES/DS/SS/CS 四种段前缀
+  作用在同一有效偏移 0x500；负 disp8（DS/SS 默认段）；BP+SI、BX+disp16、
+  BP+disp8 三种 64K 回绕。QEMU 同 transcript（`addr16s ok`，status 11）。
+- 两格都接成 ref 单元（`test/x86/run.sh`），x86 套件 **31/0**。
+- 旧的 `addr16` 探针已删除：它的 24 行矩阵覆盖之外的唯一用例是负 disp16
+  （`88 82 64 FF`，`[bp+si-0x9c]`）与 64K 回绕的组合，现已并入
+  `addr16_seg.asm` 的第 10-12 例，不再保留重复的整格。
+
+**v86 16 位资产审计**
+
+- `tests/nasm`：123 个手写测试 + 生成测试；只有 7 个文件名带 16 位标记，
+  13 个使用 16 位寄存器或 0x66。生成器的 16 位 ModRM 穷举
+  （`create_nasm_modrm_combinations_16`）只用于 **LEA**，且运行在 32 位平坦
+  模式（0x67 前缀）；fixtures 由宿主 GDB 生成。不是完整的 16 位套件。
+- `tests/qemu/test-i386`：QEMU 的全面指令测试，但依赖 Linux 用户态
+  libc、信号、mmap 和 vm86 系统调用，cemu 不能直接运行；其中的
+  `test-i386-code16.S` 只有 79 行，且需要 Linux 进程环境。
+- `tests/kvm-unit-tests/x86/realmode.c` 已接入（126 PASS），但正如 addr16
+  修复所示，它没有 BP+SI/BP+DI 和 64K 回绕；`emulator.c` 只有一条
+  `16-bit smsw reg` 检查。
+- 结论：v86 没有可直接利用的完整 16 位指令套件；可用的 realmode 部分已在
+  套件里，寻址缺口由上面两格补上。
+
+**互联网上的完整 oracle（待接入）**
+
+- `SingleStepTests/80386` 的 `v1_ex_real_mode`：MIT（数据公有领域），硬件
+  生成，941 个文件（406 个基础 opcode × 操作数/地址前缀组合，约 175 万次
+  执行），每例给出 initial/final 寄存器与 RAM，执行到 HALT 后比较；覆盖
+  `01`/`6601`/`6701`/`676601` 等 16/32 位前缀变体，且目标是 386 核，比
+  `SingleStepTests/80286`（326 种形式、约 150 万次、仅 286 语义）更贴合
+  cemu。
+- 数据总量数百 MB（80386 仓库约 579MB，326/941 个 gzip 文件），不能按仓内
+  “单文件 ≤5MB、测试自足”规则整包入库。MOO→JSON 转换器已验证可解析
+  386E 样本（`moo2json_generic.py`，Cpu type: 386E）。
+- 接入方式（外部 calibration 跑全套 / 仓内只放按 opcode 形式的精选 fixture）
+  尚未决定，因此没有把外部数据放进 `test/`。
+
+## VGA CGA 模式 4/5/6 的 bank 地址旋转（D33，2026-10-21）
+
+Windows 1.01 的启动画面用 CGA mode 6（640x400 双扫描，R17=0xC2、R9=0xC1、
+R13=0x28）。之前 cemu 显示三份 logo：`vga-timing` 已写明 R9 的双扫描位，
+但渲染器仍按线性行距 80 读一个 bank，前半屏显示 640x200 原图，后半屏把
+VRAM 的下一段也画出来。QEMU 的同一帧是 2× 行复制的整幅画面。
+
+修复：`VgaRenderGraphics` 改成 QEMU `vga_draw_graphic` 的地址生成器——
+R17 bit0=0 时线性地址 bit14/15（按 bit6 选哪个）取 `y1&1`；R17 bit1=0 时
+bit15 取 `y1&2`；行偏移每 `(R17&3)^3` 个 y1 前进一次；映射到 cemu 的
+plane-offset 空间即 bit12/13。`VgaPicture` 记录 R17。
+
+验收：启动帧三条内容带与 QEMU screendump 完全同构（logo 74..143、
+版本 224..253、版权 368..399，无重复）；桌面帧与 QEMU
+`build/windows/s2.ppm` **逐像素 0 差异**；x86 31/0（含随后新增的
+`addr16_matrix`、`addr16_seg` 与 `vga_cga` 三格；旧 `addr16` 已并入
+`addr16_seg` 后删除）、
+riscv64 136/0、依赖边 ok。
+显示地址生成器 guest 读不到，渲染结果按既有 CGA 目验先例用 fbdump/QEMU
+对拍；mode 6 的孔径另有 `vga_cga` 自足探针（无固件直接起，填 4KB 后按同址/
+另一奇偶/按字读回）接成 ref 格，两模型同一行 transcript。该格钉的是孔径读写，
+不是行地址生成器本身。
+
 ## win101 死机根因：16 位 ModRM 的 BP+SI/BP+DI 与 64K 回绕（2026-10-21）
 
 已定案并修复。`src/cpu/isa/x86/exec.c` 的 `modrm()` 在 16 位寻址下有两处
@@ -25,7 +99,9 @@ FONTS 模块段），cemu 返回 0 并转入从磁盘装载 `FONTS.FON` 的失�
 修复：`index` 表补回 rm=2/3 的 SI/DI，基址/索引取 16 位寄存器（`.x`），16 位
 有效地址在加段基址前 `& 0xffff`。新增自足探针
 `test/x86/probe/addr16.asm`（raw 编码 `88 82/83 64 FF` 与 disp8 形式），
-cemu 与 QEMU 双跑同为 `addr16 464F4E0000 4445`、退出码 11。回归：
+cemu 与 QEMU 双跑同为 `addr16 464F4E0000 4445`、退出码 11；该文件的负 disp16
+与回绕用例现已并入 `addr16_seg.asm` 的第 10-12 例，`addr16.asm` 随重复格删除
+（见本页顶部矩阵一节）。回归：
 `bash test/x86/run.sh` 29/0（含新探针）、`bash test/riscv64/run.sh` 136/0、
 `cmake --build build --target check` 依赖边 ok。
 

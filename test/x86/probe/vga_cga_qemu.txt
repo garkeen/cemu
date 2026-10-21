@@ -1,0 +1,25 @@
+# Dual run of test/x86/probe/vga_cga.asm, 2026-10-21, the same 512-byte boot
+# sector on both models (no firmware; the probe programs mode 6 itself):
+#
+#   cemu --machine x86 --isa x86 vga_cga.bin
+#   qemu-system-i386 -machine pc -m 32 \
+#       -drive file=vga_cga.bin,format=raw,if=floppy -boot a \
+#       -display none -no-reboot -serial file:vga_cga_qemu.txt \
+#       -device isa-debug-exit,iobase=0xf4,iosize=0x4
+#
+# Mode 6 as SeaBIOS's stdvgamodes shapes it: SR2=01 (plane 0 only), SR4=06
+# (odd/even on, no chain 4), GR6=0x0D (the aperture at 0xB8000), AR10=01
+# (graphics) and AR12=01 (colour plane 0). The probe fills 4KB one byte at a
+# time with 0x11,0x12,... then reads back:
+#   same=  32 bytes at the write addresses
+#   odd=   32 bytes at the other parity (does the parity bit alias?)
+#   word=  32 bytes after a word-at-a-time fill of the same window
+# Exit: debug-exit 5 -> status 11 on both.
+cemu vga-cga same=1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30 odd=12131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031 word=2b1a2c1a2d1a2e1a2f1a301a311a321a331a341a351a361a371a381a391a3a1a ok
+qemu vga-cga same=1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30 odd=12131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031 word=2b1a2c1a2d1a2e1a2f1a301a311a321a331a341a351a361a371a381a391a3a1a ok
+
+The values are the card's answers, not a self-judgement: a model that ignores
+odd/even aliasing or that splits word writes differently prints a different
+line. This pins the mode 6 aperture; the display address generator that turns
+those bytes into scan lines is not guest-readable and is checked by
+fbdump/screendump instead (progress.md D33).

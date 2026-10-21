@@ -25,13 +25,13 @@
 ;   - prints what came back. Two cards that disagree on any of it disagree about
 ;     a mode a real guest paints into.
 ;
-; Run (the image is a 1.44MB floppy so the firmware accepts it):
-;   cemu --machine x86 -bios <seabios>/out/bios.bin -vgabios <seabios>/out/vgabios.bin
-;        -fda vga_cga.img
-;   qemu-system-i386 -machine pc -m 32 -bios <seabios>/out/bios.bin -fda
-;        vga_cga.img -vga std -fw_cfg name=opt/isa-vga/rom,file=<seabios>/out/vgabios.bin
-;        -display none -no-reboot -serial file:vga_cga_qemu.txt
-; Exit: debug-exit 5. The two transcripts must match byte for byte.
+; Run (self-contained: the probe programs the mode itself, no firmware):
+;   cemu --machine x86 --isa x86 vga_cga.bin
+;   qemu-system-i386 -machine pc -m 32 -drive file=vga_cga.bin,format=raw,if=floppy \
+;       -boot a -display none -serial file:vga_cga_qemu.txt -no-reboot \
+;       -device isa-debug-exit,iobase=0xf4,iosize=0x4
+; Exit: debug-exit 5 (QEMU status 11). One self-labelled transcript line; the
+; two models must print it byte for byte.
 
   bits 16
 
@@ -51,7 +51,7 @@ start:
   call mode6
 
   ; Byte at a time over 4KB, the value counting up so a miss is visible.
-  mov si, msg_fill
+  mov si, msg_head
   call puts
   xor ax, ax
   mov es, ax
@@ -69,14 +69,12 @@ start:
   mov di, WIN
   mov cx, 32
   call putbytes                  ; read back where it was written
-  call crlf
 
   mov si, msg_par
   call puts
   mov di, WIN + 1
   mov cx, 32
   call putbytes                  ; the other parity: aliased, or its own bytes?
-  call crlf
 
   ; Now the same window written a word at a time: a word is two bytes at two
   ; consecutive addresses, and with the parity bit in play the two halves may
@@ -95,7 +93,6 @@ start:
   mov di, WIN
   mov cx, 32
   call putbytes
-  call crlf
 
   mov si, msg_ok
   call puts
@@ -106,8 +103,8 @@ start:
 ; Mode 6 as SeaBIOS's own table programs it: one plane, odd/even addressing on,
 ; the window at 0xB8000, and the attribute controller switched to graphics. The
 ; CRTC registers that shape the picture rather than the aperture (the scan-line
-; table, the display end) are left as POST left them: this probe is about where
-; a byte lands, not about the raster.
+; table, the display end) are left at the machine's reset values: this probe is
+; about where a byte lands, not about the raster.
 mode6:
   mov dx, 0x3c4                 ; sequencer 1: character height / shift
   mov al, 0x01
@@ -240,11 +237,11 @@ exit:
   hlt
   jmp $
 
-msg_fill: db "fill=", 0
+msg_head: db "vga-cga ", 0
 msg_same: db "same=", 0
-msg_par:  db "odd=", 0
-msg_word: db "word=", 0
-msg_ok:   db "vga-cga ok", 0
+msg_par:  db " odd=", 0
+msg_word: db " word=", 0
+msg_ok:   db " ok", 0
 
   times 510 - ($ - $$) db 0
   dw 0xaa55
