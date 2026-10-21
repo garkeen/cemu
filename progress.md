@@ -65,14 +65,28 @@ QEMU 对照（`qemu-system-i386 -d int`，一次鼠标移动的 3 字节包）�
 PS/2 包现在产生 `aux-irq 1 → 0 → 1` 两次重填加三次 `pic1-eoi`，与 QEMU 的
 3 次 INT 0x74 一致。
 
-但指针仍不动：Windows MOUSE 模块的 INT 74 处理程序在
-`test byte [cs:0x88],0xff; jz return` 处直接返回，`[0x88]` 为 0——驱动没有被
-ENABLE。这张镜像没有 DOS 鼠标驱动（AUTOEXEC 只有 WIN），Windows 的 MOUSE
-模块探测 INT 33h/串口/总线鼠标都失败，只装了中断入口而没有启用。给镜像副本
-加 `MOUSE.COM`（或经 Windows SETUP 选择鼠标）才能让驱动真正接管；这是 guest
-配置，不是 cemu 没抓到输入。串口路径也不要再建议 `-mouse serial`：本镜像的
-探测握手与 cemu 的 msmouse 只发不收不匹配，默认 PS/2 才走到上面这条已验证
-的硬件路径。
+但指针仍不动。继续对照发现：同一个自建 BIOS 在 QEMU 里指针也不动，换回
+QEMU 自带的 `bios-256k.bin` 就正常——根因在自建 SeaBIOS 的 clang 构建，
+不在 cemu 的输入通路：
+
+- `ps2_mouse_command(PSMOUSE_CMD_ENABLE)` 先写 `Ps2ctr |= AUXINT`，再走
+  `__ps2_command`。clang 的 16 位代码把 `READ8_SEG` 的 `u8` 输出分到 BH，
+  而 asm 模板 `%b0` 写的是 BL：`__ps2_command` 随后用 BH 的旧值算 newctr
+  并恢复 Ps2ctr，AUXINT 被清掉。`handle_74` 的
+  `if (!(GET_LOW(Ps2ctr) & AUXINT)) goto done` 因此永远跳过
+  `process_mouse`，EBDA 的 `mouse_data` 一直是 0。
+- pcshot 把整条链钉住：低内存 relay `0B86:05D2` → `F000:D3E2` →
+  `handle_74`；watch 低内存 `Ps2ctr`（本次布局 `0xED1CC`）看到使能写
+  `0x12` 后立刻被 `0x30` 覆盖。Windows 的 `[cs:0x88]` 是回调置的数据就绪
+  标志，不是驱动使能位；之前把它读成“驱动没 ENABLE”是误判。
+- 修复在 `seabios/src/farptr.h` 的 `READ8_SEG/WRITE8_SEG`：8 位访问改用
+  32 位临时量 + `Q` 约束，避免 clang 把字节输出分到高字节寄存器；死分支
+  改用字节指针存取，兼容 clang 对 `sizeof()` 死分支的类型检查。删掉临时
+  调试输出后重建，EBDA `mouse_data` 收到注入的 `08 28 14`（40:20），
+  Windows 回调 16B9:008D 执行；同一时刻注入/不注入两帧的差异是
+  320,135-411,194 的 106 个像素（两枚指针箭头），指针恢复移动。
+- 串口路径仍不要建议 `-mouse serial`（本镜像的探测握手与 cemu 的 msmouse
+  只发不收不匹配），默认 PS/2 是正确路径。
 
 ## win101 定位进展与 pcshot 设施（2026-10-20）
 
