@@ -29,7 +29,7 @@ VBE/DISPI、链式 256 色与 EDID，PS/2 键盘鼠标与串口鼠标，8259/825
 回归：x86 36/0、riscv64 136/0、riscv32 104/0、依赖边 ok。
 逐轮记录见 [progress.md](progress.md)。
 x86 固件（SeaBIOS + 显卡 option ROM）来自库外的一棵源码树，其现状、重建步骤与配置
-快照见 [firmware.md](firmware.md)。
+快照见库外 `../seabios/firmware.md`（不随本仓库跟踪）。
 
 ## 构建
 
@@ -104,5 +104,4 @@ CEMU_DEBUG="trace:table,state,mem,budget=200" \
 | [AGENTS.md](AGENTS.md) | 开发铁律（改代码前必读） |
 | [arch.md](arch.md) | 架构与阶段路线图 |
 | [progress.md](progress.md) | 现状与决策记录（最近的在最上） |
-| [firmware.md](firmware.md) | 库外 x86 固件（SeaBIOS + 显卡 option ROM）的现状与重建步骤 |
 | [reference.md](reference.md) | 参考项目索引与语义裁决顺序 |

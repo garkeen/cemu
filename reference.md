@@ -25,7 +25,7 @@
 | abstract-machine | abstract-machine/ | 阶段 3 cesdk 蓝本：am/src/platform/nemu/ 的 trm.c、include/nemu.h 设备图、scripts/linker.ld | Mulan PSL v2 |
 | opensbi | opensbi/ | 阶段 2 验收固件源码（fw_dynamic.h 等结构定义） | BSD-2 |
 | riscv-tests / riscv-test-env | riscv-tests/ riscv-test-env/ | riscv 验收套件；env/p/riscv_test.h 是 tohost/fromhost 退出契约 | MIT/BSD 系 |
-| seabios | seabios/ | 阶段 4 SeaBIOS 路线：自建 `out/bios.bin`（256KiB 窗口、有效内容 135232 字节，复位向量逐字节验证）+ 显卡 option ROM `out/vgabios.bin`（38400 字节，int10 视频服务的来源）。**该树在库外且不是 git 仓库**——它的现状、重建步骤与配置快照见 [firmware.md](firmware.md) | LGPL 等 |
+| seabios | seabios/ | 阶段 4 SeaBIOS 路线：自建 `out/bios.bin`（256KiB 窗口、有效内容 135232 字节，复位向量逐字节验证）+ 显卡 option ROM `out/vgabios.bin`（38400 字节，int10 视频服务的来源）。**该树在库外且不是 git 仓库**——它的现状、重建步骤与配置快照见库外 `../seabios/firmware.md`（不随本仓库跟踪） | LGPL 等 |
 | xv6-public | xv6-public/ | 阶段 4 x86 验收件源码（用户镜像即它构建的 i386 版）：ide.c/lapic.c/ioapic.c 是设备语义的现成判据 | MIT |
 | pintos | pintos/ | 阶段 5 及之后的 OS 候选验收件（线程/文件系统/驱动契约），当前尚未使用 | 见树内 LICENSE |
 | UcoreOS | UcoreOS/ | 同上：阶段 5+ 候选验收件，当前尚未使用 | 见树内 LICENSE |

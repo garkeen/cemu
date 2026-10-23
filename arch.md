@@ -213,7 +213,7 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - PC 设备模型全集（VGA 家族核、PS/2、PIC、PIT、UART、IDE/ATAPI、软盘 FDC+8237、LAPIC、
   IOAPIC、**PIIX4 PM function（ACPI PM timer）**）✅
   —— 片 1–14 逐项落地，片 26 补软盘通路，片 27 补显示家族，片 35 补 PM function（固件的
-  微秒时基因此切到 PM timer，见 firmware.md）。片 30–36 重做把显示形状压平（渲染基线、
+  微秒时基因此切到 PM timer，见库外 `../seabios/firmware.md`）。片 30–36 重做把显示形状压平（渲染基线、
   PCI BAR、光栅/片选、线性 PC 的 trace 与 gdb），此后 D17/D19 落地：VBE/DISPI 与链式
   256 色渲染、EDID、行比较/分屏/pel 平移、ATA LBA-48 与 multi-sector、PM1_STS/EN/CNT
   与 SCI IRQ9 及 S5 关机、IOAPIC 的 NMI 交付。余下的规格缺口（IOAPIC 的 SMI/INIT 交付、

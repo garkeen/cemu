@@ -1,6 +1,9 @@
 # Build output (cmake build dir)
 build/
 
+# Firmware notes live with the out-of-repo SeaBIOS tree (../seabios/firmware.md)
+/firmware.md
+
 # Object files and binaries anywhere they might stray
 *.o
 *.obj
