@@ -73,7 +73,7 @@ add_custom_target(check
 
 # The machine suites: the same scripts the developer runs by hand, behind a
 # target so the entry point does not depend on which shell the caller is in.
-foreach(suite x86 riscv64)
+foreach(suite x86 riscv64 riscv32)
   add_custom_target(check-${suite}
     COMMAND "${CEMU_BASH}" -l "${CMAKE_CURRENT_SOURCE_DIR}/test/${suite}/run.sh"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"

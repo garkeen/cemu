@@ -5,8 +5,8 @@
 
 ## 一、目标
 
-1. **cemu**：纯 C、纯 Win32 API 的解释型全系统模拟器。多 ISA：riscv64 先行，
-   之后 x86 早期、arm 早期、mips32。加载 .bin/.elf/.img，模拟真实机器契约，
+1. **cemu**：纯 C、纯 Win32 API 的解释型全系统模拟器。多 ISA：riscv64 先行、
+   riscv32 已接入，之后 x86 早期、arm 早期、mips32。加载 .bin/.elf/.img，模拟真实机器契约，
    运行真实软件。
 2. **cesdk**：AM 式构建系统，C 源码 → 自含 .bin/.elf/.img，产物在真 QEMU 上
    可运行。
@@ -21,8 +21,9 @@
   设备不感知 CPU 型号；机器定义与 ISA 正交。
 - 不造协议：机器按 spike 与 QEMU virt 的真实契约；退出走 HTIF 或
   sifive_test。
-- 运行时选 ISA：ELF 读 e_machine 自动分派（isa/registry.c 的 kIsaTable，
-  NULL 结尾注册表，未来 ISA 在此追加），.bin 由命令行指定。一个 exe 内
+- 运行时选 ISA：ELF 读 e_machine + EI_CLASS 自动分派（isa/registry.c 的 kIsaTable，
+  NULL 结尾注册表，未来 ISA 在此追加；riscv32/riscv64 共用 e_machine=243，
+  由 isa_ops.elf_class 区分），.bin 由命令行指定。一个 exe 内
   所有 ISA 同时在场。x86 接入日即通用性审计日。
 - 中断注入范式：机器把 int_ack/timer_read/irq sink 等钩子装在 CpuState 上，
   加载器之后才选 ISA——接线先于 ISA 存在。
@@ -52,6 +53,8 @@ cemu/
         registry.c   k_isa_table：有哪些型号
         riscv64/     riscv.h  exec.h  platform.h  exec.c  step.c
                      csr.c  mmu.c  fp.c  trigger.c  isa_riscv64.c
+        riscv32/     同形状的 RV32 后端：riscv32.h  exec.h  platform.h  exec.c  step.c
+                     csr.c  mmu.c(Sv32)  fp.c  trigger.c  isa_riscv32.c
         x86/         x86.h  exec.h  exec.c  step.c  isa_x86.c
     bus/           bus.h/.c     地址空间与译码
     mem/           ram.h/.c     内存
@@ -67,14 +70,14 @@ cemu/
     board/         主板：设备布局 + 复位态 + 接线 + 装载 + 运行循环
       board.h/.c    Board 契约 + 工厂
       run.c         运行循环 + 销毁
-      loader.h/.c   装载（按 e_machine 选 ISA）
+      loader.h/.c   装载（按 e_machine + EI_CLASS 选 ISA）
       elf.h/.c      ELF 解析
       spike_min.c  virt.c(+virt_dtb.h)  x86_min.c
     debug/         debug.h/.c  CEMU_DEBUG 观测中枢；gdbstub.h/.c  RSP 服务端
     host/          host.h  console_win.c  file_win.c  time_win.c
                    display_win.c  input_win.c  sock_win.c
     util/          log.h/.c  table.h/.c  type.h
-  test/            run.sh  riscv64/  x86/
+  test/            run.sh  riscv64/  riscv32/  x86/
 ```
 
 CpuState（cpu.h）对所有模块可见；CPU 型号的私有态只存在于 `cpu/isa/<name>/`
@@ -107,9 +110,10 @@ ISA 一份的 `execute.c` 大循环重写为 `exec.c`），遵循"代码简单�
 - **步进协议**：各 ISA 的 `step.c` —— 中断投递 + 取指（x86 还有前缀消费）+
   setjmp/raise 落地 + 单点提交 + 计数器。与 `exec.c` 共享的每步视图放在私有头
   `exec.h`（必须最后 include：它定义 `x`/`f`/`eax` 这类短宏）。
-- **共享语义后端**：不进 switch 的语义抽成函数——riscv 的 `csr.c`（CSR/特权/
+- **共享语义后端**：不进 switch 的语义抽成函数——riscv64 的 `csr.c`（CSR/特权/
   陷阱/xRET）、`mmu.c`（Sv39 + PMP）、`fp.c`（IEEE-754，宿主浮点模拟，见简化
-  登记 E1）；x86 的 `exec.c` 内 helper（do_int/IVT/串操作）。
+  登记 E1）；riscv32 目录是同形状的 RV32 副本（Sv32、RV32 CSR 布局、32 位本地
+  寄存器 bank）；x86 的 `exec.c` 内 helper（do_int/IVT/串操作）。
 - **中断注入**：主板只调 `CpuState.set_irq`（型号在自己的 init 里安装），不调
   型号函数。因此 `spike_min.c`、`x86_min.c` 完全不含 ISA 头；只有平台板
   `virt.c` 引 `cpu/isa/riscv64/platform.h` 取中断线号常量。
@@ -120,13 +124,14 @@ ISA 一份的 `execute.c` 大循环重写为 `exec.c`），遵循"代码简单�
 
 ## 五、三块主板
 
-主板只是一张设备表加复位状态：三块主板覆盖三种接线（spike/virt 共用 riscv64，
-x86_min 装第三种 ISA）。类型是 `Board`，CLI 仍是 `--machine`（QEMU 惯例）。
+主板只是一张设备表加复位状态：spike 同时跑 riscv64 与 riscv32，virt 的复位
+ROM 是 RV64（riscv32 的 virt32 尚未建），x86_min 装第三种 ISA。类型是 `Board`，
+CLI 仍是 `--machine`（QEMU 惯例）。
 
 | 主板 | 布局 | 用途 |
 |---|---|---|
-| spike_min | RAM 0x80000000 + HTIF | 阶段 1 跑 riscv-tests。tohost 从 ELF 符号表读，spike 同款约定 |
-| virt | DRAM 0x80000000、mask ROM 0x1000（QEMU 复位向量逐字）、CLINT 0x02000000、PLIC 0x0c000000、UART16550 0x10000000、test 0x100000 | 阶段 2 起 OpenSBI。权威来源 QEMU hw/riscv/virt.c + dumpdtb/pmemsave 实测 |
+| spike_min | RAM 0x80000000 + HTIF | 阶段 1 起跑 riscv-tests（riscv64 与 riscv32 共用）。tohost 从 ELF 符号表读，spike 同款约定 |
+| virt | DRAM 0x80000000、mask ROM 0x1000（QEMU RV64 复位向量逐字）、CLINT 0x02000000、PLIC 0x0c000000、UART16550 0x10000000、test 0x100000 | 阶段 2 起 OpenSBI（RV64）。权威来源 QEMU hw/riscv/virt.c + dumpdtb/pmemsave 实测；riscv32 需要单独的 virt32 复位 ROM/DTB |
 | x86_min | 32MB RAM@0（`--mem` 可调，上限 0xFEE00000）、PIC 0x20/0xA0、PIT 0x40、COM1 0x3F8→IRQ4、debug-exit 0xF4、debugcon 0x402、fw_cfg 0x510、i8042 0x60/0x64、port92 0x92、CMOS 0x70/0x71、LAPIC 0xFEE00000、IOAPIC 0xFEC00000、CGA 0xB8000+0x3D0 → VGA 家族核 0xA0000-0xBFFFF+0x3B0-0x3DF（option ROM 走 `-vgabios`）、i440FX+PIIX3+IDE（`--hda/--hdb/--cdrom`）、ROM 窗口 0xC0000-0xFFFFF（`-bios`，复位 F000:FFF0） | 阶段 1.5 起的 x86 平台；PC 芯片组在阶段 4 片 1–14 补齐。引导扇区契约：加载 0x7C00、CS:IP=0000:7C00、DL=0x80 |
 
 对照真机：riscv `qemu-system-riscv64 -M spike -bios none -kernel rv64ui-p-add.elf`；
@@ -254,7 +259,7 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   那半，根因在仓外 SeaBIOS 自身的 clang 8 位 farvar 误编译）。16 位寻址由
   `addr16_matrix`/`addr16_seg` 两格自足探针钉住（QEMU 同 transcript）。
   取证链见 progress.md 2026-10-21 各节。
-  回归：riscv64 136/0、x86 36/0、依赖边 ok。
+  回归：riscv64 136/0、riscv32 104/0、x86 36/0、依赖边 ok。
 - **验收 4（Windows 1.01）与显示实现形状**（2026-09-24 用户裁决；2026-09-29 落地）：验收件
   `build/windows/windows101.img`（1.44MB、MS-DOS 3.3 引导软盘，卷标 WIN101），QEMU
   基线是 **EGA 640×350** 下的 MS-DOS Executive 桌面（7 秒时截屏）。它给出两条硬前置：

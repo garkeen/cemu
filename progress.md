@@ -1,5 +1,35 @@
 # cemu 当前状态（progress.md）
 
+## riscv32 独立后端：RV32IMAFDC + Sv32 + rv32 官方套件（2026-10-23）
+
+- **目录独立**：`src/cpu/isa/riscv32/` 从 riscv64 复制后按 RV32 规格改造，
+  riscv64 的语义文件零改动；共享层只在 `isa_ops` 末尾加 `elf_class` 元数据
+  （riscv64 填 2、x86 填 1），以及 ELF32 symtab 与 gdb `riscv:rv32` 目标描述。
+- **32 位执行模型**：解释器跑在本地 `uint32_t` 寄存器 bank 上，step 入口载入、
+  退休时写回 CpuState；C 算术天然按 32 位回绕，故障指令的寄存器写随本地 bank
+  整体回滚。pc 在提交点截 32 位，虚拟地址在 `Riscv32Translate` 入口截 32 位。
+- **规格差异**：RV64-only 的 LD/SD/LWU、OP-IMM-32/OP-32、LR.D/SC.D/AMO*.D、
+  FMV.X.D/FMV.D.X、FCVT.L/LU 全部 illegal；C 扩展按 RV32C 解 c.jal、
+  c.flw/fsw、c.flwsp/fswsp（c.fld/fsd 两个宽度都有）；CSR 补 mstatush、
+  medelegh、menvcfgh/senvcfgh、stimecmph 与 `*h` 计数器，pmpcfg0-3 每 CSR
+  4 项、pmpaddr 32 位；satp 用 Sv32（mode=1，两级 4 字节 PTE、22 位 PPN、
+  4MiB 超级页）；trigger 的 type/dmode 在 XLEN 相对位（tdata1[31:28]/[27]）。
+- **装载/调试**：riscv32 与 riscv64 共用 e_machine=243，`isa_ops.elf_class`
+  让装载器按 EI_CLASS 区分；`elf.c` 补 ELF32 `.symtab` 的 tohost/fromhost
+  解析（此前只走 Elf64）；gdb 目标描述新增 `riscv:rv32`，寄存器包 33×4 字节。
+- **验收**：`riscv-tests` rv32 p 套 **104 格全过**（ui 42 / um 8 / ua 10 /
+  uc 1 / uf 11 / ud 10 / mi 16 / si 6）。其中 `rv32si-p-dirty` 实际触发
+  store page fault（cause 15）并覆盖 4MiB 超级页的 PPN LSB 检查；
+  `rv32mi-p-instret_overflow` 覆盖 minstreth 写路径；`rv32uc-p-rvc` 覆盖
+  c.jal。`isa/rv32ud/move.S` 在本 checkout 的 rv64 体内使用 fmv.d.x/fmv.x.d
+  （RV64-only），无法按 RV32 汇编，`build.sh` 明确排除并注明原因。
+- **探针**：`test/riscv32/probe/probe_rv32.S` 钉住官方套件没覆盖的
+  c.flw/c.fsw、c.flwsp/c.fswsp、c.fld/c.fsd、misa.MXL=1、satp Sv32
+  round-trip、mstatush、mcycleh/minstreth，8 项全过（exit 0）。
+- **回归**：riscv32 104/0、riscv64 136/0、x86 36/0，依赖边 ok；
+  `bash test/run.sh` 自动包含新套件。留待后续：virt32 主板（RV32 复位 ROM +
+  QEMU riscv32 DTB）与 OpenSBI rv32。
+
 ## D17/D19 落地：VBE、链式 256、EDID、行比较/平移、ATA LBA-48/multi、PM/SCI、IOAPIC NMI（2026-10-21）
 
 ### VGA / D17
@@ -2325,7 +2355,7 @@ gp）；位段类 bug 用 llvm-objdump 对照 cemu trace 的 raw/dnpc 即可裁�
   （2026-09-04 实测）。Git Bash 命令行调用全路径：
   `& 'C:\Program Files\Git\bin\bash.exe' -c '...'`
 - 回归：`bash test/run.sh`；单独 riscv `bash test/riscv64/run.sh`、
-  x86 `bash test/x86/run.sh`
+  `bash test/riscv32/run.sh`、x86 `bash test/x86/run.sh`
 - 回归基线（2026-09-13，DR/触发器落地后实测）：riscv64 **136 passed /
   0 failed**；x86 **8 passed / 0 failed**（smoke + pm 24/24 + realmode
   122/122 + kvm taskswitch/taskswitch2/cmpxchg8b/memory/debug；debug 为
@@ -2333,6 +2363,8 @@ gp）；位段类 bug 用 llvm-objdump 对照 cemu trace 的 raw/dnpc 即可裁�
   D13 登记容纳，run.sh 的 timeout 判据容纳）
 - 回归基线（2026-09-19，阶段 4 片 1 后实测）：riscv64 **136 passed / 0 failed**、
   x86 **9 passed / 0 failed**；依赖边 `bash tools/depcheck.sh` → ok。
+- 回归基线（2026-10-23，riscv32 后端后实测）：riscv32 **104 passed / 0 failed**、
+  riscv64 **136 passed / 0 failed**、x86 **36 passed / 0 failed**；依赖边 ok。
 - debug：`CEMU_DEBUG=...`（见 AGENTS.md 第十节），例
   `CEMU_DEBUG="trace:table,state,mem,budget=200" build/cemu.exe --machine x86 --isa x86 test/x86/realmode/realmode.elf`
 

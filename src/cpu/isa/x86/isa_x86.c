@@ -161,4 +161,5 @@ const isa_ops k_isa_x86 = {
     x86_gdb_set_watch,
     x86_gdb_clear_watch,
     x86_gdb_watch_hits,
+    1,  // ELFCLASS32 (EM_386)
 };

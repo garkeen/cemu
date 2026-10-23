@@ -67,6 +67,7 @@ QEMU 源码不在树中：QEMU 行为经 D:/qemu 的二进制实测校准
 | riscv 指令语义 | cpu/isa/riscv64/exec.c（巨型 switch 直执） | xiangshanNEMU def_EHelper 逐条翻译 |
 | riscv CSR/特权 | cpu/isa/riscv64/csr.c + mmu.c（PMP/Sv39） | xiangshanNEMU system/*.c |
 | riscv 步进协议 | cpu/isa/riscv64/step.c（wfi + 取指 + 单点提交 + 计数器） | priv spec + spike 单核语义 |
+| riscv32 指令语义/CSR/Sv32 | cpu/isa/riscv32/（独立后端：RV32IMAFDC、RV32 CSR 布局、Sv32） | dearchap-tinyemu riscv_cpu_template.h（MAX_XLEN=32）与 Sv32 页表走查；riscv-tests isa/rv32* p 套（test/riscv32） |
 | x86 指令语义 | cpu/isa/x86/exec.c（modrm/SIB→opcode 序直执） | tiny386 i386.c + SDM |
 | x86 步进协议 | cpu/isa/x86/step.c（INTR 采样 + 前缀消费 + 单点提交） | SDM 6.x/20.x + QEMU 行为 |
 | HTIF 退出 | device/misc/htif.c（单通道 + fromhost 应答） | fesvr/dearchap riscv_machine.c |

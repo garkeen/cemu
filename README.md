@@ -1,14 +1,15 @@
 # cemu
 
-纯 C、纯 Win32 API 的解释型全系统模拟器。多 ISA（riscv64 先行，x86 已接入，
-之后 arm / mips），加载 `.bin` / `.elf` / `.img`，按真实机器契约运行真实软件。
+纯 C、纯 Win32 API 的解释型全系统模拟器。多 ISA（riscv64 先行、riscv32 已接入，
+x86 已接入，之后 arm / mips），加载 `.bin` / `.elf` / `.img`，按真实机器契约运行真实软件。
 
 ## 目标
 
 - **不做翻译、不做中间表示**：巨型 switch 直接解释一条指令（取指→译码→执行
   在同一 C 作用域内），代码对照手册逐行可读，pc 是唯一提交点。
 - **通用性靠结构**：core 不认 CPU 型号，设备不感知 ISA，机器定义与 ISA 正交；
-  运行时按 ELF 的 `e_machine` 选 ISA，一个 exe 内所有 ISA 同时在场。
+  运行时按 ELF 的 `e_machine` + `EI_CLASS` 选 ISA（riscv32/riscv64 共用
+  `e_machine=243`），一个 exe 内所有 ISA 同时在场。
 - **阶梯上全是真实软件**：riscv-tests → OpenSBI → xv6 → Linux，无 cemu 定制成分。
 - cesdk（AM 式构建系统）排在真实 OS 跑通之后，其 API 才有设计依据。
 
@@ -25,7 +26,7 @@ VBE/DISPI、链式 256 色与 EDID，PS/2 键盘鼠标与串口鼠标，8259/825
 `VFS: Mounted root (ext2 filesystem)`，控制台出提示符）、**Windows 1.01 ✅**（EGA
 640×350 的 MS-DOS Executive 桌面，`fbdump` 帧与 QEMU 基线逐像素相同，PS/2 指针可
 移动）、**xv6-riscv 未开始**（镜像与 OpenSBI fw_jump 素材未取）。
-回归：x86 36/0、riscv64 136/0、依赖边 ok。
+回归：x86 36/0、riscv64 136/0、riscv32 104/0、依赖边 ok。
 逐轮记录见 [progress.md](progress.md)。
 x86 固件（SeaBIOS + 显卡 option ROM）来自库外的一棵源码树，其现状、重建步骤与配置
 快照见 [firmware.md](firmware.md)。
@@ -53,8 +54,9 @@ build/cemu.exe [options] image.bin|image.elf
 不带参数运行会打印全部开关。三块主板按 QEMU 惯例用 `--machine` 选：
 
 ```sh
-# spike 主板：riscv-tests，HTIF 退出
+# spike 主板：riscv-tests，HTIF 退出（ELF 的 EI_CLASS 决定 32/64 位）
 build/cemu.exe test/riscv64/rv64ui-p-add.elf
+build/cemu.exe test/riscv32/rv32ui-p-add.elf
 
 # virt 主板：QEMU virt 布局，OpenSBI 引导
 build/cemu.exe --machine virt -bios fw_jump.bin
@@ -79,6 +81,7 @@ build/cemu.exe --machine x86 -display win32 -bios bios.bin \
 bash test/run.sh                            # 全部套件（分层：test/<isa>/run.sh）
 cmake --build build --target check          # 目录依赖边（tools/depcheck.sh）
 cmake --build build --target check-riscv64  # riscv64 套件
+cmake --build build --target check-riscv32  # riscv32 套件
 cmake --build build --target check-x86      # x86 套件
 ```
 

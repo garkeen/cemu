@@ -242,7 +242,8 @@ static const char* TargetXml(const char* isa_name) {
              "<reg name=\"fop\" bitsize=\"32\" type=\"int\" group=\"float\"/>"
              "</feature></target>");
     cached = xml;
-  } else if (strcmp(isa_name, "riscv64") == 0) {
+  } else if (strcmp(isa_name, "riscv64") == 0 || strcmp(isa_name, "riscv32") == 0) {
+    int rv32 = strcmp(isa_name, "riscv32") == 0;
     static const char* names[32] = {"zero", "ra", "sp",  "gp",  "tp", "t0", "t1", "t2",
                                     "s0",   "s1", "a0",  "a1",  "a2", "a3", "a4", "a5",
                                     "a6",   "a7", "s2",  "s3",  "s4", "s5", "s6", "s7",
@@ -250,14 +251,17 @@ static const char* TargetXml(const char* isa_name) {
     size_t off = (size_t)snprintf(xml, sizeof(xml),
                                   "<?xml version=\"1.0\"?>"
                                   "<!DOCTYPE target SYSTEM \"gdb-target.dtd\">"
-                                  "<target><architecture>riscv:rv64</architecture>"
-                                  "<feature name=\"org.gnu.gdb.riscv.cpu\">");
+                                  "<target><architecture>riscv:%s</architecture>"
+                                  "<feature name=\"org.gnu.gdb.riscv.cpu\">",
+                                  rv32 ? "rv32" : "rv64");
     for (int i = 0; i < 32 && off < sizeof(xml) - 96; i++)
       off += (size_t)snprintf(xml + off, sizeof(xml) - off,
-                              "<reg name=\"%s\" bitsize=\"64\" type=\"int64\"/>", names[i]);
+                              "<reg name=\"%s\" bitsize=\"%d\" type=\"int%d\"/>", names[i],
+                              rv32 ? 32 : 64, rv32 ? 32 : 64);
     snprintf(xml + off, sizeof(xml) - off,
-             "<reg name=\"pc\" bitsize=\"64\" type=\"code_ptr\"/>"
-             "</feature></target>");
+             "<reg name=\"pc\" bitsize=\"%d\" type=\"code_ptr\"/>"
+             "</feature></target>",
+             rv32 ? 32 : 64);
     cached = xml;
   }
   return cached;

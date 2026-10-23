@@ -98,11 +98,12 @@ ISA 头，`virt.c` 仅引 `platform.h`。
   PATH 时前置 `PATH=/d/ninja:$PATH`）。clang 与 gcc 的差异注意：
   -fno-common（暂定定义重复即错，exec.c 的 cpu 共享指针已显式化）、
   clang 的 mingw 驱动预定义 UNICODE（uxtheme 的 SetWindowTheme 映射 W 版）。
-- 每轮改动结束前限时跑回归：`bash test/run.sh`（分层入口：riscv
-  `bash test/riscv64/run.sh`，x86 `bash test/x86/run.sh`）；依赖边用
+- 每轮改动结束前限时跑回归：`bash test/run.sh`（分层入口：riscv64
+  `bash test/riscv64/run.sh`、riscv32 `bash test/riscv32/run.sh`，x86
+  `bash test/x86/run.sh`）；依赖边用
   `cmake --build build --target check`。脚本是 bash，调用方不必是：CMake 在配置时
   解析出 Git 的 bash（打印 `shell for check targets:`），`check` / `check-x86` /
-  `check-riscv64` 三个目标用登录 shell 跑脚本，cmd/PowerShell 下入口一致；直跑脚本
+  `check-riscv64` / `check-riscv32` 四个目标用登录 shell 跑脚本，cmd/PowerShell 下入口一致；直跑脚本
   要用 Git Bash（非登录 shell 的 PATH 无 /usr/bin）。
 - 运行限时：**所有**运行一律限时——run.sh 用 `timeout` 包裹 cemu 调用；
   会话内的临时手跑（调试观测、state 对拍、探针复现）同样必须前置
@@ -389,7 +390,8 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 | D21 | i8042.c 软驱数据线 | 8042 侧的软驱数据线（键盘控制器输出端口上那条给软驱控制器的数据线）没有建模；本机的软驱路径由 8272A + 8237 通道 2 承担，固件不经过这条线 | PC/AT Technical Reference（8042 输出端口）；IBM 8042 数据表 | 需要复现"经 8042 传盘"的硬件时 | 登记中 |
 | D32 | uart16550.c 接收侧 FIFO 语义 | `PushRx` 无视 FCR.FE 一直缓存 16 字节：实机 16550 在 FIFO 关闭时只保留 1 字节（RBR），后续字节按溢出丢弃并置 LSR.OE，本机不丢。后果：不开 FIFO 的客户机驱动在本机也能收全突发（sermouse 探针原先正是靠这处偏差通过的），在实机/QEMU 上会丢字节 | 16550D datasheet（FCR.FE、RBR 单字节与 OE）；QEMU hw/char/serial.c `serial_receive1` | 需要精确接收溢出语义的客户机出现时（sermouse 探针已改为开 FIFO，销账无阻塞） | 登记中 |
 | D34 | mmu.c Sv39 PTE 高位 | **Svnapot 与 Svpbmt 未实现**：叶 PTE 的 bit63:54（N 与 PBMT）任一位置起即按保留位报 page fault，本机不解释 NAPOT 大页也不解释 PBMT 内存类型。后果要说清楚：`rv64ssvnapot-p-napot` 那格走的是**验收件自带的 skip 分支**（件源 `riscv-tests/isa/rv64ssvnapot/napot.S` 的 `mtvec_handler` 见 store page fault + `mepc=napot_store` + `mtval=MY_VA` 就跳 `pass`），所以它在套件里是绿的，但**没钉任何东西**——64KB NAPOT 区间与 PBMT 属性在本机无验证。别和已实现的那半混淆：PMP 的 NAPOT 区间编码是实现了的（mmu.c 的 PMP 段） | 特权规范 4.3.2（叶 PTE 保留位与 N/PBMT 字段）；Svnapot v1.0、Svpbmt v1.0；QEMU target/riscv 的 RV_PTE_NAPOT 与 pbmt 解码；件源 riscv-tests isa/rv64ssvnapot/napot.S | 出现依赖 NAPOT 大页或 PBMT 的客户机时（当前 Linux 0.11/2.6.34 都不用；riscv 侧 xv6-riscv 验收时若 OpenSBI 要求再核） | 登记中 |
-| D35 | csr.c misa 写路径 | `csrw misa` 的掩码 `(val & kMisaSupported) \| kMisaI` 只挡"未实现的位"，不挡"只读位"：客机写 0 能把 S 与 U 位清掉，而清掉之后本机照样进 U 模式、照样按 PTE.U 判权限（状态与自述脱钩）。这两位在规范里是否强制只读**缺手册 §3.1.1 的原文**，未据裁决（先例：DAS 的 18 处分歧按实机、计数器抑制只实现有测试覆盖的一侧——这里两侧都无证据，故不猜） | 特权规范 3.1.1 misa 的 WARL 措辞（原文待核）；dearchap-tinyemu riscv_cpu.c:1306 只组装 misa、无 csrw misa 路径可参照 | 核到手册原文后：若 S/U 强制只读，则把这两位从可改掩码里摘出并补一个自足探针（写 misa 后读回） | 登记中 |
+| D35 | riscv64/csr.c、riscv32/csr.c 的 misa 写路径 | `csrw misa` 的掩码 `(val & kMisaSupported) \| kMisaI` 只挡"未实现的位"，不挡"只读位"：客机写 0 能把 S 与 U 位清掉，而清掉之后本机照样进 U 模式、照样按 PTE.U 判权限（状态与自述脱钩）。这两位在规范里是否强制只读**缺手册 §3.1.1 的原文**，未据裁决（先例：DAS 的 18 处分歧按实机、计数器抑制只实现有测试覆盖的一侧——这里两侧都无证据，故不猜） | 特权规范 3.1.1 misa 的 WARL 措辞（原文待核）；dearchap-tinyemu riscv_cpu.c:1306 只组装 misa、无 csrw misa 路径可参照 | 核到手册原文后：若 S/U 强制只读，则把这两位从可改掩码里摘出并补一个自足探针（写 misa 后读回） | 登记中 |
+| D36 | riscv64/csr.c、riscv32/csr.c 的 MHPM 计数器 | **MHPM 计数器只存储不自增**：`mhpmcounter3..18` 在 cemu 里没有事件源，写进去的值能读回，但从不增长；`mhpmevent3..18` 同样只存储。mcycle/minstret 不受影响（step.c 每步自增）。OpenSBI 按 CSR 存在探测计数器数量，拿到的是"能读但不动"的计数器 | QEMU target/riscv/csr.c 的 pmu 计数（Zihpm 允许实现定义事件）；特权规范 3.1.11 | 出现依赖性能计数器/剖析的客户机或工具时 | 登记中 |
 | E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中 |
 
 ## 附：关键行为裁决存档（修复时的先例依据）

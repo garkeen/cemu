@@ -164,4 +164,5 @@ const isa_ops k_isa_riscv64 = {
            // onto the trigger module yet (AGENTS.md 简化登记 D6)
     NULL,
     NULL,
+    2,  // ELFCLASS64 (riscv32 shares e_machine 243; the loader matches class)
 };

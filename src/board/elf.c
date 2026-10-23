@@ -65,6 +65,51 @@ static void FindHtifSymbols(const uint8_t* data, size_t size, uint64_t shoff, ui
   }
 }
 
+// ELF32 counterpart of FindHtifSymbols: Elf32_Shdr is 40 bytes with 32-bit
+// offsets/sizes and Elf32_Sym is 16 bytes with a 32-bit st_value
+// (elf.h / gABI). rv32 riscv-tests images carry their tohost here.
+static void FindHtifSymbols32(const uint8_t* data, size_t size, uint64_t shoff, uint16_t shentsize,
+                              uint16_t shnum, uint32_t shstrndx, ElfInfo* out) {
+  if (shoff == 0 || shnum == 0 || shoff + (uint64_t)shnum * shentsize > size) return;
+  const uint8_t* shstr_hdr = data + shoff + (size_t)shstrndx * shentsize;
+  uint64_t shstr_off = Rd32(shstr_hdr + 16);
+  uint64_t shstr_size = Rd32(shstr_hdr + 20);
+  if (shstr_off + shstr_size > size) return;
+  const uint8_t* shstr = data + shstr_off;
+
+  const uint8_t* symtab = NULL;
+  const uint8_t* strtab = NULL;
+  uint64_t sym_count = 0;
+  for (uint16_t i = 0; i < shnum; i++) {
+    const uint8_t* sh = data + shoff + (size_t)i * shentsize;
+    uint32_t type = Rd32(sh + 4);
+    uint32_t name_off = Rd32(sh);
+    uint64_t offset = Rd32(sh + 16);
+    uint64_t shsize = Rd32(sh + 20);
+    uint64_t entsize = Rd32(sh + 36);
+    const char* sname = (const char*)shstr + name_off;
+    if (type == kShtSymtab && strcmp(sname, ".symtab") == 0) {
+      symtab = data + offset;
+      sym_count = entsize ? shsize / entsize : 0;
+      const uint8_t* str_hdr = data + shoff + (size_t)Rd32(sh + 24) * shentsize;
+      strtab = data + Rd32(str_hdr + 16);
+    }
+  }
+  if (!symtab || !strtab) return;
+  for (uint64_t i = 0; i < sym_count; i++) {
+    const uint8_t* sym = symtab + i * 16;  // Elf32_Sym is 16 bytes
+    uint32_t name_off = Rd32(sym);
+    uint32_t value = Rd32(sym + 4);
+    if (name_off == 0) continue;
+    if (NameIs(strtab, name_off, "tohost")) {
+      out->tohost = value;
+      out->has_tohost = 1;
+    } else if (NameIs(strtab, name_off, "fromhost")) {
+      out->fromhost = value;
+    }
+  }
+}
+
 int ElfLoad(Bus* bus, const uint8_t* data, size_t size, ElfInfo* out) {
   memset(out, 0, sizeof(*out));
   if (size < 64 || memcmp(data,
@@ -130,6 +175,9 @@ int ElfLoad(Bus* bus, const uint8_t* data, size_t size, ElfInfo* out) {
     if (p_memsz > p_filesz) memset(host + p_filesz, 0, (size_t)(p_memsz - p_filesz));
   }
 
-  if (is64) FindHtifSymbols(data, size, shoff, shentsize, shnum, shstrndx, out);
+  if (is64)
+    FindHtifSymbols(data, size, shoff, shentsize, shnum, shstrndx, out);
+  else
+    FindHtifSymbols32(data, size, shoff, shentsize, shnum, shstrndx, out);
   return 0;
 }

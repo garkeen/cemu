@@ -125,9 +125,15 @@ typedef struct isa_ops {
   // rather than vectored (cpu/isa/x86/step.c's debug-trap block). NULL = no such
   // report.
   uint32_t (*gdb_watch_hits)(CpuState* cpu);
+
+  // The ELF class this model implements: 1 = ELFCLASS32, 2 = ELFCLASS64,
+  // 0 = any. riscv32 and riscv64 share e_machine 243, so the loader must
+  // match EI_CLASS too; x86's EM_386 is unambiguously 32-bit.
+  int elf_class;
 } isa_ops;
 
 extern const isa_ops k_isa_x86;
+extern const isa_ops k_isa_riscv32;
 extern const isa_ops k_isa_riscv64;
 
 // Every ISA linked into the emulator registers itself here (NULL-terminated).

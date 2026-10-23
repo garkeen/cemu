@@ -45,9 +45,13 @@ static const char kDefaultIsaName[] = "riscv64";
 // mirrors this layout.
 enum { kBinTohostOffset = 0x1000, kBinFromhostOffset = 0x40 };
 
-static const isa_ops* FindIsaByMachine(uint32_t elf_machine) {
+// e_machine alone cannot separate riscv32 from riscv64 (both are EM_RISCV);
+// EI_CLASS is the discriminator, declared per ISA in elf_class (0 = any).
+static const isa_ops* FindIsaByMachine(uint32_t elf_machine, int elf_class) {
   for (const isa_ops* const* p = k_isa_table; *p; p++) {
-    if ((*p)->elf_machine == elf_machine) return *p;
+    if ((*p)->elf_machine != elf_machine) continue;
+    if ((*p)->elf_class && (*p)->elf_class != elf_class) continue;
+    return *p;
   }
   return NULL;
 }
@@ -61,13 +65,16 @@ static const isa_ops* FindIsaByName(const char* name) {
 
 const isa_ops* LoaderFindIsa(const char* name) { return FindIsaByName(name); }
 
-// ELF images always self-identify through e_machine; --isa must agree if the
-// user gave it. Raw bins have no header, so --isa (or the default) applies.
-static const isa_ops* PickIsa(const char* isa_name, int is_elf, uint32_t elf_machine) {
+// ELF images always self-identify through e_machine plus ELF class; --isa
+// must agree if the user gave it. Raw bins have no header, so --isa (or the
+// default) applies.
+static const isa_ops* PickIsa(const char* isa_name, int is_elf, uint32_t elf_machine,
+                              int elf_class) {
   if (is_elf) {
-    const isa_ops* isa = FindIsaByMachine(elf_machine);
+    const isa_ops* isa = FindIsaByMachine(elf_machine, elf_class);
     if (!isa) {
-      LogError("elf e_machine %u has no registered isa", elf_machine);
+      LogError("elf e_machine %u (%s) has no registered isa", elf_machine,
+               elf_class == 2 ? "ELFCLASS64" : "ELFCLASS32");
       return NULL;
     }
     if (isa_name && strcmp(isa_name, isa->name) != 0) {
@@ -101,7 +108,7 @@ int LoaderLoadImage(Bus* bus, const char* path, const char* isa_name, uint64_t b
       free(data);
       return -1;
     }
-    isa = PickIsa(isa_name, 1, info.machine);
+    isa = PickIsa(isa_name, 1, info.machine, info.is_64 ? 2 : 1);
     if (!isa) {
       free(data);
       return -1;
@@ -114,7 +121,7 @@ int LoaderLoadImage(Bus* bus, const char* path, const char* isa_name, uint64_t b
       out->fromhost = info.fromhost;
     }
   } else {
-    isa = PickIsa(isa_name, 0, 0);
+    isa = PickIsa(isa_name, 0, 0, 0);
     if (!isa) {
       free(data);
       return -1;
