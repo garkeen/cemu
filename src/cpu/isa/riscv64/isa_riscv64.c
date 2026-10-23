@@ -21,7 +21,7 @@ void riscv_init(CpuState* cpu) {
   }
   s->priv = kPrivMachine;
   s->mstatus = 2ULL << 32;           // mstatus.UXL = 2 (U-mode is RV64)
-  s->misa = kMisaSupported;          // RV64IMAFDC + S-mode
+  s->misa = kMisaSupported;          // RV64IMAFDC + S/U (mstatus.UXL says U is RV64)
   s->tdata1[0] = kTrigTypeMcontrol6;  // both triggers are mcontrol6 (Sdtrig)
   s->tdata1[1] = kTrigTypeMcontrol6;
   s->stimecmp = ~0ULL;               // Sstc: no S-level timer interrupt until programmed

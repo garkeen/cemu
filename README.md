@@ -16,12 +16,16 @@
 
 阶段 0–3.5 完成（ISA 一致性、真实固件、x86 保护模式与分页、调试器与 GUI；
 gdb 的硬件观察点走 CPU 自己的 DR0-DR7，只读观察点因 DR7 没有该编码而拒接、
-riscv 侧尚未接 trigger 模块，两处记在 D6）；
-**阶段 4（设备全集与真实 OS）进行中**：验收 1 xv6-x86 已到 shell；验收 2 Linux
-引导链已到 `VFS: Mounted root (ext2 filesystem)`，卡在其后一段（未定案）；
-验收 3 xv6-riscv 未开始；验收 4 Windows 1.01 **未过**——显示驱动没有请求图形模式，
-客人退回文本模式后缺字库文件，报 `FatalExit code = 0x0410`，同一镜像在
-`qemu-system-i386 -vga std` 上进 640×350 桌面。取证与已排除的候选见 progress.md。
+riscv 侧尚未接 trigger 模块，两处记在 D6）。
+**阶段 4（设备全集与真实 OS）进行中**：PC 设备模型全集到位——VGA 家族核含
+VBE/DISPI、链式 256 色与 EDID，PS/2 键盘鼠标与串口鼠标，8259/8254，8272 FDC +
+8237 DMA，IDE/ATAPI 含 LBA-48 与 multi-sector，LAPIC/IOAPIC 含 NMI 交付，PIIX4 PM
+含 SCI 与 S5 关机；余下缺口按 AGENTS.md §X 的 D17/D19 在册。
+验收阶梯：**xv6-x86 ✅**（SeaBIOS → IDE 盘 → shell）、**Linux ✅**（引导越过
+`VFS: Mounted root (ext2 filesystem)`，控制台出提示符）、**Windows 1.01 ✅**（EGA
+640×350 的 MS-DOS Executive 桌面，`fbdump` 帧与 QEMU 基线逐像素相同，PS/2 指针可
+移动）、**xv6-riscv 未开始**（镜像与 OpenSBI fw_jump 素材未取）。
+回归：x86 36/0、riscv64 136/0、依赖边 ok。
 逐轮记录见 [progress.md](progress.md)。
 x86 固件（SeaBIOS + 显卡 option ROM）来自库外的一棵源码树，其现状、重建步骤与配置
 快照见 [firmware.md](firmware.md)。
@@ -62,12 +66,12 @@ build/cemu.exe --machine x86 -display win32 -cdrom linux.iso
 # PC 主板 + 显示：显卡的 option ROM 提供 int10 视频服务
 # （vgaroms/vgabios.bin 一般是 seabios 树按 CONFIG_NO_VGABIOS=0 构建的产物）
 build/cemu.exe --machine x86 -display win32 -bios bios.bin \
-  -vgabios vgabios.bin -fda win101.img
+  -vgabios vgabios.bin -fda win101.img -mouse ps2
 ```
 
 `.bin` 需要 `--isa NAME`（ELF 自报 ISA）。常用：`--mem MB`、`--max-inst N`、
-`--skip-idle`、`-hdb`、`-fda`、`-vgabios`、`-gdb tcp::PORT` / `-s` / `-S`（gdb RSP
-stub，配套图形前端 `cemugui`）。
+`--skip-idle`、`-hdb`、`-fda`、`-vgabios`、`-mouse ps2|serial`、`-gdb tcp::PORT`
+/ `-s` / `-S`（gdb RSP stub，配套图形前端 `cemugui`）。
 
 ## 测试
 
@@ -97,4 +101,5 @@ CEMU_DEBUG="trace:table,state,mem,budget=200" \
 | [AGENTS.md](AGENTS.md) | 开发铁律（改代码前必读） |
 | [arch.md](arch.md) | 架构与阶段路线图 |
 | [progress.md](progress.md) | 现状与决策记录（最近的在最上） |
+| [firmware.md](firmware.md) | 库外 x86 固件（SeaBIOS + 显卡 option ROM）的现状与重建步骤 |
 | [reference.md](reference.md) | 参考项目索引与语义裁决顺序 |

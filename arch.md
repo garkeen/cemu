@@ -136,7 +136,8 @@ x86 `qemu-system-i386 -device isa-debug-exit,iobase=0xf4,iosize=0x4`。
 
 ### 阶段 0：工具链与素材 ✅
 xpack riscv gcc（guest riscv）、nasm（D:/nasm，2.16.03 在 D:/SSDOWN/tools）、
-LLVM 23.1（D:/LLVM，seabios 与 x86 构建用）、mingw gcc 8.1（cemu 本体）、
+LLVM 23.1（D:/LLVM，cemu 本体与 seabios、x86 构建都用它：2026-09-13 起编译器是 clang，
+`tools/clang.cmake`，mingw-w64 只当头文件与运行时 sysroot）、
 qemu-system-i386（D:/qemu）。seabios bios.bin 已从源码构建成功（256KiB，
 复位向量逐字节验证，为阶段 4 SeaBIOS 路线备料）——**在库外**，路径
 `D:\code\c\EMU\seabios\out\bios.bin`（seabios 是与 cemu 平级的参考/素材目录，跑
@@ -207,10 +208,13 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
 - PC 设备模型全集（VGA 家族核、PS/2、PIC、PIT、UART、IDE/ATAPI、软盘 FDC+8237、LAPIC、
   IOAPIC、**PIIX4 PM function（ACPI PM timer）**）✅
   —— 片 1–14 逐项落地，片 26 补软盘通路，片 27 补显示家族，片 35 补 PM function（固件的
-  微秒时基因此切到 PM timer，见 firmware.md）。余下的规格缺口（IOAPIC 的
-  NMI/SMI/INIT/ExtINT 交付模式、PIRQ 消费者、ACPI 的 SCI/关机路径与 ACPI 表、
-  ATA LBA-48/multi-sector）按
-  AGENTS.md 第十节台账在册。
+  微秒时基因此切到 PM timer，见 firmware.md）。片 30–36 重做把显示形状压平（渲染基线、
+  PCI BAR、光栅/片选、线性 PC 的 trace 与 gdb），此后 D17/D19 落地：VBE/DISPI 与链式
+  256 色渲染、EDID、行比较/分屏/pel 平移、ATA LBA-48 与 multi-sector、PM1_STS/EN/CNT
+  与 SCI IRQ9 及 S5 关机、IOAPIC 的 NMI 交付。余下的规格缺口（IOAPIC 的 SMI/INIT 交付、
+  PIRQ 消费者、XBCS、SMBus 主机控制器、PM 的 S3/S4 唤醒路径；显示侧的 CRTC R17 bit5
+  地址回绕、过扫描边框、CGA 复合 NTSC 伪色）按 AGENTS.md §X 台账在册。ACPI 表（DSDT/FADT）
+  由 SeaBIOS 生成，不属于芯片组模型。
 - bin 路线：multiboot 等价的入口契约，xv6 去掉 bootasm.S/bootmain.c
   编为 .bin；SeaBIOS 路线：官方 bios.bin 映射内存顶端，复位 F000:FFF0
   （bios.bin 已备料；跑通 SeaBIOS 本体属本阶段设备集成，不前置）。
@@ -228,7 +232,7 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   仍缺 x87 算术与 RDTSC（0F 31 仍 #UD），前提是 CPUID 特性位如实为 0（EDX=0）。
   D14（VM86）已在片 18 按 SDM vol.3 17.3 实现并销账（IRET 返回 VM86、
   任务切换从 TSS 装载 VM、`seg_synth` 段合成、VM86 帧投递、TSS I/O 许可位图）。
-- **现状（2026-09-23）**：验收 1（xv6-x86）✅ SeaBIOS → IDE 盘 → xv6 到 shell，
+- **现状（2026-10-21）**：验收 1（xv6-x86）✅ SeaBIOS → IDE 盘 → xv6 到 shell，
   与 QEMU 基线逐项一致。验收 2（Linux）✅ —— 片 15 把卡点钉到指令级：用户态访问
   只查 U/S 不查 R/W（SDM vol.3 §4.6 表 4-2），写时复制失效，`/linuxrc` 死在
   `_stdio_openlist_del_lock` 的 futex 上；补上用户态写保护后引导越过
@@ -237,9 +241,20 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   BT 位串寻址探针）、
   收紧判据（宿主失败码 2 与客机通过码撞码、kvm 用例
   输出不再丢弃）、修 `taskswitch2`（SLDT/STR 内存目标恒 16 位）与 EFLAGS 保留位
-  不变式。回归：riscv64 136/0、x86 15/0。验收 3（xv6-riscv）未开始：素材
-  （xv6-riscv 镜像与 OpenSBI fw_jump）尚未取，串口输入通道已就绪。过程与证据见
-  progress.md。
+  不变式。验收 3（xv6-riscv）未开始：素材
+  （xv6-riscv 镜像与 OpenSBI fw_jump）尚未取，串口输入通道已就绪。
+  **验收 4（Windows 1.01）✅** —— 此前记的"显示驱动没有请求图形模式"是误判。真因是
+  `modrm()` 的 16 位寻址两处结构错误（`[bp+si]`/`[bp+di]` 丢掉 SI/DI、16 位有效
+  地址加段基址前没有 `& 0xffff` 回绕）：KERNEL 的路径解析器正是用它把 `"FONTS.FON"`
+  截断后写进栈上的名字缓冲，五个字符全落到 64K 之外，模块查找拿空名逐个比较全部
+  失败，长期不返回，最终触发堆守卫 FatalExit。补齐后进入桌面，
+  帧缓冲与 QEMU 基线逐像素相同；连带修的是 GR8 按逐像素掩码展开（此前文字画成
+  彩色横条）、CGA mode 6 的 bank 地址旋转（此前启动画面三份 logo）、8042 逐字节
+  投递 IRQ12 边沿（此前 PS/2 指针不动；同一份自建固件在 QEMU 里指针同样不动的
+  那半，根因在仓外 SeaBIOS 自身的 clang 8 位 farvar 误编译）。16 位寻址由
+  `addr16_matrix`/`addr16_seg` 两格自足探针钉住（QEMU 同 transcript）。
+  取证链见 progress.md 2026-10-21 各节。
+  回归：riscv64 136/0、x86 36/0、依赖边 ok。
 - **验收 4（Windows 1.01）与显示实现形状**（2026-09-24 用户裁决；2026-09-29 落地）：验收件
   `build/windows/windows101.img`（1.44MB、MS-DOS 3.3 引导软盘，卷标 WIN101），QEMU
   基线是 **EGA 640×350** 下的 MS-DOS Executive 桌面（7 秒时截屏）。它给出两条硬前置：
@@ -255,12 +270,15 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   （SeaVGABIOS，38400 字节），主板用 `-vgabios` 把它作为 fw_cfg 文件 `vgaroms/vgabios.bin`
   交给固件，固件自己影子到 C0000。显卡另有 PCI function（`00:02.0` = `1234:1111`，
   显示控制器类，片 30 之后补上）供固件与客人按 PCI 枚举它、并给线性帧缓冲提供 BAR0；
-  Region 2 是 4KB MMIO（0x000-0x3FF 的 EDID 未建模，0x400-0x41F 1:1 映射
+  Region 2 是 4KB MMIO（0x000-0x3FF 给 EDID：BAR2 偏移 0 返回 256 字节 = QEMU 默认
+  1280×800 监视器的基础块 + DTA 扩展实测副本，0x400-0x41F 1:1 映射
   0x3C0-0x3DF 端口，按 QEMU 标准 VGA 规范），但它**不带扩展 ROM**（0x30 的 ROM
   地址寄存器读回 0），ROM 仍走上面这条 fw_cfg 通路。验收见
   `test/x86/probe/vga_probe.asm`（int10 切 mode 3/0x10/0x04 后核对寄存器与平面寻址，
-  QEMU `-vga std` 同一镜像同样通过）。剩余显示缺口见 AGENTS.md D17（链式 256 色只做
-  寻址不渲染、无 VBE、渲染结果缺无头 dump 设施）。
+  QEMU `-vga std` 同一镜像同样通过）。剩余显示缺口见 AGENTS.md D17（CRTC R17 bit5
+  的 64K 地址回绕 AW、过扫描边框、CGA 复合 NTSC 伪色）。渲染结果的对拍通道是
+  `CEMU_DEBUG=fbdump=FILE`：落二进制 P6 PPM，与 QEMU `screendump` 同格式可逐字节
+  diff（win101 桌面帧与 QEMU 基线即以此核对）。
 
 ### 阶段 5：cesdk（放后：真实 OS 跑通后再做 SDK）
 - 交付：crun 运行时（_start、putch→UART、halt→sifive_test）、klib、

@@ -68,8 +68,13 @@ static const uint64_t kMisaF = 1ULL << 5;  // misa bit letters: E=4, F=5
 static const uint64_t kMisaI = 1ULL << 8;
 static const uint64_t kMisaM = 1ULL << 12;
 static const uint64_t kMisaS = 1ULL << 18;
+static const uint64_t kMisaU = 1ULL << 20;  // misa bit letters: S=18, U=20
+// U=1 because user mode is implemented: ecall from U raises cause 8, sret can
+// land in U, and the walk checks PTE.U against the effective privilege
+// (priv spec 3.1.1 "U: User mode is implemented"; dearchap-tinyemu
+// riscv_cpu.c sets MCPUID_USER alongside MCPUID_SUPER).
 static const uint64_t kMisaSupported =
-    kMisaMxl64 | kMisaA | kMisaC | kMisaD | kMisaF | kMisaI | kMisaM | kMisaS;
+    kMisaMxl64 | kMisaA | kMisaC | kMisaD | kMisaF | kMisaI | kMisaM | kMisaS | kMisaU;
 // tcontrol MTE/MPTE (RISC-V debug spec, tcontrol register)
 static const uint64_t kTcontrolMte = 1ULL << 7;
 static const uint64_t kTcontrolMpte = 1ULL << 6;
