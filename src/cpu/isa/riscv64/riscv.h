@@ -133,10 +133,12 @@ static const uint64_t kIrqSLevelMask = kMidelegWmask;
 // MEDELEG_NONRVH agrees).
 static const uint64_t kMedelegWmask = 0xf7ffULL;
 
-// satp (priv spec 4.1.11): Bare and Sv39 are the implemented modes; the
+// satp (priv spec 4.1.11): Bare, Sv39 and Sv48 are the implemented modes
+// (Sv48 is priv spec 4.4.1, same walk as Sv39 with one more level); the
 // writable fields are mode, ASID and PPN.
 static const uint64_t kSatpModeBare = 0;
 static const uint64_t kSatpModeSv39 = 8;
+static const uint64_t kSatpModeSv48 = 9;
 static const uint64_t kSatpWmask = (0xfULL << 60) | (0xffffULL << 44) | ((1ULL << 44) - 1);
 
 // PMP (priv spec 3.7): 16 entries like QEMU virt (OpenSBI banner "PMP Count

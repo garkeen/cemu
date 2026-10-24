@@ -437,3 +437,17 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
   因为 CS 已提交而 eip 还没写）。实现：程序类 `bus_load/bus_store` 对处理器类
   `kbus_load/kbus_store/krd*/kwr*/kpush*`，由
   `page_translate_as(lin, write, user)` 的 user 参数分派。
+
+- **PMP 零活动规则放行**：从未配置任何 PMP 条目（全部 A=OFF）时，S/U 访问
+  放行（QEMU pmp.c `pmp_hart_has_privs` 的零规则早退；gem5 pmp.cc 与手册
+  3.7 字面"实现过 PMP 但全 OFF 则 S/U 访问失败"分歧，按 QEMU）。实机依据：
+  裸机 loader（HelenOS 0.14.1 riscv64）不配 PMP 直接 mret 进 S 态，
+  首次取指与页表走查即按 S 态过 PMP，在 QEMU -M spike（cemu spike 板的
+  机器参照）上正常引导。规则已配置但无一命中时仍拒 S/U 不变。
+
+- **非叶 PTE 的 A/D/U/G 不拒**：手册 4.3.2"非叶 PTE 的 D、A、U 位必须
+  清零"约束的是建表软件，不是走查硬件——QEMU ptw 忽略这些位。实机 OS
+  就这么建表：HelenOS 0.14.1 riscv64 的指针 PTE 实测 `root[256] =
+  0x101038d1`（V|U|A|D），取证走 pcshot 取 satp + 确定性回放 dump 根表。
+  xiangshanNEMU 此处拒——其客户 OpenSBI/Linux 不置这些位，该检查未经
+  校准，按 QEMU 放宽（riscv64/riscv32 两个后端同步）。

@@ -72,9 +72,11 @@ int Riscv32PmpAllowed(const Riscv32State* s, uint64_t addr, uint64_t len, int ac
   int need_r = (acc == acc_read || acc == acc_amo);
   int need_w = (acc == acc_write || acc == acc_amo);
   int need_x = (acc == acc_ifetch);
+  int active = 0;
   for (int i = 0; i < kPmpCount; i++) {
     uint64_t base, size;
     if (!PmpRegion(s, i, &base, &size)) continue;
+    active = 1;
     int any = addr < base + size && addr + len > base;
     if (!any) continue;
     // The lowest-numbered matching entry decides; an access that straddles
@@ -86,7 +88,13 @@ int Riscv32PmpAllowed(const Riscv32State* s, uint64_t addr, uint64_t len, int ac
       return 0;
     return 1;
   }
-  return mode == kPrivMachine;  // no match: M passes, S/U are denied
+  if (!active) return 1;  // no entry ever configured: allowed (QEMU pmp.c
+                         // pmp_hart_has_privs treats zero active rules as
+                         // allow-all — bare-metal loaders jump to S-mode
+                         // without any SBI to program PMP first. gem5 pmp.cc
+                         // follows the priv spec 3.7 wording instead and
+                         // fails S/U here; the spike machine models QEMU.)
+  return mode == kPrivMachine;  // rules exist but none match: M passes, S/U are denied
 }
 
 // ---- Sv32 (priv spec 4.3.2 / 5.3) ----
@@ -139,10 +147,10 @@ int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int acc, uint64_
       raise_(f, PageFaultCause(acc), vaddr);
     }
     if (pte & (kPteR | kPteX)) break;  // leaf
-    // Non-leaf PTEs must have A/D/U clear (priv spec 4.3.2).
-    if (pte & (kPteA | kPteD | kPteU)) {
-      raise_(f, PageFaultCause(acc), vaddr);
-    }
+    // Non-leaf: a pointer to the next level. Its A/D/U/G bits carry no
+    // walk meaning — the priv spec sentence binds the page-table writer,
+    // not the walker: QEMU's ptw ignores them, and real OSes do set them
+    // (HelenOS 0.14.1 writes V|G|A|D pointers).
     ppn_base = (pte >> 10) & kSatpPpnMask;
   }
 

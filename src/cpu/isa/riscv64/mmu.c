@@ -1,4 +1,4 @@
-// Sv39 address translation and PMP enforcement. Semantics translated from
+// Sv39/Sv48 address translation and PMP enforcement. Semantics translated from
 // xiangshanNEMU src/isa/riscv64/system/mmu.c (ptw, check_permission,
 // pmp_check_permission_with_mode); divergences follow the priv spec or are
 // calibrated against QEMU behavior where noted. The interpreter walks page
@@ -72,9 +72,11 @@ int RiscvPmpAllowed(const RiscvState* s, uint64_t addr, uint64_t len, int acc, i
   int need_r = (acc == acc_read || acc == acc_amo);
   int need_w = (acc == acc_write || acc == acc_amo);
   int need_x = (acc == acc_ifetch);
+  int active = 0;
   for (int i = 0; i < kPmpCount; i++) {
     uint64_t base, size;
     if (!PmpRegion(s, i, &base, &size)) continue;
+    active = 1;
     int any = addr < base + size && addr + len > base;
     if (!any) continue;
     // The lowest-numbered matching entry decides; an access that straddles
@@ -86,10 +88,16 @@ int RiscvPmpAllowed(const RiscvState* s, uint64_t addr, uint64_t len, int acc, i
       return 0;
     return 1;
   }
-  return mode == kPrivMachine;  // no match: M passes, S/U are denied
+  if (!active) return 1;  // no entry ever configured: allowed (QEMU pmp.c
+                         // pmp_hart_has_privs treats zero active rules as
+                         // allow-all — bare-metal loaders jump to S-mode
+                         // without any SBI to program PMP first. gem5 pmp.cc
+                         // follows the priv spec 3.7 wording instead and
+                         // fails S/U here; the spike machine models QEMU.)
+  return mode == kPrivMachine;  // rules exist but none match: M passes, S/U are denied
 }
 
-// ---- Sv39 (priv spec 4.3.2 / 5.3) ----
+// ---- Sv39/Sv48 (priv spec 4.3.2 / 4.4.1 / 5.3) ----
 
 static int AccessFaultCause(int acc) {
   if (acc == acc_ifetch) return kExFetchFault;
@@ -125,16 +133,25 @@ int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int acc, uint64_t* p
     return 0;
   }
 
-  // Sv39 canonical-address check (priv spec 5.3): bits 63:39 must all copy
-  // bit 38.
-  int64_t v39 = (int64_t)(vaddr << 25) >> 25;
-  if ((uint64_t)v39 != vaddr) raise_(f, PageFaultCause(acc), vaddr);
+  // Sv39 walks three levels, Sv48 four (priv spec 4.4.1); the walk itself is
+  // identical, only the top level and the canonical-address window differ.
+  int top = satp_mode == kSatpModeSv48 ? 3 : 2;
+  // Canonical-address check (priv spec 5.3): the bits above the mode's VA
+  // width must all copy the top VA bit — bits 63:39 copy bit 38 for Sv39,
+  // bits 63:48 copy bit 47 for Sv48.
+  if (top == 3) {
+    int64_t v48 = (int64_t)(vaddr << 16) >> 16;
+    if ((uint64_t)v48 != vaddr) raise_(f, PageFaultCause(acc), vaddr);
+  } else {
+    int64_t v39 = (int64_t)(vaddr << 25) >> 25;
+    if ((uint64_t)v39 != vaddr) raise_(f, PageFaultCause(acc), vaddr);
+  }
 
   uint64_t ppn_base = s->satp & ((1ULL << 44) - 1);
   uint64_t pte = 0;
   uint64_t pte_addr = 0;
   int level;
-  for (level = 2; level >= 0; level--) {
+  for (level = top; level >= 0; level--) {
     uint64_t vpn = (vaddr >> (12 + 9 * level)) & 0x1ff;
     pte_addr = (ppn_base << 12) + vpn * 8;
     pte = PteRead(f, s, pte_addr, acc);
@@ -142,10 +159,12 @@ int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int acc, uint64_t* p
       raise_(f, PageFaultCause(acc), vaddr);
     }
     if (pte & (kPteR | kPteX)) break;  // leaf
-    // Non-leaf PTEs must have A/D/U clear (priv spec 4.3.2).
-    if (pte & (kPteA | kPteD | kPteU)) {
-      raise_(f, PageFaultCause(acc), vaddr);
-    }
+    // Non-leaf: a pointer to the next level. Its A/D/U/G bits carry no
+    // walk meaning — the priv spec 4.3.2 sentence ("the D, A, and U bits
+    // must all be cleared") binds the page-table writer, not the walker:
+    // QEMU's ptw ignores them, and real OSes do set them (HelenOS 0.14.1
+    // writes V|G|A|D pointers). xiangshanNEMU faults here, but its guests
+    // (OpenSBI/Linux) never set the bits, so its check is uncalibrated.
     ppn_base = pte >> 10;
   }
 
@@ -191,7 +210,7 @@ int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int acc, uint64_t* p
   uint64_t ppn = pte >> 10;
   if (level > 0) {
     // Superpage: PPN bits below the leaf level must be zero (priv spec
-    // 4.3.2), which also keeps PPN[2] within 27 bits for Sv39.
+    // 4.3.2), which also keeps PPN[2] within 27 bits for a Sv39 leaf.
     uint64_t low = (1ULL << (9 * level)) - 1;
     if (ppn & low) goto page_fault;
     uint64_t off_mask = (1ULL << (12 + 9 * level)) - 1;

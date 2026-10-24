@@ -22,12 +22,14 @@ const DeviceOps kRamOps = {"ram", RamRead, RamWrite};
 RamDevice* RamCreate(uint64_t base, uint64_t size) {
   RamDevice* ram = (RamDevice*)malloc(sizeof(RamDevice));
   if (!ram) return NULL;
-  ram->mem = (uint8_t*)malloc((size_t)size);
+  // calloc, not malloc+memset: a guest RAM of a gigabyte must not cost a
+  // gigabyte of host physical memory — the big-block allocator hands out
+  // OS zero pages that are only backed on first touch.
+  ram->mem = (uint8_t*)calloc(1, (size_t)size);
   if (!ram->mem) {
     free(ram);
     return NULL;
   }
-  memset(ram->mem, 0, (size_t)size);
   ram->base = base;
   ram->size = size;
   return ram;

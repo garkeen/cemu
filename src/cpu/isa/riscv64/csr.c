@@ -413,9 +413,11 @@ int riscv_csr_write(RiscvState* s, uint64_t addr, uint64_t val, uint64_t next_pc
       // S-mode writes with TVM set trap (priv spec 3.1.6.8, 4.1.11).
       if (s->priv == kPrivSupervisor && (s->mstatus & kMstatusTvm)) return -1;
       uint64_t mode = (val >> 60) & 0xf;
-      // WARL: only Bare and Sv39 are implemented; other modes leave satp
-      // unchanged (xiangshanNEMU priv.c CSR_SATP write path).
-      if (mode != kSatpModeBare && mode != kSatpModeSv39) return 0;
+      // WARL: only Bare, Sv39 and Sv48 are implemented; other modes leave
+      // satp unchanged (xiangshanNEMU priv.c CSR_SATP write path; Sv48 per
+      // priv spec 4.4.1).
+      if (mode != kSatpModeBare && mode != kSatpModeSv39 && mode != kSatpModeSv48)
+        return 0;
       s->satp = val & kSatpWmask;
       return 0;
     }

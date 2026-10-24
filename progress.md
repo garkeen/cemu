@@ -2432,3 +2432,41 @@ oberon_io 的 TraceWrite（0xAA 累积文件名/0xCC 压栈/0 弹栈/0xBB 落
 mark 行 + screen 整行——客人 pc 取不到（设备不见 CPU），以无帧行的
 inst=N 戳代替，`--max-inst` 可复现；文件名累积钳在 19 字节，oracle
 此处无界）。台账整行删除。
+
+## HelenOS riscv64 引导落地（2026-10-24，片 38）
+
+目标：HelenOS-0.14.1-riscv64.boot（发行镜像）在 cemu 上启动。全程静态
+分析镜像（llvm-readobj/nm/objdump + python 解 tar/ext2），未联网。用户
+裁决：不启动参考模拟器；HelenOS 特化代码必须解耦（helen_xx.c）——事后
+证明零特化代码，未动 board/，`--machine spike --base 0x40000000 --mem
+1024` 现成参数即引导。
+
+镜像解剖：单 PT_LOAD@0x40000000（8.3MB）M-mode 起动；唯一设备 HTIF
+（dev1/cmd1 putc、fesvr 应答纪律，无读请求路径）；.pt 根叶超级页
+ptl_0[256]=0xCF（PA=VA mod 2^39）扛到内核自建页表；内核 S 态 Sv48
+（satp=9<<60|ppn，VA 0xffff800048000000↔PA 0x48000000——高半 VA 的
+规范地址只在 Sv48 成立）；时钟=rdcycle（loader 先 mcounteren=7），
+零中断零定时器（idle=wfi）；memmap 是编译期常量（宣告 1GB 领地；
+装载硬下限≈160MB：内核落 +128MB、initrd 铺到 +150MB，解压后内容
+仅~30MB）；无图形——内核零显示驱动，initrd 里 GUI 全套（taskbar/
+terminal/tetris/kfb…）是该端口的死重，HTIF 文本即全部输出。
+
+四关五修（每关一处 trap 行/pcshot 定位；取证用 dump= 只在会话正常结束
+落盘，被杀的回放不落盘）：① Sv48 未实现（satp mode9 被 WARL 丢弃、
+Sv39 规范地址检查直接拒内核 VA）→ mmu.c 四级走查+48 位规范检查、
+csr.c WARL 收 9；② S 态页表走查被自家 PMP 拒杀（PteRead 按 S 态过
+PMP，零规则=全拒）→ 零活动规则放行（QEMU pmp.c 语义，AGENTS.md
+裁决存档）；③ srai shamt≥32 误判 illegal（riscv-tests 的 srai 向量
+只测到 31、slli 有 63，解码跟着覆盖长歪）→ inst[25]=shamt[5]；
+④ 内核重写 satp 后取指页异常 → pcshot 取 satp=0x9000000000040003，
+确定性回放 dump 根表：root[256]=0x101038d1=V|U|A|D 指针，非叶
+A/D/U 检查开枪 → 放宽（QEMU ptw 语义，裁决存档）；附带 ram.c
+malloc+memset→calloc（1GB 客机内存宿主驻留实测 29MB）。
+
+终点裁决：内核全量引导零异常（12B 指令 traps=0），止于 pc=0x7522
+自跳——该 PC 所在符号即 userspace()（六条指令的空桩），唯一调用方
+uinit：0.14.1 的 riscv64 端口未实现 S→U 交接（全内核无 sret/stvec/
+ecall），QEMU 执行同一镜像止于同一条 j .，非 cemu 缺陷。结论：真客户
+引导一轮暴露 4 处套件覆盖洞（Sv48、PMP 零配置、非叶 A/D、srai63），
+HelenOS 可作 riscv64 应力源；引导本身不进套件（~2.2B 指令才到内核，
+慢）。回归 136/104/36、dep: ok。

@@ -675,12 +675,15 @@ uint64_t riscv_exec_inst(frame* fr, uint32_t i) {
           x[rd(i)] = a << (rs2(i) | ((i >> 25) & 1) << 5);
           break;
         }
-        case 5: {  // srli / srai by inst[30]
+        case 5: {  // srli / srai by inst[30]; inst[25] is shamt[5] (RV64
+          // shamt is 6 bits, volume I table 5-4: srai's funct6 is 010000,
+          // so the funct7 view is 0x20|shamt[5], not just 0x20)
           int f7v = f7(i);
-          if ((f7v & 0x7e) != 0 && f7v != 0x20) illegal(fr, i);
-          fr->rec.mnemonic = f7v == 0x20 ? "srai" : "srli";
-          x[rd(i)] = f7v == 0x20 ? (uint64_t)((int64_t)a >> (rs2(i) | ((i >> 25) & 1) << 5))
-                                 : a >> (rs2(i) | ((i >> 25) & 1) << 5);
+          if ((f7v & 0x7e) != 0 && (f7v & 0x7e) != 0x20) illegal(fr, i);
+          int shamt = rs2(i) | ((i >> 25) & 1) << 5;
+          int arith = (i >> 30) & 1;
+          fr->rec.mnemonic = arith ? "srai" : "srli";
+          x[rd(i)] = arith ? (uint64_t)((int64_t)a >> shamt) : a >> shamt;
           break;
         }
       }
