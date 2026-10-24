@@ -2375,3 +2375,60 @@ main 分支单线性，每轮工作一个检查点（git log 见历史）。test
 `test/x86/probe/*_qemu.txt` 入库——那不是捕获，是**参考模型对同一个二进制答了什么**
 的记录（探针格的注释按名字引它），只有几行；`.gitignore` 里为它单开了一条
 `!`，因为全局的 `*.txt` 把这类记录一起吞掉过（三份写好就一直躺在盘上加不进版本库）。
+
+## oberon 主板落地（2026-10-24，片 37）
+
+目标：Project Oberon（solbjorg 的 RV 移植，参考模拟器 oberon-riscv-emu，
+位于 D:\code\c\EMU\oberon-riscv-emu）在 cemu 上跑起来。用户裁决两条：
+Oberon 专用代码名字必须带 oberon（通用件不带，判据 = 换客机要不要改
+行为）；镜像引导不进测试套件，验收走与参考模拟器对拍。
+
+机器契约全部钉自参考源码：src/emu/cpu.h（1MB RAM、帧 0xE7F00、
+ROM 0xFFFFF800、IO 0xFFFFFFC0）、cpu.c（IO 寄存器块与未定义读写语义）、
+riscv.c（取指路径、无 C 扩展、REM 做 floored 修正、jal x0,0 当停机）、
+disk.c（SD 卡：CMD17/CMD24 真实现、其余命令回单字节 0——正是
+Kernel.SDShift 判 SDHC 的校准值、0x9B1EA38D FileDir 魔数偏移）、
+sdl-main.c（调色板 0xfdf6e3/0x657b83、帧缓冲字内 bit0 最左、行序自底
+向上、每帧 25MHz/60 条指令、计时器喂墙钟 ms）、sdl-ps2.c + Input.Mod
+（键盘是 PS/2 **set-2** 流，0xF0 break/0xE0 ext）。Kernel.Init 从 RAM
+字 12/24 读 MemLim/heapOrg，由 ROM 引导块自己写入——故 RAM 钉死 1MB。
+
+新增：board/oberon.c(+oberon_rom.h，bootloader.inc 逐字 512 字)、
+device/misc/oberon_io.c（上窗口 [1MB,2^32)：洞/ROM/IO 块单设备译码，
+洞读 0 写丢弃带 mark——cemu 总线未挂载即 Fatal，必须显式盖住）、
+device/storage/oberon_sd.c（disk.c 逐行为移植）、device/video/ramfb.c
+（通用单色 RAM 帧缓冲视图：位序/行序/调色板皆 init 参数，走
+DisplaySourceOps，写 bump version、懒渲染）。键盘零新代码：ps2kbd 原生
+set-2，板里 SetTranslate(0) 后 tx 流直灌 16 字节 FIFO。CLI 增 -dsk。
+
+验收证据：200M 指令 0 陷阱，fbdump 2359312 字节恰为 16 头+1024×768×3，
+直方图仅两色且即调色板双色；画面结构正确——OpenDisplay(640,384,768)
+把系统轨道摆在屏幕右 384 列（x≥640），亮区 608-1023 = 系统轨道两条
+标题带 + 文字行 + x≈639 全高轨道分隔线（恰 768px）+ 左上角星标光标
+（59px）；两次 `-icount shift=5` 独立跑的 fbdump 逐字节相同（确定性
+端到端成立）。回归 riscv32 104/0、riscv64 136/0、x86 36/0，dep ok。
+
+与参考模拟器的语义分歧按用户裁决记档于此（不进 §X 台账：本机全部
+按 RISC-V 规格，是 oracle 偏离规格，无法销账的记录不叫账）：
+REM 截断式（oracle 做 floored 修正 `(r+rs2)%rs2`，riscv.c:185-190；
+RVOG 对非 2 幂模数发裸 rem 无修正，负被除数 + 正模数时两模型分叉——
+已知运行时 REM 仅 Kernel `sec MOD 29` 且扇区号非负，对拍出现时按
+实测裁决）；`jal x0,0` 按规格死循环（oracle 当进程终止，riscv.c:244，
+Oberon Trap 的停机路径，本机以 LED mark + `--max-inst`/关窗收场）；
+非法指令走陷阱（oracle 静默当 NOP，镜像在 oracle 上跑得动 ⇒ 不含
+本机不识的指令，不可达）；ROM 对数据读返回内容（oracle 回 0——取指
+与数据读共用总线无法区分，良构客人不数据读 ROM）。对拍通道：
+fbdump PPM vs oracle 截屏逐字节（调色板已一致）、key=@N vs oracle
+手按、mark 观测 LED/IO 丢弃。
+
+D37 同日销账（用户裁决"完成 D37"）：PCLink 串口落地
+device/char/oberon_pclink.c（pclink.c 逐行为移植到 host 文件接缝，
+作业文件 PCLink.REC/PCLink.SND 语义一致，host/ 新增 HostFileRemove）；
+剪贴板落地 device/misc/oberon_clipboard.c + host/clipboard_win.c
+（sdl-clipboard 的 GET/PUT 协议与 CRLF 折叠逐行为移植，Win32
+CF_UNICODETEXT 经 UTF-8 转换，windows.h 只在 host/）；开关寄存器接
+`--switches N`（bit 0 = oracle 的 `-S` 串口引导）；+32 插桩落地
+oberon_io 的 TraceWrite（0xAA 累积文件名/0xCC 压栈/0 弹栈/0xBB 落
+mark 行 + screen 整行——客人 pc 取不到（设备不见 CPU），以无帧行的
+inst=N 戳代替，`--max-inst` 可复现；文件名累积钳在 19 字节，oracle
+此处无界）。台账整行删除。

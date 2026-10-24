@@ -78,3 +78,7 @@ void HostFileClose(HostFile* f) {
   CloseHandle(f->handle);
   free(f);
 }
+
+int HostFileRemove(const char* path) {
+  return DeleteFileA(path) ? 0 : -1;
+}

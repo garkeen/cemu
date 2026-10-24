@@ -119,6 +119,15 @@ typedef struct BoardOpts {
   // over the 8237's channel 2. NULL = no floppy, and firmware then sees no
   // drive at all.
   const char* fda;
+  // Disk image for a machine whose storage is a removable card (-dsk): the
+  // oberon machine's boot ROM loads the system off it over SPI. NULL = no
+  // card, and that machine has nothing to boot from. Machines without such
+  // a slot ignore it.
+  const char* dsk;
+  // Front-panel switches (--switches N) for a machine that has any: bit 0 on
+  // the oberon machine makes its boot ROM load over RS232 instead of the
+  // card (the reference emulator's -S). Machines without switches ignore it.
+  uint32_t switches;
   // The display card's own ROM (-vgabios FILE): the int10 video BIOS a PC's
   // display card carries. NULL = no ROM, and the firmware's int10 stub is all
   // a guest finds — DOS-era programs set their video mode through int10, so
@@ -140,6 +149,7 @@ Board* BoardCreate(const char* name, const BoardOpts* opts);
 Board* SpikeBoardCreate(const BoardOpts* opts);
 Board* X86BoardCreate(const BoardOpts* opts);
 Board* VirtBoardCreate(const BoardOpts* opts);
+Board* OberonBoardCreate(const BoardOpts* opts);
 
 void BoardRun(Board* b, uint64_t max_inst);
 // The run loop's inner batch: steps until cpu->halted, the instruction limit,

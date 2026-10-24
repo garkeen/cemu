@@ -59,20 +59,22 @@ cemu/
     bus/           bus.h/.c     地址空间与译码
     mem/           ram.h/.c     内存
     device/        外设，按类分
-      char/         uart16550
+      char/         uart16550  oberon_pclink（Oberon 机的 PCLink1 文件通道）
       timer/        i8254  clint
       intc/         i8259  lapic  ioapic  plic
-      input/        i8042（PS/2 键盘控制器）
-      storage/      ide（PIIX ATA/ATAPI）
-      video/        vga（VGA 家族核，CGA/EGA 是其兼容模式；+ display.h 显示后端契约）
+      input/        i8042（PS/2 键盘控制器） ps2kbd  ps2mouse  msmouse
+      storage/      ide（PIIX ATA/ATAPI） fdc  oberon_sd（Oberon 机的 SD 卡）
+      video/        vga（VGA 家族核，CGA/EGA 是其兼容模式；+ display.h 显示后端
+                    契约） ramfb（RAM 内单色帧缓冲视图）
       misc/         htif  sifive_test  debug_exit  i440fx  piix3  pci
-                    cmos  port92  fwcfg  debugcon
-    board/         主板：设备布局 + 复位态 + 接线 + 装载 + 运行循环
+                    cmos  port92  fwcfg  debugcon  oberon_io（Oberon 机外设块）
+                    oberon_clipboard（Oberon 机的宿主剪贴板通道）
+      board/         主板：设备布局 + 复位态 + 接线 + 装载 + 运行循环
       board.h/.c    Board 契约 + 工厂
       run.c         运行循环 + 销毁
       loader.h/.c   装载（按 e_machine + EI_CLASS 选 ISA）
       elf.h/.c      ELF 解析
-      spike_min.c  virt.c(+virt_dtb.h)  x86_min.c
+      spike_min.c  virt.c(+virt_dtb.h)  x86_min.c  oberon.c(+oberon_rom.h)
     debug/         debug.h/.c  CEMU_DEBUG 观测中枢；gdbstub.h/.c  RSP 服务端
     host/          host.h  console_win.c  file_win.c  time_win.c
                    display_win.c  input_win.c  sock_win.c
@@ -132,6 +134,7 @@ CLI 仍是 `--machine`（QEMU 惯例）。
 |---|---|---|
 | spike_min | RAM 0x80000000 + HTIF | 阶段 1 起跑 riscv-tests（riscv64 与 riscv32 共用）。tohost 从 ELF 符号表读，spike 同款约定 |
 | virt | DRAM 0x80000000、mask ROM 0x1000（QEMU RV64 复位向量逐字）、CLINT 0x02000000、PLIC 0x0c000000、UART16550 0x10000000、test 0x100000 | 阶段 2 起 OpenSBI（RV64）。权威来源 QEMU hw/riscv/virt.c + dumpdtb/pmemsave 实测；riscv32 需要单独的 virt32 复位 ROM/DTB |
+| oberon | RAM 1MB@0（定死）、帧缓冲窗 0xE7F00（1024×768 1bpp，RAM 内，ramfb 视图）、ROM 0xFFFFF800（bootloader 512 字逐字，来自 oberon-riscv-emu）、IO 块 0xFFFFFFC0（ms 计时器/LED/开关 `--switches`/SPI-SD/PCLink 串口/PS/2 set-2 FIFO/绝对鼠标字/宿主剪贴板/插桩通道），复位 0xFFFFF800，`-dsk` 挂 SD 卡镜像 | Project Oberon（RV 移植）按 oberon-riscv-emu 逐契约复刻；CPU 即现成 riscv32 后端。验收 = 与参考模拟器对拍（fbdump PPM vs 截屏、key=@N vs 手按），镜像引导不进测试套件（用户裁决） |
 | x86_min | 32MB RAM@0（`--mem` 可调，上限 0xFEE00000）、PIC 0x20/0xA0、PIT 0x40、COM1 0x3F8→IRQ4、debug-exit 0xF4、debugcon 0x402、fw_cfg 0x510、i8042 0x60/0x64、port92 0x92、CMOS 0x70/0x71、LAPIC 0xFEE00000、IOAPIC 0xFEC00000、CGA 0xB8000+0x3D0 → VGA 家族核 0xA0000-0xBFFFF+0x3B0-0x3DF（option ROM 走 `-vgabios`）、i440FX+PIIX3+IDE（`--hda/--hdb/--cdrom`）、ROM 窗口 0xC0000-0xFFFFF（`-bios`，复位 F000:FFF0） | 阶段 1.5 起的 x86 平台；PC 芯片组在阶段 4 片 1–14 补齐。引导扇区契约：加载 0x7C00、CS:IP=0000:7C00、DL=0x80 |
 
 对照真机：riscv `qemu-system-riscv64 -M spike -bios none -kernel rv64ui-p-add.elf`；

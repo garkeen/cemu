@@ -18,6 +18,7 @@ typedef struct Args {
   const char* hdb;        // -hdb FILE: primary IDE slave image
   const char* cdrom;      // -cdrom FILE: secondary IDE master CD-ROM image
   const char* fda;        // -fda FILE: the PC's A: floppy image
+  const char* dsk;        // -dsk FILE: a card-slot disk image (oberon board)
   const char* vgabios;    // -vgabios FILE: the display card's option ROM
   const char* display_backend;  // -display win32; NULL = headless
   const char* mouse_name;       // -mouse ps2|serial (NULL = the board's default)
@@ -26,6 +27,7 @@ typedef struct Args {
   uint64_t bin_base;
   uint64_t bin_tohost;
   uint64_t max_inst;
+  uint32_t switches;  // --switches N: a machine's front-panel switches
   int dump_regs;
   int skip_idle;  // --skip-idle: a halted CPU's idle time runs at full speed
   int icount;         // -icount: the emulated clock is declared, not wall time
@@ -57,6 +59,10 @@ static void Usage(void) {
       "  -hdb FILE         x86: primary IDE slave disk image\n"
       "  -cdrom FILE       x86: secondary IDE master CD-ROM image\n"
       "  -fda FILE         x86: floppy image for drive A:\n"
+      "  -dsk FILE         disk image for the machine's card slot (oberon:\n"
+      "                    the SD card the boot ROM loads the system from)\n"
+      "  --switches N      front-panel switches (oberon: bit 0 boots from the\n"
+      "                    RS232 channel instead of the card)\n"
       "  -vgabios FILE     x86: the display card's option ROM (int10 services)\n"
       "  -display win32    open a window on the machine's display card\n"
       "  -s                gdb stub on tcp::1234 (guest runs until attached)\n"
@@ -149,6 +155,13 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       a->cdrom = argv[++i];
     else if (strcmp(arg, "-fda") == 0)
       a->fda = argv[++i];
+    else if (strcmp(arg, "-dsk") == 0)
+      a->dsk = argv[++i];
+    else if (strcmp(arg, "--switches") == 0) {
+      uint64_t v;
+      if (ParseU64(argv[++i], &v) != 0 || v > 0xFFFFFFFFULL) return -1;
+      a->switches = (uint32_t)v;
+    }
     else if (strcmp(arg, "-vgabios") == 0)
       a->vgabios = argv[++i];
     else if (strcmp(arg, "-mouse") == 0)
@@ -159,8 +172,9 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       a->image = arg;
   }
   // An image file is the normal way in; -bios boots the machine from its
-  // firmware ROM instead, and main() rejects boards that cannot do that.
-  if (!a->image && !a->bios_path) return -1;
+  // firmware ROM instead, and -dsk hands a card-slot machine its disk — either
+  // way main() rejects boards that cannot run without a loaded image.
+  if (!a->image && !a->bios_path && !a->dsk) return -1;
   if (a->gdb_wait && !a->gdb_port) {
     LogError("-S needs -s or -gdb");
     return -1;
@@ -207,6 +221,8 @@ int main(int argc, char** argv) {
                     .hdb = a.hdb,
                     .cdrom = a.cdrom,
                     .fda = a.fda,
+                    .dsk = a.dsk,
+                    .switches = a.switches,
                     .vgabios_path = a.vgabios,
                     .skip_idle = a.skip_idle,
                     .mouse = mouse};

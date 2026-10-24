@@ -20,6 +20,9 @@ size_t HostFileRead(HostFile* f, void* buf, size_t n);
 size_t HostFileReadAt(HostFile* f, int64_t off, void* buf, size_t n);
 size_t HostFileWriteAt(HostFile* f, int64_t off, const void* buf, size_t n);
 void HostFileClose(HostFile* f);
+// Deletes a path (the pclink job-file protocol unlinks its job files; a
+// missing path is an error like unlink(2)'s). 0 = removed.
+int HostFileRemove(const char* path);
 
 void HostWriteOut(const char* buf, size_t n);
 void HostWriteErr(const char* buf, size_t n);
@@ -129,5 +132,12 @@ void HostInputPoll();
 // 1 once the user closed the window (the caller ends the emulation).
 int HostDisplayClosed(const HostDisplay* d);
 void HostDisplayFree(HostDisplay* d);
+
+// ---- system clipboard (clipboard_win.c) ---------------------------------------
+// UTF-8 text in and out, the SDL_GetClipboardText / SDL_SetClipboardText
+// contract. HostClipboardGetText returns a malloc'd string (caller frees) or
+// NULL when there is no text; HostClipboardSetText returns 0 on delivery.
+char* HostClipboardGetText(void);
+int HostClipboardSetText(const char* text);
 
 #endif
