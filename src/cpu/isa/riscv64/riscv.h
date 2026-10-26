@@ -145,15 +145,15 @@ static const uint64_t kSatpWmask = (0xfULL << 60) | (0xffffULL << 44) | ((1ULL <
 // : 16"), G = 2 (16-byte granularity, banner "PMP Granularity : 2 bits"),
 // implemented physical address bits 54 (banner "PMP Address Bits : 54").
 enum { kPmpCount = 16, kPmpAddrBits = 54 };
-// pmpcfg byte fields (priv spec 3.7.1): the A field occupies bits 5:4.
+// pmpcfg byte fields (priv spec 3.7.1): the A field occupies bits 4:3.
 enum {
   kPmpR = 1 << 0,
   kPmpW = 1 << 1,
   kPmpX = 1 << 2,
-  kPmpAMask = 3 << 4,
-  kPmpATor = 1 << 4,
-  kPmpANa4 = 2 << 4,
-  kPmpANapot = 3 << 4,
+  kPmpAMask = 3 << 3,
+  kPmpATor = 1 << 3,
+  kPmpANa4 = 2 << 3,
+  kPmpANapot = 3 << 3,
   kPmpL = 1 << 7,
 };
 
@@ -178,6 +178,30 @@ enum {
   kExLoadPageFault = 13,
   kExStorePageFault = 15,
 };
+
+// Sv39/Sv48 translation cache (mmu.c): 512 entries, two ways per set. Each
+// entry carries the exact context its permission/PMP decision was made under
+// (satp, raw and effective privilege, SUM/MXR, ADUE, PMP generation), plus an
+// sfence generation. A lookup compares those fields, so a privilege or satp
+// change simply misses instead of flushing the whole cache; only sfence.vma
+// invalidates entries (gen bump). Keys are 4 KiB virtual pages plus the access
+// class, because permission and PMP checks are per access type.
+enum { kTlbSets = 256, kTlbWays = 2 };
+
+typedef struct RiscvTlbEntry {
+  uint64_t vpn;
+  uint64_t pbase;     // translated page base (paddr & ~0xfff)
+  uint8_t* host;      // host backing of that whole page, NULL unless pure RAM
+  uint64_t gen;       // sfence generation
+  uint64_t satp;      // context fields, stored as decided at fill time
+  uint64_t mstatus;   // SUM | MXR
+  uint64_t menvcfg;   // ADUE
+  uint32_t pmp_gen;
+  uint8_t priv;       // raw privilege (final PMP check mode)
+  uint8_t eff;        // effective translation/permission privilege
+  uint8_t acc;
+  uint8_t pad;
+} RiscvTlbEntry;
 
 typedef struct RiscvState {
   uint64_t misa;
@@ -218,6 +242,10 @@ typedef struct RiscvState {
   uint64_t mhpmevent[kMhpmCount];
   uint64_t pmpcfg[2];  // pmpcfg0/pmpcfg2, 8 entries each (RV64 layout)
   uint64_t pmpaddr[kPmpCount];
+  RiscvTlbEntry tlb[kTlbSets * kTlbWays];
+  uint64_t tlb_gen;    // bumped by sfence.vma; every entry misses afterwards
+  uint32_t tlb_clock;  // way-selection clock for set conflicts
+  uint32_t pmp_gen;    // PMP writes bump this; entries carry their value
   uint8_t priv;
   uint8_t frm;
   uint8_t fflags;
@@ -281,6 +309,10 @@ uint64_t riscv_trap(CpuState* cpu, RiscvState* s, uint64_t cause, uint64_t tval)
 // (priority order MEI, MSI, MTI, SEI, SSI, STI; target-mode gating through
 // delegation and the xIE stack) and injects it as a trap into cpu->pc.
 void riscv_deliver_interrupt(CpuState* cpu, RiscvState* s);
+// Sstc: folds stimecmp vs mtime into the STIP line. Called on the board's
+// idle cadence (every poll while asleep) and every kTimerSyncStride steps,
+// not once per instruction — a host clock read per step was pure cost.
+void riscv_sync_timer(CpuState* cpu, RiscvState* s);
 // xRET helpers return the target PC; the caller routes it through next_pc.
 uint64_t riscv_mret(RiscvState* s);
 uint64_t riscv_sret(RiscvState* s);
@@ -289,7 +321,12 @@ uint64_t riscv_sret(RiscvState* s);
 // matching trap through the frame (page fault for translation failures,
 // access fault for PMP) and longjmps to the step landing pad; success
 // returns the physical address through *paddr.
-int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int acc, uint64_t* paddr);
+// Translates one access, enforcing PMP for its final physical address (the
+// caller's access type and size decide the permission bits). On return `host`
+// is the direct host backing of the page when the whole page is plain RAM, so
+// the caller may read/write without a bus decode.
+int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int size, int acc, uint64_t* paddr,
+                   uint8_t** host);
 // PMP check for a physical range under a privilege mode; 0 = allowed.
 int RiscvPmpAllowed(const RiscvState* s, uint64_t addr, uint64_t len, int acc, int mode);
 

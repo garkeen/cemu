@@ -76,32 +76,43 @@ uint64_t riscv_mem_load(frame* fr, uint64_t vaddr, int size, int acc) {
   // in the ldst templates before the rtl memory op). Fetches don't qualify.
   if (acc != acc_ifetch) RiscvTriggerCheck(fr, rs, kTrigOpLoad, vaddr);
   uint64_t paddr;
-  RiscvTranslate(fr, rs, vaddr, acc, &paddr);  // raises the page fault itself
+  uint8_t* host = NULL;
+  // Translation enforces PMP for this access; its cache stores the host
+  // backing of plain RAM pages, which is the fast path below.
+  RiscvTranslate(fr, rs, vaddr, size, acc, &paddr, &host);
+  if (host && (vaddr & 0xfff) + (uint64_t)size <= 0x1000 && !DebugOn(kDbgMem)) {
+    uint64_t v = 0;
+    memcpy(&v, host + (vaddr & 0xfff), (size_t)size);
+    return v;
+  }
   BusRegion* r;
-  if (!RiscvPmpAllowed(rs, paddr, (uint64_t)size, acc, rs->priv) ||
-      BusProbe(cpu->bus, paddr, size, &r) != 0)
-    raise_(fr, fault_cause(acc), vaddr);
+  if (BusProbe(cpu->bus, paddr, size, &r) != 0)
+    raise_paddr_(fr, fault_cause(acc), vaddr, paddr);
   uint64_t v = BusRead(cpu->bus, paddr, size);
   // The bus category reports device accesses (MMIO and port hits); an
   // instruction fetch is not one — see the x86 funnel's is_fetch.
   if (DebugOn(kDbgBus) && !r->host && acc != acc_ifetch)
     DebugBus(fr, r->ops->name, paddr, size, 1, v);
-  if (DebugOn(kDbgMem)) DebugMem(fr, vaddr, size, acc, v, 1);
+  if (DebugOn(kDbgMem)) DebugMem(fr, vaddr, paddr, size, acc, v, 1);
   return v;
 }
 
 void riscv_mem_store(frame* fr, uint64_t vaddr, int size, uint64_t val) {
   RiscvTriggerCheck(fr, rs, kTrigOpStore, vaddr);  // before the store commits
   uint64_t paddr;
-  RiscvTranslate(fr, rs, vaddr, acc_write, &paddr);
+  uint8_t* host = NULL;
+  RiscvTranslate(fr, rs, vaddr, size, acc_write, &paddr, &host);
+  if (host && (vaddr & 0xfff) + (uint64_t)size <= 0x1000 && !DebugOn(kDbgMem)) {
+    memcpy(host + (vaddr & 0xfff), &val, (size_t)size);
+    return;
+  }
   BusRegion* r;
-  if (!RiscvPmpAllowed(rs, paddr, (uint64_t)size, acc_write, rs->priv) ||
-      BusProbe(cpu->bus, paddr, size, &r) != 0)
-    raise_(fr, kExStoreFault, vaddr);
+  if (BusProbe(cpu->bus, paddr, size, &r) != 0)
+    raise_paddr_(fr, kExStoreFault, vaddr, paddr);
   if (DebugOn(kDbgBus) && !r->host) {
     DebugBus(fr, r->ops->name, paddr, size, 0, val);
   } else if (DebugOn(kDbgMem)) {
-    DebugMem(fr, vaddr, size, acc_write, val, 0);
+    DebugMem(fr, vaddr, paddr, size, acc_write, val, 0);
   }
   BusWrite(cpu->bus, paddr, size, val);
 }
@@ -190,9 +201,9 @@ static uint64_t system_op(frame* fr, uint32_t i) {
       fr->rec.mnemonic = "sfence.vma";
       if (rd(i)) illegal(fr, i);
       // TVM: S-mode fences trap (priv spec 3.1.6.8); U-mode always traps.
-      // No translation cache exists: every access walks the tables.
       if (rs->priv == kPrivUser || (rs->priv == kPrivSupervisor && (rs->mstatus & kMstatusTvm)))
         illegal(fr, i);
+      rs->tlb_gen++;  // the MMU cache (mmu.c) has no finer-grained flush
       return cpu->pc + 4;
     default:
       illegal(fr, i);
@@ -996,11 +1007,11 @@ uint64_t riscv_exec_c(frame* fr, uint16_t i16) {
         x[rdq] = x[2] + imm;
         break;
       }
-      case 1: {  // c.fld
-        uint64_t imm = (uint64_t)((((i16 >> 10) & 7) << 3) | (((i16 >> 5) & 3) << 6));
-        (void)imm;
-        fp_ldst(fr, i16, 0, 1);
+      case 1: {  // c.fld: f[rd'] = mem[x[rs1'] + uimm]
         fr->rec.mnemonic = "c.fld";
+        fp_enter(fr, i16);
+        uint64_t imm = (uint64_t)((((i16 >> 10) & 7) << 3) | (((i16 >> 5) & 3) << 6));
+        f[rdq] = riscv_mem_load(fr, x[rs1q] + imm, 8, acc_read);
         break;
       }
       case 2: {  // c.lw: rd = sext32(mem[x[rs1]+uimm])
@@ -1016,9 +1027,11 @@ uint64_t riscv_exec_c(frame* fr, uint16_t i16) {
         x[rdq] = load(fr, x[rs1q] + imm, 8, 0);
         break;
       }
-      case 5: {  // c.fsd
-        fp_ldst(fr, i16, 1, 1);
+      case 5: {  // c.fsd: mem[x[rs1'] + uimm] = f[rs2']
         fr->rec.mnemonic = "c.fsd";
+        fp_enter(fr, i16);
+        uint64_t imm = (uint64_t)((((i16 >> 10) & 7) << 3) | (((i16 >> 5) & 3) << 6));
+        riscv_mem_store(fr, x[rs1q] + imm, 8, f[rs2q]);
         break;
       }
       case 6: {  // c.sw

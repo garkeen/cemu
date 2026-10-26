@@ -55,13 +55,17 @@ uint64_t riscv_trap(CpuState* cpu, RiscvState* s, uint64_t cause, uint64_t tval)
   }
 }
 
-void riscv_deliver_interrupt(CpuState* cpu, RiscvState* s) {
+void riscv_sync_timer(CpuState* cpu, RiscvState* s) {
   // Sstc: when the machine provides mtime, stimecmp drives the STIP line
   // (QEMU target/riscv does not gate the CSR on menvcfg.STCE). Skipped
   // while stimecmp holds its reset all-ones value so the common path costs
-  // no host clock reads.
+  // no host clock reads. step.c calls this on the idle cadence and every
+  // 1024 steps, not per instruction.
   if (cpu->timer_read && s->stimecmp != ~0ULL)
     riscv_set_ext_irq(cpu, kIrqStip, cpu->timer_read(cpu->timer_dev) >= s->stimecmp);
+}
+
+void riscv_deliver_interrupt(CpuState* cpu, RiscvState* s) {
   uint64_t pending = MipAll(s) & s->mie;
   if (!pending) return;
   // Strict priority order (priv spec 3.1.9): MEI, MSI, MTI, SEI, SSI, STI.
@@ -338,6 +342,7 @@ static void WritePmpCfg(RiscvState* s, int which, uint64_t val) {
     out |= (uint64_t)cfg << (8 * b);
   }
   s->pmpcfg[which] = out;
+  s->pmp_gen++;
 }
 
 static void WritePmpAddr(RiscvState* s, int i, uint64_t val) {
@@ -349,6 +354,7 @@ static void WritePmpAddr(RiscvState* s, int i, uint64_t val) {
   // is locked and TOR (it forms the successor's lower bound).
   if ((cfg & kPmpL) || ((next_cfg & kPmpL) && (next_cfg & kPmpAMask) == kPmpATor)) return;
   s->pmpaddr[i] = val & ((1ULL << kPmpAddrBits) - 1);
+  s->pmp_gen++;
 }
 
 int riscv_csr_write(RiscvState* s, uint64_t addr, uint64_t val, uint64_t next_pc) {
@@ -473,8 +479,15 @@ int riscv_csr_write(RiscvState* s, uint64_t addr, uint64_t val, uint64_t next_pc
     case 0x343:
       s->mtval = val;
       return 0;
-    case 0x344:  // mip: only SSIP is writable (priv spec 3.1.9)
-      s->mip = (s->mip & ~kIrqSsip) | (val & kIrqSsip);
+    case 0x344:  // mip: M-mode software forwarding of S/U interrupts
+      // OpenSBI's timer and IPI forwarding is built on M-mode writing
+      // mip.STIP/SSIP/SEIP (lib/sbi/sbi_timer.c csr_set(CSR_MIP, MIP_STIP)).
+      // The spec leaves these bits to the platform (3.1.9); QEMU made them
+      // M-mode-writable for exactly this firmware (target/riscv csr.c mip
+      // mask), so the machine follows the de-facto contract. S-mode keeps
+      // the sip view below, where only SSIP is software-writable.
+      s->mip = (s->mip & ~(kIrqSsip | kIrqStip | kIrqSeip)) |
+               (val & (kIrqSsip | kIrqStip | kIrqSeip));
       return 0;
     case 0x5A8:
       s->scontext = val;

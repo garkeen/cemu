@@ -34,33 +34,42 @@ static const uint32_t* DebugFbPixels(void* ctx) {
   return m->display_ops->Framebuffer(m->display_dev);
 }
 
+// Host-side servicing (SCANOUT checks, serial FIFOs, virtio pumps, stdin,
+// window messages) is paced rather than run on every retired instruction.
+// Each of those paths self-gates on wall time, and the clock read behind that
+// gate was the interpreter's dominant per-instruction cost. 1024 instructions
+// keeps every device edge inside a millisecond at the speeds this machine runs.
+enum { kPollStrideLog2 = 10 };
+
 int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuState* cpu),
-                  void* cb_ctx) {  while (!m->cpu.halted) {
-    if (m->poll) m->poll(m);
-    // Host input (stdin: the console or a pipe) goes to the board's sinks; the
-    // poll self-gates, so calling it every loop costs almost nothing.
-    HostInputPoll();
-    // CEMU_DEBUG=mouse=/key=: the synthetic pointer and keyboard
-    // (debug/debug.h). A headless run has no window, and a guest-driven test
-    // cannot press a button or a key, so the host input paths would otherwise
-    // be unreachable from a test; these events enter through the same sinks the
-    // window drives.
-    DebugInjection inj;
-    while (DebugNextInjection(m->cpu.inst_count, &inj)) {
-      if (inj.kind == kInjMouse) {
-        if (m->mouse_in) m->mouse_in(m->mouse_ctx, inj.dx, inj.dy, inj.dz, inj.buttons);
-      } else {
-        if (m->key_in) m->key_in(m->key_ctx, inj.scan, inj.extended, inj.up);
+                  void* cb_ctx) {
+  while (!m->cpu.halted) {
+    if ((m->cpu.inst_count & ((1u << kPollStrideLog2) - 1)) == 0 || m->cpu.wait) {
+      if (m->poll) m->poll(m);
+      // Host input (stdin: the console or a pipe) goes to the board's sinks.
+      HostInputPoll();
+      // CEMU_DEBUG=mouse=/key=: the synthetic pointer and keyboard
+      // (debug/debug.h). A headless run has no window, and a guest-driven test
+      // cannot press a button or a key, so the host input paths would otherwise
+      // be unreachable from a test; these events enter through the same sinks the
+      // window drives.
+      DebugInjection inj;
+      while (DebugNextInjection(m->cpu.inst_count, &inj)) {
+        if (inj.kind == kInjMouse) {
+          if (m->mouse_in) m->mouse_in(m->mouse_ctx, inj.dx, inj.dy, inj.dz, inj.buttons);
+        } else {
+          if (m->key_in) m->key_in(m->key_ctx, inj.scan, inj.extended, inj.up);
+        }
       }
-    }
-    if (m->display) {
-      // Attached display window (-display): pump its message queue and stop
-      // the emulation when the user closes it, like QEMU quitting.
-      HostDisplayPump(m->display);
-      if (HostDisplayClosed(m->display)) {
-        LogInfo("display window closed");
-        m->cpu.halted = kCpuExited;
-        break;
+      if (m->display) {
+        // Attached display window (-display): pump its message queue and stop
+        // the emulation when the user closes it, like QEMU quitting.
+        HostDisplayPump(m->display);
+        if (HostDisplayClosed(m->display)) {
+          LogInfo("display window closed");
+          m->cpu.halted = kCpuExited;
+          break;
+        }
       }
     }
     int asleep = m->cpu.wait;

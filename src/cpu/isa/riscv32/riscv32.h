@@ -166,15 +166,15 @@ static const uint64_t kXlenMask = 0xffffffffULL;
 // pmpaddr[33:2] in a 32-bit CSR.
 enum { kPmpCount = 16 };
 
-// pmpcfg byte fields (priv spec 3.7.1): the A field occupies bits 5:4.
+// pmpcfg byte fields (priv spec 3.7.1): the A field occupies bits 4:3.
 enum {
   kPmpR = 1 << 0,
   kPmpW = 1 << 1,
   kPmpX = 1 << 2,
-  kPmpAMask = 3 << 4,
-  kPmpATor = 1 << 4,
-  kPmpANa4 = 2 << 4,
-  kPmpANapot = 3 << 4,
+  kPmpAMask = 3 << 3,
+  kPmpATor = 1 << 3,
+  kPmpANa4 = 2 << 3,
+  kPmpANapot = 3 << 3,
   kPmpL = 1 << 7,
 };
 

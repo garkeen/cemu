@@ -39,6 +39,11 @@ typedef struct insn_rec {
 
 typedef struct trap_rec {
   uint64_t cause, tval;
+  // Access faults: the physical address the access targeted (or the PTE
+  // address when the walk itself faulted). tval alone cannot say whether a
+  // denial came from PMP or from an unmapped device.
+  uint64_t paddr;
+  int has_paddr;
 } trap_rec;
 
 // One step's world: the CPU, the ISA-private state, the record, and the
@@ -60,6 +65,7 @@ enum { acc_ifetch = 0, acc_read, acc_write, acc_amo };
 // the resume point in rec.dnpc. The whole step unwinds — the manual's
 // instruction atomicity.
 _Noreturn void raise_(frame* f, uint64_t cause, uint64_t tval);
+_Noreturn void raise_paddr_(frame* f, uint64_t cause, uint64_t tval, uint64_t paddr);
 
 // ---- the ops table ----------------------------------------------------------
 

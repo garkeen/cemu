@@ -18,6 +18,10 @@ typedef struct BusRegion {
   uint64_t size;
   const DeviceOps* ops;
   void* dev;
+  // Set when another region intersects this one: the smallest-match rule can
+  // then pick the other for some address here, so a one-entry lookup cache
+  // must not short-circuit this region.
+  int overlaps;
   // Direct host backing store. RAM regions expose theirs so the loader can
   // copy images in without device callbacks (same shape as dearchap-tinyemu
   // iomem.h PhysMemoryRange.is_ram/phys_mem); MMIO devices leave it NULL.
@@ -27,6 +31,7 @@ typedef struct BusRegion {
 typedef struct Bus {
   BusRegion regions[32];
   int count;
+  BusRegion* last;  // one-entry FindRegion cache (validated by overlaps/base)
 } Bus;
 
 // Registers an MMIO device window (accesses go through ops->Read/Write).
@@ -49,5 +54,9 @@ uint64_t BusRead(Bus* bus, uint64_t addr, int size);
 void BusWrite(Bus* bus, uint64_t addr, int size, uint64_t val);
 // Returns the host pointer backing [addr, addr+len) inside a RAM region.
 int BusRamRange(Bus* bus, uint64_t addr, uint64_t len, uint8_t** host);
+// Page-granular RAM fast path for the CPU's translation cache: succeeds only
+// when one non-overlapping RAM region backs the whole 4 KiB page at `addr`
+// (page-aligned), so a direct host load/store needs no bus decode.
+int BusRamPage(Bus* bus, uint64_t addr, uint8_t** host);
 
 #endif

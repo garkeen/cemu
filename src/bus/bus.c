@@ -2,6 +2,25 @@
 
 #include "util/log.h"
 
+// Recomputes the "another region intersects me" flag the one-entry lookup
+// cache consults, and drops that cache. Region sets change only at board
+// build / BAR programming, never on the hot path.
+static void RefreshBus(Bus* bus) {
+  bus->last = NULL;
+  for (int i = 0; i < bus->count; i++) {
+    BusRegion* a = &bus->regions[i];
+    a->overlaps = 0;
+    for (int j = 0; j < bus->count; j++) {
+      if (i == j) continue;
+      BusRegion* b = &bus->regions[j];
+      if (a->base < b->base + b->size && b->base < a->base + a->size) {
+        a->overlaps = 1;
+        break;
+      }
+    }
+  }
+}
+
 void BusAddRegion(Bus* bus, uint64_t base, uint64_t size, const DeviceOps* ops, void* dev) {
   if (bus->count >= (int)ARRAY_SIZE(bus->regions))
     Fatal("bus full, cannot map %s at %llx", ops->name, (unsigned long long)base);
@@ -11,6 +30,8 @@ void BusAddRegion(Bus* bus, uint64_t base, uint64_t size, const DeviceOps* ops, 
   r->ops = ops;
   r->dev = dev;
   r->host = NULL;
+  r->overlaps = 0;
+  RefreshBus(bus);
 }
 
 void BusAddRamRegion(Bus* bus, uint64_t base, uint64_t size, const DeviceOps* ops, void* dev,
@@ -24,6 +45,7 @@ void BusRelocateRegion(Bus* bus, const DeviceOps* ops, void* dev, uint64_t base,
     if (bus->regions[i].ops == ops && bus->regions[i].dev == dev) {
       bus->regions[i].base = base;
       bus->regions[i].size = size;
+      RefreshBus(bus);
       return;
     }
   }
@@ -35,6 +57,7 @@ int BusRemoveRegion(Bus* bus, const DeviceOps* ops, void* dev) {
     if (bus->regions[i].ops == ops && bus->regions[i].dev == dev) {
       for (int j = i + 1; j < bus->count; j++) bus->regions[j - 1] = bus->regions[j];
       bus->count--;
+      RefreshBus(bus);
       return 1;
     }
   }
@@ -49,6 +72,10 @@ static BusRegion* FindRegion(Bus* bus, uint64_t addr, int len) {
   // probing near the top of the address space, or a bare-metal guest access,
   // reaches this edge).
   if ((uint64_t)len > ~addr) return NULL;
+  BusRegion* last = bus->last;
+  if (last && !last->overlaps && addr >= last->base &&
+      addr + len <= last->base + last->size)
+    return last;
   BusRegion* best = NULL;
   for (int i = 0; i < bus->count; i++) {
     BusRegion* r = &bus->regions[i];
@@ -56,6 +83,7 @@ static BusRegion* FindRegion(Bus* bus, uint64_t addr, int len) {
       if (!best || r->size < best->size) best = r;
     }
   }
+  bus->last = (best && !best->overlaps) ? best : NULL;
   return best;
 }
 
@@ -75,6 +103,18 @@ void BusWrite(Bus* bus, uint64_t addr, int size, uint64_t val) {
   BusRegion* r = FindRegion(bus, addr, size);
   if (!r) Fatal("write of unmapped address %llx", (unsigned long long)addr);
   r->ops->Write(r->dev, addr, size, val);
+}
+
+int BusRamPage(Bus* bus, uint64_t addr, uint8_t** host) {
+  if (addr & 0xfff) return -1;
+  for (int i = 0; i < bus->count; i++) {
+    BusRegion* r = &bus->regions[i];
+    if (r->host && !r->overlaps && addr >= r->base && addr + 0x1000 <= r->base + r->size) {
+      *host = r->host + (addr - r->base);
+      return 0;
+    }
+  }
+  return -1;
 }
 
 int BusRamRange(Bus* bus, uint64_t addr, uint64_t len, uint8_t** host) {

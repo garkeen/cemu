@@ -25,7 +25,9 @@ enum {
   kDbgScreen = 1 << 10,     // text-screen mirror rows (console with no serial)
   kDbgVgaIo = 1 << 11,      // guest port writes into the video card
   kDbgPcShot = 1 << 12,     // canonical state row at a linear PC checkpoint
-  kDbgAny = 0x1fff,
+  kDbgPmp = 1 << 13,        // PMP denials: the entry that decided the access
+  kDbgVirtio = 1 << 14,     // virtio-mmio queue notify / chain parse / backend
+  kDbgAny = 0x7fff,
 };
 
 int DebugOn(uint32_t cat);
@@ -43,8 +45,8 @@ void DebugInsn(struct frame* f);
 void DebugTrap(struct frame* f);
 
 // In the ISA memory funnels: ld/st + watch rows. addr is linear.
-void DebugMem(struct frame* f, uint64_t addr, int size, int acc, uint64_t val_or_result,
-              int is_load);
+void DebugMem(struct frame* f, uint64_t addr, uint64_t watch_addr, int size, int acc,
+              uint64_t val_or_result, int is_load);
 
 // MMIO/device hit row: called by the funnels when the winning region has no
 // RAM backing. name comes from DeviceOps.
@@ -62,6 +64,19 @@ void DebugGdbNote(const char* note);
 // interrupt-line transitions, host input — have no instruction frame to report.
 // a/b are the two numbers the call site wants in the detail cell.
 void DebugMark(const char* what, int a, int b);
+
+// PMP denial (kDbgPmp): the physical range, the access class and mode, and
+// the lowest-numbered entry that matched (idx = -1: no entry matched).
+// A denied access never reaches the bus, so `bus` rows cannot explain it.
+void DebugPmpDeny(uint64_t addr, int len, int acc, int mode, int idx, unsigned cfg,
+                  uint64_t base, uint64_t size);
+
+// VirtIO transport events (kDbgVirtio): the queue state at notify time, a
+// descriptor chain the transport could not parse, and the backend call. The
+// guest's used-ring wait is invisible in RAM traces, so these rows are the
+// only way to tell "the host never saw the notify" from "the host saw it and
+// dropped the chain". QEMU's virtio_mmio trace events are the counterpart.
+void DebugVirtio(const char* what, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 
 // The argument registers of a BIOS/DOS service call, in the hub's plain-integer
 // form: the hub knows no ISA's register file (AGENTS.md §七's forbidden

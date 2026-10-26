@@ -58,7 +58,7 @@ static uint64_t phys_load(uint64_t addr, int size, int is_fetch) {
   if (BusProbe(cpu->bus, addr, size, &r) != 0) return size == 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
   uint64_t v = BusRead(cpu->bus, addr, size);
   if (DebugOn(kDbgBus) && !r->host && !is_fetch) DebugBus(fr, r->ops->name, addr, size, 1, v);
-  if (DebugOn(kDbgMem)) DebugMem(fr, addr, size, acc_read, v, 1);
+  if (DebugOn(kDbgMem)) DebugMem(fr, addr, addr, size, acc_read, v, 1);
   return v;
 }
 
@@ -69,7 +69,7 @@ static void phys_store(uint64_t addr, int size, uint64_t v) {
   if (DebugOn(kDbgBus) && !r->host) {
     DebugBus(fr, r->ops->name, addr, size, 0, v);
   } else if (DebugOn(kDbgMem)) {
-    DebugMem(fr, addr, size, acc_write, v, 0);
+    DebugMem(fr, addr, addr, size, acc_write, v, 0);
   }
   BusWrite(cpu->bus, addr, size, v);
 }

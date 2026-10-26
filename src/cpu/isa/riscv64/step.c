@@ -27,6 +27,15 @@ static int GdbTrapSignal(uint64_t cause) {
   }
 }
 
+// Interrupt delivery and the Sstc timer line are sampled at the board's
+// 1024-step service boundaries, not every instruction (TinyEMU
+// riscv_cpu_interp checks between blocks). Any instruction boundary is an
+// architecturally valid delivery point, so this only bounds latency; aligning
+// with the board means a line raised by the device poll is taken in the same
+// batch. A sleeping CPU samples every step so wfi still wakes on the first
+// pending line.
+enum { kStepBatch = 1 << 10 };
+
 void riscv_step(CpuState* c) {
   cpu = c;
   rs = (RiscvState*)cpu->priv;
@@ -35,6 +44,16 @@ void riscv_step(CpuState* c) {
   fr->cpu = cpu;
   fr->priv = rs;
   fr->isa = &k_isa_riscv64;
+  // Watchpoints are not a mask bit: DebugOn(kDbgMem) also reports them, and
+  // their rows carry the instruction bytes, so keep the record filled then.
+  int dbg = DebugOn(kDbgAny) || DebugOn(kDbgMem);
+
+  // Sstc STIP is a timer line, not an instruction-stream fact: sampling the
+  // host clock on every step was pure cost. Refresh it at the same batch
+  // boundaries (the board polls while the CPU sleeps, so a sleeping guest
+  // still wakes on time) — well under the timer's own period.
+  int boundary = cpu->wait || (cpu->inst_count & (kStepBatch - 1)) == 0;
+  if (boundary) riscv_sync_timer(cpu, rs);
 
   // wfi sleep: no fetch until an enabled interrupt is pending; cpu->wait is
   // the one sleep flag and the board run loop keeps the timers running.
@@ -42,8 +61,10 @@ void riscv_step(CpuState* c) {
     if (((rs->mip | rs->ext_irq) & rs->mie) == 0) return;
     cpu->wait = 0;
   }
-  riscv_deliver_interrupt(cpu, rs);
-  if (cpu->halted) return;
+  if (boundary) {
+    riscv_deliver_interrupt(cpu, rs);
+    if (cpu->halted) return;
+  }
 
   if (setjmp(fr->raise)) {
     // The trap consumer: take it and land on the vector.
@@ -62,28 +83,45 @@ void riscv_step(CpuState* c) {
 
     fr->rec.pc = cpu->pc;
     fr->rec.dnpc = cpu->pc + 2;  // provisional; corrected to +4 below
-    fr->rec.raw_len = 0;
-    fr->rec.mnemonic = NULL;  // per-step reset (the frame buffer is static)
-    uint16_t half = (uint16_t)riscv_mem_load(fr, cpu->pc, 2, acc_ifetch);
+    if (dbg) {
+      fr->rec.raw_len = 0;
+      fr->rec.mnemonic = NULL;  // per-step reset (the frame buffer is static)
+    }
     uint32_t inst;
     int ilen;
-    if (c_on && (half & 3) != 3) {
-      inst = half;
-      ilen = 2;
+    if (c_on && (cpu->pc & 3) == 0) {
+      // A 4-aligned fetch cannot cross its 4 KiB page, and C code still puts
+      // the deciding low halfword first: one 32-bit read fetches both cases.
+      inst = (uint32_t)riscv_mem_load(fr, cpu->pc, 4, acc_ifetch);
+      if ((inst & 3) != 3) {
+        inst &= 0xffff;
+        ilen = 2;
+      } else {
+        ilen = 4;
+        fr->rec.dnpc = cpu->pc + 4;
+      }
     } else {
-      uint16_t high = (uint16_t)riscv_mem_load(fr, cpu->pc + 2, 2, acc_ifetch);
-      inst = (uint32_t)half | ((uint32_t)high << 16);
-      ilen = 4;
-      fr->rec.dnpc = cpu->pc + 4;
+      uint16_t half = (uint16_t)riscv_mem_load(fr, cpu->pc, 2, acc_ifetch);
+      if (c_on && (half & 3) != 3) {
+        inst = half;
+        ilen = 2;
+      } else {
+        uint16_t high = (uint16_t)riscv_mem_load(fr, cpu->pc + 2, 2, acc_ifetch);
+        inst = (uint32_t)half | ((uint32_t)high << 16);
+        ilen = 4;
+        fr->rec.dnpc = cpu->pc + 4;
+      }
     }
-    fr->rec.raw[0] = (uint8_t)inst;
-    fr->rec.raw[1] = (uint8_t)(inst >> 8);
-    fr->rec.raw_len = (uint8_t)ilen;
-    if (ilen == 4) {
-      fr->rec.raw[2] = (uint8_t)(inst >> 16);
-      fr->rec.raw[3] = (uint8_t)(inst >> 24);
+    if (dbg) {
+      fr->rec.raw[0] = (uint8_t)inst;
+      fr->rec.raw[1] = (uint8_t)(inst >> 8);
+      fr->rec.raw_len = (uint8_t)ilen;
+      if (ilen == 4) {
+        fr->rec.raw[2] = (uint8_t)(inst >> 16);
+        fr->rec.raw[3] = (uint8_t)(inst >> 24);
+      }
+      fr->rec.len = (uint8_t)ilen;
     }
-    fr->rec.len = (uint8_t)ilen;
 
     // Execute triggers fire on the fetched pc before the instruction runs
     // (Sdtrig 5.3.12; xiangshanNEMU checks at decode — after the fetch, so a
@@ -94,7 +132,7 @@ void riscv_step(CpuState* c) {
     x[0] = 0;
     cpu->pc = ilen == 2 ? riscv_exec_c(fr, (uint16_t)inst) : riscv_exec_inst(fr, inst);
     fr->rec.dnpc = cpu->pc;
-    DebugInsn(fr);
+    if (dbg) DebugInsn(fr);
   }
 
   // Counter increments gated by mcountinhibit; a write to a counter

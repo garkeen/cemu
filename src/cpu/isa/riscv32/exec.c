@@ -99,13 +99,13 @@ uint64_t riscv32_mem_load(frame* fr, uint64_t vaddr, int size, int acc) {
   BusRegion* r;
   if (!Riscv32PmpAllowed(rs, paddr, (uint64_t)size, acc, rs->priv) ||
       BusProbe(rv32_cpu->bus, paddr, size, &r) != 0)
-    raise_(fr, fault_cause(acc), vaddr);
+    raise_paddr_(fr, fault_cause(acc), vaddr, paddr);
   uint64_t v = BusRead(rv32_cpu->bus, paddr, size);
   // The bus category reports device accesses (MMIO and port hits); an
   // instruction fetch is not one — see the x86 funnel's is_fetch.
   if (DebugOn(kDbgBus) && !r->host && acc != acc_ifetch)
     DebugBus(fr, r->ops->name, paddr, size, 1, v);
-  if (DebugOn(kDbgMem)) DebugMem(fr, vaddr, size, acc, v, 1);
+  if (DebugOn(kDbgMem)) DebugMem(fr, vaddr, paddr, size, acc, v, 1);
   return v;
 }
 
@@ -116,11 +116,11 @@ void riscv32_mem_store(frame* fr, uint64_t vaddr, int size, uint64_t val) {
   BusRegion* r;
   if (!Riscv32PmpAllowed(rs, paddr, (uint64_t)size, acc_write, rs->priv) ||
       BusProbe(rv32_cpu->bus, paddr, size, &r) != 0)
-    raise_(fr, kExStoreFault, vaddr);
+    raise_paddr_(fr, kExStoreFault, vaddr, paddr);
   if (DebugOn(kDbgBus) && !r->host) {
     DebugBus(fr, r->ops->name, paddr, size, 0, val);
   } else if (DebugOn(kDbgMem)) {
-    DebugMem(fr, vaddr, size, acc_write, val, 0);
+    DebugMem(fr, vaddr, paddr, size, acc_write, val, 0);
   }
   BusWrite(rv32_cpu->bus, paddr, size, val);
 }

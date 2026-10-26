@@ -202,6 +202,11 @@ CEMU_DEBUG = item[,item...]
   trap                      异常/中断/陷入事件
   bus                       MMIO / IO 端口命中（**不含指令取指**：固件在 ROM 窗口
                            执行时取指行会淹没一切）
+  pmp                       PMP 拒绝事件（每次拒绝一行）：
+                           `pmp-deny addr=<物理地址> len=4 w S entry=0 cfg=18 base=... size=...`
+                           —— 被拒绝的访问不会到达总线，`bus` 一行都不出；这一行给出
+                           最低号命中条目的 cfg 与解码区间（`entry=none` = 无规则命中）。
+                           riscv 的负载/存储/取指与页表走查都过 PMP，32/64 两个后端同款
   regs=N                    每 N 条指令打一次全寄存器表；halt/exit 必打
   watch=ADDR:SIZE[:r|w|rw]  地址观测（可重复逗号分隔；数字按 C 字面量解析，
                             **十六进制必须写 0x**，否则静默丢弃——现已改为报错）。
@@ -299,7 +304,9 @@ CEMU_DEBUG = item[,item...]
   一行 BIOS 调用要装下 `int/ax/bx/cx/dx/ds/es/at`，宽度不够就等于为它加宽了列
   还是把它截了），KIND：
   I 指令 / L 读 / S 写 / T 陷阱 / B 设备 / W 观测点 / O IR 操作转储 / K 标记
-  （K 与 screen 都是无帧行：K 走事件表，screen 走整行文本）。
+  （K 与 screen 都是无帧行：K 走事件表，screen 走整行文本）。T 行的 DETAIL 在
+  访问故障时带 `paddr=`（被访问的物理地址；页表走查本身故障时是 PTE 地址）：
+  tval 只给虚拟地址，PMP 拒绝与未映射设备在它上面分不开。
 - **PC 列打的是取指地址（线性地址），`->` 用同一条线性约定**：x86 实模式的
   `cpu->pc` 是 EIP；解释器在取指时把 CS base + EIP 记进 `rec.pc_lin`，提交后把
   新 CS base + dnpc 记进 `rec.dnpc_lin`，所以一行里的 `->` 就是下一行的 `pc=`
@@ -327,6 +334,10 @@ CEMU_DEBUG="trace:line,watch=c0e4:4:w" ./cemu.exe ... img 2> w.txt
 # 异常去向不明 / 设备寄存器被谁读写
 CEMU_DEBUG="trap,trace:line" ./cemu.exe ... img 2> t.txt
 CEMU_DEBUG="bus,trace:line" ./cemu.exe ... img 2> b.txt
+
+# 访问故障（load/store access fault）：trap 行先给 paddr；若总线里明明有
+# 这个设备，就是 PMP 拒绝，再用 pmp 看命中的是哪个条目、解码成了什么区间
+CEMU_DEBUG="trap,pmp" ./cemu.exe ... img 2> p.txt
 
 # 卡死：哪两类事件在打转（退出汇总的 suppressed 计数暴露循环构成）
 CEMU_DEBUG="trace:line,mem,budget=50000" ./cemu.exe ... img 2> t.txt

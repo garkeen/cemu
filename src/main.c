@@ -14,6 +14,8 @@ typedef struct Args {
   const char* machine_name;
   const char* log_file;
   const char* bios_path;  // -bios FILE: firmware ROM image (x86 PC board)
+  const char* kernel_path;  // -kernel FILE: payload at board kernel_base
+  const char* append;  // -append STR: cmdline into /chosen/bootargs
   const char* hda;        // -hda FILE: primary IDE master image (x86 PC board)
   const char* hdb;        // -hdb FILE: primary IDE slave image
   const char* cdrom;      // -cdrom FILE: secondary IDE master CD-ROM image
@@ -55,6 +57,9 @@ static void Usage(void) {
       "                    instruction, so timer edges are a function of the\n"
       "                    instruction stream and a run reproduces exactly\n"
       "  -bios FILE        x86: map a firmware ROM image and reset into it\n"
+      "  -kernel FILE      raw payload at the board's kernel address (virt:\n"
+      "                    0x80200000, what OpenSBI fw_jump jumps to)\n"
+      "  -append STR       kernel command line -> device tree /chosen/bootargs\n"
       "  -hda FILE         x86: primary IDE master disk image\n"
       "  -hdb FILE         x86: primary IDE slave disk image\n"
       "  -cdrom FILE       x86: secondary IDE master CD-ROM image\n"
@@ -147,6 +152,10 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       a->gdb_wait = 1;
     else if (strcmp(arg, "-bios") == 0)
       a->bios_path = argv[++i];
+    else if (strcmp(arg, "-kernel") == 0)
+      a->kernel_path = argv[++i];
+    else if (strcmp(arg, "-append") == 0)
+      a->append = argv[++i];
     else if (strcmp(arg, "-hda") == 0)
       a->hda = argv[++i];
     else if (strcmp(arg, "-hdb") == 0)
@@ -217,6 +226,8 @@ int main(int argc, char** argv) {
   BoardOpts opts = {.ram_base = a.mem_base,
                     .ram_size = a.mem_size,
                     .bios_path = a.bios_path,
+                    .kernel_path = a.kernel_path,
+                    .append = a.append,
                     .hda = a.hda,
                     .hdb = a.hdb,
                     .cdrom = a.cdrom,
@@ -228,6 +239,40 @@ int main(int argc, char** argv) {
                     .mouse = mouse};
   Board* m = BoardCreate(a.machine_name, &opts);
   if (!m) return kExitHostFailure;
+
+  // -kernel: raw payload into the board's kernel slot (the firmware's
+  // follow-on image, QEMU's -kernel). Pure byte delivery -- no entry, no
+  // ISA, the firmware owns what happens to it.
+  if (a.kernel_path) {
+    if (!m->kernel_base) {
+      LogError("machine %s has no kernel slot", a.machine_name);
+      BoardDestroy(m);
+      return kExitHostFailure;
+    }
+    HostFile* kf = HostFileOpenRead(a.kernel_path);
+    if (!kf) {
+      LogError("cannot open kernel '%s'", a.kernel_path);
+      BoardDestroy(m);
+      return kExitHostFailure;
+    }
+    static char kbuf[1 << 16];
+    uint64_t off = 0;
+    size_t n;
+    while ((n = HostFileRead(kf, kbuf, sizeof kbuf)) > 0) {
+      uint8_t* dst;
+      if (BusRamRange(&m->bus, m->kernel_base + off, n, &dst) != 0) {
+        LogError("kernel image runs past RAM at +0x%llx", (unsigned long long)off);
+        HostFileClose(kf);
+        BoardDestroy(m);
+        return kExitHostFailure;
+      }
+      memcpy(dst, kbuf, n);
+      off += n;
+    }
+    HostFileClose(kf);
+    LogInfo("kernel %s: 0x%llx bytes at 0x%llx", a.kernel_path,
+            (unsigned long long)off, (unsigned long long)m->kernel_base);
+  }
 
   uint64_t bin_base = a.bin_base ? a.bin_base : m->bin_base;
   LoadResult lr;

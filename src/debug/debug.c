@@ -546,6 +546,10 @@ void DebugInit(void) {
       g_mask |= kDbgGdb;
     else if (!strcmp(tok, "mark"))
       g_mask |= kDbgMark;
+    else if (!strcmp(tok, "pmp"))
+      g_mask |= kDbgPmp;
+    else if (!strcmp(tok, "virtio"))
+      g_mask |= kDbgVirtio;
     else if (!strcmp(tok, "screen"))
       g_mask |= kDbgScreen;
     else if (!strcmp(tok, "vga-io"))
@@ -577,7 +581,7 @@ void DebugInit(void) {
   }
   if (g_mask &
           (kDbgTraceTable | kDbgMem | kDbgTrap | kDbgBus | kDbgGdb | kDbgMark |
-           kDbgScreen | kDbgVgaIo) ||
+           kDbgScreen | kDbgVgaIo | kDbgPmp | kDbgVirtio) ||
       g_nwatch) {
     g_tbl = TableOpen(kEventCols, 6, g_ascii, g_header_every);
     TableHeader(g_tbl);
@@ -811,17 +815,21 @@ void DebugTrap(frame* f) {
   g_traps++;
   if (!DebugOn(kDbgTrap) || !Allow(kDbgTrap)) return;
   RowBegin(g_tbl, 'T', f);
-  char det[96];
+  char det[128];
   const char* cn = f->isa->cause_name ? f->isa->cause_name(f->trap.cause) : NULL;
-  snprintf(det, sizeof(det), "%s=%llu tval=%016llx -> %016llx", cn ? cn : "cause",
-           (unsigned long long)f->trap.cause, (unsigned long long)f->trap.tval,
-           (unsigned long long)FrameDnpc(f));
+  int n = snprintf(det, sizeof(det), "%s=%llu tval=%016llx", cn ? cn : "cause",
+                   (unsigned long long)f->trap.cause, (unsigned long long)f->trap.tval);
+  if (f->trap.has_paddr)
+    n += snprintf(det + n, sizeof(det) - (size_t)n, " paddr=%016llx",
+                  (unsigned long long)f->trap.paddr);
+  snprintf(det + n, sizeof(det) - (size_t)n, " -> %016llx", (unsigned long long)FrameDnpc(f));
   TableRowCell(g_tbl, det);
   CellFlags(g_tbl, f);
   TableRowEnd(g_tbl);
 }
 
-void DebugMem(frame* f, uint64_t addr, int size, int acc, uint64_t val_or_result, int is_load) {
+void DebugMem(frame* f, uint64_t addr, uint64_t watch_addr, int size, int acc,
+              uint64_t val_or_result, int is_load) {
   // Fetch rows: the instruction is still being assembled, so PC/RAW/
   // MNEMONIC are mid-fill. Fetches are their own access class.
   int mid_fetch = acc == 0;  // acc_ifetch: rec still mid-fill
@@ -840,7 +848,7 @@ void DebugMem(frame* f, uint64_t addr, int size, int acc, uint64_t val_or_result
       TableRowEnd(g_tbl);
     }
   }
-  if (DebugWatchHit(addr, size, is_load)) {
+  if (DebugWatchHit(watch_addr, size, is_load)) {
     if (mid_fetch)
       RowBeginBare(g_tbl, 'W');
     else
@@ -897,6 +905,37 @@ void DebugMark(const char* what, int a, int b) {
   RowBeginBare(g_tbl, 'K');
   char det[80];
   snprintf(det, sizeof(det), "%s a=%d b=0x%x", what, a, (unsigned)b);
+  TableRowCell(g_tbl, det);
+  TableRowEnd(g_tbl);
+}
+
+void DebugVirtio(const char* what, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  if (!DebugOn(kDbgVirtio) || !Allow(kDbgVirtio)) return;
+  RowBeginBare(g_tbl, 'K');
+  char det[112];
+  snprintf(det, sizeof(det), "virtio %s a=%llx b=%llx c=%llx d=%llx", what,
+           (unsigned long long)a, (unsigned long long)b, (unsigned long long)c,
+           (unsigned long long)d);
+  TableRowCell(g_tbl, det);
+  TableRowEnd(g_tbl);
+}
+
+void DebugPmpDeny(uint64_t addr, int len, int acc, int mode, int idx, unsigned cfg,
+                  uint64_t base, uint64_t size) {
+  if (!DebugOn(kDbgPmp) || !Allow(kDbgPmp)) return;
+  static const char kAcc[] = "irwa";
+  RowBeginBare(g_tbl, 'K');
+  char det[112];
+  if (idx < 0)
+    snprintf(det, sizeof(det), "pmp-deny addr=%llx len=%d %c %c entry=none",
+             (unsigned long long)addr, len, kAcc[acc & 3],
+             mode == 3 ? 'M' : mode == 1 ? 'S' : 'U');
+  else
+    snprintf(det, sizeof(det),
+             "pmp-deny addr=%llx len=%d %c %c entry=%d cfg=%02x base=%llx size=%llx",
+             (unsigned long long)addr, len, kAcc[acc & 3],
+             mode == 3 ? 'M' : mode == 1 ? 'S' : 'U', idx, cfg, (unsigned long long)base,
+             (unsigned long long)size);
   TableRowCell(g_tbl, det);
   TableRowEnd(g_tbl);
 }

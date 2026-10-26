@@ -25,6 +25,10 @@ typedef struct Board {
   HtifDevice htif;    // attached only when the loaded image speaks HTIF
   RamDevice* ram;     // main RAM, freed by BoardDestroy
   uint64_t bin_base;  // where the board expects raw images to load
+  // Where -kernel lands (QEMU's -kernel contract: the firmware's follow-on
+  // payload at a fixed board address, e.g. the virt machine's 0x80200000
+  // that OpenSBI fw_jump jumps to). 0 = the board takes no -kernel.
+  uint64_t kernel_base;
   // The CPU model this board runs when execution does not come from a loaded
   // image at all — a PC resetting into its firmware ROM. NULL = the board can
   // only run an image, which then names its own ISA.
@@ -128,6 +132,14 @@ typedef struct BoardOpts {
   // the oberon machine makes its boot ROM load over RS232 instead of the
   // card (the reference emulator's -S). Machines without switches ignore it.
   uint32_t switches;
+  // Follow-on payload for a firmware-boot machine (-kernel FILE): raw bytes
+  // to the board's kernel_base. NULL = none. Boards without a kernel_base
+  // ignore it.
+  const char* kernel_path;
+  // Kernel command line (-append STRING), the QEMU option of the same name:
+  // delivered to the firmware through the device tree's /chosen/bootargs.
+  // NULL = leave the tree as the board built it.
+  const char* append;
   // The display card's own ROM (-vgabios FILE): the int10 video BIOS a PC's
   // display card carries. NULL = no ROM, and the firmware's int10 stub is all
   // a guest finds — DOS-era programs set their video mode through int10, so

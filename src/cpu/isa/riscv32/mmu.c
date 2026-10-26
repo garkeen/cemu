@@ -11,6 +11,7 @@
 // Faults raise through the frame (raise_): translation failures page-fault,
 // PMP and unmapped-physical failures access-fault, each with the faulting
 // virtual address in tval.
+#include "debug/debug.h"
 #include "riscv32.h"
 
 // Sv32 PTE fields (priv spec 4.3.2).
@@ -59,10 +60,12 @@ static int PmpRegion(const Riscv32State* s, int i, uint64_t* base, uint64_t* siz
       *size = kSv32PhysSize;
       return 1;
     }
+    // A run of n trailing ones encodes a 2^(n+3)-byte region (priv spec
+    // 3.7.1; OpenSBI sbi_pmp_decode's len = ctz(~addr) + PMP_SHIFT + 1).
     int n = 0;  // count of trailing ones in pmpaddr
     while (!((inv >> n) & 1)) n++;
     *base = (addr >> n) << (n + 2);
-    *size = 1ULL << (n + 2);
+    *size = 1ULL << (n + 3);
     return 1;
   }
   return 0;  // A = OFF
@@ -81,11 +84,16 @@ int Riscv32PmpAllowed(const Riscv32State* s, uint64_t addr, uint64_t len, int ac
     if (!any) continue;
     // The lowest-numbered matching entry decides; an access that straddles
     // an entry boundary is denied (xiangshanNEMU pmp_check_permission).
-    if (!(addr >= base && addr + len <= base + size)) return 0;
+    if (!(addr >= base && addr + len <= base + size)) {
+      DebugPmpDeny(addr, (int)len, acc, mode, i, PmpCfg(s, i), base, size);
+      return 0;
+    }
     uint8_t cfg = PmpCfg(s, i);
     if (mode == kPrivMachine && !(cfg & kPmpL)) return 1;  // M passes unlocked
-    if ((need_r && !(cfg & kPmpR)) || (need_w && !(cfg & kPmpW)) || (need_x && !(cfg & kPmpX)))
+    if ((need_r && !(cfg & kPmpR)) || (need_w && !(cfg & kPmpW)) || (need_x && !(cfg & kPmpX))) {
+      DebugPmpDeny(addr, (int)len, acc, mode, i, cfg, base, size);
       return 0;
+    }
     return 1;
   }
   if (!active) return 1;  // no entry ever configured: allowed (QEMU pmp.c
@@ -94,7 +102,9 @@ int Riscv32PmpAllowed(const Riscv32State* s, uint64_t addr, uint64_t len, int ac
                          // without any SBI to program PMP first. gem5 pmp.cc
                          // follows the priv spec 3.7 wording instead and
                          // fails S/U here; the spike machine models QEMU.)
-  return mode == kPrivMachine;  // rules exist but none match: M passes, S/U are denied
+  if (mode == kPrivMachine) return 1;  // rules exist but none match: M passes
+  DebugPmpDeny(addr, (int)len, acc, mode, -1, 0, 0, 0);
+  return 0;  // S/U denied when no rule matched
 }
 
 // ---- Sv32 (priv spec 4.3.2 / 5.3) ----
@@ -116,7 +126,7 @@ static int PageFaultCause(int acc) {
 static uint32_t PteRead(frame* f, Riscv32State* s, uint64_t pte_addr, int acc) {
   if (!Riscv32PmpAllowed(s, pte_addr, kSv32PteSize, acc_read, kPrivSupervisor) ||
       BusProbe(f->cpu->bus, pte_addr, kSv32PteSize, NULL) != 0) {
-    raise_(f, AccessFaultCause(acc), pte_addr);
+    raise_paddr_(f, AccessFaultCause(acc), pte_addr, pte_addr);
   }
   return (uint32_t)BusRead(f->cpu->bus, pte_addr, kSv32PteSize);
 }
@@ -185,7 +195,7 @@ int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int acc, uint64_
     // The PTE lives in RAM on every machine that pages; a missing region
     // means it no longer does, which is an access fault.
     if (BusProbe(f->cpu->bus, pte_addr, kSv32PteSize, NULL) != 0) {
-      raise_(f, AccessFaultCause(acc), vaddr);
+      raise_paddr_(f, AccessFaultCause(acc), vaddr, pte_addr);
     }
     BusWrite(f->cpu->bus, pte_addr, kSv32PteSize, new_pte);
     pte = new_pte;

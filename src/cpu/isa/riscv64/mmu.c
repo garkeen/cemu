@@ -1,13 +1,16 @@
 // Sv39/Sv48 address translation and PMP enforcement. Semantics translated from
 // xiangshanNEMU src/isa/riscv64/system/mmu.c (ptw, check_permission,
 // pmp_check_permission_with_mode); divergences follow the priv spec or are
-// calibrated against QEMU behavior where noted. The interpreter walks page
-// tables on every access — there is no translation cache, so sfence.vma has
-// nothing to flush beyond its permission checks.
+// calibrated against QEMU behavior where noted. Successful translations are
+// cached (RiscvTlbEntry): page walk, PMP and A/D handling all happen at fill
+// time, and the cache stores the host backing of plain RAM pages so the hot
+// load/store path is a direct memcpy. riscv_step invalidates the cache on any
+// context change; sfence.vma invalidates it directly.
 //
 // Faults raise through the frame (raise_): translation failures page-fault,
 // PMP and unmapped-physical failures access-fault, each with the faulting
 // virtual address in tval.
+#include "debug/debug.h"
 #include "riscv.h"
 
 // Sv39 PTE fields (priv spec 4.3.2).
@@ -59,10 +62,12 @@ static int PmpRegion(const RiscvState* s, int i, uint64_t* base, uint64_t* size)
       *size = ~0ULL;
       return 1;
     }
+    // A run of n trailing ones encodes a 2^(n+3)-byte region (priv spec
+    // 3.7.1; OpenSBI sbi_pmp_decode's len = ctz(~addr) + PMP_SHIFT + 1).
     int n = 0;  // count of trailing ones in pmpaddr
     while (!(inv >> n & 1)) n++;
     *base = (addr >> n) << (n + 2);
-    *size = 1ULL << (n + 2);
+    *size = 1ULL << (n + 3);
     return 1;
   }
   return 0;  // A = OFF
@@ -81,11 +86,16 @@ int RiscvPmpAllowed(const RiscvState* s, uint64_t addr, uint64_t len, int acc, i
     if (!any) continue;
     // The lowest-numbered matching entry decides; an access that straddles
     // an entry boundary is denied (xiangshanNEMU pmp_check_permission).
-    if (!(addr >= base && addr + len <= base + size)) return 0;
+    if (!(addr >= base && addr + len <= base + size)) {
+      DebugPmpDeny(addr, (int)len, acc, mode, i, PmpCfg(s, i), base, size);
+      return 0;
+    }
     uint8_t cfg = PmpCfg(s, i);
     if (mode == kPrivMachine && !(cfg & kPmpL)) return 1;  // M passes unlocked
-    if ((need_r && !(cfg & kPmpR)) || (need_w && !(cfg & kPmpW)) || (need_x && !(cfg & kPmpX)))
+    if ((need_r && !(cfg & kPmpR)) || (need_w && !(cfg & kPmpW)) || (need_x && !(cfg & kPmpX))) {
+      DebugPmpDeny(addr, (int)len, acc, mode, i, cfg, base, size);
       return 0;
+    }
     return 1;
   }
   if (!active) return 1;  // no entry ever configured: allowed (QEMU pmp.c
@@ -94,7 +104,9 @@ int RiscvPmpAllowed(const RiscvState* s, uint64_t addr, uint64_t len, int acc, i
                          // without any SBI to program PMP first. gem5 pmp.cc
                          // follows the priv spec 3.7 wording instead and
                          // fails S/U here; the spike machine models QEMU.)
-  return mode == kPrivMachine;  // rules exist but none match: M passes, S/U are denied
+  if (mode == kPrivMachine) return 1;  // rules exist but none match: M passes
+  DebugPmpDeny(addr, (int)len, acc, mode, -1, 0, 0, 0);
+  return 0;  // S/U denied when no rule matched
 }
 
 // ---- Sv39/Sv48 (priv spec 4.3.2 / 4.4.1 / 5.3) ----
@@ -116,12 +128,14 @@ static int PageFaultCause(int acc) {
 static uint64_t PteRead(frame* f, RiscvState* s, uint64_t pte_addr, int acc) {
   if (!RiscvPmpAllowed(s, pte_addr, 8, acc_read, kPrivSupervisor) ||
       BusProbe(f->cpu->bus, pte_addr, 8, NULL) != 0) {
-    raise_(f, AccessFaultCause(acc), pte_addr);
+    raise_paddr_(f, AccessFaultCause(acc), pte_addr, pte_addr);
   }
   return BusRead(f->cpu->bus, pte_addr, 8);
 }
 
-int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int acc, uint64_t* paddr) {
+int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int size, int acc, uint64_t* paddr,
+                   uint8_t** host) {
+  if (host) *host = NULL;
   // Effective privilege for data accesses under MPRV uses MPP (priv spec
   // 3.1.6.6); instruction fetch always uses the current mode.
   int eff = s->priv;
@@ -130,7 +144,30 @@ int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int acc, uint64_t* p
   uint64_t satp_mode = (s->satp >> 60) & 0xf;
   if (eff == kPrivMachine || satp_mode == kSatpModeBare) {
     *paddr = vaddr;
+    if (!RiscvPmpAllowed(s, vaddr, (uint64_t)size, acc, s->priv))
+      raise_paddr_(f, AccessFaultCause(acc), vaddr, vaddr);
+    if (host) BusRamPage(f->cpu->bus, vaddr & ~0xfffULL, host);
     return 0;
+  }
+
+  // Translation cache: a hit skips the walk, its PMP checks and the A/D
+  // writes. Each entry records the context its decision was made under, so a
+  // miss on any field simply refills; sfence.vma bumps the generation. Set
+  // index mixes the access class in because permissions are per access type.
+  uint64_t vpn = vaddr >> 12;
+  uint64_t msb = s->mstatus & (kMstatusSum | kMstatusMxr);
+  uint64_t menv = s->menvcfg & kMenvcfgAdue;
+  uint32_t set = (uint32_t)(vpn ^ ((uint64_t)acc * 0x9E3779B97F4A7C15ULL)) & (kTlbSets - 1);
+  RiscvTlbEntry* ways = &s->tlb[(size_t)set * kTlbWays];
+  for (int w = 0; w < kTlbWays; w++) {
+    RiscvTlbEntry* e = &ways[w];
+    if (e->gen == s->tlb_gen && e->vpn == vpn && e->acc == (uint8_t)acc &&
+        e->satp == s->satp && e->priv == s->priv && e->eff == (uint8_t)eff &&
+        e->mstatus == msb && e->menvcfg == menv && e->pmp_gen == s->pmp_gen) {
+      *paddr = e->pbase | (vaddr & 0xfff);
+      if (host) *host = e->host;
+      return 0;
+    }
   }
 
   // Sv39 walks three levels, Sv48 four (priv spec 4.4.1); the walk itself is
@@ -201,7 +238,7 @@ int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int acc, uint64_t* p
     // The PTE lives in RAM on every machine that pages; a missing region
     // means it no longer does, which is an access fault.
     if (BusProbe(f->cpu->bus, pte_addr, 8, NULL) != 0) {
-      raise_(f, AccessFaultCause(acc), vaddr);
+      raise_paddr_(f, AccessFaultCause(acc), vaddr, pte_addr);
     }
     BusWrite(f->cpu->bus, pte_addr, 8, new_pte);
     pte = new_pte;
@@ -218,6 +255,29 @@ int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int acc, uint64_t* p
   } else {
     *paddr = (ppn << 12) | (vaddr & 0xfff);
   }
+  // PMP for the final physical access is decided once, at fill time: a cache
+  // hit may then skip the 16-entry scan. The entry records pmp_gen, so a PMP
+  // CSR write makes every old decision miss.
+  if (!RiscvPmpAllowed(s, *paddr, (uint64_t)size, acc, s->priv))
+    raise_paddr_(f, AccessFaultCause(acc), vaddr, *paddr);
+  uint8_t* h = NULL;
+  BusRamPage(f->cpu->bus, *paddr & ~0xfffULL, &h);
+  // Prefer a slot invalidated by sfence; otherwise alternate ways so one hot
+  // page cannot pin a set forever.
+  int w = ways[0].gen != s->tlb_gen ? 0 : ways[1].gen != s->tlb_gen ? 1 : (int)(s->tlb_clock++ & 1);
+  RiscvTlbEntry* te = &ways[w];
+  te->vpn = vpn;
+  te->pbase = *paddr & ~0xfffULL;
+  te->host = h;
+  te->acc = (uint8_t)acc;
+  te->gen = s->tlb_gen;
+  te->satp = s->satp;
+  te->priv = s->priv;
+  te->eff = (uint8_t)eff;
+  te->mstatus = msb;
+  te->menvcfg = menv;
+  te->pmp_gen = s->pmp_gen;
+  if (host) *host = h;
   return 0;
 
 page_fault:

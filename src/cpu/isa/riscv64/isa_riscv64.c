@@ -20,6 +20,7 @@ void riscv_init(CpuState* cpu) {
     memset(s, 0, sizeof(*s));
   }
   s->priv = kPrivMachine;
+  s->tlb_gen = 1;  // zeroed cache entries (gen 0) must not read as valid
   s->mstatus = 2ULL << 32;           // mstatus.UXL = 2 (U-mode is RV64)
   s->misa = kMisaSupported;          // RV64IMAFDC + S/U (mstatus.UXL says U is RV64)
   s->tdata1[0] = kTrigTypeMcontrol6;  // both triggers are mcontrol6 (Sdtrig)

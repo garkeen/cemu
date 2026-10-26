@@ -532,8 +532,15 @@ int riscv32_csr_write(Riscv32State* s, uint64_t addr, uint64_t val, uint64_t nex
     case 0x343:
       s->mtval = (uint32_t)val;
       return 0;
-    case 0x344:  // mip: only SSIP is writable (priv spec 3.1.9)
-      s->mip = (s->mip & ~kIrqSsip) | (val & kIrqSsip);
+    case 0x344:  // mip: M-mode software forwarding of S/U interrupts
+      // OpenSBI's timer and IPI forwarding is built on M-mode writing
+      // mip.STIP/SSIP/SEIP (lib/sbi/sbi_timer.c csr_set(CSR_MIP, MIP_STIP)).
+      // The spec leaves these bits to the platform (3.1.9); QEMU made them
+      // M-mode-writable for exactly this firmware (target/riscv csr.c mip
+      // mask), so the machine follows the de-facto contract. S-mode keeps
+      // the sip view below, where only SSIP is software-writable.
+      s->mip = (s->mip & ~(kIrqSsip | kIrqStip | kIrqSeip)) |
+               (val & (kIrqSsip | kIrqStip | kIrqSeip));
       return 0;
     case 0x5A8:
       s->scontext = (uint32_t)val;
