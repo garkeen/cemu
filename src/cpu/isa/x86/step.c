@@ -90,7 +90,15 @@ void x86_step(CpuState* c) {
   int intr_shadow = s->intr_inhibit;
   s->intr_inhibit = 0;
 
-  memset(&g, 0, sizeof(g));
+  // Only the fields that can survive from the previous instruction are
+  // cleared; every modrm-derived field is written by modrm() before use, and
+  // w32/a32/seg are set below. This avoids an 80-byte memset per instruction.
+  g.watch_hit = 0;
+  g.rf_load = 0;
+  g.delivered = 0;
+  g.op2 = 0;
+  g.rep = 0;
+  g.nxt = 0;
   // The watchpoint report the stub reads after the step (cpu/step.h): per step,
   // so a hit reported once cannot be reported again.
   s->watch_hits = 0;
@@ -176,7 +184,7 @@ void x86_step(CpuState* c) {
     delivering_vec = vec_nmi;
     do_int(vec_nmi, (uint32_t)cpu->pc, kIntExternal, 0);
     delivering_vec = -1;
-    DebugInsn(fr);
+    if (g_dbg_any) DebugInsn(fr);
     return;
   }
 
@@ -198,7 +206,7 @@ void x86_step(CpuState* c) {
     delivering_vec = vec;
     do_int(vec, (uint32_t)cpu->pc, kIntExternal, 0);
     delivering_vec = -1;
-    DebugInsn(fr);
+    if (g_dbg_any) DebugInsn(fr);
     return;
   }
 
@@ -265,12 +273,12 @@ void x86_step(CpuState* c) {
     s->dr[6] |= dr6set;
     s->bt_pending = 0;
     cpu->wait = 0;  // a #DB after hlt wakes the processor
-    DebugInsn(fr);
+    if (g_dbg_any) DebugInsn(fr);
     do_int(vec_db, (uint32_t)cpu->pc, kIntException, 0);
     s->trap_seq++;
     s->trap_signal = (uint8_t)GdbTrapSignal(vec_db);
     DebugTrap(fr);
     return;
   }
-  DebugInsn(fr);
+  if (g_dbg_any) DebugInsn(fr);
 }

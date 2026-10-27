@@ -26,7 +26,8 @@ VBE/DISPI、链式 256 色与 EDID，PS/2 键盘鼠标与串口鼠标，8259/825
 `VFS: Mounted root (ext2 filesystem)`，控制台出提示符）、**Windows 1.01 ✅**（EGA
 640×350 的 MS-DOS Executive 桌面，`fbdump` 帧与 QEMU 基线逐像素相同，PS/2 指针可
 移动）、**xv6-riscv 未开始**（镜像与 OpenSBI fw_jump 素材未取）。
-回归：x86 36/0、riscv64 136/0、riscv32 104/0、依赖边 ok。
+回归：x86 37 格（新增 `paging32` PAE/PGE/NX 探针；KUT/pm/realmode/新探针
+逐格通过）、riscv64 136/0、riscv32 104/0、依赖边 ok。
 逐轮记录见 [progress.md](progress.md)。
 x86 固件（SeaBIOS + 显卡 option ROM）来自库外的一棵源码树，其现状、重建步骤与配置
 快照见库外 `../seabios/firmware.md`（不随本仓库跟踪）。

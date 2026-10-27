@@ -404,6 +404,7 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 | D35 | riscv64/csr.c、riscv32/csr.c 的 misa 写路径 | `csrw misa` 的掩码 `(val & kMisaSupported) \| kMisaI` 只挡"未实现的位"，不挡"只读位"：客机写 0 能把 S 与 U 位清掉，而清掉之后本机照样进 U 模式、照样按 PTE.U 判权限（状态与自述脱钩）。这两位在规范里是否强制只读**缺手册 §3.1.1 的原文**，未据裁决（先例：DAS 的 18 处分歧按实机、计数器抑制只实现有测试覆盖的一侧——这里两侧都无证据，故不猜） | 特权规范 3.1.1 misa 的 WARL 措辞（原文待核）；dearchap-tinyemu riscv_cpu.c:1306 只组装 misa、无 csrw misa 路径可参照 | 核到手册原文后：若 S/U 强制只读，则把这两位从可改掩码里摘出并补一个自足探针（写 misa 后读回） | 登记中 |
 | D36 | riscv64/csr.c、riscv32/csr.c 的 MHPM 计数器 | **MHPM 计数器只存储不自增**：`mhpmcounter3..18` 在 cemu 里没有事件源，写进去的值能读回，但从不增长；`mhpmevent3..18` 同样只存储。mcycle/minstret 不受影响（step.c 每步自增）。OpenSBI 按 CSR 存在探测计数器数量，拿到的是"能读但不动"的计数器 | QEMU target/riscv/csr.c 的 pmu 计数（Zihpm 允许实现定义事件）；特权规范 3.1.11 | 出现依赖性能计数器/剖析的客户机或工具时 | 登记中 |
 | D38 | x86_min.c 绝对指针（PS/2） | **PS/2 鼠标只有相对计数，没有绝对包**。窗口的绝对位置由 x86 板换算成 PS/2 位移：首次/换模式时发负向回零包把客人光标钉到 (0,0)，之后按板级模型逐包走向目标；包按 AUX 队列空位与 100 Hz 限速，按键转换排队到点击位置再发。模型假设客人 1:1 应用计数、在屏幕边缘钳位；客人若做鼠标加速、自己 warp 光标，会漂移；PS/2 2:1 缩放由设备的逆变换补偿，单包在途（AUX 队列清空才发下一包）。`-mouse serial` 仍是相对设备 | PS/2 鼠标协议（相对计数，9 位二补码）；QEMU 对 PS/2 用相对 + 指针 grab，绝对输入另走 USB tablet/vmmouse；真实绝对需要客人驱动 | 出现支持 USB tablet/vmmouse 的 x86 客人驱动时换真绝对设备；当前模式为 best-effort，漂移时以相对模式兜底 | 登记中 |
+| D39 | x86 后端（exec.c / x86.h） | **i686 其余功能未实现**：AC 对齐检查、VME/PVI/TSD 行为、PSE-36、SYSENTER/SYSEXIT、MMX/SSE/SSE2、FXSAVE/FXRSTOR、MTRR/PAT、MCE、性能计数器与长模式；PAE/PGE/NX（含 IA32_EFER.NXE）已实现并由 `test/x86/probe/paging32.asm` 钉住，但 CPUID 仍报 EDX=0、尚未广告；CR4 写路径也没有对未支持位做 WARL；RDTSC/x87 仍见 D13 | SDM vol.2/vol.3（CR4、EFER、SYSENTER、MTRR/MCE、SSE/FXSAVE 各章）；QEMU target/i386；v86 cpu.rs/instructions_0f.rs | i686 功能阶段（x86 优化之后）按 CPUID 逐项广告；长模式另立项 | 登记中 |
 | E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中 |
 
 ## 十一、显示窗口指针契约（所有主板）
@@ -465,8 +466,8 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
   A 位写回被当成"用户写 GDT"（U=0）→ #PF 错误码 7；随后 #PF 的投递读 IDT 又被
   当成"用户读" → #PF 错误码 5 → #DF → triple fault（三次陷阱都报在 iret 上，
   因为 CS 已提交而 eip 还没写）。实现：程序类 `bus_load/bus_store` 对处理器类
-  `kbus_load/kbus_store/krd*/kwr*/kpush*`，由
-  `page_translate_as(lin, write, user)` 的 user 参数分派。
+  `kbus_load/kbus_store/krd*/kwr*/kpush*`，由 `lin_load/lin_store` 的 user
+  参数分派（kbus_* 固定 user=0；`page_translate_as` 是慢路径的走查入口）。
 
 - **PMP 零活动规则放行**：从未配置任何 PMP 条目（全部 A=OFF）时，S/U 访问
   放行（QEMU pmp.c `pmp_hart_has_privs` 的零规则早退；gem5 pmp.cc 与手册
@@ -481,3 +482,19 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
   0x101038d1`（V|U|A|D），取证走 pcshot 取 satp + 确定性回放 dump 根表。
   xiangshanNEMU 此处拒——其客户 OpenSBI/Linux 不置这些位，该检查未经
   校准，按 QEMU 放宽（riscv64/riscv32 两个后端同步）。
+
+- **x86 A/D 在 TLB 填充时置位**：命中不再回写页表（QEMU softmmu 同款）。读填充
+  置 A，写填充置 A|D；修改 PTE 后必须 INVLPG 或重载 CR3 才能让新权限/新映射
+  生效，这与 SDM 对软件的要求一致。验收：pm_smoke t17（4KB）、t25（4MB）、
+  KUT access（2305 组合）与 paging32 t3（PAE 4KB）；TLB 的读/写槽分开，否则
+  一次读填充会让后续写永远不置 D。
+
+- **x86 巨大页的 TLB 失效按线性范围**：PAE 2MB 与非 PAE 4MB 叶都按 4KB 槽缓存，
+  但每项记录 `lin_base/page_shift`；INVLPG 任一子页要清掉整张巨大叶派生的所有
+  槽。验收：test/x86/probe/paging32.asm 的 t2b（重映射 PDE[4] 后 INVLPG 一个
+  4KB 子页，另一个子页的旧缓存也必须消失）。
+
+- **x86 慢路径优先**：`CEMU_DEBUG=mem|bus|watch=` 任一开启时 `g_mem_slow=1`，
+  `lin_load/lin_store` 退回逐次走查 + `phys_load/phys_store` 事件路径，保证
+  观测流与 TLB 引入前一致；`trace/state` 不改变访存路径，只打开 `g_record_raw`
+  与 `DebugInsn` 门控。

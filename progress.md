@@ -1,5 +1,42 @@
 # cemu 当前状态（progress.md）
 
+## x86 内存路径一次性优化：TLB + PAE/PGE/NX + 热路径（2026-10-27）
+
+用户裁决：优化一次做到 32 位终态，之后加 x87/SSE 等功能不再回头改内存快路径；
+为测试新优化所需的功能（PAE/PGE/NX）一并实现。
+
+- **基线**（同一构建、同一探针，3 次取样）：`test/x86/probe/membench.asm`
+  （256 页 + 1024 页两段、4KB 页、读+RMW）5.76–5.87s；`alubench.asm`
+  （50M 条纯寄存器指令）3.08–3.26s。
+- **终态**：`membench` 1.72–1.78s（约 3.3×），`alubench` 2.49–2.55s
+  （约 1.25×）。内存段的主要收益来自 TLB；纯 ALU 段来自标志打包/LTO。
+- **TLB**（`x86.h`/`exec.c`）：1024 sets × 2 ways，读/写各一槽（否则读填充会
+  让后续写永远不置 D）；条目含线性页、物理页、R/W、U/S、NX、G、宿主指针与
+  `lin_base/page_shift`。只对非重叠 RAM 存宿主指针，设备/ROM 仍走总线；
+  A/D 在填充时置位。失效：CR3（PGE=1 保留 G）、INVLPG（按线性范围清整张
+  2MB/4MB 叶）、CR0/CR4/任务切换/A20 全清。取指新增单页宿主指针捷径。
+  `BusRamPage` 改为按**具体 4KB 页**判断重叠（PC 的 32MB RAM 整段都含
+  VGA/ROM，旧的整段 `overlaps` 会让 x86 永远拿不到宿主指针）。
+- **PAE/PGE/NX**：PAE 三级 64 位页表、2MB 叶、A/D、保留位 RSVD、NX（EFER
+  MSR 0xC0000080）；PGE global 跨 CR3 生存；`paging32.asm` 七组（4KB、2MB、
+  巨大页 INVLPG、A/D、PGE、跨页非连续、NX）全过。CPUID 仍报 EDX=0，
+  功能阶段再广告（D39）。
+- **热路径**：`debug.h` 的 `g_mem_slow/g_record_raw/g_dbg_any` 一次解析，
+  `mem/bus/watch` 时退回原走查+事件路径；`phys_load/store` 复用 BusProbe
+  结果直接读宿主内存；PF 用半字节奇偶表；六个算术标志一次打包写；
+  省掉每步 `memset(&g)`；构建加 `-flto`（step.c/exec.c 跨 TU 内联，见
+  CMakeLists 注释）。
+- **验收**：x86 KUT 7 个镜像全过（taskswitch/taskswitch2/cmpxchg8b/memory/
+  debug/access/ioapic；access 2305 tests 0 failures）；pm_smoke 26/26；
+  realmode 126 PASS + 1 个预期 `FAIL: fninit`（D13 无 FPU）；smoke/cga 通过；
+  新 `paging32` 通过。riscv64 136/0、riscv32 104/0，`check` 依赖边 ok，
+  clean build 零告警。
+- **未跑整包**：x86 套件内 realmode 自己就带 60s 上限且不自行结束，整包必然
+  超过外层 1 分钟；按用户要求逐格跑完，未跑整包。
+- **未做**：`setjmp` 仍是每条指令的落点（约 5ns/条，换 `__builtin_setjmp`
+  收益约 8%，但跨函数保存寄存器的语义风险不值）；AC/VME/PVI/TSD、SYSENTER、
+  PSE-36、MMX/SSE/SSE2、MTRR/MCE、长模式等见 D39。
+
 ## riscv32 独立后端：RV32IMAFDC + Sv32 + rv32 官方套件（2026-10-23）
 
 - **目录独立**：`src/cpu/isa/riscv32/` 从 riscv64 复制后按 RV32 规格改造，

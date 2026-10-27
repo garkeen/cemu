@@ -109,7 +109,23 @@ int BusRamPage(Bus* bus, uint64_t addr, uint8_t** host) {
   if (addr & 0xfff) return -1;
   for (int i = 0; i < bus->count; i++) {
     BusRegion* r = &bus->regions[i];
-    if (r->host && !r->overlaps && addr >= r->base && addr + 0x1000 <= r->base + r->size) {
+    if (!r->host || addr < r->base || addr + 0x1000 > r->base + r->size) continue;
+    // `overlaps` is region-granular: the PC's 32MB RAM contains the VGA/ROM
+    // windows, so it is set for the whole RAM region even though almost every
+    // page is plain RAM. Direct access is safe only when no other region
+    // covers any byte of THIS page; check the page, not the region.
+    int safe = 1;
+    if (r->overlaps) {
+      for (int j = 0; j < bus->count; j++) {
+        BusRegion* o = &bus->regions[j];
+        if (i == j) continue;
+        if (addr < o->base + o->size && o->base < addr + 0x1000) {
+          safe = 0;
+          break;
+        }
+      }
+    }
+    if (safe) {
       *host = r->host + (addr - r->base);
       return 0;
     }

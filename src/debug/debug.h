@@ -32,6 +32,19 @@ enum {
 
 int DebugOn(uint32_t cat);
 
+// Resolved once by DebugInit. The interpreters read these directly on their
+// hot paths:
+//   g_mem_slow   any category that observes every memory access is on, so the
+//                TLB/宿主指针 fast path must be bypassed to keep the event
+//                stream identical (mem, bus, and watch=).
+//   g_record_raw raw instruction bytes are needed by the trace formats; with
+//                none of them on, fetch8 skips the per-byte recording.
+//   g_dbg_any    any observation at all is on (mask or watch), so the step's
+//                DebugInsn call is worth making.
+extern int g_mem_slow;
+extern int g_record_raw;
+extern int g_dbg_any;
+
 // Parses CEMU_DEBUG into the bitmask, registers watchpoints, and opens the
 // tables. Call once before the first step. Inert when the env var is unset.
 void DebugInit(void);

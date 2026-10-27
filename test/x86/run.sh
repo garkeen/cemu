@@ -705,6 +705,30 @@ else
   report_fail "pm: rc=$rc, $n_ok ok, $n_bad bad"
 fi
 
+# PAE/PGE/NX/cross-page probe: three-level PAE paging with 4KB and 2MB
+# leaves, A/D in PAE entries, PGE global survival across CR3, INVLPG of one
+# 4KB subpage dropping a whole 2MB leaf, an unaligned access crossing two
+# non-contiguous pages, and NX (#PF.I=1). Self-contained; pass status 11,
+# failure status 3 (the fault record at 0x9000 is dump=-able).
+paging32="$dir/probe/paging32.elf"
+if [ ! -f "$paging32" ] && command -v nasm > /dev/null 2>&1 &&
+   command -v ld.lld > /dev/null 2>&1; then
+  nasm -f elf32 -o "$dir/probe/paging32.o" "$dir/probe/paging32.asm" &&
+    ld.lld -m elf_i386 -T "$dir/pm/pm_smoke.ld" -o "$paging32" "$dir/probe/paging32.o"
+fi
+if [ -f "$paging32" ]; then
+  out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$paging32" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 11 ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "paging32: rc=$rc"
+  fi
+else
+  echo "SKIP (paging32: needs nasm/ld.lld)"
+fi
+
 # kvm-unit-tests 32-bit flat images (built from the v86 checkout by
 # build_kut.sh; boot via multiboot, exit via 0xF4 debug-exit — payload 0
 # (pass) shows up as status 1). taskswitch/taskswitch2 exercise the stage-3

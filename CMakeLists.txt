@@ -7,11 +7,12 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
-# Mirrors the old Makefile CFLAGS exactly:
-#   -O2 -Wall -Wextra -std=c11 -D__USE_MINGW_ANSI_STDIO=1 -Isrc -MMD -MP
-# Header dependencies are tracked by CMake/Ninja automatically (depfile),
-# so -MMD/-MP are not passed by hand.
-add_compile_options(-O2 -Wall -Wextra -D__USE_MINGW_ANSI_STDIO=1)
+# Base optimization is -O2. LTO lets the deliberate step.c/exec.c split inline
+# across translation units (the x86 hot path keeps the giant switch readable
+# without paying an out-of-line call for every step); the same flag goes to the
+# link so clang's LTO plugin sees bitcode.
+add_compile_options(-O2 -flto -Wall -Wextra -D__USE_MINGW_ANSI_STDIO=1)
+add_link_options(-flto)
 
 # --- sources --------------------------------------------------------------
 # GLOB_RECURSE is a superset of the old Makefile's four-level explicit

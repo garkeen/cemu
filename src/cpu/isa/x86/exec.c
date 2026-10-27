@@ -56,9 +56,19 @@ static uint64_t phys_load(uint64_t addr, int size, int is_fetch) {
   BusRegion* r;
   addr = a20_gate(addr);
   if (BusProbe(cpu->bus, addr, size, &r) != 0) return size == 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
-  uint64_t v = BusRead(cpu->bus, addr, size);
-  if (DebugOn(kDbgBus) && !r->host && !is_fetch) DebugBus(fr, r->ops->name, addr, size, 1, v);
-  if (DebugOn(kDbgMem)) DebugMem(fr, addr, addr, size, acc_read, v, 1);
+  uint64_t v;
+  if (r->host && !r->overlaps) {
+    // RAM: one region lookup, no device call. The bytes are the same ones
+    // kRamOps would copy; page-table walks and the non-host fallback both use
+    // this.
+    memcpy(&v, r->host + (addr - r->base), (size_t)size);
+  } else {
+    v = r->ops->Read(r->dev, addr, size);
+  }
+  if (g_mem_slow) {
+    if (DebugOn(kDbgBus) && !r->host && !is_fetch) DebugBus(fr, r->ops->name, addr, size, 1, v);
+    if (DebugOn(kDbgMem)) DebugMem(fr, addr, addr, size, acc_read, v, 1);
+  }
   return v;
 }
 
@@ -66,29 +76,36 @@ static void phys_store(uint64_t addr, int size, uint64_t v) {
   BusRegion* r;
   addr = a20_gate(addr);
   if (BusProbe(cpu->bus, addr, size, &r) != 0) return;
-  if (DebugOn(kDbgBus) && !r->host) {
-    DebugBus(fr, r->ops->name, addr, size, 0, v);
-  } else if (DebugOn(kDbgMem)) {
-    DebugMem(fr, addr, addr, size, acc_write, v, 0);
+  if (g_mem_slow) {
+    if (DebugOn(kDbgBus) && !r->host) {
+      DebugBus(fr, r->ops->name, addr, size, 0, v);
+    } else if (DebugOn(kDbgMem)) {
+      DebugMem(fr, addr, addr, size, acc_write, v, 0);
+    }
   }
-  BusWrite(cpu->bus, addr, size, v);
+  if (r->host && !r->overlaps) {
+    memcpy(r->host + (addr - r->base), &v, (size_t)size);
+  } else {
+    r->ops->Write(r->dev, addr, size, v);
+  }
 }
 
-// The page walk lives with the segment machinery below (it faults through the
-// raise channel); the access class decides whether the U/S bits are checked.
-static uint64_t page_translate_as(uint64_t lin, int write, int user);
-static uint64_t page_translate(uint64_t lin, int write);
+// Linear accesses go through the TLB/fetch fast path unless an observation
+// category needs every walk (debug.h g_mem_slow). The page walk itself lives
+// with the segment machinery below; these are the only entry points.
+static uint64_t lin_load(uint64_t lin, int size, int user, int fetch);
+static void lin_store(uint64_t lin, int size, int user, uint64_t v);
+static uint64_t page_translate_as(uint64_t lin, int write, int user, int fetch);
+static int cpl(void);
+static x86_tlb_entry* TlbLookup(uint64_t lin, int write);
+static x86_tlb_entry* TlbFill(uint64_t lin, int write, int fetch, int user);
+static void TlbCheck(x86_tlb_entry* e, uint64_t lin, int write, int fetch, int user);
 
 static uint64_t bus_load(uint64_t lin, int size) {
-  return phys_load(page_translate(lin, 0), size, 0);
-}
-// The instruction stream reads through the same funnel (code in ROM or RAM is
-// observed identically) but is not a device access — see phys_load.
-static uint64_t bus_fetch(uint64_t lin, int size) {
-  return phys_load(page_translate(lin, 0), size, 1);
+  return lin_load(lin, size, cpl() == 3, 0);
 }
 static void bus_store(uint64_t lin, int size, uint64_t v) {
-  phys_store(page_translate(lin, 1), size, v);
+  lin_store(lin, size, cpl() == 3, v);
 }
 
 // Processor-internal accesses — the GDT/LDT/IDT/TSS, and the frames the
@@ -100,10 +117,10 @@ static void bus_store(uint64_t lin, int size, uint64_t v) {
 // are the processor's own state), and every OS depends on it — its GDT/IDT/TSS
 // live in supervisor pages.
 static uint64_t kbus_load(uint64_t lin, int size) {
-  return phys_load(page_translate_as(lin, 0, 0), size, 0);
+  return lin_load(lin, size, 0, 0);
 }
 static void kbus_store(uint64_t lin, int size, uint64_t v) {
-  phys_store(page_translate_as(lin, 1, 0), size, v);
+  lin_store(lin, size, 0, v);
 }
 static uint8_t krd8(uint64_t lin) { return (uint8_t)kbus_load(lin, 1); }
 static uint16_t krd16(uint64_t lin) { return (uint16_t)kbus_load(lin, 2); }
@@ -290,46 +307,68 @@ static uint32_t vmask(int size) { return size == 4 ? 0xffffffffu : (1u << (size 
 static uint32_t vmsb(int size) { return 1u << (size * 8 - 1); }
 
 // PF/ZF/SF from a result at a width (shared by every family).
-static void szp(uint32_t r, int size) {
-  int ones = 0;
-  for (int i = 0; i < 8; i++) ones += (r >> i) & 1;
-  fl->pf = !(ones & 1);
-  fl->zf = (r & vmask(size)) == 0;
-  fl->sf = (r & vmsb(size)) != 0;
+// Odd parity of each nibble: PF is the complement of the XOR of the two
+// nibble parities (SDM: PF set when the low byte has an even number of 1s).
+static const uint8_t kNibbleParity[16] = {0, 1, 1, 0, 1, 0, 0, 1,
+                                          1, 0, 0, 1, 0, 1, 1, 0};
+
+// The six arithmetic flags as bits of eflags.word (SDM vol.1 3.4.3). Packing
+// them once per instruction avoids a separate read-modify-write for each
+// bitfield; the `fl->cf` spelling remains for the places that update one flag.
+enum {
+  kFlagCf = 1u << 0,
+  kFlagPf = 1u << 2,
+  kFlagAf = 1u << 4,
+  kFlagZf = 1u << 6,
+  kFlagSf = 1u << 7,
+  kFlagOf = 1u << 11,
+  kFlagArith = kFlagCf | kFlagPf | kFlagAf | kFlagZf | kFlagSf | kFlagOf,
+  kFlagSzp = kFlagPf | kFlagZf | kFlagSf,
+};
+
+static uint32_t szp_bits(uint32_t r, int size) {
+  uint32_t f = 0;
+  if (!(kNibbleParity[r & 0xf] ^ kNibbleParity[(r >> 4) & 0xf])) f |= kFlagPf;
+  if ((r & vmask(size)) == 0) f |= kFlagZf;
+  if ((r & vmsb(size)) != 0) f |= kFlagSf;
+  return f;
 }
+static void szp(uint32_t r, int size) { fl->word = (fl->word & ~kFlagSzp) | szp_bits(r, size); }
 
 void flags_add(uint32_t a, uint32_t b, uint32_t r, int size, int cin) {
-  fl->cf = (uint64_t)(a & vmask(size)) + (b & vmask(size)) + cin > vmask(size);
-  fl->af = ((a ^ b ^ r) >> 4) & 1;
-  fl->of = (((~(a ^ b)) & (a ^ r)) >> (size * 8 - 1)) & 1;
-  szp(r, size);
+  uint32_t f = szp_bits(r, size);
+  if ((uint64_t)(a & vmask(size)) + (b & vmask(size)) + cin > vmask(size)) f |= kFlagCf;
+  if (((a ^ b ^ r) >> 4) & 1) f |= kFlagAf;
+  if ((((~(a ^ b)) & (a ^ r)) >> (size * 8 - 1)) & 1) f |= kFlagOf;
+  fl->word = (fl->word & ~kFlagArith) | f;
 }
 
 void flags_sub(uint32_t a, uint32_t b, uint32_t r, int size, int bin) {
-  fl->cf = (uint64_t)(a & vmask(size)) < (uint64_t)(b & vmask(size)) + bin;
-  fl->af = ((a ^ b ^ r) >> 4) & 1;
-  fl->of = ((a ^ b) & (a ^ r) & vmsb(size)) != 0;
-  szp(r, size);
+  uint32_t f = szp_bits(r, size);
+  if ((uint64_t)(a & vmask(size)) < (uint64_t)(b & vmask(size)) + bin) f |= kFlagCf;
+  if (((a ^ b ^ r) >> 4) & 1) f |= kFlagAf;
+  if (((a ^ b) & (a ^ r) & vmsb(size)) != 0) f |= kFlagOf;
+  fl->word = (fl->word & ~kFlagArith) | f;
 }
 
 void flags_logic(uint32_t r, int size) {
-  fl->cf = 0;
-  fl->of = 0;
-  fl->af = 0;
-  szp(r, size);
+  // CF=OF=AF=0; the packed result leaves those bits clear.
+  fl->word = (fl->word & ~kFlagArith) | szp_bits(r, size);
 }
 
 // INC/DEC keep CF (SDM).
 void flags_inc(uint32_t r, int size) {
-  fl->of = r == vmsb(size);
-  fl->af = (r & 0xf) == 0;
-  szp(r, size);
+  uint32_t f = szp_bits(r, size);
+  if (r == vmsb(size)) f |= kFlagOf;
+  if ((r & 0xf) == 0) f |= kFlagAf;
+  fl->word = (fl->word & ~(kFlagSzp | kFlagAf | kFlagOf)) | f;
 }
 
 void flags_dec(uint32_t r, int size) {
-  fl->of = r == vmsb(size) - 1;
-  fl->af = (r & 0xf) == 0xf;
-  szp(r, size);
+  uint32_t f = szp_bits(r, size);
+  if (r == vmsb(size) - 1) f |= kFlagOf;
+  if ((r & 0xf) == 0xf) f |= kFlagAf;
+  fl->word = (fl->word & ~(kFlagSzp | kFlagAf | kFlagOf)) | f;
 }
 
 // MUL/IMUL: CF=OF=1 when the high half is significant (SDM MUL/IMUL).
@@ -349,8 +388,45 @@ uint8_t fetch8(void) {
   uint32_t off = (uint32_t)(eip + d.nxt);
   // CS limit (SDM vol.3 5.3): every fetched byte lies inside the segment.
   if ((s->cr0 & 1) && off > s->limit[cs_i]) gp_fault(0);
-  uint8_t v = (uint8_t)bus_fetch(s->base[cs_i] + eip + d.nxt, 1);
-  if (fr->rec.raw_len < sizeof(fr->rec.raw)) fr->rec.raw[fr->rec.raw_len++] = v;
+  uint64_t lin = s->base[cs_i] + off;
+  int user = cpl() == 3;
+  uint8_t v;
+  if (g_mem_slow) {
+    v = (uint8_t)lin_load(lin, 1, user, 1);
+  } else {
+    uint32_t page = (uint32_t)(lin >> 12);
+    if (s->fetch_valid && s->fetch_page == page) {
+      v = s->fetch_host[(uint32_t)lin & 0xfff];
+    } else {
+      uint8_t* host = NULL;
+      uint64_t paddr;
+      if (!(s->cr0 & kCr0Pg)) {
+        paddr = a20_gate(lin);
+        BusRamPage(cpu->bus, paddr & ~(uint64_t)0xfff, &host);
+      } else {
+        x86_tlb_entry* e = TlbLookup(lin, 0);
+        if (!e) {
+          e = TlbFill(lin, 0, 1, user);
+        } else {
+          TlbCheck(e, lin, 0, 1, user);
+        }
+        paddr = e->pbase + ((uint32_t)lin & 0xfff);
+        if (e->flags & kTlbHost) host = e->host;
+      }
+      if (host) {
+        s->fetch_page = page;
+        s->fetch_host = host;
+        s->fetch_valid = 1;
+        v = host[(uint32_t)lin & 0xfff];
+      } else {
+        // ROM/MMIO has no host backing; every byte goes through the bus.
+        s->fetch_valid = 0;
+        v = (uint8_t)phys_load(paddr, 1, 1);
+      }
+    }
+  }
+  if (g_record_raw && fr->rec.raw_len < sizeof(fr->rec.raw))
+    fr->rec.raw[fr->rec.raw_len++] = v;
   d.nxt++;
   return v;
 }
@@ -717,67 +793,326 @@ static void io_out(uint16_t port, int size, uint32_t v) {
   IoBpHit(port);
 }
 
-// The two-level 4KB page walk (SDM vol.3 4.3, 4.6, 4.7). CR3 names the page
-// directory; each level's R/W and U/S combine with the next (a page is
-// writable / user-accessible only where BOTH entries allow), then one
-// permission check against the access class: a user-mode program access needs
-// U on both levels, a write
-// 486+ but SDM defines the flag). A missing entry at either level faults as
-// not-present (error code P=0); every other violation faults with P=1. A
-// goes into PDE and PTE on each successful translation and D into the PTE on
-// a write (vol.3 4.7) — the RMW lands in RAM below this layer. The walk's
-// own reads are physical and bypass translation plus the debug mem/bus
-// events: page tables are machine state, not program accesses.
-// The program's own access: U/S runs against CPL, and a write additionally
-// needs R/W on every level of the walk (SDM vol.3 4.6, table 4-2).
-static uint64_t page_translate(uint64_t lin, int write) {
-  return page_translate_as(lin, write, cpl() == 3);
+// ---- paging: walker, TLB and the linear access paths --------------------------
+//
+// The 32-bit paging unit, complete for the i686 target: two-level 4KB/4MB
+// pages, PAE's three-level 64-bit-entry walk with 2MB leaves, PGE global
+// translations and the PAE NX bit. The walker sets A/D on every fill (a TLB
+// hit does not revisit the tables, QEMU's behavior); changing a PTE therefore
+// requires INVLPG or a CR3 reload, exactly as the SDM requires of software.
+
+typedef struct walk_res {
+  uint64_t paddr;  // A20 already applied
+  uint32_t flags;  // kTlbWritable / kTlbUser / kTlbNx / kTlbGlobal
+  uint32_t lin_base;   // page start for INVLPG's range match
+  uint32_t page_shift; // 12 = 4KB, 21 = 2MB, 22 = 4MB
+} walk_res;
+
+// PAE entry masks (SDM vol.3 figs 4-5/4-6/4-7): physical base 51:12, 2MB leaf
+// base 51:21, bits 62:52 reserved, bit 63 the NX bit.
+static const uint64_t kPaeAddrMask = 0x000ffffffffff000ull;
+static const uint64_t kPae2mMask = 0x000fffffffe00000ull;
+static const uint64_t kPaeRsvdHi = 0x7ffull << 52;
+static const uint64_t kNxBit = 1ull << 63;
+
+static void PfRsvd(uint64_t lin, uint32_t code) {
+  pf_fault(lin, code | kPfPresent | kPfRsvd);
+}
+static void PfNx(uint64_t lin, uint32_t code) {
+  pf_fault(lin, code | kPfPresent | kPfInstr);
 }
 
-// `user` is the access class: 1 for the program's own accesses, 0 for the
-// processor's (see kbus_* above) — the descriptor tables, the TSS and the
-// frames a delivery pushes are the processor's own state, which every OS keeps
-// in supervisor pages whatever the live CPL is.
-static uint64_t page_translate_as(uint64_t lin, int write, int user) {
-  if (!(s->cr0 & kCr0Pg)) return lin;
-  uint32_t code = (write ? 2u : 0u) | (user ? 4u : 0u);
+// The shared permission rule (SDM vol.3 4.6 table 4-2): a user access needs
+// U on every level and a user write needs R/W whatever CR0.WP says; a
+// supervisor write needs R/W only when WP=1. `writable` and `user_ok` are the
+// AND of the levels.
+static void CheckPerm(uint64_t lin, int write, int user, int writable, int user_ok,
+                      uint32_t code) {
+  if (user ? (!user_ok || (write && !writable))
+           : (write && (s->cr0 & kCr0Wp) && !writable))
+    pf_fault(lin, code | kPfPresent);
+}
+
+// Two-level 386/486 page walk (SDM vol.3 4.3, 4.6, 4.7). PSE-36 is not in
+// this machine's CPUID, so a 4MB leaf's bits 21:13 stay reserved and a set one
+// faults as an ordinary present fault (the 386-class #PF code has no RSVD).
+static void WalkNonPae(uint64_t lin, int write, int user, walk_res* w) {
+  uint32_t code = (write ? kPfWrite : 0) | (user ? kPfUser : 0);
   uint32_t pde_addr = (uint32_t)(s->cr3 & ~0xfffu) | ((uint32_t)(lin >> 20) & 0xffc);
-  uint32_t pde = phys_load(pde_addr, 4, 0);
+  uint32_t pde = (uint32_t)phys_load(pde_addr, 4, 0);
   if (!(pde & kPdeP)) pf_fault(lin, code);
   if ((pde & kPdePs) && (s->cr4 & kCr4Pse)) {
-    // 4MB page (SDM vol.3 4.3): the PDE is the leaf — frame = bits 31:22,
-    // offset = linear[21:0]; the permission check uses the PDE alone and A/D
-    // update in the PDE. Bits 21:13 are reserved for a 4MB leaf (the frame
-    // stops at bit 22 and this machine reports no PSE-36), so a set one is
-    // rejected before the permission check; the error code is an ordinary
-    // present fault, the 386-class code having no RSVD flag (fig 4-3, §4.3).
-    if (pde & kPde4mReserved) pf_fault(lin, code | 1);
-    // A user-mode write needs R/W whatever CR0.WP says (SDM vol.3 4.6 table
-    // 4-2: WP governs supervisor writes only; at CPL=3 a write to a R/W=0 page
-    // faults outright). Without this the write lands in the shared read-only
-    // page the kernel handed out — its COW fault never happens.
-    if (user ? (!(pde & kPdeUs) || (write && !(pde & kPdeRw)))
-             : (write && (s->cr0 & kCr0Wp) && !(pde & kPdeRw)))
-      pf_fault(lin, code | 1);
+    if (pde & kPde4mReserved) pf_fault(lin, code | kPfPresent);
+    CheckPerm(lin, write, user, (pde & kPdeRw) != 0, (pde & kPdeUs) != 0, code);
     uint32_t new_pde = pde | kPdeA | (write ? kPdeD : 0u);
     if (new_pde != pde) phys_store(pde_addr, 4, new_pde);
-    return ((uint64_t)(pde & 0xffc00000u)) | (lin & 0x3fffff);
+    w->paddr = a20_gate(((uint64_t)(pde & 0xffc00000u)) | (lin & 0x3fffff));
+    w->flags = ((pde & kPdeRw) ? kTlbWritable : 0) |
+               ((pde & kPdeUs) ? kTlbUser : 0) | ((pde & kPdeG) ? kTlbGlobal : 0);
+    w->lin_base = (uint32_t)lin & ~0x3fffffu;
+    w->page_shift = 22;
+    return;
   }
   uint32_t pte_addr = (pde & ~0xfffu) | ((uint32_t)(lin >> 10) & 0xffc);
-  uint32_t pte = phys_load(pte_addr, 4, 0);
+  uint32_t pte = (uint32_t)phys_load(pte_addr, 4, 0);
   if (!(pte & kPteP)) pf_fault(lin, code);
-  int writable = (pde & kPdeRw) != 0 && (pte & kPteRw) != 0;
-  // Same R/W rule as the 4MB leaf above (SDM vol.3 4.6 table 4-2): a user-mode
-  // write is refused by the page's own R/W alone, CR0.WP or not. This is the
-  // check that makes the kernel's copy-on-write work — every untouched
-  // anonymous page is handed out read-only and expects the write to fault.
-  if (user ? (!(pde & kPdeUs) || !(pte & kPteUs) || (write && !writable))
-           : (write && (s->cr0 & kCr0Wp) && !writable))
-    pf_fault(lin, code | 1);  // present: the entry was there, the right was not
+  int writable = (pde & kPdeRw) && (pte & kPteRw);
+  int user_ok = (pde & kPdeUs) && (pte & kPteUs);
+  CheckPerm(lin, write, user, writable, user_ok, code);
   uint32_t new_pte = pte | kPteA | (write ? kPteD : 0u);
   if (new_pte != pte) phys_store(pte_addr, 4, new_pte);
   if (!(pde & kPdeA)) phys_store(pde_addr, 4, pde | kPdeA);
-  return ((uint64_t)(pte & ~0xfffu)) | (lin & 0xfff);
+  w->paddr = a20_gate(((uint64_t)(pte & ~0xfffu)) | (lin & 0xfff));
+  w->flags = (writable ? kTlbWritable : 0) | (user_ok ? kTlbUser : 0) |
+             ((pte & kPteG) ? kTlbGlobal : 0);
+  w->lin_base = (uint32_t)lin & ~0xfffu;
+  w->page_shift = 12;
+}
+
+// PAE: CR3 names a 32-byte-aligned PDPT; PDPTE -> PDE (2MB leaf or a page
+// table) -> PTE. Every entry is 64-bit and carries A; D lives in the leaf
+// (PDE for 2MB, PTE for 4KB). NX in any level forbids instruction fetch.
+static void WalkPae(uint64_t lin, int write, int user, int fetch, walk_res* w) {
+  uint32_t code = (write ? kPfWrite : 0) | (user ? kPfUser : 0);
+  uint64_t pdpte_addr = (s->cr3 & 0xffffffe0u) + (((lin >> 30) & 3) * 8);
+  uint64_t pdpte = phys_load(pdpte_addr, 8, 0);
+  if (!(pdpte & kPdeP)) pf_fault(lin, code);
+  uint64_t nx = pdpte & kNxBit;
+  if (pdpte & kPdePs) PfRsvd(lin, code);  // 1GB pages do not exist in 32-bit PAE
+  if (pdpte & kPaeRsvdHi) PfRsvd(lin, code);
+  if (nx && !(s->efer & kEferNxe)) PfRsvd(lin, code);
+
+  uint64_t pde_addr = (pdpte & kPaeAddrMask) | (((lin >> 21) & 0x1ff) * 8);
+  uint64_t pde = phys_load(pde_addr, 8, 0);
+  if (!(pde & kPdeP)) pf_fault(lin, code);
+  nx |= pde & kNxBit;
+  if (pde & kPaeRsvdHi) PfRsvd(lin, code);
+  if (nx && !(s->efer & kEferNxe)) PfRsvd(lin, code);
+  int writable = (pdpte & kPdeRw) && (pde & kPdeRw);
+  int user_ok = (pdpte & kPdeUs) && (pde & kPdeUs);
+
+  if (pde & kPdePs) {  // 2MB leaf: base 51:21, PDE holds A/D
+    if (pde & 0x1fe000) PfRsvd(lin, code);
+    CheckPerm(lin, write, user, writable, user_ok, code);
+    if (fetch && nx) PfNx(lin, code);
+    uint64_t new_pde = pde | kPdeA | (write ? kPdeD : 0u);
+    if (new_pde != pde) phys_store(pde_addr, 8, new_pde);
+    if (!(pdpte & kPdeA)) phys_store(pdpte_addr, 8, pdpte | kPdeA);
+    w->paddr = a20_gate((pde & kPae2mMask) | (lin & 0x1fffff));
+    w->flags = (writable ? kTlbWritable : 0) | (user_ok ? kTlbUser : 0) |
+               (nx ? kTlbNx : 0) | ((pde & kPdeG) ? kTlbGlobal : 0);
+    w->lin_base = (uint32_t)lin & ~0x1fffffu;
+    w->page_shift = 21;
+    return;
+  }
+
+  uint64_t pte_addr = (pde & kPaeAddrMask) | (((lin >> 12) & 0x1ff) * 8);
+  uint64_t pte = phys_load(pte_addr, 8, 0);
+  if (!(pte & kPteP)) pf_fault(lin, code);
+  nx |= pte & kNxBit;
+  if (pte & kPaeRsvdHi) PfRsvd(lin, code);
+  if (nx && !(s->efer & kEferNxe)) PfRsvd(lin, code);
+  writable = writable && (pte & kPteRw);
+  user_ok = user_ok && (pte & kPteUs);
+  CheckPerm(lin, write, user, writable, user_ok, code);
+  if (fetch && nx) PfNx(lin, code);
+  uint64_t new_pte = pte | kPteA | (write ? kPteD : 0u);
+  if (new_pte != pte) phys_store(pte_addr, 8, new_pte);
+  if (!(pde & kPdeA)) phys_store(pde_addr, 8, pde | kPdeA);
+  if (!(pdpte & kPdeA)) phys_store(pdpte_addr, 8, pdpte | kPdeA);
+  w->paddr = a20_gate((pte & kPaeAddrMask) | (lin & 0xfff));
+  w->flags = (writable ? kTlbWritable : 0) | (user_ok ? kTlbUser : 0) |
+             (nx ? kTlbNx : 0) | ((pte & kPteG) ? kTlbGlobal : 0);
+  w->lin_base = (uint32_t)lin & ~0xfffu;
+  w->page_shift = 12;
+}
+
+static void WalkPage(uint64_t lin, int write, int user, int fetch, walk_res* w) {
+  if (s->cr4 & kCr4Pae)
+    WalkPae(lin, write, user, fetch, w);
+  else
+    WalkNonPae(lin, write, user, w);
+}
+
+// The slow translation entry: one walk, no cache. Used whenever g_mem_slow is
+// set (mem/bus/watch observation) and by processor-internal accessors.
+static uint64_t page_translate_as(uint64_t lin, int write, int user, int fetch) {
+  if (!(s->cr0 & kCr0Pg)) return lin;
+  walk_res w;
+  WalkPage(lin, write, user, fetch, &w);
+  return w.paddr;
+}
+
+// ---- translation cache --------------------------------------------------------
+
+static uint32_t TlbSet(uint32_t vpn) { return (vpn ^ (vpn >> 10)) & (kTlbSets - 1); }
+static uint32_t TlbTag(uint32_t vpn, int write) {
+  return kTlbValid | (vpn << 1) | (uint32_t)(write != 0);
+}
+static x86_tlb_entry* TlbSlot(uint32_t vpn, int write) {
+  return &s->tlb[TlbSet(vpn) * kTlbWays + (write ? 1 : 0)];
+}
+static x86_tlb_entry* TlbLookup(uint64_t lin, int write) {
+  uint32_t vpn = (uint32_t)(lin >> 12);
+  x86_tlb_entry* e = TlbSlot(vpn, write);
+  return e->tag == TlbTag(vpn, write) ? e : NULL;
+}
+
+static void TlbCheck(x86_tlb_entry* e, uint64_t lin, int write, int fetch, int user) {
+  uint32_t code = (write ? kPfWrite : 0) | (user ? kPfUser : 0);
+  if (user && !(e->flags & kTlbUser)) pf_fault(lin, code | kPfPresent);
+  if (write && (user ? !(e->flags & kTlbWritable)
+                     : ((s->cr0 & kCr0Wp) && !(e->flags & kTlbWritable))))
+    pf_fault(lin, code | kPfPresent);
+  if (fetch && (e->flags & kTlbNx) && (s->efer & kEferNxe))
+    pf_fault(lin, code | kPfPresent | kPfInstr);
+}
+
+// Walk once, set A/D once, and cache the 4KB translation (huge leaves are
+// cached at 4KB granularity; the walk's page-size choice is not observable).
+static x86_tlb_entry* TlbFill(uint64_t lin, int write, int fetch, int user) {
+  walk_res w;
+  WalkPage(lin, write, user, fetch, &w);
+  uint32_t vpn = (uint32_t)(lin >> 12);
+  x86_tlb_entry* e = TlbSlot(vpn, write);
+  e->tag = TlbTag(vpn, write);
+  e->flags = w.flags;
+  e->lin_base = w.lin_base;
+  e->page_shift = w.page_shift;
+  e->pbase = w.paddr & ~(uint64_t)0xfff;
+  e->host = NULL;
+  uint8_t* host;
+  if (!g_mem_slow && BusRamPage(cpu->bus, e->pbase, &host) == 0) {
+    e->host = host;
+    e->flags |= kTlbHost;
+  }
+  return e;
+}
+
+static void TlbFlushAll(x86_state* st) {
+  memset(st->tlb, 0, sizeof(st->tlb));
+  st->fetch_valid = 0;
+}
+
+// A CR3 reload keeps only global translations when CR4.PGE=1; without PGE
+// every entry goes (SDM vol.3 4.10.4.1).
+static void TlbFlushNonGlobal(x86_state* st) {
+  if (!(st->cr4 & kCr4Pge)) {
+    TlbFlushAll(st);
+    return;
+  }
+  for (int i = 0; i < (int)(kTlbSets * kTlbWays); i++)
+    if (!(st->tlb[i].flags & kTlbGlobal)) st->tlb[i].tag = 0;
+  st->fetch_valid = 0;
+}
+
+// INVLPG invalidates the page regardless of G. A huge leaf was cached as
+// several 4KB slots, so the match is against the entry's linear range: every
+// slot derived from the same 2MB/4MB leaf goes. The fetch shortcut is dropped
+// conservatively.
+static void TlbFlushPage(x86_state* st, uint32_t lin) {
+  for (int i = 0; i < (int)(kTlbSets * kTlbWays); i++) {
+    x86_tlb_entry* e = &st->tlb[i];
+    if (!(e->tag & kTlbValid)) continue;
+    if ((lin >> e->page_shift) == (e->lin_base >> e->page_shift)) e->tag = 0;
+  }
+  st->fetch_valid = 0;
+}
+
+// ---- linear access ------------------------------------------------------------
+
+static uint64_t FastLoadOne(uint64_t lin, int size, int user, int fetch) {
+  x86_tlb_entry* e = TlbLookup(lin, 0);
+  if (!e) {
+    e = TlbFill(lin, 0, fetch, user);
+  } else {
+    TlbCheck(e, lin, 0, fetch, user);
+  }
+  uint32_t off = (uint32_t)lin & 0xfff;
+  if (e->flags & kTlbHost) {
+    uint64_t v = 0;
+    memcpy(&v, e->host + off, (size_t)size);
+    return v;
+  }
+  return phys_load(e->pbase + off, size, fetch);
+}
+
+static void FastStoreOne(uint64_t lin, int size, int user, uint64_t v) {
+  x86_tlb_entry* e = TlbLookup(lin, 1);
+  if (!e) {
+    e = TlbFill(lin, 1, 0, user);
+  } else {
+    TlbCheck(e, lin, 1, 0, user);
+  }
+  uint32_t off = (uint32_t)lin & 0xfff;
+  if (e->flags & kTlbHost) {
+    memcpy(e->host + off, &v, (size_t)size);
+  } else {
+    phys_store(e->pbase + off, size, v);
+  }
+}
+
+static uint64_t SlowLoadOne(uint64_t lin, int size, int user, int fetch) {
+  return phys_load(page_translate_as(lin, 0, user, fetch), size, fetch);
+}
+
+static void SlowStoreOne(uint64_t lin, int size, int user, uint64_t v) {
+  phys_store(page_translate_as(lin, 1, user, 0), size, v);
+}
+
+static uint64_t lin_load(uint64_t lin, int size, int user, int fetch) {
+  uint32_t off = (uint32_t)lin & 0xfff;
+  if (g_mem_slow) {
+    if (off + (uint32_t)size <= 0x1000) return SlowLoadOne(lin, size, user, fetch);
+    int n1 = (int)(0x1000 - off);
+    uint64_t lo = SlowLoadOne(lin, n1, user, fetch);
+    uint64_t hi = SlowLoadOne(lin + (uint64_t)n1, size - n1, user, fetch);
+    return lo | (hi << (n1 * 8));
+  }
+  if (!(s->cr0 & kCr0Pg)) {
+    if (off + (uint32_t)size <= 0x1000) return phys_load(lin, size, fetch);
+    int n1 = (int)(0x1000 - off);
+    uint64_t lo = phys_load(lin, n1, fetch);
+    uint64_t hi = phys_load(lin + (uint64_t)n1, size - n1, fetch);
+    return lo | (hi << (n1 * 8));
+  }
+  if (off + (uint32_t)size <= 0x1000) return FastLoadOne(lin, size, user, fetch);
+  int n1 = (int)(0x1000 - off);
+  uint64_t lo = FastLoadOne(lin, n1, user, fetch);
+  uint64_t hi = FastLoadOne(lin + (uint64_t)n1, size - n1, user, fetch);
+  return lo | (hi << (n1 * 8));
+}
+
+static void lin_store(uint64_t lin, int size, int user, uint64_t v) {
+  uint32_t off = (uint32_t)lin & 0xfff;
+  int crossing = off + (uint32_t)size > 0x1000;
+  int n1 = crossing ? (int)(0x1000 - off) : 0;
+  uint64_t lo = crossing ? (v & ((1ull << (n1 * 8)) - 1)) : v;
+  uint64_t hi = crossing ? (v >> (n1 * 8)) : 0;
+  if (g_mem_slow) {
+    if (!crossing) {
+      SlowStoreOne(lin, size, user, v);
+    } else {
+      SlowStoreOne(lin, n1, user, lo);
+      SlowStoreOne(lin + (uint64_t)n1, size - n1, user, hi);
+    }
+    return;
+  }
+  if (!(s->cr0 & kCr0Pg)) {
+    if (!crossing) {
+      phys_store(lin, size, v);
+    } else {
+      phys_store(lin, n1, lo);
+      phys_store(lin + (uint64_t)n1, size - n1, hi);
+    }
+    return;
+  }
+  if (!crossing) {
+    FastStoreOne(lin, size, user, v);
+  } else {
+    FastStoreOne(lin, n1, user, lo);
+    FastStoreOne(lin + (uint64_t)n1, size - n1, user, hi);
+  }
 }
 
 // DS/ES/FS/GS (SDM vol.2 MOV to Sreg Operation): a null selector loads and
@@ -1024,8 +1359,12 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   s->tr_ar = (uint8_t)(v.ar | 2);
 
   // A 16-bit TSS has no CR3 field, so the switch leaves the page directory
-  // alone (QEMU applies CR3 only when type & 8).
-  if (!tss16) s->cr3 = krd32(v.base + 0x1c);  // carried along (SDM 7.2.1)
+  // alone (QEMU applies CR3 only when type & 8). Loading CR3 flushes
+  // non-global translations, exactly like MOV CR3.
+  if (!tss16) {
+    s->cr3 = krd32(v.base + 0x1c);  // carried along (SDM 7.2.1)
+    TlbFlushNonGlobal(s);
+  }
   // The incoming LDT (TSS +0x60, or +0x2a in the 16-bit shape) loads BEFORE
   // the segment selectors: their TI=1 lookups go through the new task's own
   // LDT (SDM 7.2.1 step order). It is not written back to the outgoing TSS
@@ -2452,13 +2791,17 @@ static void run_op2(uint8_t op2) {
           if (cpl() != 0) gp_fault(0);
           uint16_t v = rm16();
           s->cr0 = (s->cr0 & ~0xfu) | (v & 0xfu) | (s->cr0 & kCr0Pe);
+          TlbFlushAll(s);
           break;
         }
-        case 7:  // invlpg: nothing to flush — every access re-walks, and
-                 // INVLPG never faults on unmapped pages (SDM vol.2)
+        case 7: {  // invlpg: drop the page's translations; never faults on an
+                   // unmapped page (SDM vol.2)
           fr->rec.mnemonic = "invlpg";
           if (cpl() != 0) gp_fault(0);
+          if (!d.is_mem) ud();
+          TlbFlushPage(s, (uint32_t)d.mlin);
           break;
+        }
         default:
           ud();
       }
@@ -2513,12 +2856,20 @@ static void run_op2(uint8_t op2) {
         // PG=1 with PE=0 is #GP(0); vol.3 9.9 sets PE first).
         if ((v & kCr0Pg) && !(v & kCr0Pe)) gp_fault(0);
         s->cr0 = v;
+        // PG/PE/WP changes all alter translation or its permission check;
+        // dropping the cache is cheap and always safe.
+        TlbFlushAll(s);
       } else if (d.reg == 2) {
         s->cr2 = s->r[d.rm].e;
       } else if (d.reg == 3) {
-        s->cr3 = s->r[d.rm].e;  // PDBR; nothing to flush — every access re-walks
+        s->cr3 = s->r[d.rm].e;
+        // MOV CR3 flushes non-global translations; PGE keeps global ones
+        // (SDM vol.3 4.10.4.1).
+        TlbFlushNonGlobal(s);
       } else if (d.reg == 4) {
         s->cr4 = s->r[d.rm].e;
+        // PAE/PSE/PGE all change what the walk means.
+        TlbFlushAll(s);
       } else {
         ud();
       }
@@ -2562,6 +2913,11 @@ static void run_op2(uint8_t op2) {
         // long-mode FS/GS bases: no architectural effect on this machine
         // (QEMU accepts the write; the kvm boot programs GS base)
         s->msr_fs_gs_base[ecx - 0xc0000100] = v;
+      } else if (ecx == 0xc0000080) {
+        // IA32_EFER: only NXE changes translation (the PAE NX bit). Long mode
+        // is not implemented; the other bits are stored and ignored.
+        s->efer = v;
+        TlbFlushAll(s);
       } else {
         gp_fault(0);  // an MSR this machine does not implement
       }
@@ -2579,6 +2935,9 @@ static void run_op2(uint8_t op2) {
         uint64_t v = s->msr_fs_gs_base[ecx - 0xc0000100];
         eax = (uint32_t)v;
         edx = (uint32_t)(v >> 32);
+      } else if (ecx == 0xc0000080) {
+        eax = (uint32_t)s->efer;
+        edx = (uint32_t)(s->efer >> 32);
       } else if (ecx == 0x1a0) {
         // IA32_MISC_ENABLE (SDM vol.4 table 2-24): fast strings on, PEBS/BTS
         // report unavailable — the QEMU default policy for a machine with
@@ -4676,7 +5035,11 @@ static void x86_set_irq_line(CpuState* cpu, uint64_t line, int level) {
 // port 0x92 (both funnel into CpuState.set_a20).
 static void x86_set_a20_line(CpuState* c, int on) {
   x86_state* st = (x86_state*)c->priv;
-  st->a20 = on ? 1 : 0;
+  int v = on ? 1 : 0;
+  if (st->a20 == v) return;
+  st->a20 = v;
+  // Every cached physical page was formed with the old gate state.
+  TlbFlushAll(st);
 }
 
 void x86_init(CpuState* c) {

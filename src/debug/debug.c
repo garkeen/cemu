@@ -17,6 +17,13 @@
 
 static uint32_t g_mask;
 static int g_inited;
+// Hot-path gates the interpreters read directly (see debug.h): whether any
+// per-access/per-instruction observation is on, whether raw instruction bytes
+// are needed, and whether memory accesses must take the event-emitting slow
+// path instead of the TLB/宿主指针 fast path.
+int g_mem_slow;
+int g_record_raw;
+int g_dbg_any;
 static int g_ascii = 1;  // plain borders by default (console codepages
                          // mangle UTF-8); `utf8` switches on
 static int g_header_every = 40;
@@ -586,6 +593,13 @@ void DebugInit(void) {
     g_tbl = TableOpen(kEventCols, 6, g_ascii, g_header_every);
     TableHeader(g_tbl);
   }
+  // One-time resolution of the per-access/per-instruction gates. The hot
+  // interpreters test these plain globals instead of calling DebugOn on every
+  // byte of every instruction; a category that needs the event-emitting path
+  // disables the fast memory path wholesale.
+  g_mem_slow = ((g_mask & (kDbgMem | kDbgBus)) != 0) || g_nwatch != 0;
+  g_record_raw = (g_mask & (kDbgTraceLine | kDbgTraceTable)) != 0;
+  g_dbg_any = (g_mask != 0) || g_nwatch != 0;
 }
 
 int DebugOn(uint32_t cat) { return g_inited && ((g_mask & cat) || (g_nwatch && cat == kDbgMem)); }

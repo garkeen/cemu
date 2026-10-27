@@ -58,13 +58,31 @@ enum { kDrLenCount = 4, kDrCount = 4 };
 // LMSW/CLTS.
 enum { kCr0Pe = 1u, kCr0Mp = 2u, kCr0Em = 4u, kCr0Ts = 8u, kCr0Wp = 1u << 16,
        kCr0Pg = 1u << 31 };
-enum { kCr4Vme = 1u, kCr4Pvi = 2u, kCr4Tsd = 4u, kCr4De = 8u, kCr4Pse = 0x10u };
+// CR4: PSE gates 4MB pages; PAE selects the three-level 64-bit-entry walk;
+// PGE makes global translations survive a CR3 reload (SDM vol.3 2.5, 4.3,
+// 4.10.4.1). DE/TSD/VME/PVI are defined so the register reads back honestly;
+// the behaviours this machine does not have yet are registered in AGENTS.md.
+enum {
+  kCr4Vme = 1u,
+  kCr4Pvi = 2u,
+  kCr4Tsd = 4u,
+  kCr4De = 8u,
+  kCr4Pse = 0x10u,
+  kCr4Pae = 0x20u,
+  kCr4Pge = 0x80u,
+};
+// IA32_EFER (MSR 0xC0000080): only NX enable is meaningful without long mode.
+enum { kEferNxe = 1ull << 11 };
 // Page-directory / page-table entry flags for 4KB pages (SDM vol.3 4.3):
 // P, R/W, U/S and A exist at both levels, D only in the leaf. PS lives in
 // the PDE alone and turns it into a 4MB page when CR4.PSE=1 (vol.3 4.3).
 enum { kPdeP = 1u, kPdeRw = 2u, kPdeUs = 4u, kPdeA = 0x20u, kPdeD = 0x40u,
-       kPdePs = 0x80u };
-enum { kPteP = 1u, kPteRw = 2u, kPteUs = 4u, kPteA = 0x20u, kPteD = 0x40u };
+       kPdePs = 0x80u, kPdeG = 0x100u };
+enum { kPteP = 1u, kPteRw = 2u, kPteUs = 4u, kPteA = 0x20u, kPteD = 0x40u,
+       kPteG = 0x100u };
+// #PF error-code bits beyond the 386 set (SDM vol.3 table 6-1): RSVD and I
+// appear with PAE/NX. The non-PAE 386-class code keeps exactly P|W|U.
+enum { kPfPresent = 1u, kPfWrite = 2u, kPfUser = 4u, kPfRsvd = 8u, kPfInstr = 0x10u };
 // A 4-MByte page keeps its frame in PDE bits 31:22, so bits 21:13 are
 // reserved and must be 0; a set one is a page fault (SDM vol.3 fig 4-3 labels
 // bit 21 "RSvd" and bits 20:13 "Reserved", and §4.3 requires them 0). PSE-36
@@ -109,6 +127,30 @@ typedef union eflags {
   };
 } eflags;
 
+// The unified translation cache. One read and one write slot per set: a read
+// fill must not satisfy a later write, or the page's D bit would never be set
+// (the pm_smoke A/D test and KUT access rely on the write walk doing that).
+// Tags are linear page numbers; CR3 changes flush non-global entries, and
+// INVLPG flushes a page, so no ASID is needed on a 32-bit machine.
+enum {
+  kTlbSets = 1024,
+  kTlbWays = 2,
+  kTlbValid = 1u << 31,
+  kTlbWritable = 1u << 0,
+  kTlbUser = 1u << 1,
+  kTlbNx = 1u << 2,
+  kTlbGlobal = 1u << 3,
+  kTlbHost = 1u << 4,
+};
+typedef struct x86_tlb_entry {
+  uint32_t tag;    // kTlbValid | (linear page << 1) | write
+  uint32_t flags;  // kTlbWritable/User/Nx/Global/Host
+  uint32_t lin_base;   // start of the mapped page (4KB, 2MB or 4MB)
+  uint32_t page_shift; // 12, 21 or 22: INVLPG must drop the whole range
+  uint64_t pbase;      // physical page base, A20 already applied
+  uint8_t* host;       // page start when kTlbHost
+} x86_tlb_entry;
+
 typedef struct x86_state {
   cell* r;           // the shared CpuState bank, seen as eight cells
   uint16_t sreg[6];  // visible selector values
@@ -120,12 +162,22 @@ typedef struct x86_state {
   uint32_t cr0;
   uint32_t cr2;       // #PF stores the faulting linear address here (SDM vol.3 2.5)
   uint32_t cr3;       // page-directory base (PDBR); carried by task switches
-                      // (TSS +1c); the walk uses bits 31:12
-  uint32_t cr4;       // PSE gates 4MB pages (SDM vol.3 2.5; 486+/Pentium)
+                      // (TSS +1c); the walk uses bits 31:12 (PAE: 31:5)
+  uint32_t cr4;       // PSE/PGE select 4MB pages and global translations;
+                      // PAE selects the three-level walk (SDM vol.3 2.5)
+  uint64_t efer;      // IA32_EFER: NXE (bit 11) enables the PAE NX bit
   uint64_t msr_apic_base;  // MSR 0x1B image; the MMIO region itself is fixed
   uint64_t msr_fs_gs_base[2];  // 0xc0000100/101: written by the kvm-unit-tests
                                // boot (cstart setup_percpu_area), no effect
                                // without long mode — read back per QEMU
+  // Translation cache and the single-page fetch shortcut. Both are
+  // architecture-invisible caches; every TLB invalidation also drops the
+  // fetch shortcut. The fetch pointer aims at RAM, so a guest writing code
+  // sees its own bytes (no I-cache to invalidate).
+  x86_tlb_entry tlb[kTlbSets * kTlbWays];
+  uint32_t fetch_page;  // linear page the shortcut describes
+  uint8_t* fetch_host;
+  int fetch_valid;
   uint64_t gdtr;
   uint16_t gdtr_limit;
   uint64_t idtr;
