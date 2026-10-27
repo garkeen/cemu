@@ -75,6 +75,10 @@ build/cemu.exe --machine x86 -display win32 -bios bios.bin \
 `--skip-idle`、`-hdb`、`-fda`、`-vgabios`、`-mouse ps2|serial`、`-gdb tcp::PORT`
 / `-s` / `-S`（gdb RSP stub，配套图形前端 `cemugui`）。
 
+窗口鼠标统一按绝对位置映射：指针在画面内直接对应客人画面的像素位置，画面外的黑边
+钳到最近边缘，离开窗口停发；缩放窗口时画面矩形动态重算。virt/Oberon 是原生绝对设备，
+x86 的 PS/2 由板级换算（相对协议的近似与漂移边界见 AGENTS.md D38）。
+
 ## 测试
 
 ```sh

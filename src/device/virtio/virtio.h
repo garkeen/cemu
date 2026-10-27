@@ -5,12 +5,13 @@
 
 #include "bus/bus.h"
 
-// VirtIO over MMIO, legacy revision 1 (the register layout of the "Virtio
-// over MMIO" appendix before VirtIO 1.0's revision 2; offset constants below
-// match include/uapi/linux/virtio_mmio.h and dearchap-tinyemu virtio.c, and
-// the handshake semantics are calibrated against QEMU 10.2's virtio-mmio in
-// force-legacy mode -- the transport this machine's guests actually speak,
-// captured with QEMU's virtio_mmio trace events).
+// VirtIO over MMIO. Both revisions are implemented: revision 1 (the legacy
+// PFN transport, calibrated against QEMU 10.2's virtio-mmio in force-legacy
+// mode) and revision 2 (VirtIO 1.0: explicit queue addresses and QueueReady).
+// Offset constants match include/uapi/linux/virtio_mmio.h and
+// dearchap-tinyemu virtio.c. Revision 2 exists because Linux 4.15's
+// virtio_input driver refuses to probe a device without VIRTIO_F_VERSION_1
+// (virtio_input.c:207), and that bit belongs to the modern transport.
 //
 // One VirtioDevice is one slot on the virtio-mmio bus: a register file, a set
 // of split virtqueues living in guest RAM, a config-space page the backend
@@ -39,20 +40,34 @@ enum {
   kVirtioMmioQueueNum = 0x038,
   kVirtioMmioQueueAlign = 0x03c,  // legacy only
   kVirtioMmioQueuePfn = 0x040,    // legacy only
+  kVirtioMmioQueueReady = 0x044,  // modern only
   kVirtioMmioQueueNotify = 0x050,
   kVirtioMmioInterruptStatus = 0x060,
   kVirtioMmioInterruptAck = 0x064,
   kVirtioMmioStatus = 0x070,
+  kVirtioMmioQueueDescLow = 0x080,    // modern only
+  kVirtioMmioQueueDescHigh = 0x084,
+  kVirtioMmioQueueDriverLow = 0x090,  // avail ring
+  kVirtioMmioQueueDriverHigh = 0x094,
+  kVirtioMmioQueueDeviceLow = 0x0a0,  // used ring
+  kVirtioMmioQueueDeviceHigh = 0x0a4,
+  kVirtioMmioConfigGeneration = 0x0fc,
   kVirtioMmioConfig = 0x100,
 };
 
-// Legacy device status bits (VirtIO 1.1 spec 2.1).
+// Device status bits (VirtIO 1.1 spec 2.1).
 enum {
   kVirtioStatusAcknowledge = 1u << 0,
   kVirtioStatusDriver = 1u << 1,
   kVirtioStatusDriverOk = 1u << 2,
+  kVirtioStatusFeaturesOk = 1u << 3,
   kVirtioStatusFailed = 1u << 7,
 };
+
+// Device feature bit 32 (VirtIO 1.0's VIRTIO_F_VERSION_1). Revision 2
+// devices advertise it; Linux's virtio core then keeps it in the negotiated
+// set and the input driver's probe gate passes (virtio.c:225-233).
+enum { kVirtioFVersion1 = 32 };
 
 // Descriptor flags (spec 2.6.5).
 enum {
@@ -77,10 +92,12 @@ enum {
 typedef struct VirtioQueue {
   uint32_t num;            // queue size in descriptors (power of two)
   uint32_t pfn;            // legacy: written by the driver, read back
-  uint64_t desc_addr;      // guest physical, derived from pfn << page_shift
+  uint64_t desc_addr;      // legacy: derived from pfn << page_shift;
+                           // modern: written through the address registers
   uint64_t avail_addr;
   uint64_t used_addr;
   uint16_t last_avail_idx;
+  int ready;               // modern QueueReady
   int manual;              // the transport does not drain this queue on
                            // notify; the backend pulls it (console receive)
 } VirtioQueue;
@@ -98,10 +115,12 @@ typedef void (*VirtioConfigWriteFn)(VirtioDevice* v);
 struct VirtioDevice {
   Bus* bus;
   uint32_t device_id, vendor_id;
-  uint32_t device_features;  // legacy: bits 0..31
-  uint32_t guest_features;
+  uint32_t version;          // 1 = legacy PFN transport, 2 = modern addresses
+  uint64_t device_features;  // 64-bit feature space, read through the two-word
+                             // DeviceFeatures selector
+  uint64_t guest_features;
   uint32_t status;
-  uint32_t features_sel, queue_sel;
+  uint32_t device_features_sel, driver_features_sel, queue_sel;
   uint32_t int_status;
   uint32_t page_shift;  // from GuestPageSize (legacy)
   uint32_t align;       // from QueueAlign (legacy), bytes
@@ -123,7 +142,8 @@ extern const DeviceOps kVirtioMmioOps;
 extern const DeviceOps kVirtioMmioEmptyOps;
 
 void VirtioInit(VirtioDevice* v, Bus* bus, uint32_t device_id, uint32_t vendor_id,
-                uint32_t features, int config_size, VirtioRecvFn recv);
+                uint64_t features, uint32_t version, int config_size,
+                VirtioRecvFn recv);
 
 // Queue helpers shared by the backends. Copy between a descriptor chain and
 // a linear buffer: `to_guest` picks the first device-writable descriptor and

@@ -57,6 +57,8 @@ static void Usage(void) {
       "                    instruction, so timer edges are a function of the\n"
       "                    instruction stream and a run reproduces exactly\n"
       "  -bios FILE        x86: map a firmware ROM image and reset into it\n"
+      "                    virt: load the firmware at the DRAM base, what\n"
+      "                    OpenSBI fw_jump expects (QEMU's -bios)\n"
       "  -kernel FILE      raw payload at the board's kernel address (virt:\n"
       "                    0x80200000, what OpenSBI fw_jump jumps to)\n"
       "  -append STR       kernel command line -> device tree /chosen/bootargs\n"
@@ -277,9 +279,13 @@ int main(int argc, char** argv) {
   uint64_t bin_base = a.bin_base ? a.bin_base : m->bin_base;
   LoadResult lr;
   memset(&lr, 0, sizeof(lr));
-  if (a.image) {
-    if (LoaderLoadImage(&m->bus, a.image, a.isa_name, bin_base, a.bin_tohost, m->bin_htif, &lr) !=
-        0) {
+  // On boards whose -bios is a plain image (virt firmware), it takes the
+  // image slot; on the PC board the board itself mapped the ROM during
+  // creation, so m->bios_image stays 0 and a positional image is separate.
+  const char* image_path = a.image ? a.image : (m->bios_image ? a.bios_path : NULL);
+  if (image_path) {
+    if (LoaderLoadImage(&m->bus, image_path, a.isa_name, bin_base, a.bin_tohost, m->bin_htif,
+                        &lr) != 0) {
       BoardDestroy(m);
       return kExitHostFailure;
     }
@@ -306,8 +312,8 @@ int main(int argc, char** argv) {
   m->entry = m->cpu.pc;  // where a machine reset restarts (board.h)
   m->cpu.image_base = lr.image_base;
   lr.isa->init(&m->cpu);
-  if (a.image)
-    LogInfo("loaded %s: entry=%llx isa=%s htif=%d", a.image, (unsigned long long)lr.entry,
+  if (image_path)
+    LogInfo("loaded %s: entry=%llx isa=%s htif=%d", image_path, (unsigned long long)lr.entry,
             lr.isa->name, lr.has_htif);
   else
     LogInfo("firmware boot: reset=%llx isa=%s", (unsigned long long)m->cpu.pc, lr.isa->name);
@@ -340,9 +346,12 @@ int main(int argc, char** argv) {
       return kExitHostFailure;
     }
     // The board's keyboard sink (the PC's 8042): window keys drive it, and
-    // the pointer sink drives the same controller's auxiliary port.
+    // the pointer sinks drive the same controller's auxiliary port. The
+    // absolute sink is the window's default when the board has one; the
+    // relative sink remains for the debug hub's synthetic events.
     if (m->key_in) HostDisplaySetKeySink(m->display, m->key_in, m->key_ctx);
     if (m->mouse_in) HostDisplaySetMouseSink(m->display, m->mouse_in, m->mouse_ctx);
+    if (m->mouse_abs) HostDisplaySetMouseAbsSink(m->display, m->mouse_abs, m->mouse_abs_ctx);
   }
 
   if (a.gdb_port) {

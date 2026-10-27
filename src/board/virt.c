@@ -90,10 +90,11 @@ static const KeyMap kKeys[] = {
     {0x53, 83},  {0x57, 87},  {0x58, 88},  {0x45, 69},  {0x46, 70},
 };
 static const KeyMap kKeysExt[] = {  // 0xe0-prefixed
-    {0x1c, 96},   {0x1d, 183},  {0x35, 84},   {0x38, 184},
+    {0x1c, 96},   {0x1d, 97},   {0x35, 98},   {0x38, 100},
     {0x47, 102},  {0x48, 103},  {0x49, 104},  {0x4b, 105},
     {0x4d, 106},  {0x4f, 107},  {0x50, 108},  {0x51, 109},
-    {0x52, 110},  {0x53, 111},
+    {0x52, 110},  {0x53, 111},  {0x5b, 125},  {0x5c, 126},
+    {0x5d, 127},
 };
 
 // Reset vector, word-for-word from the QEMU mask ROM dump. The six
@@ -175,7 +176,18 @@ static void OnHostKey(void* ctx, uint32_t scan, int extended, int up) {
 
 // Host window -> virtio tablet: deltas accumulated into the 0..0x7fff
 // absolute field the device reports (the window itself only produces
-// relative motion events).
+// relative motion events). This is the debug hub's channel; the window uses
+// the absolute sink below.
+static void TabletSend(VirtBoard* vm, int dz, int buttons) {
+  VirtioInputPointer(vm->tablet, vm->px, vm->py);
+  if (dz) VirtioInputWheel(vm->tablet, dz > 0 ? 1 : -1);
+  for (int b = 0; b < 3; b++) {
+    int now = (buttons >> b) & 1;
+    if (now != ((vm->tablet->buttons >> b) & 1))
+      VirtioInputButton(vm->tablet, b, now);
+  }
+}
+
 static void OnHostMouse(void* ctx, int dx, int dy, int dz, int buttons) {
   VirtBoard* vm = (VirtBoard*)ctx;
   vm->px += dx * 0x8000 / kVirtFbWidth;
@@ -184,13 +196,16 @@ static void OnHostMouse(void* ctx, int dx, int dy, int dz, int buttons) {
   if (vm->py < 0) vm->py = 0;
   if (vm->px >= 0x8000) vm->px = 0x7fff;
   if (vm->py >= 0x8000) vm->py = 0x7fff;
-  if (dx || dy) VirtioInputPointer(vm->tablet, vm->px, vm->py);
-  if (dz) VirtioInputWheel(vm->tablet, dz > 0 ? 1 : -1);
-  for (int b = 0; b < 3; b++) {
-    int now = (buttons >> b) & 1;
-    if (now != ((vm->tablet->buttons >> b) & 1))
-      VirtioInputButton(vm->tablet, b, now);
-  }
+  TabletSend(vm, dz, buttons);
+}
+
+// Source-picture pixels -> the tablet's 0..0x7fff range. The window has
+// already clamped to the picture and reports nothing outside the client.
+static void OnHostMouseAbs(void* ctx, int x, int y, int dz, int buttons) {
+  VirtBoard* vm = (VirtBoard*)ctx;
+  vm->px = x * 0x7fff / (kVirtFbWidth - 1);
+  vm->py = y * 0x7fff / (kVirtFbHeight - 1);
+  TabletSend(vm, dz, buttons);
 }
 
 // Host input -> the guest's consoles. The firmware talks on the 16550
@@ -377,6 +392,7 @@ Board* VirtBoardCreate(const BoardOpts* opts) {
   BusAddRamRegion(&m->bus, kDramBase, ram_size, &kRamOps, m->ram, m->ram->mem);
   BusAddRamRegion(&m->bus, kMromBase, kMromSize, &kRamOps, vm->mrom, vm->mrom->mem);
   m->bin_base = kDramBase;  // firmware loads at the DRAM base
+  m->bios_image = 1;        // -bios FILE is that firmware (QEMU -bios)
 
   // Mask-ROM contents: the reset vector, then the data slots it references.
   // start_addr (0x1018) is the firmware load address (m->bin_base, so
@@ -463,6 +479,8 @@ Board* VirtBoardCreate(const BoardOpts* opts) {
   m->key_ctx = vm;
   m->mouse_in = OnHostMouse;
   m->mouse_ctx = vm;
+  m->mouse_abs = OnHostMouseAbs;
+  m->mouse_abs_ctx = vm;
 
   // The DTB framebuffer as a display source, when DRAM actually covers it.
   if (ram_size >= kVirtFbBase - kDramBase + kVirtFbStride * kVirtFbHeight) {

@@ -74,7 +74,8 @@ VirtioBlk* VirtioBlkCreate(Bus* bus, uint64_t base, uint64_t size, const char* f
   if (!f) return NULL;
   VirtioBlk* blk = calloc(1, sizeof *blk);
   VirtioInit(&blk->vdev, bus, 2 /*virtio-blk id, spec 5.2*/, kVirtioVendorId,
-             0 /*legacy: no optional features*/, 8 /*capacity field*/, BlkRecv);
+             0 /*legacy: no optional features*/, 1 /*legacy transport*/,
+             8 /*capacity field*/, BlkRecv);
   blk->file = f;
   blk->sectors = HostFileSize(f) / kSectorSize;
   uint64_t cap = blk->sectors;

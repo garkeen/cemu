@@ -403,7 +403,26 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 | D34 | mmu.c Sv39 PTE 高位 | **Svnapot 与 Svpbmt 未实现**：叶 PTE 的 bit63:54（N 与 PBMT）任一位置起即按保留位报 page fault，本机不解释 NAPOT 大页也不解释 PBMT 内存类型。后果要说清楚：`rv64ssvnapot-p-napot` 那格走的是**验收件自带的 skip 分支**（件源 `riscv-tests/isa/rv64ssvnapot/napot.S` 的 `mtvec_handler` 见 store page fault + `mepc=napot_store` + `mtval=MY_VA` 就跳 `pass`），所以它在套件里是绿的，但**没钉任何东西**——64KB NAPOT 区间与 PBMT 属性在本机无验证。别和已实现的那半混淆：PMP 的 NAPOT 区间编码是实现了的（mmu.c 的 PMP 段） | 特权规范 4.3.2（叶 PTE 保留位与 N/PBMT 字段）；Svnapot v1.0、Svpbmt v1.0；QEMU target/riscv 的 RV_PTE_NAPOT 与 pbmt 解码；件源 riscv-tests isa/rv64ssvnapot/napot.S | 出现依赖 NAPOT 大页或 PBMT 的客户机时（当前 Linux 0.11/2.6.34 都不用；riscv 侧 xv6-riscv 验收时若 OpenSBI 要求再核） | 登记中 |
 | D35 | riscv64/csr.c、riscv32/csr.c 的 misa 写路径 | `csrw misa` 的掩码 `(val & kMisaSupported) \| kMisaI` 只挡"未实现的位"，不挡"只读位"：客机写 0 能把 S 与 U 位清掉，而清掉之后本机照样进 U 模式、照样按 PTE.U 判权限（状态与自述脱钩）。这两位在规范里是否强制只读**缺手册 §3.1.1 的原文**，未据裁决（先例：DAS 的 18 处分歧按实机、计数器抑制只实现有测试覆盖的一侧——这里两侧都无证据，故不猜） | 特权规范 3.1.1 misa 的 WARL 措辞（原文待核）；dearchap-tinyemu riscv_cpu.c:1306 只组装 misa、无 csrw misa 路径可参照 | 核到手册原文后：若 S/U 强制只读，则把这两位从可改掩码里摘出并补一个自足探针（写 misa 后读回） | 登记中 |
 | D36 | riscv64/csr.c、riscv32/csr.c 的 MHPM 计数器 | **MHPM 计数器只存储不自增**：`mhpmcounter3..18` 在 cemu 里没有事件源，写进去的值能读回，但从不增长；`mhpmevent3..18` 同样只存储。mcycle/minstret 不受影响（step.c 每步自增）。OpenSBI 按 CSR 存在探测计数器数量，拿到的是"能读但不动"的计数器 | QEMU target/riscv/csr.c 的 pmu 计数（Zihpm 允许实现定义事件）；特权规范 3.1.11 | 出现依赖性能计数器/剖析的客户机或工具时 | 登记中 |
+| D38 | x86_min.c 绝对指针（PS/2） | **PS/2 鼠标只有相对计数，没有绝对包**。窗口的绝对位置由 x86 板换算成 PS/2 位移：首次/换模式时发负向回零包把客人光标钉到 (0,0)，之后按板级模型逐包走向目标；包按 AUX 队列空位与 100 Hz 限速，按键转换排队到点击位置再发。模型假设客人 1:1 应用计数、在屏幕边缘钳位；客人若做鼠标加速、自己 warp 光标，会漂移；PS/2 2:1 缩放由设备的逆变换补偿，单包在途（AUX 队列清空才发下一包）。`-mouse serial` 仍是相对设备 | PS/2 鼠标协议（相对计数，9 位二补码）；QEMU 对 PS/2 用相对 + 指针 grab，绝对输入另走 USB tablet/vmmouse；真实绝对需要客人驱动 | 出现支持 USB tablet/vmmouse 的 x86 客人驱动时换真绝对设备；当前模式为 best-effort，漂移时以相对模式兜底 | 登记中 |
 | E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中 |
+
+## 十一、显示窗口指针契约（所有主板）
+
+窗口的指针一律按**绝对位置**工作，不做"相对位移累积"：
+
+- 指针在画面矩形内：把客户区坐标映射成**源画面像素**（X 向右、Y 向下），板级把它当
+  绝对坐标。
+- 画面矩形按 Blit 的 fit/letterbox 规则**每次事件重算**，窗口缩放/模式变化都不缓存几何
+  （原"先固定窗口大小"的待做项直接实现，不留待做）。
+- 指针在客户区内但在画面外的黑边：钳到画面最近的边缘，绝不发画面外坐标。
+- 指针离开客户区：完全停发；按住键拖出客户区时移动停发，但**释放事件用最后一次有效
+  画面位置发出**，避免客人卡住按键。
+- 每个移动/按键/滚轮包以 `EV_SYN`/`SYN_REPORT` 结束（virtio-input 路径）。
+- 设备层：virtio-tablet 与 Oberon 鼠标寄存器原生绝对（`src/board/virt.c`、
+  `src/device/misc/oberon_io.c`）；x86 PS/2 由板级换算，假设与漂移边界见 D38；
+  `-mouse serial` 仍是相对设备。
+- `CEMU_DEBUG=mouse=...` 的合成事件仍走相对 sink（`Board.mouse_in`）；窗口优先走绝对
+  sink（`Board.mouse_abs`）。
 
 ## 附：关键行为裁决存档（修复时的先例依据）
 

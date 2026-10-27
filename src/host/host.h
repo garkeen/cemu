@@ -121,6 +121,21 @@ void HostDisplaySetMouseSink(HostDisplay* d,
                              void (*cb)(void* ctx, int dx, int dy, int dz, int buttons),
                              void* ctx);
 
+// The absolute pointer channel (all boards): source-picture pixel coordinates
+// (0..Width-1, 0..Height-1, Y down). While the pointer is inside the client
+// area the window reports the position mapped to the picture, clamped to the
+// nearest picture edge when it is in the letterbox; a point outside the client
+// area reports nothing at all. The picture rect is recomputed on every event
+// from the current client size and the source size, so window resizing needs
+// no cached geometry. A board with a relative-only device (PS/2) translates
+// this into its own coordinate space; a board with an absolute device
+// (virtio-tablet) sends it as-is. When both sinks are installed the window
+// prefers this one; mouse_in stays available for the debug hub's synthetic
+// events.
+void HostDisplaySetMouseAbsSink(HostDisplay* d,
+                                void (*cb)(void* ctx, int x, int y, int dz, int buttons),
+                                void* ctx);
+
 // The host's own keyboard source: stdin, read at the machine's input sinks —
 // the console the user runs cemu from, or a pipe a script drives. A board with
 // a serial port takes stdin at its receiver (raw bytes); otherwise it takes it

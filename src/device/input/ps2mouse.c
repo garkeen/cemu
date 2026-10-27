@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "debug/debug.h"
+
 // The command set (PS/2 mouse protocol: the "mouse" half of the same 0x60/0x64
 // protocol as the keyboard; QEMU hw/input/ps2.c spells these AUX_*, v86
 // src/ps2.js handles them in port60_write's mouse branch).
@@ -213,10 +215,12 @@ void Ps2MouseWrite(Ps2MouseDevice* d, uint8_t val) {
   switch (val) {
     case kCmdSetScale11:
       st->scale21 = 0;
+      if (DebugOn(kDbgMark)) DebugMark("ps2-scale", 0, 0);
       Tx(d, kReplyAck);
       break;
     case kCmdSetScale21:
       st->scale21 = 1;
+      if (DebugOn(kDbgMark)) DebugMark("ps2-scale", 1, 0);
       Tx(d, kReplyAck);
       break;
     case kCmdSetRes:
@@ -295,6 +299,36 @@ void Ps2MouseEvent(Ps2MouseDevice* d, int dx, int dy, int dz, int buttons) {
   st->dy += dy;
   st->dz += dz;
   Sync(d);
+}
+
+int Ps2MouseCanReport(const Ps2MouseDevice* d) {
+  return d->st && d->st->enabled && !d->st->remote;
+}
+
+int Ps2MouseScaling(const Ps2MouseDevice* d) { return d->st && d->st->scale21; }
+
+int Ps2MouseScale21(int n) { return Scale21(n); }
+
+int Ps2MouseScale21Inverse(int d) {
+  int sign = d < 0 ? -1 : 1;
+  int a = d < 0 ? -d : d;
+  int n;
+  switch (a) {
+    case 0: n = 0; break;
+    case 1: n = 1; break;
+    case 2: n = 1; break;   // Scale21(1) = 1
+    case 3: n = 3; break;
+    case 4: n = 3; break;   // 3
+    case 5: n = 4; break;   // 6
+    case 6: n = 4; break;
+    case 7: n = 4; break;   // 6
+    case 8: n = 5; break;   // 9
+    case 9: n = 5; break;
+    case 10: n = 5; break;  // 9
+    case 11: n = 6; break;  // 12
+    default: n = a / 2; break;  // 2*n or 2*n-1
+  }
+  return sign * n;
 }
 
 void Ps2MouseInit(Ps2MouseDevice* d) {

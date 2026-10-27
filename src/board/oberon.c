@@ -53,15 +53,11 @@ static void OnHostKey(void* ctx, uint32_t scan, int extended, int up) {
   Ps2KbdKey((Ps2KbdDevice*)ctx, scan, extended, up);
 }
 
-// The host pointer reports PS/2-style movement deltas; the machine's register
-// holds absolute coordinates, which the IO device integrates. The machine's
-// pointer has no wheel.
-//
-// Pointer gain: the host counts one per window pixel and its cursor is free
-// to leave the window (the star then stops at the edge until it returns), so
-// 1:1 reads sluggish on the 1024x768 field — the reference frontend instead
-// maps absolute window coordinates straight onto the guest. 3/2 keeps the
-// star moving while the host cursor still has window to travel.
+// The window now uses the absolute pointer channel: source-picture pixels map
+// straight onto the machine's absolute mouse register (the reference frontend
+// does the same). The relative sink remains for CEMU_DEBUG=mouse= synthetic
+// events; the 3/2 gain there keeps a short synthetic delta visible on the
+// 1024x768 field.
 enum { kOberonPointerGainNum = 3, kOberonPointerGainDen = 2 };
 
 static void OnHostMouse(void* ctx, int dx, int dy, int dz, int buttons) {
@@ -69,6 +65,14 @@ static void OnHostMouse(void* ctx, int dx, int dy, int dz, int buttons) {
   OberonIoDevice* io = (OberonIoDevice*)ctx;
   OberonIoMouseMove(io, dx * kOberonPointerGainNum / kOberonPointerGainDen,
                     dy * kOberonPointerGainNum / kOberonPointerGainDen);
+  OberonIoMouseButtons(io, buttons);
+}
+
+static void OnHostMouseAbs(void* ctx, int x, int y, int dz, int buttons) {
+  (void)dz;
+  OberonIoDevice* io = (OberonIoDevice*)ctx;
+  // The register's Y grows upward; the window's source picture Y grows down.
+  OberonIoMouseSet(io, x, kFrameHeight - 1 - y);
   OberonIoMouseButtons(io, buttons);
 }
 
@@ -139,6 +143,8 @@ Board* OberonBoardCreate(const BoardOpts* opts) {
   m->key_ctx = &ob->kbd;
   m->mouse_in = OnHostMouse;
   m->mouse_ctx = &ob->io;
+  m->mouse_abs = OnHostMouseAbs;
+  m->mouse_abs_ctx = &ob->io;
 
   m->display_dev = &ob->fb;
   m->display_ops = &kRamfbDisplayOps;

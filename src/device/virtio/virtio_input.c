@@ -140,10 +140,14 @@ void VirtioInputPointer(VirtioInput* in, int abs_x, int abs_y) {
   if (abs_y >= kAbsScale) abs_y = kAbsScale - 1;
   Enqueue(in, kEvAbs, kAbsX, abs_x);
   Enqueue(in, kEvAbs, kAbsY, abs_y);
+  // evdev buffers events until SYN_REPORT; without it the motion sits in the
+  // kernel until the next button/key packet flushes the backlog.
+  Enqueue(in, kEvSyn, 0, 0);
 }
 
 void VirtioInputWheel(VirtioInput* in, int notches) {
   Enqueue(in, kEvRel, kRelWheel, notches);
+  Enqueue(in, kEvSyn, 0, 0);
 }
 
 void VirtioInputButton(VirtioInput* in, int bit, int down) {
@@ -161,7 +165,9 @@ VirtioInput* VirtioInputCreate(Bus* bus, uint64_t base, uint64_t size,
                                VirtioInputType type, int irq_src,
                                void (*set_irq)(void*, int, int), void* irq_ctx) {
   VirtioInput* in = calloc(1, sizeof *in);
-  VirtioInit(&in->vdev, bus, 18 /*virtio-input id, spec 5.10*/, kVirtioVendorId, 0,
+  VirtioInit(&in->vdev, bus, 18 /*virtio-input id, spec 5.10*/, kVirtioVendorId,
+             1ULL << kVirtioFVersion1 /* Linux's virtio_input probe gate */,
+             2 /*modern transport*/,
              256 /*selector-driven config page*/, InputRecv);
   in->type = type;
   in->vdev.config_hook = InputConfigSelected;

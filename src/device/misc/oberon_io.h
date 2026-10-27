@@ -112,6 +112,9 @@ void OberonIoKey(OberonIoDevice* d, uint8_t byte);
 // dy counting up (host.h's pointer sink); the register holds absolute
 // coordinates, so the device integrates and clamps to the 12-bit field.
 void OberonIoMouseMove(OberonIoDevice* d, int dx, int dy);
+// Absolute position in screen pixels (the window's absolute pointer channel;
+// the register already holds absolute coordinates, so this is a direct set).
+void OberonIoMouseSet(OberonIoDevice* d, int x, int y);
 // Button state after the event, the host sink's convention: bit 0 left,
 // bit 1 right, bit 2 middle — packed into register bits 26/24/25.
 void OberonIoMouseButtons(OberonIoDevice* d, int buttons);

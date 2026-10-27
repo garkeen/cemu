@@ -36,8 +36,8 @@ VirtioConsole* VirtioConsoleCreate(Bus* bus, uint64_t base, uint64_t size, int i
                                    void (*set_irq)(void*, int, int), void* irq_ctx) {
   VirtioConsole* con = calloc(1, sizeof *con);
   VirtioInit(&con->vdev, bus, 3 /*virtio-console id, spec 5.3*/,
-             kVirtioVendorId, kConsoleFeatureSize, 4 /*cols/rows*/,
-             ConsoleRecv);
+             kVirtioVendorId, kConsoleFeatureSize, 1 /*legacy transport*/,
+             4 /*cols/rows*/, ConsoleRecv);
   con->vdev.reset_hook = ConsoleReset;
   con->vdev.queue[kConsoleQueueRx].manual = 1;
   con->vdev.config[0] = 128;  // cols: the simplefb text grid the guest draws

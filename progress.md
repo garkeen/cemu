@@ -2470,3 +2470,23 @@ ecall），QEMU 执行同一镜像止于同一条 j .，非 cemu 缺陷。结论
 引导一轮暴露 4 处套件覆盖洞（Sv48、PMP 零配置、非叶 A/D、srai63），
 HelenOS 可作 riscv64 应力源；引导本身不进套件（~2.2B 指令才到内核，
 慢）。回归 136/104/36、dep: ok。
+
+## 统一绝对指针契约（2026-10-27，片 39）
+
+用户裁决：所有显示主板的鼠标一律按绝对位置——指针在画面矩形内直接映射到源画面像素，
+客户区黑边钳到最近边缘，离开客户区完全停发（拖拽释放用最后有效画面位置，避免按键
+卡住）；窗口缩放动态计算矩形（原“先固定窗口大小”的待做项直接实现）。契约写入
+AGENTS.md §十一。
+
+实现：display_win.c 增绝对 sink；ClientPictureRect/MapPointer 与 Blit 共用 fit 规则，
+每个 WM_MOUSEMOVE/按键/滚轮从当前客户区重算。Board 增 mouse_abs，main 在 mouse_in
+之外装载；virt 把源像素映射到 tablet 0..0x7fff（窗口路径不再累积），Oberon 新增
+OberonIoMouseSet 直写绝对寄存器，virtio-input 的 pointer/wheel 补 SYN_REPORT
+（缺 SYN 时 evdev 把事件缓存到下一次按键，正是“指针贴右、右键才刷新”的根因）。
+x86 PS/2 只有相对协议：D38 模型首次/换模式回零 (0,0)，按键转换按点击位置排队，按
+AUX 队列空位与 100 Hz 限速逐包逼近目标；2:1 缩放由设备逆变换补偿，单包在途（队列
+清空才发下一包），-mouse serial 保持相对。Oberon 绝对 Y 取反（寄存器 Y 向上、画面
+Y 向下）。
+
+验证：构建零告警、dep ok、riscv64 136/0、riscv32 104/0；图像（JSLinux/Oberon/
+Win101）按用户要求由宿主侧自测，本会话未启动。

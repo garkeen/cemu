@@ -38,5 +38,18 @@ void Ps2MouseWrite(Ps2MouseDevice* d, uint8_t val);
 // button state afterwards — bit 0 left, bit 1 right, bit 2 middle, the same
 // bit order the packet's first byte uses (ps2.js mouse_send_click).
 void Ps2MouseEvent(Ps2MouseDevice* d, int dx, int dy, int dz, int buttons);
+// Whether the device emits a packet right now: reporting on (0xf4) and not in
+// remote mode. The board's absolute pointer integration uses this so it never
+// advances a guest-cursor tracker with packets the guest will not see.
+int Ps2MouseCanReport(const Ps2MouseDevice* d);
+// 2:1 scaling (0xe7) transforms counts before they reach the packet, so a
+// delta tracker cannot assume 1:1.
+int Ps2MouseScaling(const Ps2MouseDevice* d);
+// The device's 2:1 transform and an inverse that returns a count whose scaled
+// result is as close as possible to the requested movement. The board's
+// absolute model uses them so the guest cursor still reaches the target when
+// the driver turns scaling on.
+int Ps2MouseScale21(int n);
+int Ps2MouseScale21Inverse(int d);
 
 #endif

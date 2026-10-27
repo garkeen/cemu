@@ -235,7 +235,8 @@ int VirtioManualFill(VirtioDevice* v, int q, const void* buf, int len) {
 
 static void TransportReset(VirtioDevice* v) {
   v->guest_features = 0;
-  v->features_sel = 0;
+  v->device_features_sel = 0;
+  v->driver_features_sel = 0;
   v->queue_sel = 0;
   v->int_status = 0;
   v->page_shift = 12;
@@ -246,23 +247,32 @@ static void TransportReset(VirtioDevice* v) {
     qs->pfn = 0;
     qs->desc_addr = qs->avail_addr = qs->used_addr = 0;
     qs->last_avail_idx = 0;
+    qs->ready = 0;
   }
   if (v->reset_hook) v->reset_hook(v);
 }
 
 void VirtioInit(VirtioDevice* v, Bus* bus, uint32_t device_id, uint32_t vendor_id,
-                uint32_t features, int config_size, VirtioRecvFn recv) {
+                uint64_t features, uint32_t version, int config_size,
+                VirtioRecvFn recv) {
   memset(v, 0, sizeof *v);
   v->bus = bus;
   v->device_id = device_id;
   v->vendor_id = vendor_id;
   v->device_features = features;
+  v->version = version;
   v->config_size = config_size;
   v->recv = recv;
   TransportReset(v);
 }
 
 // ---- register file ----
+
+// One 32-bit word of the 64-bit feature space, selected by the guest's
+// DeviceFeaturesSel/DriverFeaturesSel (virtio-mmio spec 4.2.2).
+static uint32_t FeatureWord(uint64_t features, uint32_t sel) {
+  return sel < 2 ? (uint32_t)(features >> (32 * sel)) : 0;
+}
 
 static uint64_t MmioRead(void* dev, uint64_t addr, int size) {
   VirtioDevice* v = dev;
@@ -285,15 +295,19 @@ static uint64_t MmioRead(void* dev, uint64_t addr, int size) {
     case kVirtioMmioMagic:
       return kVirtioMagicValue;
     case kVirtioMmioVersion:
-      return 1;  // legacy transport
+      return v->version;
     case kVirtioMmioDeviceId:
       return v->device_id;
     case kVirtioMmioVendorId:
       return v->vendor_id;
     case kVirtioMmioDeviceFeatures:
-      return v->features_sel == 0 ? v->device_features : 0;
+      return FeatureWord(v->device_features, v->device_features_sel);
     case kVirtioMmioDeviceFeaturesSel:
-      return v->features_sel;
+      return v->device_features_sel;
+    case kVirtioMmioDriverFeatures:
+      return FeatureWord(v->guest_features, v->driver_features_sel);
+    case kVirtioMmioDriverFeaturesSel:
+      return v->driver_features_sel;
     case kVirtioMmioQueueSel:
       return v->queue_sel;
     case kVirtioMmioQueueNumMax:
@@ -302,6 +316,22 @@ static uint64_t MmioRead(void* dev, uint64_t addr, int size) {
       return qs->num;
     case kVirtioMmioQueuePfn:
       return qs->pfn;
+    case kVirtioMmioQueueReady:
+      return (uint64_t)qs->ready;
+    case kVirtioMmioQueueDescLow:
+      return (uint32_t)qs->desc_addr;
+    case kVirtioMmioQueueDescHigh:
+      return (uint32_t)(qs->desc_addr >> 32);
+    case kVirtioMmioQueueDriverLow:
+      return (uint32_t)qs->avail_addr;
+    case kVirtioMmioQueueDriverHigh:
+      return (uint32_t)(qs->avail_addr >> 32);
+    case kVirtioMmioQueueDeviceLow:
+      return (uint32_t)qs->used_addr;
+    case kVirtioMmioQueueDeviceHigh:
+      return (uint32_t)(qs->used_addr >> 32);
+    case kVirtioMmioConfigGeneration:
+      return 0;
     case kVirtioMmioInterruptStatus:
       DebugVirtio("isr", v->device_id, v->int_status, v->queue_sel, 0);
       return v->int_status;
@@ -310,6 +340,13 @@ static uint64_t MmioRead(void* dev, uint64_t addr, int size) {
     default:
       return 0;
   }
+}
+
+static void SetAddrWord(uint64_t* a, uint32_t val, int high) {
+  if (high)
+    *a = (*a & 0xffffffffULL) | ((uint64_t)val << 32);
+  else
+    *a = (*a & ~0xffffffffULL) | val;
 }
 
 static void MmioWrite(void* dev, uint64_t addr, int size, uint64_t val64) {
@@ -328,22 +365,27 @@ static void MmioWrite(void* dev, uint64_t addr, int size, uint64_t val64) {
   VirtioQueue* qs = &v->queue[v->queue_sel];
   switch (addr) {
     case kVirtioMmioDeviceFeaturesSel:
-      v->features_sel = val;
+      v->device_features_sel = val;
       break;
     case kVirtioMmioDriverFeatures:
-      if (v->features_sel == 0) v->guest_features = val;
-      DebugVirtio("feat", v->device_id, v->features_sel, val, v->device_features);
+      if (v->driver_features_sel < 2) {
+        int shift = 32 * (int)v->driver_features_sel;
+        v->guest_features =
+            (v->guest_features & ~(0xffffffffULL << shift)) | ((uint64_t)val << shift);
+      }
+      DebugVirtio("feat", v->device_id, v->driver_features_sel, val, v->device_features);
       break;
     case kVirtioMmioDriverFeaturesSel:
-      v->features_sel = val;  // one selector register serves both words
+      v->driver_features_sel = val;
       break;
-    case kVirtioMmioGuestPageSize: {
-      uint64_t sz = val;
-      int shift = 12;
-      while ((1ull << shift) < sz) shift++;
-      v->page_shift = shift;
+    case kVirtioMmioGuestPageSize:
+      if (v->version == 1) {
+        uint64_t sz = val;
+        int shift = 12;
+        while ((1ull << shift) < sz) shift++;
+        v->page_shift = shift;
+      }
       break;
-    }
     case kVirtioMmioQueueSel:
       DebugVirtio("qsel", v->device_id, val, v->queue_sel, 0);
       if (val < kVirtioMaxQueue) v->queue_sel = val;
@@ -353,22 +395,49 @@ static void MmioWrite(void* dev, uint64_t addr, int size, uint64_t val64) {
       if (val > 0 && (val & (val - 1)) == 0 && val <= kVirtioMaxQueueNum) qs->num = val;
       break;
     case kVirtioMmioQueueAlign:
-      v->align = val < 0x1000 ? 0x1000 : val;
+      if (v->version == 1) v->align = val < 0x1000 ? 0x1000 : val;
       break;
-    case kVirtioMmioQueuePfn: {
-      // vring_init() addressing: desc at pfn<<page_shift, avail follows the
-      // descriptors, used is aligned past the avail ring and its used_event.
-      uint64_t desc = (uint64_t)val << v->page_shift;
-      uint64_t avail = desc + (uint64_t)qs->num * sizeof(VringDesc);
-      uint64_t used = (avail + 6 + (uint64_t)qs->num * 2 + v->align - 1) & ~(uint64_t)(v->align - 1);
-      qs->pfn = val;
-      qs->desc_addr = desc;
-      qs->avail_addr = avail;
-      qs->used_addr = used;
-      qs->last_avail_idx = 0;
-      DebugVirtio("qpfn", v->device_id, v->queue_sel, val, avail);
+    case kVirtioMmioQueuePfn:
+      if (v->version == 1) {
+        // vring_init() addressing: desc at pfn<<page_shift, avail follows the
+        // descriptors, used is aligned past the avail ring and its used_event.
+        uint64_t desc = (uint64_t)val << v->page_shift;
+        uint64_t avail = desc + (uint64_t)qs->num * sizeof(VringDesc);
+        uint64_t used =
+            (avail + 6 + (uint64_t)qs->num * 2 + v->align - 1) & ~(uint64_t)(v->align - 1);
+        qs->pfn = val;
+        qs->desc_addr = desc;
+        qs->avail_addr = avail;
+        qs->used_addr = used;
+        qs->last_avail_idx = 0;
+        DebugVirtio("qpfn", v->device_id, v->queue_sel, val, avail);
+      }
       break;
-    }
+    case kVirtioMmioQueueReady:
+      if (v->version == 2) {
+        int was = qs->ready;
+        qs->ready = (int)(val & 1);
+        if (!was && qs->ready) qs->last_avail_idx = 0;
+      }
+      break;
+    case kVirtioMmioQueueDescLow:
+      if (v->version == 2) SetAddrWord(&qs->desc_addr, val, 0);
+      break;
+    case kVirtioMmioQueueDescHigh:
+      if (v->version == 2) SetAddrWord(&qs->desc_addr, val, 1);
+      break;
+    case kVirtioMmioQueueDriverLow:
+      if (v->version == 2) SetAddrWord(&qs->avail_addr, val, 0);
+      break;
+    case kVirtioMmioQueueDriverHigh:
+      if (v->version == 2) SetAddrWord(&qs->avail_addr, val, 1);
+      break;
+    case kVirtioMmioQueueDeviceLow:
+      if (v->version == 2) SetAddrWord(&qs->used_addr, val, 0);
+      break;
+    case kVirtioMmioQueueDeviceHigh:
+      if (v->version == 2) SetAddrWord(&qs->used_addr, val, 1);
+      break;
     case kVirtioMmioQueueNotify:
       DebugVirtio("notify-mmio", v->device_id, val, addr, 0);
       if (val < kVirtioMaxQueue) VirtioNotifyQueue(v, (int)val);

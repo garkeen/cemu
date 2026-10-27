@@ -207,9 +207,7 @@ void OberonIoKey(OberonIoDevice* d, uint8_t byte) {
   if (d->key_cnt < kOberonKeyFifoDepth) d->key_buf[d->key_cnt++] = byte;
 }
 
-void OberonIoMouseMove(OberonIoDevice* d, int dx, int dy) {
-  int x = (int)(d->mouse & kOberonMouseX) + dx;
-  int y = (int)((d->mouse >> kOberonMouseYShift) & kOberonMouseXYMask) + dy;
+static void SetMouseXY(OberonIoDevice* d, int x, int y) {
   if (x < 0) x = 0;
   if (x > kOberonMouseX) x = kOberonMouseX;
   if (y < 0) y = 0;
@@ -218,6 +216,14 @@ void OberonIoMouseMove(OberonIoDevice* d, int dx, int dy) {
                                                << kOberonMouseYShift)) |
              (uint32_t)x | (uint32_t)y << kOberonMouseYShift;
 }
+
+void OberonIoMouseMove(OberonIoDevice* d, int dx, int dy) {
+  int x = (int)(d->mouse & kOberonMouseX) + dx;
+  int y = (int)((d->mouse >> kOberonMouseYShift) & kOberonMouseXYMask) + dy;
+  SetMouseXY(d, x, y);
+}
+
+void OberonIoMouseSet(OberonIoDevice* d, int x, int y) { SetMouseXY(d, x, y); }
 
 void OberonIoMouseButtons(OberonIoDevice* d, int buttons) {
   // Host: bit 0 left, 1 right, 2 middle → register: 26 left, 24 right,

@@ -25,6 +25,10 @@ typedef struct Board {
   HtifDevice htif;    // attached only when the loaded image speaks HTIF
   RamDevice* ram;     // main RAM, freed by BoardDestroy
   uint64_t bin_base;  // where the board expects raw images to load
+  // -bios names a raw image to load at bin_base (the virt machine's firmware,
+  // QEMU's -bios contract) rather than a ROM the board maps itself (the PC's
+  // BIOS window). main.c picks the file path accordingly.
+  int bios_image;
   // Where -kernel lands (QEMU's -kernel contract: the firmware's follow-on
   // payload at a fixed board address, e.g. the virt machine's 0x80200000
   // that OpenSBI fw_jump jumps to). 0 = the board takes no -kernel.
@@ -73,6 +77,14 @@ typedef struct Board {
   // afterwards (bit 0 left, bit 1 right, bit 2 middle). NULL = no pointer.
   void (*mouse_in)(void* ctx, int dx, int dy, int dz, int buttons);
   void* mouse_ctx;
+  // Absolute pointer channel (all display boards): source-picture pixel
+  // coordinates (X right, Y down, already clamped to the picture; the window
+  // reports nothing outside the client area). A board with an absolute device
+  // (virtio-tablet, Oberon's mouse register) consumes it directly; a
+  // relative-only device (PS/2) translates it in the board. mouse_in stays for
+  // the debug hub's synthetic relative events.
+  void (*mouse_abs)(void* ctx, int x, int y, int dz, int buttons);
+  void* mouse_abs_ctx;
   // Serial channel: the board's byte sink, fed by the host's stdin (the console
   // cemu was started from, or a pipe a script drives). On the PC that is COM1's
   // receiver. A board with one takes stdin here and leaves the keyboard to the
