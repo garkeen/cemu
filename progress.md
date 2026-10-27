@@ -2527,3 +2527,49 @@ Y 向下）。
 
 验证：构建零告警、dep ok、riscv64 136/0、riscv32 104/0；图像（JSLinux/Oberon/
 Win101）按用户要求由宿主侧自测，本会话未启动。
+
+## x86 D13/D39 落地：x87 + i686 功能面（2026-10-27，片 40）
+
+用户裁决：把 D13（x87/RDTSC）与 D39（i686 其余功能）一起做。实现分三层：
+
+**数值内核**：引入 Berkeley SoftFloat 3e 的 8086-SSE 合并源（v86 的
+lib/softfloat，BSD-3-Clause，原样入库；只补了两处 amalgamation 自守卫
+导致的 128/256 位移函数缺失，用 `#if 1` 并注明）。x87 状态（8 个 80 位寄存器
+栈、物理 TOP、2 位 tag word、CW/SW、FIP/FCS/FOP/FDP/FDS）在 fpu.c，D8-DF
+全部基础指令由 exec.c 解码：FLD/FST(P) m32/m64/m80/int16/32/64/BCD、四则、
+比较、常数、F2XM1/FYL2X/FPTAN/FPATAN/FXTRACT/FPREM(1)/FYL2XP1/FSQRT/
+FSINCOS/FRNDINT/FSCALE/FSIN/FCOS、FCOMI/FUCOMI/FCMOVcc、FINIT/FCLEX/
+FLDCW/FNSTCW/FNSTSW、FLDENV/FNSTENV/FRSTOR/FNSAVE 与 FXSAVE/FXRSTOR
+（含 MXCSR_MASK、abridged tag word）。异常按 SDM/FCOM 表：FCOM 的
+C0/C2/C3、FXAM（QEMU 的 C1=sign 分类）、#NM（CR0.TS/EM）、WAIT 的 TS 检查、
+未屏蔽异常在指令后 #MF；栈溢出/下溢给 IE|SF 与 indefinite。超越函数走宿主
+long double + libm（QEMU 同类路径用 double；库内注释注明）。
+
+**SSE/SSE2**：XMM0-7 与 MXCSR 放进 fpu.c；exec.c 的 SimdOp 覆盖 0F
+10-17/28-2F/50-77/7E-7F/C2-C6/D1-DF/E0-EF/F0-FE：块/半块移动、MOVD/Q、
+标量与打包 float 四则/SQRT/MIN/MAX、RCP/RSQRT、CMPPS 的 8 个谓词、
+COMISS/UCOMISS、CVT 家族（CVTSI2SS/SD、CVTPS2PD/PD2PS、CVTDQ2PS、
+CVTPS2DQ、CVTTPD2DQ、CVTDQ2PD、MOVQ2DQ/DQ2Q）、SHUF/UNPCK、全部 MMX/SSE2
+打包整数（含饱和、PAVG、PMUL、PMADDWD、PSADBW、PSLL/PSRL/PSRA、
+PACK/UNPCK、PCMP、PAND/POR/PXOR、PMOVMSKB、PINSRW/PEXTRW、MASKMOV）、
+MXCSR 的 DAZ/FTZ/掩码与 #XM/#UD（CR4.OSXMMEXCPT）、FXSAVE 的 XMM 段。
+CPUID 广告 EDX=0x078bf9fd（FPU/DE/PSE/TSC/MSR/PAE/MCE/CX8/SEP/MTRR/PGE/
+MCA/CMOV/PAT/PSE36/CLFSH/MMX/FXSR/SSE/SSE2），扩展叶报 NX+RDTSCP。
+
+**i686 系统面**：RDTSC/RDTSCP（TSC = 仿真 ns + 退休指令数，WRMSR 0x10
+存偏移；CR4.TSD 与 CPL 检查）、SYSENTER/SYSEXIT（MSR 0x174-176、扁平
+0/3 段缓存、清 IF/TF/VM/RF）、MTRR/PAT（8 对 physbase/physmask、DEF_TYPE、
+MTRRCAP=0x501、PAT）、MCE 寄存器组（MCG_CAP=0x101、STATUS/CTL、bank0）、
+架构性能计数器（2 通用 + 3 固定，0x3C/0xC0 每退休指令 +1，FIXED/GLOBAL
+使能、溢出状态位）、AC（CR0.AM + EFLAGS.AC + CPL3，2/4/8 字节；先走页表
+再 #AC）、PSE-36（PDE[20:13]=PA[39:32]，bit21 仍保留）、VME/PVI 的
+VIF/VIP（CLI/STI/PUSHF/POPF/IRET 与硬件 INTR 按 VIF 门控，VIP 置位；
+软件中断重定向位图未做，见 D39）、CR4 WARL 掩码。FPU/SSE 的 gdb
+st0-7/fctrl 段已接上；realmode 的 fninit 由“预期失败”转为 PASS。
+
+验收：新增自足探针 x87（12 项，含 #NM/栈溢出/FXSAVE）、sse（18 项）、
+sys686（TSC/RDTSCP/MSR/PMU/SYSENTER）、pse36（4MB 位段与 bit21）、ac
+（CPL3 对齐检查）；`bash test/x86/run.sh` 42/0（KUT 7 镜像、pm 26、paging32、
+realmode 127 PASS/0 FAIL）；riscv64 136/0、riscv32 104/0、dep ok。残留
+D39：VME/PVI 重定向位图、PMU 其余事件；长模式未立项。图像（win101/
+JSLinux/Oberon）按用户要求未启动。

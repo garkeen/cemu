@@ -14,6 +14,15 @@ set(CMAKE_C_EXTENSIONS OFF)
 add_compile_options(-O2 -flto -Wall -Wextra -D__USE_MINGW_ANSI_STDIO=1)
 add_link_options(-flto)
 
+# Berkeley SoftFloat 3e (vendored amalgamation, BSD-3-Clause): the 8086-SSE
+# build variant needs SOFTFLOAT_FAST_INT64, and the upstream file carries a
+# couple of its own warnings — it is third-party code, so it compiles with
+# -w rather than being edited.
+set_source_files_properties(
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/isa/x86/softfloat/softfloat.c"
+  PROPERTIES COMPILE_OPTIONS
+  "-DSOFTFLOAT_FAST_INT64;-DINLINE_LEVEL=5;-DSOFTFLOAT_FAST_DIV32TO16;-DSOFTFLOAT_FAST_DIV64TO32;-w")
+
 # --- sources --------------------------------------------------------------
 # GLOB_RECURSE is a superset of the old Makefile's four-level explicit
 # wildcard (src/*.c ... src/*/*/*/*.c). CONFIGURE_DEPENDS makes CMake

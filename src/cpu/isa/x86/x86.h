@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "cpu/cpu.h"
+#include "cpu/isa/x86/fpu.h"
 
 // The x86 interpreter, written to read like the manual: each case is one
 // instruction, operand names are the manual's names (r/m8, reg8, imm8...),
@@ -22,7 +23,8 @@ enum { es_i, cs_i, ss_i, ds_i, fs_i, gs_i };
 enum {
   vec_de = 0, vec_db = 1, vec_nmi = 2, vec_bp = 3, vec_br = 5, vec_ud = 6, vec_nm = 7,
   vec_df = 8,
-  vec_ts = 10, vec_np = 11, vec_ss = 12, vec_gp = 13, vec_pf = 14, vec_ac = 17
+  vec_ts = 10, vec_np = 11, vec_ss = 12, vec_gp = 13, vec_pf = 14, vec_mf = 16,
+  vec_ac = 17, vec_mc = 18, vec_xm = 19
 };
 // Where a delivered vector came from (SDM vol.2 INT Operation / vol.3 table
 // 6-1): only a CPU-raised exception pushes the vector's error code — a software
@@ -56,8 +58,8 @@ enum { kDrLenCount = 4, kDrCount = 4 };
 // tables; WP makes supervisor stores honor read-only pages (486+; wired
 // because SDM vol.3 4.6 defines the flag); TS/EM/MP ride along for
 // LMSW/CLTS.
-enum { kCr0Pe = 1u, kCr0Mp = 2u, kCr0Em = 4u, kCr0Ts = 8u, kCr0Wp = 1u << 16,
-       kCr0Pg = 1u << 31 };
+enum { kCr0Pe = 1u, kCr0Mp = 2u, kCr0Em = 4u, kCr0Ts = 8u, kCr0Ne = 1u << 5,
+       kCr0Wp = 1u << 16, kCr0Am = 1u << 18, kCr0Pg = 1u << 31 };
 // CR4: PSE gates 4MB pages; PAE selects the three-level 64-bit-entry walk;
 // PGE makes global translations survive a CR3 reload (SDM vol.3 2.5, 4.3,
 // 4.10.4.1). DE/TSD/VME/PVI are defined so the register reads back honestly;
@@ -70,7 +72,13 @@ enum {
   kCr4Pse = 0x10u,
   kCr4Pae = 0x20u,
   kCr4Pge = 0x80u,
+  kCr4Osfxsr = 0x200u,     // FXSAVE/FXRSTOR + SSE state enable (SDM 13.5)
+  kCr4Osxmmexcpt = 0x400u, // SSE unmasked exceptions report #XM
 };
+// The CR4 bits this machine implements. A write is WARL: unsupported bits
+// read back zero (SDM vol.3 2.5 "CR4 ... may be ... reserved").
+enum { kCr4Supported = kCr4Vme | kCr4Pvi | kCr4Tsd | kCr4De | kCr4Pse | kCr4Pae |
+                         kCr4Pge | kCr4Osfxsr | kCr4Osxmmexcpt };
 // IA32_EFER (MSR 0xC0000080): only NX enable is meaningful without long mode.
 enum { kEferNxe = 1ull << 11 };
 // Page-directory / page-table entry flags for 4KB pages (SDM vol.3 4.3):
@@ -83,13 +91,11 @@ enum { kPteP = 1u, kPteRw = 2u, kPteUs = 4u, kPteA = 0x20u, kPteD = 0x40u,
 // #PF error-code bits beyond the 386 set (SDM vol.3 table 6-1): RSVD and I
 // appear with PAE/NX. The non-PAE 386-class code keeps exactly P|W|U.
 enum { kPfPresent = 1u, kPfWrite = 2u, kPfUser = 4u, kPfRsvd = 8u, kPfInstr = 0x10u };
-// A 4-MByte page keeps its frame in PDE bits 31:22, so bits 21:13 are
-// reserved and must be 0; a set one is a page fault (SDM vol.3 fig 4-3 labels
-// bit 21 "RSvd" and bits 20:13 "Reserved", and §4.3 requires them 0). PSE-36
-// — the feature that would promote bits 20:13 to address bits — is not in
-// this machine's CPUID, so they stay reserved. The 386-class #PF error code
+// A 4-MByte page with PSE-36 keeps bits 31:22 in the PDE, takes physical
+// address bits 39:32 from PDE[20:13], and leaves PDE[21] reserved (SDM vol.3
+// fig 4-4). A set reserved bit is a page fault; the 386-class #PF error code
 // carries no RSVD flag, so the fault reads as an ordinary present fault.
-enum { kPde4mReserved = 0x3fe000u };
+enum { kPde4mReserved = 0x00200000u };
 
 // One general-purpose bank cell, named exactly the way the architecture
 // names its parts: a 32-bit register, whose low half is the 16-bit one,
@@ -123,7 +129,8 @@ typedef union eflags {
   uint32_t word;
   struct {
     unsigned cf : 1, : 1, pf : 1, : 1, af : 1, : 1, zf : 1, sf : 1;
-    unsigned tf : 1, if_ : 1, df : 1, of : 1, iopl : 2, nt : 1, : 1, rf : 1, vm : 1, rest : 14;
+    unsigned tf : 1, if_ : 1, df : 1, of : 1, iopl : 2, nt : 1, : 1, rf : 1, vm : 1;
+    unsigned ac : 1, vif : 1, vip : 1, id : 1, rest : 10;
   };
 } eflags;
 
@@ -166,10 +173,31 @@ typedef struct x86_state {
   uint32_t cr4;       // PSE/PGE select 4MB pages and global translations;
                       // PAE selects the three-level walk (SDM vol.3 2.5)
   uint64_t efer;      // IA32_EFER: NXE (bit 11) enables the PAE NX bit
+  x86_fpu fpu;        // x87 stack, control/status and the SSE state (fpu.h)
   uint64_t msr_apic_base;  // MSR 0x1B image; the MMIO region itself is fixed
   uint64_t msr_fs_gs_base[2];  // 0xc0000100/101: written by the kvm-unit-tests
                                // boot (cstart setup_percpu_area), no effect
                                // without long mode — read back per QEMU
+  // IA32_TSC (0x10) is read as elapsed emulated time plus the instruction
+  // count; a WRMSR stores the difference from that base so the next RDTSC
+  // continues from the written value (SDM vol.3 17.17).
+  uint64_t tsc_offset;
+  uint32_t tsc_aux;   // IA32_TSC_AUX (0xc0000103), returned by RDTSCP
+  // SYSENTER/SYSEXIT state (SDM vol.2 SYSENTER/SYSEXIT; MSRs 0x174-0x176).
+  uint32_t sysenter_cs, sysenter_esp, sysenter_eip;
+  uint64_t mtrr_physbase[8], mtrr_physmask[8];
+  uint64_t mtrr_def_type;  // IA32_MTRR_DEF_TYPE (0x2ff)
+  uint64_t pat;            // IA32_PAT (0x277); no cache model consumes it
+  // Machine-check registers: IA32_MCG_* plus bank 0's four registers. This
+  // machine has no error source that raises #MC; the registers are the
+  // architectural probe/reset interface (SDM vol.3 ch.15).
+  uint64_t mcg_status, mcg_ctl;
+  uint64_t mc0_ctl, mc0_status, mc0_addr, mc0_misc;
+  // Architectural performance counters (SDM vol.3 ch.19): two general
+  // counters plus the three fixed ones. Counted per retired instruction.
+  uint64_t perf_evtsel[2], perf_pmc[2];
+  uint64_t perf_fixed_ctrl, perf_global_ctrl, perf_global_status, perf_global_ovf;
+  uint64_t perf_fixed_ctr[3];
   // Translation cache and the single-page fetch shortcut. Both are
   // architecture-invisible caches; every TLB invalidation also drops the
   // fetch shortcut. The fetch pointer aims at RAM, so a guest writing code

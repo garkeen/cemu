@@ -13,7 +13,7 @@ fail=0
 # "the image would not open" from "the guest ran and disagreed", and the one
 # run that came back all-rc=1 (stage 4 片 12) left no evidence at all. Print
 # the tail of the guest's own output with every FAIL; FAIL_TAIL caps it (the
-# realmode suite prints 126 PASS lines).
+# realmode suite prints 127 PASS lines).
 report_fail() {
   echo "FAIL ($1)"
   echo "$out" | tail -n "${FAIL_TAIL:-12}" | sed 's/^/    | /'
@@ -729,6 +729,33 @@ else
   echo "SKIP (paging32: needs nasm/ld.lld)"
 fi
 
+# The D13/D39 feature probes: x87 (stack, arithmetic, control words, FXSAVE,
+# #NM), MMX/SSE/SSE2 (moves, float/packed arithmetic, conversions, MXCSR),
+# the i686 system MSRs (TSC/RDTSCP, SYSENTER, MTRR/PAT, MCE, performance
+# counters), PSE-36's 4MB PDE decode and the CPL-3 alignment check (#AC).
+# All are self-contained multiboot images exiting through 0xF4 with payload 5
+# (status 11); a failure carries its own status > 1.
+for t in x87 sse sys686 pse36 ac; do
+  elf="$dir/probe/$t.elf"
+  if [ ! -f "$elf" ] && command -v nasm > /dev/null 2>&1 &&
+     command -v ld.lld > /dev/null 2>&1; then
+    nasm -f elf32 -o "$dir/probe/$t.o" "$dir/probe/$t.asm" &&
+      ld.lld -m elf_i386 -T "$dir/pm/pm_smoke.ld" -o "$elf" "$dir/probe/$t.o"
+  fi
+  if [ -f "$elf" ]; then
+    out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$elf" 2>&1)
+    rc=$?
+    if [ "$rc" -eq 11 ]; then
+      pass=$((pass + 1))
+    else
+      fail=$((fail + 1))
+      report_fail "$t: rc=$rc"
+    fi
+  else
+    echo "SKIP ($t: needs nasm/ld.lld)"
+  fi
+done
+
 # kvm-unit-tests 32-bit flat images (built from the v86 checkout by
 # build_kut.sh; boot via multiboot, exit via 0xF4 debug-exit — payload 0
 # (pass) shows up as status 1). taskswitch/taskswitch2 exercise the stage-3
@@ -766,29 +793,23 @@ for t in taskswitch taskswitch2 cmpxchg8b memory debug access ioapic; do
 done
 
 # Realmode: suite self-reports PASS/FAIL lines. Stage 2 added the 8259 PIC
-# + 8254 PIT so hlt wakes on IRQ0, and the whole suite runs: 126 PASS.
+# + 8254 PIT so hlt wakes on IRQ0, and the whole suite runs: 127 PASS with the
+# x87 engine live (test_fninit now sees fsw == 0 and fcw & 0x103f == 0x3f,
+# the check that used to be the one expected failure under the no-FPU model).
 # QEMU reference (qemu-system-i386 -kernel realmode.elf) prints the same
 # first 110 lines byte-identically and then stalls mid-suite (QEMU-side
 # behavior, reproduced on every run); cemu runs the full suite. The goldens
 # agree on every test QEMU actually reports.
 #
-# test_fninit asserts an x87 FPU is there (after fninit: fsw == 0 and
-# fcw & 0x103f == 0x3f). This machine reports no FPU in CPUID (EDX.FPU = 0)
-# and therefore executes the ESC opcodes as NOPs, exactly like a 386SX/486SX
-# (D13); the test's memory words keep their preloaded values and it fails.
-# That one failure is the no-FPU model, not a semantic gap -- QEMU passes it
-# because QEMU's CPU does have an FPU.
-#
 # The process does NOT terminate on its own (the suite ends in a spin), so the
 # run.sh judge works on output captured under a timeout.
-expected_pass=126
+expected_pass=127
 out=$(timeout 60 "$CEMU" --machine x86 --isa x86 "$dir/realmode/realmode.elf" 2>&1)
 # Note: cemu's [info] loader line has no trailing newline, gluing the first
 # "PASS:" to it, so match PASS:/FAIL: anywhere in a line, not at line start.
 n_pass=$(echo "$out" | grep -c 'PASS:')
 n_fail=$(echo "$out" | grep -c 'FAIL:')
-if [ "$n_pass" -eq "$expected_pass" ] && [ "$n_fail" -eq 1 ] &&
-   echo "$out" | grep -q 'FAIL: fninit'; then
+if [ "$n_pass" -eq "$expected_pass" ] && [ "$n_fail" -eq 0 ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))

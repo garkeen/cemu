@@ -29,9 +29,11 @@
  *     check_smep_andnot_wp): they test the KVM MMU's own bookkeeping, not the
  *     CPU. check_large_pte_dirty_for_nowp is KEPT -- it is the CR0.WP=0
  *     read-only large-page write, i.e. the 4MB leaf branch.
- *   - pde.bit13 is KEPT and is the reserved-bit axis: this machine reports no
- *     PSE-36, so PDE bits 21:13 stay reserved in a largepage entry and a set
- *     one faults (SDM vol.3 fig 4-3, §4.3).
+ *   - pde.bit13 is the reserved-bit axis only when CPUID reports no PSE-36;
+ *     this machine now advertises PSE-36, where PDE[20:13] are physical
+ *     address bits 39:32 and only bit 21 stays reserved (SDM vol.3 fig 4-4),
+ *     so the axis is dropped by ac_test_legal (PSE-36's decode itself has no
+ *     testable page below 4GB on a 32MB machine).
  *   - The accessed/dirty axes are fixed set, so this test's tables always
  *     arrive with A|D already on and never exercise the update itself; the
  *     update rule is covered by test/x86/pm instead -- t17 for the 4KB walk
@@ -181,6 +183,8 @@ int ac_test_bump_one(ac_test_t *at)
 
 #define F(x) ((flags & x##_MASK) != 0)
 
+static int cpu_has_pse36;
+
 static _Bool ac_test_legal(ac_test_t *at)
 {
     int flags = at->flags;
@@ -190,9 +194,13 @@ static _Bool ac_test_legal(ac_test_t *at)
 
     /*
      * pde.bit13 checks handling of reserved bits in largepage PDEs. It is
-     * meaningless if there is a PTE (upstream wording).
+     * meaningless if there is a PTE (upstream wording), and it is not a
+     * reserved bit at all on a PSE-36 machine: PDE[20:13] then supply
+     * physical address bits 39:32 (SDM vol.3 fig 4-4).
      */
     if (!F(AC_PDE_PSE) && F(AC_PDE_BIT13))
+        return false;
+    if (cpu_has_pse36 && F(AC_PDE_BIT13))
         return false;
 
     return true;
@@ -270,7 +278,7 @@ static void ac_emulate_access(ac_test_t *at, unsigned flags)
      * is an ordinary one -- the 386-class error code has no RSVD bit for
      * upstream's PFERR_RESERVED_MASK to land in.
      */
-    pde_valid = F(AC_PDE_PRESENT) && !F(AC_PDE_BIT13);
+    pde_valid = F(AC_PDE_PRESENT) && !(F(AC_PDE_BIT13) && !cpu_has_pse36);
 
     if (!pde_valid) {
         at->expected_fault = 1;
@@ -612,6 +620,9 @@ int ac_test_run(void)
 
 int main(void)
 {
+    uint32_t eax = 1, ebx, ecx, edx;
+    asm volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+    cpu_has_pse36 = (edx >> 17) & 1;
     setup_idt();
     printf("starting test\n\n");
     return ac_test_run() ? 0 : 1;

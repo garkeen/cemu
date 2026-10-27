@@ -21,9 +21,10 @@
 static void do_step(void) {
   for (;;) {
     uint8_t b = fetch8();
-    if (b == 0x66)
+    if (b == 0x66) {
       d.w32 = !d.w32;
-    else if (b == 0x67)
+      d.p66 = 1;  // also the mandatory SSE2 prefix
+    } else if (b == 0x67)
       d.a32 = !d.a32;
     else if (b == 0x26)
       d.seg = es_i;
@@ -38,10 +39,13 @@ static void do_step(void) {
     else if (b == 0x65)
       d.seg = gs_i;
     else if (b == 0xf0) {
-    } else if (b == 0xf2)
+    } else if (b == 0xf2) {
       d.rep = 2;
-    else if (b == 0xf3)
+      d.pf2 = 1;
+    } else if (b == 0xf3) {
       d.rep = 1;
+      d.pf3 = 1;
+    }
     else {
       run_op(b);  // b is the opcode; d.nxt already counts it
       return;
@@ -99,6 +103,7 @@ void x86_step(CpuState* c) {
   g.op2 = 0;
   g.rep = 0;
   g.nxt = 0;
+  g.p66 = g.pf2 = g.pf3 = 0;
   // The watchpoint report the stub reads after the step (cpu/step.h): per step,
   // so a hit reported once cannot be reported again.
   s->watch_hits = 0;
@@ -193,10 +198,20 @@ void x86_step(CpuState* c) {
   // and outside the SDM inhibit window (the instruction after STI/MOV SS/
   // POP SS — the shadow was read and cleared at step entry). A hardware
   // interrupt is a trap: the pushed return address is the next instruction.
-  if (s->intr_pending && !intr_shadow && fl->if_ && cpu->int_ack) {
+  // VME virtualizes the interrupt flag in VM86: hardware interrupts are
+  // gated by VIF instead of IF, and a request held off by VIF=0 sets VIP
+  // (SDM vol.3 20.2.2). Delivery clears both.
+  int vme = fl->vm && (s->cr4 & kCr4Vme) && fl->iopl != 3;
+  int ints_on = vme ? fl->vif : fl->if_;
+  if (s->intr_pending && !ints_on && vme) fl->vip = 1;
+  if (s->intr_pending && !intr_shadow && ints_on && cpu->int_ack) {
     int vec = cpu->int_ack(cpu->ack_dev);
     s->intr_pending = 0;
     cpu->wait = 0;
+    if (vme) {
+      fl->vif = 0;
+      fl->vip = 0;
+    }
     fr->rec.pc = cpu->pc;
     fr->rec.dnpc = cpu->pc;
     fr->rec.pc_lin = s->base[cs_i] + fr->rec.pc;
@@ -248,6 +263,10 @@ void x86_step(CpuState* c) {
   // commit restores them — otherwise the garbage leaks into the low byte a
   // guest reads back with pushf.
   fl->word = (fl->word & ~kEflagsZero) | kEflagsOne;
+  // The architectural performance counters advance once per retired
+  // instruction (SDM vol.3 19.6): this is the commit point, after the
+  // instruction's own state changes and before a post-instruction #DB.
+  x86_count_perf();
   // Debug traps (SDM vol.3 17.3.1, priority table 6-2): the task-switch trap
   // (TSS.T), data/I-O watchpoints and single-step all fire after the
   // instruction completes, reporting the next instruction's address in one

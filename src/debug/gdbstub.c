@@ -221,9 +221,8 @@ static const char* TargetXml(const char* isa_name) {
              "<reg name=\"fs\" bitsize=\"32\" type=\"int32\"/>"
              "<reg name=\"gs\" bitsize=\"32\" type=\"int32\"/>"
              // gdb's i386 validation keeps the x87 group inside the core
-             // feature (gdb features/i386/32bit-core.xml). This machine has
-             // no FPU (D13) — the registers exist in the description and
-             // read/write as zeros.
+             // feature (gdb features/i386/32bit-core.xml); the stub reports
+             // the live FPU stack and control words.
              "<reg name=\"st0\" bitsize=\"80\" type=\"i387_ext\"/>"
              "<reg name=\"st1\" bitsize=\"80\" type=\"i387_ext\"/>"
              "<reg name=\"st2\" bitsize=\"80\" type=\"i387_ext\"/>"

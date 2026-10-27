@@ -52,6 +52,8 @@ extern eflags* fl;
 // manual's vocabulary. `w32`/`a32` are the operand/address size the prefixes
 // selected; `nxt` is the ip after the fully fetched instruction.
 typedef struct dec {
+  uint8_t enc;   // the raw modrm byte (the x87 FOP image and trace)
+  int p66, pf2, pf3;  // mandatory-prefix presence (SSE: 66/F2/F3)
   int w32, a32;  // operand / address size is 32-bit (else 16)
   int seg;       // segment override, -1 = default
   int rep;       // 0 none, 1 = F3 (repe), 2 = F2 (repne)
@@ -90,6 +92,8 @@ extern dec g;
 // one.
 void run_op(uint8_t op);
 void do_int(int vec, uint32_t ret_eip, int soft, uint32_t ec);
+// Architectural performance counters: one retired instruction was committed.
+void x86_count_perf(void);
 // The instruction stream: the step consumes prefixes through this before the
 // opcode dispatch takes over. It also records raw bytes for the trace.
 uint8_t fetch8(void);

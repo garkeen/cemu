@@ -12,6 +12,7 @@
 // The step protocol around these switches (INTR sampling, prefix consumption,
 // the single commit) lives in step.c.
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -100,6 +101,7 @@ static int cpl(void);
 static x86_tlb_entry* TlbLookup(uint64_t lin, int write);
 static x86_tlb_entry* TlbFill(uint64_t lin, int write, int fetch, int user);
 static void TlbCheck(x86_tlb_entry* e, uint64_t lin, int write, int fetch, int user);
+static void AcCheckSlow(uint64_t lin, int size, int user, int fetch, int write);
 
 static uint64_t bus_load(uint64_t lin, int size) {
   return lin_load(lin, size, cpl() == 3, 0);
@@ -134,6 +136,16 @@ static uint32_t rd32(uint64_t lin) { return (uint32_t)bus_load(lin, 4); }
 static void wr8(uint64_t lin, uint8_t v) { bus_store(lin, 1, v); }
 static void wr16(uint64_t lin, uint16_t v) { bus_store(lin, 2, v); }
 static void wr32(uint64_t lin, uint32_t v) { bus_store(lin, 4, v); }
+static uint64_t rd64(uint64_t lin) { return bus_load(lin, 8); }
+static void wr64(uint64_t lin, uint64_t v) { bus_store(lin, 8, v); }
+// Byte-block copies through the bus: x87 environment/state images are byte
+// strings with reserved fields, and FXSAVE is 512 bytes of mixed widths.
+static void rd_bytes(uint64_t lin, uint8_t* out, int n) {
+  for (int i = 0; i < n; i++) out[i] = rd8(lin + (uint64_t)i);
+}
+static void wr_bytes(uint64_t lin, const uint8_t* in, int n) {
+  for (int i = 0; i < n; i++) wr8(lin + (uint64_t)i, in[i]);
+}
 
 // ---- debug registers (SDM vol.3 ch.17) ---------------------------------------
 
@@ -446,6 +458,7 @@ static uint32_t imm32(void) { return fetch32(); }
 // segment override replaces the default for every reference.
 static void modrm(void) {
   uint8_t enc = fetch8();
+  d.enc = enc;
   d.mod = enc >> 6;
   d.reg = (enc >> 3) & 7;
   d.rm = enc & 7;
@@ -833,9 +846,11 @@ static void CheckPerm(uint64_t lin, int write, int user, int writable, int user_
     pf_fault(lin, code | kPfPresent);
 }
 
-// Two-level 386/486 page walk (SDM vol.3 4.3, 4.6, 4.7). PSE-36 is not in
-// this machine's CPUID, so a 4MB leaf's bits 21:13 stay reserved and a set one
-// faults as an ordinary present fault (the 386-class #PF code has no RSVD).
+// Two-level 386/486 page walk (SDM vol.3 4.3, 4.6, 4.7). PSE-36 is advertised
+// (CPUID.01H:EDX.PSE36), so a 4MB leaf's bits 20:13 are physical address
+// bits 39:32 and only bit 21 stays reserved (SDM vol.3 fig 4-4); a set
+// reserved bit faults as an ordinary present fault (the 386-class #PF code
+// has no RSVD flag).
 static void WalkNonPae(uint64_t lin, int write, int user, walk_res* w) {
   uint32_t code = (write ? kPfWrite : 0) | (user ? kPfUser : 0);
   uint32_t pde_addr = (uint32_t)(s->cr3 & ~0xfffu) | ((uint32_t)(lin >> 20) & 0xffc);
@@ -846,7 +861,9 @@ static void WalkNonPae(uint64_t lin, int write, int user, walk_res* w) {
     CheckPerm(lin, write, user, (pde & kPdeRw) != 0, (pde & kPdeUs) != 0, code);
     uint32_t new_pde = pde | kPdeA | (write ? kPdeD : 0u);
     if (new_pde != pde) phys_store(pde_addr, 4, new_pde);
-    w->paddr = a20_gate(((uint64_t)(pde & 0xffc00000u)) | (lin & 0x3fffff));
+    uint64_t frame = (pde & 0xffe00000u) |
+                     ((uint64_t)(pde & 0x001fe000u) << (32 - 13));
+    w->paddr = a20_gate(frame | (lin & 0x3fffff));
     w->flags = ((pde & kPdeRw) ? kTlbWritable : 0) |
                ((pde & kPdeUs) ? kTlbUser : 0) | ((pde & kPdeG) ? kTlbGlobal : 0);
     w->lin_base = (uint32_t)lin & ~0x3fffffu;
@@ -1061,6 +1078,7 @@ static void SlowStoreOne(uint64_t lin, int size, int user, uint64_t v) {
 }
 
 static uint64_t lin_load(uint64_t lin, int size, int user, int fetch) {
+  AcCheckSlow(lin, size, user, fetch, 0);
   uint32_t off = (uint32_t)lin & 0xfff;
   if (g_mem_slow) {
     if (off + (uint32_t)size <= 0x1000) return SlowLoadOne(lin, size, user, fetch);
@@ -1084,6 +1102,7 @@ static uint64_t lin_load(uint64_t lin, int size, int user, int fetch) {
 }
 
 static void lin_store(uint64_t lin, int size, int user, uint64_t v) {
+  AcCheckSlow(lin, size, user, 0, 1);
   uint32_t off = (uint32_t)lin & 0xfff;
   int crossing = off + (uint32_t)size > 0x1000;
   int n1 = crossing ? (int)(0x1000 - off) : 0;
@@ -1112,6 +1131,152 @@ static void lin_store(uint64_t lin, int size, int user, uint64_t v) {
   } else {
     FastStoreOne(lin, n1, user, lo);
     FastStoreOne(lin + (uint64_t)n1, size - n1, user, hi);
+  }
+}
+
+// ---- time stamp counter (SDM vol.3 17.17) ------------------------------------
+
+// The TSC is emulated time in nanoseconds plus the retired-instruction count:
+// both terms are monotonic, -icount makes the clock exactly proportional to
+// retired instructions, and a WRMSR to IA32_TSC parks the written value as an
+// offset so the next read continues from it. 1 GHz is the nominal rate.
+static uint64_t TscNow(void) {
+  return s->tsc_offset + (uint64_t)HostTimerNow() * 1000u + cpu->inst_count;
+}
+
+// Alignment check (SDM vol.3 4.5, "CHECKING ALIGNMENT"): with CR0.AM=1,
+// EFLAGS.AC=1 and CPL=3, a 2/4/8-byte data access at an address that is not a
+// multiple of its size raises #AC. The page walk runs FIRST so a not-present
+// or permission fault keeps its architectural priority; the walk only happens
+// for the rare unaligned user case.
+static void AcCheckSlow(uint64_t lin, int size, int user, int fetch, int write) {
+  if (fetch || !user || !(s->cr0 & kCr0Am) || !fl->ac) return;
+  if (size != 2 && size != 4 && size != 8) return;
+  if ((lin & (uint64_t)(size - 1)) == 0) return;
+  if (s->cr0 & kCr0Pg) {
+    walk_res w;
+    WalkPage(lin, write, user, fetch, &w);
+  }
+  raise_(fr, vec_ac, 0);
+}
+
+// ---- MSRs -------------------------------------------------------------------
+
+// The bank this machine implements. Unknown indices #GP (SDM WRMSR/RDMSR
+// "#GP(0) if the MSR is not implemented").
+static uint64_t MsrRead(uint32_t idx) {
+  if (idx == 0x10) return TscNow();
+  if (idx == 0x1b) return s->msr_apic_base;
+  if (idx == 0xfe) return 0x501;  // MTRRCAP: 8 variable ranges, WC, no FIX
+  if (idx == 0x179) return 0x101;  // MCG_CAP: one bank, MCG_CTL present
+  if (idx == 0x17a) return s->mcg_status;
+  if (idx == 0x17b) return s->mcg_ctl;
+  if (idx == 0x174) return s->sysenter_cs;
+  if (idx == 0x175) return s->sysenter_esp;
+  if (idx == 0x176) return s->sysenter_eip;
+  if (idx == 0x186 || idx == 0x187) return s->perf_evtsel[idx - 0x186];
+  if (idx == 0xc1 || idx == 0xc2) return s->perf_pmc[idx - 0xc1];
+  if (idx >= 0x200 && idx <= 0x20f)
+    return (idx & 1) ? s->mtrr_physmask[(idx - 0x200) >> 1]
+                     : s->mtrr_physbase[(idx - 0x200) >> 1];
+  if (idx == 0x277) return s->pat;
+  if (idx == 0x2ff) return s->mtrr_def_type;
+  if (idx >= 0x309 && idx <= 0x30b) return s->perf_fixed_ctr[idx - 0x309];
+  if (idx == 0x345) return 0;  // IA32_PERF_CAPABILITIES: no LBR/PEBS
+  if (idx == 0x38d) return s->perf_fixed_ctrl;
+  if (idx == 0x38e) return s->perf_global_status;
+  if (idx == 0x38f) return s->perf_global_ctrl;
+  if (idx == 0x400) return s->mc0_ctl;
+  if (idx == 0x401) return s->mc0_status;
+  if (idx == 0x402) return s->mc0_addr;
+  if (idx == 0x403) return s->mc0_misc;
+  if (idx == 0xc0000080) return s->efer;
+  if (idx == 0xc0000100 || idx == 0xc0000101) return s->msr_fs_gs_base[idx - 0xc0000100];
+  if (idx == 0xc0000103) return s->tsc_aux;
+  if (idx == 0x1a0) return 0x1801;  // IA32_MISC_ENABLE: fast strings on
+  gp_fault(0);
+}
+
+static void MsrWrite(uint32_t idx, uint64_t v) {
+  if (idx == 0x10) {
+    s->tsc_offset = v - ((uint64_t)HostTimerNow() * 1000u + cpu->inst_count);
+  } else if (idx == 0x1b) {
+    s->msr_apic_base = v;
+  } else if (idx == 0x174) {
+    s->sysenter_cs = (uint32_t)v;
+  } else if (idx == 0x175) {
+    s->sysenter_esp = (uint32_t)v;
+  } else if (idx == 0x176) {
+    s->sysenter_eip = (uint32_t)v;
+  } else if (idx == 0x17a) {
+    s->mcg_status = v & 7;  // RIPV/EIPV/MCIP
+  } else if (idx == 0x17b) {
+    s->mcg_ctl = v;
+  } else if (idx == 0x186 || idx == 0x187) {
+    s->perf_evtsel[idx - 0x186] = (uint32_t)v;
+  } else if (idx == 0xc1 || idx == 0xc2) {
+    s->perf_pmc[idx - 0xc1] = v;
+  } else if (idx >= 0x200 && idx <= 0x20f) {
+    int i = (int)((idx - 0x200) >> 1);
+    if (idx & 1)
+      s->mtrr_physmask[i] = (v & 0xfffffffffffff000ULL) | (v & 0x800u);
+    else
+      s->mtrr_physbase[i] = (v & 0xfffffffffffff000ULL) | (v & 0xffu);
+  } else if (idx == 0x277) {
+    s->pat = v;
+  } else if (idx == 0x2ff) {
+    s->mtrr_def_type = v & 0xc07u;
+  } else if (idx == 0x38d) {
+    s->perf_fixed_ctrl = v & 0x7ffu;
+  } else if (idx == 0x38f) {
+    s->perf_global_ctrl = v & 0x700000003ULL;
+  } else if (idx == 0x390) {
+    // IA32_PERF_GLOBAL_OVF_CTRL: write-1-to-clear the status bits.
+    s->perf_global_status &= ~v;
+  } else if (idx >= 0x400 && idx <= 0x403) {
+    // Bank 0's registers are storage: no error source raises #MC. MC0_STATUS
+    // is written by software to clear its bits (SDM vol.3 15.3.2), so a write
+    // clears rather than stores.
+    if (idx == 0x400) s->mc0_ctl = v;
+    else if (idx == 0x401) s->mc0_status &= ~v;
+    else if (idx == 0x402) s->mc0_addr = v;
+    else s->mc0_misc = v;
+  } else if (idx == 0xc0000080) {
+    s->efer = v;
+    TlbFlushAll(s);
+  } else if (idx == 0xc0000100 || idx == 0xc0000101) {
+    s->msr_fs_gs_base[idx - 0xc0000100] = v;
+  } else if (idx == 0xc0000103) {
+    s->tsc_aux = (uint32_t)v;
+  } else {
+    gp_fault(0);
+  }
+}
+
+// Retired-instruction accounting for the architectural performance counters
+// (SDM vol.3 ch.19). Event 0xC0 is instructions retired and 0x3C unhalted
+// core cycles; on this single-threaded interpreter both advance once per
+// retired instruction. USR/OS select the privilege levels, EN arms the
+// counter.
+void x86_count_perf(void) {
+  int ring = cpl();
+  for (int i = 0; i < 2; i++) {
+    uint64_t sel = s->perf_evtsel[i];
+    if (!(s->perf_global_ctrl & (1ull << i))) continue;  // global enable
+    if (!(sel & (1u << 22))) continue;
+    if (!((sel & (1u << 16)) && ring == 0) && !((sel & (1u << 17)) && ring != 0))
+      continue;
+    uint32_t ev = (uint32_t)sel & 0xff;
+    if (ev == 0xc0 || ev == 0x3c) {
+      if (++s->perf_pmc[i] == 0) s->perf_global_status |= 1ull << i;
+    }
+  }
+  for (int i = 0; i < 3; i++) {
+    int mode = (int)((s->perf_fixed_ctrl >> (2 * i)) & 3);
+    int on = (mode & 1 && ring == 0) || (mode & 2 && ring != 0);
+    if (on && (s->perf_global_ctrl & (1ull << (32 + i)))) {
+      if (++s->perf_fixed_ctr[i] == 0) s->perf_global_status |= 1ull << (32 + i);
+    }
   }
 }
 
@@ -1455,7 +1620,11 @@ static void pm_iret(void) {
   // with #GP(0). The new CS is a VM86 segment, checked only against the 64K
   // limit its own base implies.
   if (fl->vm) {
-    if (fl->iopl != 3) gp_fault(0);
+    // VME lets a VM86 task IRET without IOPL=3; the image's IF bit then
+    // restores VIF and bit 20 restores VIP (SDM vol.3 20.3.5). Without VME
+    // the monitor's IOPL must be 3.
+    int vme = (s->cr4 & kCr4Vme) != 0;
+    if (!vme && fl->iopl != 3) gp_fault(0);
     uint32_t new_eip = stack_peek(w, 0);
     uint16_t sel = (uint16_t)stack_peek(w, w);
     uint32_t flv = stack_peek(w, 2 * (uint32_t)w);
@@ -1468,6 +1637,11 @@ static void pm_iret(void) {
     uint32_t mask = d.w32 ? 0x14fd7u : 0x4fd7u;
     d.rf_load = 1;
     fl->word = (fl->word & ~mask) | (flv & mask) | 2;
+    if (vme) {
+      fl->vif = (flv & 0x200u) != 0;
+      fl->vip = (flv & 0x100000u) != 0;
+      fl->if_ = 1;
+    }
     esp = s->dbit[ss_i] ? esp + (uint32_t)w * 3
                         : (esp & 0xffff0000u) | (uint16_t)(esp + (uint32_t)w * 3);
     eip = new_eip;
@@ -1550,6 +1724,9 @@ static void pm_iret(void) {
   // return always leaves VM86, so VM is cleared and never loaded here — a VM=1
   // image was handled by RETURN-TO-VIRTUAL-8086-MODE above.
   uint32_t mask = (outer || cpl() == 0 ? 0x17fd7u : 0x0fd7u);
+  // AC loads on an outward return when CR0.AM enables the alignment check
+  // (SDM vol.2 IRET Operation).
+  if ((outer || cpl() == 0) && (s->cr0 & kCr0Am)) mask |= 0x40000u;
   d.rf_load = 1;
   fl->word = (fl->word & ~(mask | 0x30000u)) | (flv & mask) | 2;
 
@@ -2623,7 +2800,1279 @@ static void aas(void) {
 // so each case reads exactly like its page.
 
 // The 0f two-byte dispatch.
+// ---- MMX / SSE / SSE2 (SDM vol.1 ch.10-11, vol.2 instruction pages) --------
+// The packed engine: elements are read/written at 1/2/4/8-byte widths out of
+// the 16-byte XMM storage (or the low 64 bits of an x87 register for MMX),
+// and the arithmetic goes through the same Berkeley SoftFloat calls the x87
+// engine uses. MMX registers alias the low 64 bits of ST0-ST7; after an MMX
+// write the x87 tag is "special" and EMMS empties the whole stack, exactly
+// the x87/MMX state relationship the manual describes (SDM vol.1 9.2.2).
+
+static uint64_t SimdElem(const uint8_t* p, int bytes, int i) {
+  uint64_t v = 0;
+  memcpy(&v, p + (size_t)bytes * i, (size_t)bytes);
+  return v;
+}
+static void SimdSetElem(uint8_t* p, int bytes, int i, uint64_t v) {
+  memcpy(p + (size_t)bytes * i, &v, (size_t)bytes);
+}
+static uint64_t SimdMask(int bytes) {
+  return bytes == 8 ? ~0ULL : ((1ULL << (bytes * 8)) - 1);
+}
+static int64_t SimdSigned(uint64_t v, int bytes) {
+  int shift = 64 - bytes * 8;
+  return (int64_t)(v << shift) >> shift;
+}
+static int SimdNan32(uint32_t v) {
+  return (v & 0x7f800000u) == 0x7f800000u && (v & 0x007fffffu) != 0;
+}
+static int SimdNan64(uint64_t v) {
+  return (v & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL &&
+         (v & 0x000fffffffffffffULL) != 0;
+}
+static int SimdDenorm32(uint32_t v) {
+  return (v & 0x7f800000u) == 0 && (v & 0x007fffffu) != 0;
+}
+static int SimdDenorm64(uint64_t v) {
+  return (v & 0x7ff0000000000000ULL) == 0 && (v & 0x000fffffffffffffULL) != 0;
+}
+
+static int MmxPhys(int i) { return (fpu_top(&s->fpu) + i) & 7; }
+static uint64_t MmxGet(int i) { return s->fpu.st[MmxPhys(i)].signif; }
+static void MmxSet(int i, uint64_t v) {
+  int p = MmxPhys(i);
+  s->fpu.st[p].signif = v;
+  s->fpu.st[p].signExp = 0xffff;  // an MMX image reads as an x87 special
+  fpu_mark(&s->fpu, p);
+}
+static void MmxEmms(void) {
+  s->fpu.tw = 0xffff;
+  fpu_set_top(&s->fpu, 0);
+}
+
+// The source operand (d.rm) as 16 bytes: register or the memory operand with
+// `membytes` useful bytes (the rest zero). xmmreg selects XMM vs MMX for a
+// register operand.
+static void SimdSrc(uint8_t out[16], int membytes, int xmmreg) {
+  memset(out, 0, 16);
+  if (d.is_mem) {
+    for (int i = 0; i < membytes; i += 8) {
+      int n = membytes - i > 8 ? 8 : membytes - i;
+      uint64_t v = rd64(d.mlin + (uint64_t)i);
+      memcpy(out + i, &v, (size_t)n);
+    }
+  } else if (xmmreg) {
+    memcpy(out, s->fpu.xmm[d.rm], 16);
+  } else {
+    uint64_t v = MmxGet(d.rm);
+    memcpy(out, &v, 8);
+  }
+}
+
+static void SimdDst(const uint8_t in[16], int xmmreg) {
+  if (xmmreg)
+    memcpy(s->fpu.xmm[d.reg], in, 16);
+  else
+    MmxSet(d.reg, SimdElem(in, 8, 0));
+}
+
+// Numeric exceptions use the MXCSR masks; CR4.OSXMMEXCPT chooses #XM, and
+// with it clear the processor reports #UD instead (SDM vol.3 13.5.2).
+static void SimdCheckSse(void) {
+  if (!fpu_sse_end(&s->fpu)) return;
+  if (s->cr4 & kCr4Osxmmexcpt)
+    raise_(fr, vec_xm, 0);
+  ud();
+}
+
+static uint32_t SseF32(uint8_t op, uint32_t a, uint32_t b) {
+  if (op == 0x52 || op == 0x53) {  // RCPPS/RSQRTPS: approximate, f32 path
+    float af, rf;
+    memcpy(&af, &a, 4);
+    rf = op == 0x52 ? 1.0f / af : 1.0f / sqrtf(af);
+    memcpy(&a, &rf, 4);
+    return a;
+  }
+  if (op == 0x5d || op == 0x5f) {  // MINPS/MAXPS: NaN -> second source
+    if (SimdNan32(a) || SimdNan32(b)) return b;
+    float af, bf;
+    memcpy(&af, &a, 4);
+    memcpy(&bf, &b, 4);
+    if (op == 0x5d) return af < bf ? a : b;
+    return af > bf ? a : b;
+  }
+  float32_t fa = {a}, fb = {b}, fr;
+  switch (op) {
+    case 0x51: fr = f32_sqrt(fa); break;
+    case 0x58: fr = f32_add(fa, fb); break;
+    case 0x59: fr = f32_mul(fa, fb); break;
+    case 0x5c: fr = f32_sub(fa, fb); break;
+    case 0x5e: fr = f32_div(fa, fb); break;
+    default: fr = fb; break;
+  }
+  return fr.v;
+}
+
+static uint64_t SseF64(uint8_t op, uint64_t a, uint64_t b) {
+  if (op == 0x5d || op == 0x5f) {
+    if (SimdNan64(a) || SimdNan64(b)) return b;
+    double ad, bd;
+    memcpy(&ad, &a, 8);
+    memcpy(&bd, &b, 8);
+    if (op == 0x5d) return ad < bd ? a : b;
+    return ad > bd ? a : b;
+  }
+  float64_t fa = {a}, fb = {b}, fr;
+  switch (op) {
+    case 0x51: fr = f64_sqrt(fa); break;
+    case 0x58: fr = f64_add(fa, fb); break;
+    case 0x59: fr = f64_mul(fa, fb); break;
+    case 0x5c: fr = f64_sub(fa, fb); break;
+    case 0x5e: fr = f64_div(fa, fb); break;
+    default: fr = fb; break;
+  }
+  return fr.v;
+}
+
+// DAZ: a denormal input element is replaced by a signed zero.
+static uint64_t SseInput(uint64_t v, int bytes) {
+  if (!fpu_sse_daz(&s->fpu)) return v;
+  if (bytes == 4) {
+    uint32_t x = (uint32_t)v;
+    if ((x & 0x7f800000u) == 0 && (x & 0x007fffffu) != 0) return x & 0x80000000u;
+  } else {
+    if ((v & 0x7ff0000000000000ULL) == 0 && (v & 0x000fffffffffffffULL) != 0)
+      return v & 0x8000000000000000ULL;
+  }
+  return v;
+}
+
+static void SimdFp(uint8_t op2) {
+  modrm();
+  // Mandatory-prefix choice: F2/F3 are scalar, 66 is packed double, none is
+  // packed single (SDM vol.2 ADDPS/ADDPD/ADDSS/ADDSD).
+  int sd = d.pf2, ss = d.pf3 && !d.pf2;
+  int pd = d.p66 && !sd && !ss;
+  int bytes = sd ? 8 : ss ? 4 : 16;
+  uint8_t a[16], b[16], r[16];
+  memcpy(a, s->fpu.xmm[d.reg], 16);
+  SimdSrc(b, bytes, 1);
+  int count = (sd || ss) ? 1 : (pd ? 2 : 4);
+  int esz = (sd || pd) ? 8 : 4;
+  fpu_sse_begin(&s->fpu);
+  memcpy(r, a, 16);
+  for (int i = 0; i < count; i++) {
+    uint64_t raw_a = SimdElem(a, esz, i), raw_b = SimdElem(b, esz, i);
+    // MXCSR.DE is the denormal-operand exception; with DAZ set the operand
+    // is treated as zero instead (SDM vol.1 11.6.3). SoftFloat 3e has no
+    // input-denormal flag, so the check is the encoding's exponent test.
+    if (!fpu_sse_daz(&s->fpu) &&
+        (esz == 8 ? (SimdDenorm64(raw_a) || SimdDenorm64(raw_b))
+                  : (SimdDenorm32((uint32_t)raw_a) || SimdDenorm32((uint32_t)raw_b))))
+      s->fpu.mxcsr |= 1u << 1;
+    uint64_t av = SseInput(raw_a, esz);
+    uint64_t bv = SseInput(raw_b, esz);
+    uint64_t rv = esz == 8 ? SseF64(op2, av, bv) : SseF32(op2, (uint32_t)av, (uint32_t)bv);
+    if (fpu_sse_ftz(&s->fpu)) {
+      uint8_t tmp[8];
+      memcpy(tmp, &rv, (size_t)esz);
+      fpu_sse_flush(tmp, esz);
+      memcpy(&rv, tmp, (size_t)esz);
+    }
+    SimdSetElem(r, esz, i, rv);
+  }
+  memcpy(s->fpu.xmm[d.reg], r, 16);
+  SimdCheckSse();
+}
+
+// Legacy CMPPS/PD/SS/SD predicates (SDM CMPPS): 0 EQ, 1 LT, 2 LE, 3 UNORD,
+// 4 NEQ, 5 NLT, 6 NLE, 7 ORD. 1/2/5/6 are signaling (a NaN raises #IA).
+static uint32_t SimdPred32(int p, uint32_t a, uint32_t b) {
+  if (SimdNan32(a) || SimdNan32(b)) {
+    if (p == 3 || p == 7) return p == 3 ? 0xffffffffu : 0;
+    if (p == 4) return 0xffffffffu;
+    if (p == 0) return 0;
+    softfloat_exceptionFlags |= softfloat_flag_invalid;
+    return p == 1 || p == 2 ? 0 : 0xffffffffu;
+  }
+  float af, bf;
+  memcpy(&af, &a, 4);
+  memcpy(&bf, &b, 4);
+  int eq = af == bf, lt = af < bf, le = lt || eq;
+  switch (p) {
+    case 0: return eq ? 0xffffffffu : 0;
+    case 1: return lt ? 0xffffffffu : 0;
+    case 2: return le ? 0xffffffffu : 0;
+    case 3: return 0;
+    case 4: return eq ? 0 : 0xffffffffu;
+    case 5: return lt ? 0 : 0xffffffffu;
+    case 6: return le ? 0 : 0xffffffffu;
+    default: return 0xffffffffu;
+  }
+}
+static uint64_t SimdPred64(int p, uint64_t a, uint64_t b) {
+  if (SimdNan64(a) || SimdNan64(b)) {
+    if (p == 3 || p == 7) return p == 3 ? ~0ULL : 0;
+    if (p == 4) return ~0ULL;
+    if (p == 0) return 0;
+    softfloat_exceptionFlags |= softfloat_flag_invalid;
+    return p == 1 || p == 2 ? 0 : ~0ULL;
+  }
+  double ad, bd;
+  memcpy(&ad, &a, 8);
+  memcpy(&bd, &b, 8);
+  int eq = ad == bd, lt = ad < bd, le = lt || eq;
+  switch (p) {
+    case 0: return eq ? ~0ULL : 0;
+    case 1: return lt ? ~0ULL : 0;
+    case 2: return le ? ~0ULL : 0;
+    case 3: return 0;
+    case 4: return eq ? 0 : ~0ULL;
+    case 5: return lt ? 0 : ~0ULL;
+    case 6: return le ? 0 : ~0ULL;
+    default: return ~0ULL;
+  }
+}
+
+static void SimdCmp(uint8_t imm) {
+  int sd = d.pf2, ss = d.pf3 && !d.pf2;
+  int pd = d.p66 && !sd && !ss;
+  int bytes = sd ? 8 : ss ? 4 : 16;
+  int count = (sd || ss) ? 1 : (pd ? 2 : 4);
+  int esz = (sd || pd) ? 8 : 4;
+  uint8_t a[16], b[16], r[16];
+  memcpy(a, s->fpu.xmm[d.reg], 16);
+  SimdSrc(b, bytes, 1);
+  memcpy(r, a, 16);
+  fpu_sse_begin(&s->fpu);
+  for (int i = 0; i < count; i++) {
+    uint64_t av = SseInput(SimdElem(a, esz, i), esz);
+    uint64_t bv = SseInput(SimdElem(b, esz, i), esz);
+    uint64_t rv = esz == 8 ? SimdPred64(imm & 7, av, bv)
+                           : SimdPred32(imm & 7, (uint32_t)av, (uint32_t)bv);
+    SimdSetElem(r, esz, i, rv);
+  }
+  memcpy(s->fpu.xmm[d.reg], r, 16);
+  SimdCheckSse();
+}
+
+// COMISS/UCOMISS/COMISD/UCOMISD: EFLAGS from the low element, unordered =
+// ZF|PF|CF. COMIS* reports a quiet NaN as invalid; UCOMIS* only a signaling
+// one (SDM COMISS/UCOMISS).
+static void SimdComi(int ucomi) {
+  modrm();
+  int sd = d.pf2;
+  int esz = sd ? 8 : 4;
+  uint8_t b[16];
+  SimdSrc(b, esz, 1);
+  uint64_t a = SimdElem(s->fpu.xmm[d.reg], esz, 0);
+  uint64_t bv = SimdElem(b, esz, 0);
+  int nan = esz == 8 ? SimdNan64(a) || SimdNan64(bv) : SimdNan32((uint32_t)a) || SimdNan32((uint32_t)bv);
+  int snan = 0;
+  if (nan) {
+    if (esz == 8) {
+      uint64_t av = a, bvv = bv;
+      snan = (((av >> 51) & 1) == 0 && (av & 0x000fffffffffffffULL) != 0) ||
+             (((bvv >> 51) & 1) == 0 && (bvv & 0x000fffffffffffffULL) != 0);
+    } else {
+      uint32_t av = (uint32_t)a, bvv = (uint32_t)bv;
+      snan = (((av >> 22) & 1) == 0 && (av & 0x003fffffu) != 0) ||
+             (((bvv >> 22) & 1) == 0 && (bvv & 0x003fffffu) != 0);
+    }
+  }
+  if (nan && (!ucomi || snan)) {
+    s->fpu.mxcsr |= 1u;  // MXCSR.IE
+    if (((s->fpu.mxcsr & 0x3f) & ~((s->fpu.mxcsr >> 7) & 0x3f)) != 0) {
+      if (s->cr4 & kCr4Osxmmexcpt)
+        raise_(fr, vec_xm, 0);
+      ud();
+    }
+  }
+  enum { kCf = 1u << 0, kPf = 1u << 2, kZf = 1u << 6 };
+  uint32_t cc;
+  if (nan) {
+    cc = kCf | kPf | kZf;
+  } else {
+    int eq, lt;
+    if (esz == 8) {
+      double ad, bd;
+      memcpy(&ad, &a, 8);
+      memcpy(&bd, &bv, 8);
+      eq = ad == bd;
+      lt = ad < bd;
+    } else {
+      float af, bf;
+      uint32_t a32 = (uint32_t)a, b32 = (uint32_t)bv;
+      memcpy(&af, &a32, 4);
+      memcpy(&bf, &b32, 4);
+      eq = af == bf;
+      lt = af < bf;
+    }
+    cc = eq ? kZf : lt ? kCf : 0;
+  }
+  fl->word = (fl->word & ~0x8d5u) | cc;
+}
+
+// MOVUPS/MOVUPD/MOVSS/MOVSD and the aligned MOVAPS/MOVAPD.
+static void SimdMov(uint8_t op2) {
+  modrm();
+  int store = op2 == 0x11 || op2 == 0x29;
+  int sd = d.pf2, ss = d.pf3 && !d.pf2;
+  int bytes = sd ? 8 : ss ? 4 : 16;
+  if (op2 == 0x28 || op2 == 0x29) {
+    if (!d.p66 && (d.pf2 || d.pf3)) ud();
+    if (d.is_mem && (d.mlin & 15)) gp_fault(0);
+  }
+  uint8_t tmp[16];
+  if (!store) {
+    if (d.is_mem) {
+      memset(tmp, 0, 16);
+      for (int i = 0; i < bytes; i += 8) {
+        int n = bytes - i > 8 ? 8 : bytes - i;
+        uint64_t v = rd64(d.mlin + (uint64_t)i);
+        memcpy(tmp + i, &v, (size_t)n);
+      }
+      if (sd || ss) memset(s->fpu.xmm[d.reg], 0, 16);
+      memcpy(s->fpu.xmm[d.reg], tmp, (size_t)bytes);
+    } else {
+      // Register form of MOVSS/MOVSD leaves the destination's upper bits.
+      memcpy(tmp, s->fpu.xmm[d.rm], 16);
+      memcpy(s->fpu.xmm[d.reg], tmp, (size_t)bytes);
+    }
+  } else {
+    memcpy(tmp, s->fpu.xmm[d.reg], 16);
+    if (d.is_mem) {
+      for (int i = 0; i < bytes; i += 8) {
+        int n = bytes - i > 8 ? 8 : bytes - i;
+        uint64_t v = 0;
+        memcpy(&v, tmp + i, (size_t)n);
+        wr64(d.mlin + (uint64_t)i, v);
+      }
+    } else {
+      // Register destination: MOVSS/MOVSD keep its upper bits.
+      memcpy(s->fpu.xmm[d.rm], tmp, (size_t)bytes);
+    }
+  }
+}
+
+// 0F 12/13/16/17: MOVLPS/MOVHPS/MOVLPD/MOVHPD, MOVSLDUP/MOVSHDUP/MOVDDUP.
+static void SimdMovHalf(uint8_t op2) {
+  modrm();
+  if (d.pf3 && op2 == 0x12) {  // MOVSLDUP
+    uint8_t b[16];
+    SimdSrc(b, 16, 1);
+    for (int i = 0; i < 4; i++) SimdSetElem(s->fpu.xmm[d.reg], 4, i, SimdElem(b, 4, i & 1));
+    return;
+  }
+  if (d.pf3 && op2 == 0x16) {  // MOVSHDUP
+    uint8_t b[16];
+    SimdSrc(b, 16, 1);
+    for (int i = 0; i < 4; i++) SimdSetElem(s->fpu.xmm[d.reg], 4, i, SimdElem(b, 4, 2 + (i & 1)));
+    return;
+  }
+  if (d.pf2 && op2 == 0x12) {  // MOVDDUP
+    uint8_t b[16];
+    SimdSrc(b, 16, 1);
+    uint64_t v = SimdElem(b, 8, 0);
+    memcpy(s->fpu.xmm[d.reg], &v, 8);
+    memcpy(s->fpu.xmm[d.reg] + 8, &v, 8);
+    return;
+  }
+  if (d.pf2 || (d.pf3 && op2 != 0x12 && op2 != 0x16)) ud();
+  if (!d.is_mem && !d.p66) {
+    // Register forms: 0F 12 is MOVHLPS (dest.low = src.high), 0F 16 is
+    // MOVLHPS (dest.high = src.low).
+    if (op2 == 0x12) {
+      memcpy(s->fpu.xmm[d.reg], s->fpu.xmm[d.rm] + 8, 8);
+    } else if (op2 == 0x16) {
+      memcpy(s->fpu.xmm[d.reg] + 8, s->fpu.xmm[d.rm], 8);
+    } else {
+      ud();
+    }
+    return;
+  }
+  int high = op2 == 0x16 || op2 == 0x17;
+  int store = op2 == 0x13 || op2 == 0x17;
+  if (store && !d.is_mem) ud();
+  if (store) {
+    uint64_t v;
+    memcpy(&v, s->fpu.xmm[d.reg] + (high ? 8 : 0), 8);
+    wr64(d.mlin, v);
+  } else if (d.is_mem) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i += 8) v = rd64(d.mlin);
+    memcpy(s->fpu.xmm[d.reg] + (high ? 8 : 0), &v, 8);
+  } else {
+    memcpy(s->fpu.xmm[d.reg] + (high ? 8 : 0), s->fpu.xmm[d.rm], 8);
+  }
+}
+
+// 0F 6E/7E/6F/7F: MOVD/MOVQ between XMM/MMX and r/m, and the block moves.
+static void SimdMovQ(uint8_t op2) {
+  modrm();
+  if (op2 == 0xd6) {  // MOVQ m64,xmm / MOVQ2DQ / MOVDQ2Q
+    if (d.p66) {      // MOVQ m64, xmm
+      uint64_t v;
+      memcpy(&v, s->fpu.xmm[d.reg], 8);
+      if (d.is_mem)
+        wr64(d.mlin, v);
+      else
+        memcpy(s->fpu.xmm[d.rm], &v, 8);
+    } else if (d.pf3) {  // MOVQ2DQ xmm, mm
+      uint64_t v = MmxGet(d.rm);
+      memset(s->fpu.xmm[d.reg], 0, 16);
+      memcpy(s->fpu.xmm[d.reg], &v, 8);
+    } else if (d.pf2) {  // MOVDQ2Q mm, xmm
+      uint64_t v;
+      memcpy(&v, s->fpu.xmm[d.rm], 8);
+      MmxSet(d.reg, v);
+    } else {
+      ud();
+    }
+    return;
+  }
+  int xmm = d.p66 || d.pf3;
+  if (op2 == 0x6e) {
+    uint32_t v;
+    if (d.is_mem) {
+      v = (uint32_t)rd32(d.mlin);
+    } else {
+      v = s->r[d.rm].e;
+    }
+    if (xmm) {
+      memset(s->fpu.xmm[d.reg], 0, 16);
+      memcpy(s->fpu.xmm[d.reg], &v, 4);
+    } else {
+      MmxSet(d.reg, v);
+    }
+    return;
+  }
+  if (op2 == 0x7e) {
+    if (d.pf3) {  // MOVQ xmm, r/m64 (low half, high zero)
+      uint64_t v = 0;
+      v = d.is_mem ? rd64(d.mlin) : s->r[d.rm].q;
+      memset(s->fpu.xmm[d.reg], 0, 16);
+      memcpy(s->fpu.xmm[d.reg], &v, 8);
+      return;
+    }
+    uint32_t v;
+    memcpy(&v, s->fpu.xmm[d.reg], 4);
+    if (xmm) {  // 66 0F 7E MOVD r/m32, xmm
+      if (d.is_mem)
+        wr32(d.mlin, v);
+      else
+        s->r[d.rm].e = v;
+    } else {  // 0F 7E MOVD r/m32, mm
+      uint32_t mv = (uint32_t)MmxGet(d.reg);
+      if (d.is_mem)
+        wr32(d.mlin, mv);
+      else
+        s->r[d.rm].e = mv;
+    }
+    return;
+  }
+  // 0x6f load / 0x7f store: 66 = MOVDQA (aligned), F3 = MOVDQU, none = MOVQ.
+  int store = op2 == 0x7f;
+  int bytes = xmm ? 16 : 8;
+  if (xmm && d.is_mem && (d.mlin & 15) && !d.pf3) gp_fault(0);
+  if (!store) {
+    uint8_t tmp[16];
+    if (d.is_mem) {
+      memset(tmp, 0, 16);
+      for (int i = 0; i < bytes; i += 8) {
+        int n = bytes - i > 8 ? 8 : bytes - i;
+        uint64_t v = rd64(d.mlin + (uint64_t)i);
+        memcpy(tmp + i, &v, (size_t)n);
+      }
+    } else if (xmm) {
+      SimdSrc(tmp, 16, 1);
+    } else {
+      uint64_t v = MmxGet(d.rm);
+      memset(tmp, 0, 16);
+      memcpy(tmp, &v, 8);
+    }
+    SimdDst(tmp, xmm);
+  } else {
+    uint8_t tmp[16];
+    if (xmm) {
+      memcpy(tmp, s->fpu.xmm[d.reg], 16);
+    } else {
+      uint64_t v = MmxGet(d.reg);
+      memset(tmp, 0, 16);
+      memcpy(tmp, &v, 8);
+    }
+    if (d.is_mem) {
+      for (int i = 0; i < bytes; i += 8) {
+        int n = bytes - i > 8 ? 8 : bytes - i;
+        uint64_t v = 0;
+        memcpy(&v, tmp + i, (size_t)n);
+        wr64(d.mlin + (uint64_t)i, v);
+      }
+    } else if (xmm) {
+      memcpy(s->fpu.xmm[d.rm], tmp, 16);
+    } else {
+      MmxSet(d.rm, SimdElem(tmp, 8, 0));
+    }
+  }
+}
+
+// 0F 50 MOVMSKPS/PD: sign bits of the source elements into a GPR.
+static void SimdMovmsk(void) {
+  modrm();
+  int pd = d.p66, count = pd ? 2 : 4;
+  uint32_t m = 0;
+  for (int i = 0; i < count; i++)
+    m |= (uint32_t)((SimdElem(s->fpu.xmm[d.rm], pd ? 8 : 4, i) >> (pd ? 63 : 31)) & 1) << i;
+  if (d.w32)
+    s->r[d.reg].e = m;
+  else
+    s->r[d.reg].x = (uint16_t)m;
+}
+
+// 0F 70 PSHUFW/PSHUFD/PSHUFLW/PSHUFHW.
+static void SimdShuf(uint8_t imm) {
+  if (!d.p66 && !d.pf2 && !d.pf3) {  // PSHUFW mm, mm/m64, imm8
+    uint64_t v = 0, r = 0;
+    if (d.is_mem)
+      v = rd64(d.mlin);
+    else
+      v = MmxGet(d.rm);
+    for (int i = 0; i < 4; i++) {
+      uint64_t e = (v >> (((imm >> (2 * i)) & 3) * 16)) & 0xffff;
+      r |= e << (16 * i);
+    }
+    MmxSet(d.reg, r);
+    return;
+  }
+  if (d.pf3 || d.pf2) {  // PSHUFHW / PSHUFLW: half the words, rest preserved
+    int high = d.pf3;
+    uint8_t b[16], r[16];
+    SimdSrc(b, 16, 1);
+    memcpy(r, s->fpu.xmm[d.reg], 16);
+    for (int i = 0; i < 4; i++) {
+      int src = (imm >> (2 * i)) & 3;
+      uint64_t e = SimdElem(b, 2, (high ? 4 : 0) + src);
+      SimdSetElem(r, 2, (high ? 4 : 0) + i, e);
+    }
+    memcpy(s->fpu.xmm[d.reg], r, 16);
+    return;
+  }
+  // PSHUFD
+  uint8_t b[16];
+  SimdSrc(b, 16, 1);
+  for (int i = 0; i < 4; i++)
+    SimdSetElem(s->fpu.xmm[d.reg], 4, i, SimdElem(b, 4, (imm >> (2 * i)) & 3));
+}
+
+// 0F C6 SHUFPS/SHUFPD.
+static void SimdShufp(uint8_t imm) {
+  int pd = d.p66;
+  uint8_t a[16], b[16], r[16];
+  memcpy(a, s->fpu.xmm[d.reg], 16);
+  SimdSrc(b, 16, 1);
+  if (!pd) {
+    SimdSetElem(r, 4, 0, SimdElem(a, 4, imm & 3));
+    SimdSetElem(r, 4, 1, SimdElem(a, 4, (imm >> 2) & 3));
+    SimdSetElem(r, 4, 2, SimdElem(b, 4, (imm >> 4) & 3));
+    SimdSetElem(r, 4, 3, SimdElem(b, 4, (imm >> 6) & 3));
+  } else {
+    SimdSetElem(r, 8, 0, SimdElem(a, 8, imm & 1));
+    SimdSetElem(r, 8, 1, SimdElem(b, 8, (imm >> 1) & 1));
+  }
+  memcpy(s->fpu.xmm[d.reg], r, 16);
+}
+
+// 0F C4 PINSRW / 0F C5 PEXTRW.
+static void SimdInsExtrWord(uint8_t op2, uint8_t imm) {
+  int sel = imm & 7;
+  int xmm = d.p66;
+  if (op2 == 0xc4) {
+    uint16_t v;
+    if (d.is_mem)
+      v = rd16(d.mlin);
+    else
+      v = (uint16_t)s->r[d.rm].x;
+    if (xmm) {
+      SimdSetElem(s->fpu.xmm[d.reg], 2, sel, v);
+    } else {
+      uint64_t m = MmxGet(d.reg);
+      m = (m & ~(0xffffULL << (16 * sel))) | ((uint64_t)v << (16 * sel));
+      MmxSet(d.reg, m);
+    }
+    return;
+  }
+  // PEXTRW: destination is a GPR, source r/m is MMX/XMM (register only in
+  // practice; a memory source is not encodable for this form).
+  uint64_t src = xmm ? SimdElem(s->fpu.xmm[d.rm], 2, sel)
+                     : ((MmxGet(d.rm) >> (16 * sel)) & 0xffff);
+  s->r[d.reg].e = (uint32_t)src;
+}
+
+static uint64_t SatAddSigned(uint64_t a, uint64_t b, int bytes) {
+  int bits = bytes * 8;
+  int64_t lo = -(1LL << (bits - 1)), hi = (1LL << (bits - 1)) - 1;
+  int64_t s = SimdSigned(a, bytes) + SimdSigned(b, bytes);
+  if (s < lo) s = lo;
+  if (s > hi) s = hi;
+  return (uint64_t)s & SimdMask(bytes);
+}
+static uint64_t SatAddUnsigned(uint64_t a, uint64_t b, int bytes) {
+  uint64_t m = SimdMask(bytes), s = (a & m) + (b & m);
+  return s > m ? m : s;
+}
+static uint64_t SatSubSigned(uint64_t a, uint64_t b, int bytes) {
+  int bits = bytes * 8;
+  int64_t lo = -(1LL << (bits - 1)), hi = (1LL << (bits - 1)) - 1;
+  int64_t s = SimdSigned(a, bytes) - SimdSigned(b, bytes);
+  if (s < lo) s = lo;
+  if (s > hi) s = hi;
+  return (uint64_t)s & SimdMask(bytes);
+}
+static uint64_t SatSubUnsigned(uint64_t a, uint64_t b, int bytes) {
+  uint64_t m = SimdMask(bytes), x = a & m, y = b & m;
+  return x > y ? x - y : 0;
+}
+static uint64_t SatPackSigned(uint64_t v, int frombytes, int tobytes) {
+  int bits = tobytes * 8;
+  int64_t lo = -(1LL << (bits - 1)), hi = (1LL << (bits - 1)) - 1;
+  int64_t s = SimdSigned(v, frombytes);
+  if (s < lo) s = lo;
+  if (s > hi) s = hi;
+  return (uint64_t)s & SimdMask(tobytes);
+}
+static uint64_t SatPackUnsigned(uint64_t v, int frombytes, int tobytes) {
+  int64_t s = SimdSigned(v, frombytes);
+  uint64_t hi = SimdMask(tobytes);
+  if (s < 0) return 0;
+  return (uint64_t)s > hi ? hi : (uint64_t)s;
+}
+
+// The packed-integer / MMX opcode families (SDM vol.2 PADD*, PSUB*, PCMP*,
+// PSHUF*, PACK*, PUNPCK*, PSLL/PSRL/PSRA, PMUL*, PSADBW, PAND/POR/PXOR).
+static void SimdInteger(uint8_t op2) {
+  if (op2 == 0x77) {
+    fr->rec.mnemonic = "emms";
+    MmxEmms();
+    return;
+  }
+  if (op2 == 0xd7) {  // PMOVMSKB r32, mm/xmm
+    modrm();
+    fr->rec.mnemonic = "pmovmskb";
+    int bytes = d.p66 ? 16 : 8;
+    uint8_t b[16];
+    SimdSrc(b, bytes, d.p66);
+    uint32_t m = 0;
+    for (int i = 0; i < bytes; i++) m |= (uint32_t)((b[i] >> 7) & 1) << i;
+    s->r[d.reg].e = m;
+    return;
+  }
+  if (op2 == 0xe7) {  // MOVNTQ / MOVNTDQ
+    modrm();
+    fr->rec.mnemonic = "movnt";
+    int bytes = d.p66 ? 16 : 8;
+    uint8_t b[16];
+    if (d.p66) {
+      memcpy(b, s->fpu.xmm[d.reg], 16);
+    } else {
+      uint64_t v = MmxGet(d.reg);
+      memset(b, 0, 16);
+      memcpy(b, &v, 8);
+    }
+    for (int i = 0; i < bytes; i += 8) {
+      int n = bytes - i > 8 ? 8 : bytes - i;
+      uint64_t v = 0;
+      memcpy(&v, b + i, (size_t)n);
+      wr64(d.mlin + (uint64_t)i, v);
+    }
+    return;
+  }
+  if (op2 == 0xf7) {  // MASKMOVQ/MASKMOVDQU: store bytes selected by mask MSBs
+    modrm();
+    int xmm = d.p66;
+    int n = xmm ? 16 : 8;
+    uint8_t src[16], mask[16];
+    if (xmm) {
+      memcpy(src, s->fpu.xmm[d.reg], 16);
+      memcpy(mask, s->fpu.xmm[d.rm], 16);
+    } else {
+      uint64_t a = MmxGet(d.reg), b = MmxGet(d.rm);
+      memset(src, 0, 16);
+      memset(mask, 0, 16);
+      memcpy(src, &a, 8);
+      memcpy(mask, &b, 8);
+    }
+    uint32_t dioff = d.a32 ? s->r[edi_i].e : s->r[edi_i].x;
+    for (int i = 0; i < n; i++)
+      if (mask[i] & 0x80) wr8(s->base[es_i] + dioff + (uint32_t)i, src[i]);
+    fr->rec.mnemonic = "maskmov";
+    return;
+  }
+  if (op2 == 0xf0) {      // LDDQU (F2): unaligned 16-byte load
+    modrm();
+    fr->rec.mnemonic = "lddqu";
+    if (!d.pf2) ud();
+    uint8_t b[16];
+    SimdSrc(b, 16, 1);
+    memcpy(s->fpu.xmm[d.reg], b, 16);
+    return;
+  }
+  if (op2 == 0x71 || op2 == 0x72 || op2 == 0x73) {
+    // Shift group with an imm8; reg field selects the operation.
+    modrm();
+    uint8_t imm = imm8();
+    int xmm = d.p66;
+    int bytes = op2 == 0x71 ? 2 : op2 == 0x72 ? 4 : 8;
+    uint64_t cnt = (imm > (uint64_t)bytes * 8) ? (uint64_t)bytes * 8 : imm;
+    uint8_t a[16], b[16];
+    int nreg = xmm ? 16 : 8;
+    if (xmm)
+      memcpy(a, s->fpu.xmm[d.rm], 16);
+    else {
+      uint64_t v = MmxGet(d.rm);
+      memset(a, 0, 16);
+      memcpy(a, &v, 8);
+    }
+    memset(b, 0, 16);
+    for (int i = 0; i < nreg; i += bytes) {
+      uint64_t v = SimdElem(a, bytes, i / bytes);
+      switch (d.reg) {
+        case 2: v = (v & SimdMask(bytes)) >> cnt; break;           // PSRLW/D/Q
+        case 4: v = (uint64_t)(SimdSigned(v, bytes) >> cnt); break; // PSRAW/D
+        case 6: v = (v & SimdMask(bytes)) << cnt; break;           // PSLLW/D/Q
+        default: ud();
+      }
+      SimdSetElem(b, bytes, i / bytes, v);
+    }
+    // The reg/opcode fields: 71 /2 PSRLW, /4 PSRAW, /6 PSLLW; 72 /2 PSRLD,
+    // /4 PSRAD, /6 PSLLD; 73 /2 PSRLQ, /6 PSLLQ (no PSRAQ in SSE2). The
+    // destination of a group form is rm, not reg (SDM PSLLW et al.).
+    if (xmm)
+      memcpy(s->fpu.xmm[d.rm], b, 16);
+    else
+      MmxSet(d.rm, SimdElem(b, 8, 0));
+    return;
+  }
+  modrm();
+  int xmm = d.p66;
+  int total = xmm ? 16 : 8;
+  uint8_t a[16], b[16];
+  if (xmm)
+    memcpy(a, s->fpu.xmm[d.reg], 16);
+  else {
+    uint64_t v = MmxGet(d.reg);
+    memset(a, 0, 16);
+    memcpy(a, &v, 8);
+  }
+  SimdSrc(b, total, xmm);
+  uint8_t r[16];
+  memcpy(r, a, 16);
+  int bytes = 1;
+  switch (op2) {
+    case 0x60: case 0x68: bytes = 1; goto unpack;
+    case 0x61: case 0x69: bytes = 2; goto unpack;
+    case 0x62: case 0x6a: bytes = 4; goto unpack;
+    case 0x6c: case 0x6d: bytes = 8; goto unpack;
+    default: break;
+  }
+  // PUNPCKL/H: interleave elements from a and b, low or high half.
+  if (op2 == 0x60 || op2 == 0x61 || op2 == 0x62 || op2 == 0x6c ||
+      op2 == 0x68 || op2 == 0x69 || op2 == 0x6a || op2 == 0x6d) {
+  unpack: {
+      int high = op2 == 0x68 || op2 == 0x69 || op2 == 0x6a || op2 == 0x6d;
+      int n = total / bytes;
+      int half = n / 2;
+      for (int i = 0; i < n; i++) {
+        int src = (i / 2) + (high ? half : 0);
+        uint64_t e = (i & 1) ? SimdElem(b, bytes, src) : SimdElem(a, bytes, src);
+        SimdSetElem(r, bytes, i, e);
+      }
+      SimdDst(r, xmm);
+      return;
+    }
+  }
+  switch (op2) {
+    case 0x63: {  // PACKSSWB: 8/16 words -> 8/16 bytes
+      int half = total / 2;
+      for (int i = 0; i < total; i++) {
+        const uint8_t* s = i < half ? a : b;
+        SimdSetElem(r, 1, i, SatPackSigned(SimdElem(s, 2, i % half), 2, 1));
+      }
+      SimdDst(r, xmm);
+      return;
+    }
+    case 0x67: {  // PACKUSWB
+      int half = total / 2;
+      for (int i = 0; i < total; i++) {
+        const uint8_t* s = i < half ? a : b;
+        SimdSetElem(r, 1, i, SatPackUnsigned(SimdElem(s, 2, i % half), 2, 1));
+      }
+      SimdDst(r, xmm);
+      return;
+    }
+    case 0x6b: {  // PACKSSDW: 4/8 dwords -> 4/8 words
+      int n = total / 2, half = n / 2;
+      for (int i = 0; i < n; i++) {
+        const uint8_t* s = i < half ? a : b;
+        SimdSetElem(r, 2, i, SatPackSigned(SimdElem(s, 4, i % half), 4, 2));
+      }
+      SimdDst(r, xmm);
+      return;
+    }
+    case 0x64: case 0x65: case 0x66: {  // PCMPGTB/W/D (signed)
+      bytes = op2 == 0x64 ? 1 : op2 == 0x65 ? 2 : 4;
+      int n = total / bytes;
+      for (int i = 0; i < n; i++) {
+        int64_t av = SimdSigned(SimdElem(a, bytes, i), bytes);
+        int64_t bv = SimdSigned(SimdElem(b, bytes, i), bytes);
+        SimdSetElem(r, bytes, i, av > bv ? SimdMask(bytes) : 0);
+      }
+      SimdDst(r, xmm);
+      return;
+    }
+    case 0x74: case 0x75: case 0x76: {  // PCMPEQB/W/D
+      bytes = op2 == 0x74 ? 1 : op2 == 0x75 ? 2 : 4;
+      int n = total / bytes;
+      for (int i = 0; i < n; i++)
+        SimdSetElem(r, bytes, i, SimdElem(a, bytes, i) == SimdElem(b, bytes, i) ? SimdMask(bytes) : 0);
+      SimdDst(r, xmm);
+      return;
+    }
+    case 0xdb: case 0xdf: case 0xeb: case 0xef:  // PAND/PANDN/POR/PXOR
+      for (int i = 0; i < total; i++) {
+        uint8_t av = a[i], bv = b[i], z;
+        if (op2 == 0xdb) z = av & bv;
+        else if (op2 == 0xdf) z = (uint8_t)(~av & bv);
+        else if (op2 == 0xeb) z = av | bv;
+        else z = av ^ bv;
+        r[i] = z;
+      }
+      SimdDst(r, xmm);
+      return;
+    case 0xd4: case 0xfb: {  // PADDQ / PSUBQ
+      for (int i = 0; i < total; i += 8)
+        SimdSetElem(r, 8, i / 8, SimdElem(a, 8, i / 8) + (op2 == 0xd4 ? SimdElem(b, 8, i / 8) : -SimdElem(b, 8, i / 8)));
+      SimdDst(r, xmm);
+      return;
+    }
+    case 0xd5: case 0xe5: case 0xe4: {  // PMULLW / PMULHW / PMULHUW
+      for (int i = 0; i < total; i += 2) {
+        uint64_t av = SimdElem(a, 2, i / 2), bv = SimdElem(b, 2, i / 2), z;
+        if (op2 == 0xd5) z = (av * bv) & 0xffff;
+        else if (op2 == 0xe4) z = ((av * bv) >> 16) & 0xffff;
+        else z = ((uint64_t)(SimdSigned(av, 2) * SimdSigned(bv, 2)) >> 16) & 0xffff;
+        SimdSetElem(r, 2, i / 2, z);
+      }
+      SimdDst(r, xmm);
+      return;
+    }
+    case 0xf4: {  // PMULUDQ
+      for (int i = 0; i < total; i += 8) {
+        uint64_t av = SimdElem(a, 4, (i / 8) * 2), bv = SimdElem(b, 4, (i / 8) * 2);
+        SimdSetElem(r, 8, i / 8, av * bv);
+      }
+      SimdDst(r, xmm);
+      return;
+    }
+    case 0xf5: {  // PMADDWD
+      for (int i = 0; i < total; i += 4) {
+        int64_t a0 = SimdSigned(SimdElem(a, 2, (i / 4) * 2), 2);
+        int64_t a1 = SimdSigned(SimdElem(a, 2, (i / 4) * 2 + 1), 2);
+        int64_t b0 = SimdSigned(SimdElem(b, 2, (i / 4) * 2), 2);
+        int64_t b1 = SimdSigned(SimdElem(b, 2, (i / 4) * 2 + 1), 2);
+        SimdSetElem(r, 4, i / 4, (uint32_t)(a0 * b0 + a1 * b1));
+      }
+      SimdDst(r, xmm);
+      return;
+    }
+    case 0xf6: {  // PSADBW
+      for (int i = 0; i < total; i += 8) {
+        uint32_t sum = 0;
+        for (int j = 0; j < 8; j++) {
+          int av = (int)SimdElem(a, 1, (i / 8) * 8 + j);
+          int bv = (int)SimdElem(b, 1, (i / 8) * 8 + j);
+          sum += (uint32_t)(av > bv ? av - bv : bv - av);
+        }
+        SimdSetElem(r, 8, i / 8, sum);
+      }
+      SimdDst(r, xmm);
+      return;
+    }
+    case 0xd1: case 0xd2: case 0xd3: case 0xe1: case 0xe2:
+    case 0xf1: case 0xf2: case 0xf3: {  // PSRL/PSRA/PSLL by xmm/m64 count
+      int wbytes = (op2 == 0xd1 || op2 == 0xe1 || op2 == 0xf1) ? 2
+                   : (op2 == 0xd3 || op2 == 0xf3) ? 8 : 4;
+      uint64_t cnt = SimdElem(b, 8, 0);
+      int n = total / wbytes;
+      for (int i = 0; i < n; i++) {
+        uint64_t v = SimdElem(a, wbytes, i), z;
+        uint64_t c = cnt > (uint64_t)wbytes * 8 ? (uint64_t)wbytes * 8 : cnt;
+        if (op2 == 0xd1 || op2 == 0xd2 || op2 == 0xd3) z = (v & SimdMask(wbytes)) >> c;
+        else if (op2 == 0xe1 || op2 == 0xe2) z = (uint64_t)(SimdSigned(v, wbytes) >> c);
+        else z = (v & SimdMask(wbytes)) << c;
+        SimdSetElem(r, wbytes, i, z & SimdMask(wbytes));
+      }
+      SimdDst(r, xmm);
+      return;
+    }
+    case 0xd8: case 0xd9: case 0xda: case 0xdc: case 0xdd: case 0xde:
+    case 0xe0: case 0xe3: case 0xe8: case 0xe9: case 0xea: case 0xec: case 0xed: case 0xee:
+    case 0xf8: case 0xf9: case 0xfa: case 0xfc: case 0xfd: case 0xfe: {
+      // Saturating / averaging / min-max arithmetic at element widths.
+      switch (op2) {
+        case 0xd8: case 0xdc: case 0xe0: case 0xe8: case 0xec: case 0xf8: case 0xfc: bytes = 1; break;
+        case 0xd9: case 0xdd: case 0xe3: case 0xe9: case 0xed: case 0xf9: case 0xfd: bytes = 2; break;
+        default: bytes = 4; break;
+      }
+      int n = total / bytes;
+      for (int i = 0; i < n; i++) {
+        uint64_t av = SimdElem(a, bytes, i), bv = SimdElem(b, bytes, i), z;
+        switch (op2) {
+          case 0xd8: z = SatSubUnsigned(av, bv, bytes); break;
+          case 0xd9: z = SatSubUnsigned(av, bv, bytes); break;
+          case 0xda: z = (av & SimdMask(bytes)) < (bv & SimdMask(bytes)) ? av : bv; break;
+          case 0xdc: z = SatAddUnsigned(av, bv, bytes); break;
+          case 0xdd: z = SatAddUnsigned(av, bv, bytes); break;
+          case 0xde: z = (av & SimdMask(bytes)) > (bv & SimdMask(bytes)) ? av : bv; break;
+          case 0xe0: z = ((av & SimdMask(bytes)) + (bv & SimdMask(bytes)) + 1) >> 1; break;
+          case 0xe3: z = ((av & SimdMask(bytes)) + (bv & SimdMask(bytes)) + 1) >> 1; break;
+          case 0xe8: z = SatSubSigned(av, bv, bytes); break;
+          case 0xe9: z = SatSubSigned(av, bv, bytes); break;
+          case 0xea: z = SimdSigned(av, bytes) < SimdSigned(bv, bytes) ? av : bv; break;
+          case 0xec: z = SatAddSigned(av, bv, bytes); break;
+          case 0xed: z = SatAddSigned(av, bv, bytes); break;
+          case 0xee: z = SimdSigned(av, bytes) > SimdSigned(bv, bytes) ? av : bv; break;
+          case 0xf8: z = (av - bv) & SimdMask(bytes); break;
+          case 0xf9: z = (av - bv) & SimdMask(bytes); break;
+          case 0xfa: z = (av - bv) & SimdMask(bytes); break;
+          case 0xfc: z = (av + bv) & SimdMask(bytes); break;
+          case 0xfd: z = (av + bv) & SimdMask(bytes); break;
+          default: z = (av + bv) & SimdMask(bytes); break;
+        }
+        SimdSetElem(r, bytes, i, z);
+      }
+      SimdDst(r, xmm);
+      return;
+    }
+    default:
+      ud();
+  }
+}
+
+// 0F 2A/2C/2D/5A/5B/E6: the scalar and packed conversion families.
+static void SimdConvert(uint8_t op2) {
+  modrm();
+  int sd = d.pf2, ss = d.pf3 && !d.pf2;
+  uint8_t a[16], r[16];
+  memcpy(a, s->fpu.xmm[d.reg], 16);
+  memcpy(r, a, 16);
+  if (op2 == 0x2a) {  // CVTSI2SS/SD, CVTPI2PS/PD
+    if (ss || sd) {
+      uint32_t iv = d.is_mem ? (uint32_t)rd32(d.mlin) : s->r[d.rm].e;
+      fpu_sse_begin(&s->fpu);
+      if (ss) {
+        float32_t f = i32_to_f32((int32_t)iv);
+        memcpy(r, &f.v, 4);
+      } else {
+        float64_t f = i32_to_f64((int32_t)iv);
+        memcpy(r, &f.v, 8);
+      }
+      memcpy(s->fpu.xmm[d.reg], r, 16);
+      SimdCheckSse();
+    } else {
+      uint64_t m = d.is_mem ? rd64(d.mlin) : MmxGet(d.rm);
+      int pd = d.p66;
+      fpu_sse_begin(&s->fpu);
+      for (int i = 0; i < 2; i++) {
+        int32_t iv = (int32_t)(uint32_t)(m >> (32 * i));
+        if (pd) {
+          float64_t f = i32_to_f64(iv);
+          memcpy(r + 8 * i, &f.v, 8);
+        } else {
+          float32_t f = i32_to_f32(iv);
+          memcpy(r + 4 * i, &f.v, 4);
+        }
+      }
+      memset(s->fpu.xmm[d.reg], 0, 16);
+      memcpy(s->fpu.xmm[d.reg], r, pd ? 16 : 8);
+      SimdCheckSse();
+    }
+    return;
+  }
+  if (op2 == 0x2c || op2 == 0x2d) {  // CVT[T]SS2SI/SD2SI and MMX forms
+    int trunc = op2 == 0x2c;
+    uint8_t b[16];
+    SimdSrc(b, (ss || sd) ? (ss ? 4 : 8) : 16, 1);
+    fpu_sse_begin(&s->fpu);
+    if (ss || sd) {
+      int32_t q;
+      if (ss) {
+        float32_t f;
+        memcpy(&f.v, b, 4);
+        q = (int32_t)(trunc ? f32_to_i32_r_minMag(f, true)
+                            : f32_to_i32(f, softfloat_roundingMode, true));
+      } else {
+        float64_t f;
+        memcpy(&f.v, b, 8);
+        q = (int32_t)(trunc ? f64_to_i32_r_minMag(f, true)
+                            : f64_to_i32(f, softfloat_roundingMode, true));
+      }
+      s->r[d.reg].e = (uint32_t)q;
+    } else {
+      int pd = d.p66;
+      memset(r, 0, 16);
+      for (int i = 0; i < 2; i++) {
+        int32_t q;
+        if (pd) {
+          float64_t f;
+          memcpy(&f.v, b + 8 * i, 8);
+          q = (int32_t)(trunc ? f64_to_i32_r_minMag(f, true)
+                              : f64_to_i32(f, softfloat_roundingMode, true));
+        } else {
+          float32_t f;
+          memcpy(&f.v, b + 4 * i, 4);
+          q = (int32_t)(trunc ? f32_to_i32_r_minMag(f, true)
+                              : f32_to_i32(f, softfloat_roundingMode, true));
+        }
+        memcpy(r + 4 * i, &q, 4);
+      }
+      SimdDst(r, 0);
+    }
+    SimdCheckSse();
+    return;
+  }
+  if (op2 == 0x5a) {
+    uint8_t b[16];
+    if (ss) {  // CVTSS2SD
+      SimdSrc(b, 4, 1);
+      float32_t f;
+      memcpy(&f.v, b, 4);
+      fpu_sse_begin(&s->fpu);
+      float64_t d64 = f32_to_f64(f);
+      memcpy(r, &d64.v, 8);
+      memcpy(s->fpu.xmm[d.reg], r, 16);
+      SimdCheckSse();
+    } else if (sd) {  // CVTSD2SS
+      SimdSrc(b, 8, 1);
+      float64_t f;
+      memcpy(&f.v, b, 8);
+      fpu_sse_begin(&s->fpu);
+      float32_t f32 = f64_to_f32(f);
+      memcpy(r, &f32.v, 4);
+      memcpy(s->fpu.xmm[d.reg], r, 16);
+      SimdCheckSse();
+    } else if (d.p66) {  // CVTPD2PS: high 64 of dest zeroed
+      SimdSrc(b, 16, 1);
+      fpu_sse_begin(&s->fpu);
+      memset(r, 0, 16);
+      for (int i = 0; i < 2; i++) {
+        float64_t f;
+        memcpy(&f.v, b + 8 * i, 8);
+        float32_t f32 = f64_to_f32(f);
+        memcpy(r + 4 * i, &f32.v, 4);
+      }
+      memcpy(s->fpu.xmm[d.reg], r, 16);
+      SimdCheckSse();
+    } else {  // CVTPS2PD
+      SimdSrc(b, 8, 1);
+      fpu_sse_begin(&s->fpu);
+      for (int i = 0; i < 2; i++) {
+        float32_t f;
+        memcpy(&f.v, b + 4 * i, 4);
+        float64_t d64 = f32_to_f64(f);
+        memcpy(r + 8 * i, &d64.v, 8);
+      }
+      memcpy(s->fpu.xmm[d.reg], r, 16);
+      SimdCheckSse();
+    }
+    return;
+  }
+  if (op2 == 0x5b) {  // CVTDQ2PS / CVTPS2DQ / CVTTPS2DQ
+    uint8_t b[16];
+    SimdSrc(b, 16, 1);
+    fpu_sse_begin(&s->fpu);
+    if (d.pf3) {  // CVTTPS2DQ
+      for (int i = 0; i < 4; i++) {
+        float32_t f;
+        memcpy(&f.v, b + 4 * i, 4);
+        int32_t q = (int32_t)f32_to_i32_r_minMag(f, true);
+        memcpy(r + 4 * i, &q, 4);
+      }
+    } else if (d.p66) {  // CVTPS2DQ
+      for (int i = 0; i < 4; i++) {
+        float32_t f;
+        memcpy(&f.v, b + 4 * i, 4);
+        int32_t q = (int32_t)f32_to_i32(f, softfloat_roundingMode, true);
+        memcpy(r + 4 * i, &q, 4);
+      }
+    } else {  // CVTDQ2PS
+      for (int i = 0; i < 4; i++) {
+        int32_t q;
+        memcpy(&q, b + 4 * i, 4);
+        float32_t f = i32_to_f32(q);
+        memcpy(r + 4 * i, &f.v, 4);
+      }
+    }
+    memcpy(s->fpu.xmm[d.reg], r, 16);
+    SimdCheckSse();
+    return;
+  }
+  if (op2 == 0xe6) {  // CVTDQ2PD (F3), CVTPD2DQ (66), CVTTPD2DQ (F2)
+    uint8_t b[16];
+    SimdSrc(b, 16, 1);
+    fpu_sse_begin(&s->fpu);
+    memset(r, 0, 16);
+    if (d.pf3) {  // CVTDQ2PD: two dwords -> two doubles
+      for (int i = 0; i < 2; i++) {
+        int32_t q;
+        memcpy(&q, b + 4 * i, 4);
+        float64_t f = i32_to_f64(q);
+        memcpy(r + 8 * i, &f.v, 8);
+      }
+    } else if (d.pf2) {  // CVTTPD2DQ
+      for (int i = 0; i < 2; i++) {
+        float64_t f;
+        memcpy(&f.v, b + 8 * i, 8);
+        int32_t q = (int32_t)f64_to_i32_r_minMag(f, true);
+        memcpy(r + 4 * i, &q, 4);
+      }
+    } else {  // CVTPD2DQ (66)
+      for (int i = 0; i < 2; i++) {
+        float64_t f;
+        memcpy(&f.v, b + 8 * i, 8);
+        int32_t q = (int32_t)f64_to_i32(f, softfloat_roundingMode, true);
+        memcpy(r + 4 * i, &q, 4);
+      }
+    }
+    memcpy(s->fpu.xmm[d.reg], r, 16);
+    SimdCheckSse();
+    return;
+  }
+  ud();
+}
+
+static void SimdOp(uint8_t op2) {
+  // MMX/SSE share the FPU's lazy-context machinery: TS means #NM and EM
+  // means the unit is emulated by software, which for these encodings is
+  // #UD (SDM vol.3 2.5, vol.1 11.6.3).
+  if (s->cr0 & kCr0Ts) nm();
+  if (s->cr0 & kCr0Em) ud();
+  switch (op2) {
+    case 0x10: case 0x11: case 0x28: case 0x29:
+      fr->rec.mnemonic = op2 == 0x10 ? "movups" : op2 == 0x11 ? "movups" : "movaps";
+      SimdMov(op2);
+      break;
+    case 0x12: case 0x13: case 0x16: case 0x17:
+      fr->rec.mnemonic = "movlh";
+      SimdMovHalf(op2);
+      break;
+    case 0x14: case 0x15: {  // UNPCKLPS/PD, UNPCKHPS/PD
+      modrm();
+      int pd = d.p66;
+      int n = pd ? 2 : 4, esz = pd ? 8 : 4, half = n / 2;
+      uint8_t a[16], b[16], r[16];
+      memcpy(a, s->fpu.xmm[d.reg], 16);
+      SimdSrc(b, 16, 1);
+      int base = op2 == 0x15 ? half : 0;
+      for (int i = 0; i < n; i++) {
+        int src = base + i / 2;
+        SimdSetElem(r, esz, i, SimdElem((i & 1) ? b : a, esz, src));
+      }
+      memcpy(s->fpu.xmm[d.reg], r, 16);
+      fr->rec.mnemonic = op2 == 0x14 ? "unpckl" : "unpckh";
+      break;
+    }
+    case 0x2b: {  // MOVNTPS/MOVNTPD: a non-temporal 16-byte store
+      modrm();
+      fr->rec.mnemonic = "movntps";
+      if (!d.is_mem) ud();
+      for (int i = 0; i < 16; i += 8) {
+        uint64_t v;
+        memcpy(&v, s->fpu.xmm[d.reg] + i, 8);
+        wr64(d.mlin + (uint64_t)i, v);
+      }
+      break;
+    }
+    case 0x2e: fr->rec.mnemonic = "ucomiss"; SimdComi(1); break;
+    case 0x2f: fr->rec.mnemonic = "comiss"; SimdComi(0); break;
+    case 0x2a: case 0x2c: case 0x2d: case 0x5a: case 0x5b: case 0xe6:
+      fr->rec.mnemonic = "cvt";
+      SimdConvert(op2);
+      break;
+    case 0x50:
+      fr->rec.mnemonic = "movmsk";
+      SimdMovmsk();
+      break;
+    case 0x51: case 0x52: case 0x53: case 0x58: case 0x59:
+    case 0x5c: case 0x5d: case 0x5e: case 0x5f:
+      fr->rec.mnemonic = "sse-arith";
+      SimdFp(op2);
+      break;
+    case 0x6e: case 0x7e: case 0x6f: case 0x7f: case 0xd6:
+      fr->rec.mnemonic = "movd/q";
+      SimdMovQ(op2);
+      break;
+    case 0x70: {
+      modrm();
+      uint8_t imm = imm8();
+      fr->rec.mnemonic = "pshuf";
+      SimdShuf(imm);
+      break;
+    }
+    case 0x77:
+      SimdInteger(op2);
+      break;
+    case 0xc2: {
+      modrm();
+      uint8_t imm = imm8();
+      fr->rec.mnemonic = "cmpps";
+      SimdCmp(imm);
+      break;
+    }
+    case 0xc3: {  // MOVNTI m32/m64, r32
+      modrm();
+      fr->rec.mnemonic = "movnti";
+      if (d.w32)
+        wr32(d.mlin, s->r[d.reg].e);
+      else
+        wr64(d.mlin, s->r[d.reg].q);
+      break;
+    }
+    case 0xc4: case 0xc5: {
+      modrm();
+      uint8_t imm = imm8();
+      fr->rec.mnemonic = op2 == 0xc4 ? "pinsrw" : "pextrw";
+      SimdInsExtrWord(op2, imm);
+      break;
+    }
+    case 0xc6: {
+      modrm();
+      uint8_t imm = imm8();
+      fr->rec.mnemonic = "shufps";
+      SimdShufp(imm);
+      break;
+    }
+    default:
+      if ((op2 >= 0x60 && op2 <= 0x76) || (op2 >= 0xd1 && op2 <= 0xdf) ||
+          (op2 >= 0xe0 && op2 <= 0xef) || (op2 >= 0xf0 && op2 <= 0xfe)) {
+        fr->rec.mnemonic = "sse-int";
+        SimdInteger(op2);
+      } else {
+        ud();
+      }
+      break;
+  }
+}
+
 static void run_op2(uint8_t op2) {
+  // The MMX/SSE/SSE2 map: 0F 10-17, 28-2F, 50-77, 7E/7F, C2-C6, D1-DF,
+  // E0-EF and F0-FE. Their mandatory prefixes are consumed by SimdOp.
+  if ((op2 >= 0x10 && op2 <= 0x17) || (op2 >= 0x28 && op2 <= 0x2f) ||
+      (op2 >= 0x50 && op2 <= 0x77) || op2 == 0x7e || op2 == 0x7f ||
+      (op2 >= 0xc2 && op2 <= 0xc6) || (op2 >= 0xd1 && op2 <= 0xdf) ||
+      (op2 >= 0xe0 && op2 <= 0xef) || (op2 >= 0xf0 && op2 <= 0xfe)) {
+    SimdOp(op2);
+    return;
+  }
   switch (op2) {
     case 0x00: {  // 0f 00 group: sldt/str/lldt/ltr/verr/verw (reg field)
       modrm();
@@ -2794,11 +4243,21 @@ static void run_op2(uint8_t op2) {
           TlbFlushAll(s);
           break;
         }
-        case 7: {  // invlpg: drop the page's translations; never faults on an
-                   // unmapped page (SDM vol.2)
+        case 7: {  // invlpg, or RDTSCP in the register form (0F 01 F9)
+          if (!d.is_mem) {
+            if (d.rm != 1) ud();  // SWAPGS is 64-bit only
+            fr->rec.mnemonic = "rdtscp";
+            if ((s->cr4 & kCr4Tsd) && cpl() != 0) gp_fault(0);
+            uint64_t t = TscNow();
+            eax = (uint32_t)t;
+            edx = (uint32_t)(t >> 32);
+            ecx = s->tsc_aux;
+            break;
+          }
+          // invlpg: drop the page's translations; never faults on an
+          // unmapped page (SDM vol.2)
           fr->rec.mnemonic = "invlpg";
           if (cpl() != 0) gp_fault(0);
-          if (!d.is_mem) ud();
           TlbFlushPage(s, (uint32_t)d.mlin);
           break;
         }
@@ -2867,8 +4326,9 @@ static void run_op2(uint8_t op2) {
         // (SDM vol.3 4.10.4.1).
         TlbFlushNonGlobal(s);
       } else if (d.reg == 4) {
-        s->cr4 = s->r[d.rm].e;
-        // PAE/PSE/PGE all change what the walk means.
+        // CR4 is WARL: bits this machine does not implement read back zero
+        // (SDM vol.3 2.5). PAE/PSE/PGE all change what the walk means.
+        s->cr4 = s->r[d.rm].e & kCr4Supported;
         TlbFlushAll(s);
       } else {
         ud();
@@ -2906,48 +4366,63 @@ static void run_op2(uint8_t op2) {
     case 0x30: {  // wrmsr EDX:EAX -> MSR[ECX] (SDM vol.2; privileged)
       fr->rec.mnemonic = "wrmsr";
       if (cpl() != 0) gp_fault(0);
-      uint64_t v = ((uint64_t)edx << 32) | eax;
-      if (ecx == 0x1b) {
-        s->msr_apic_base = v;  // the MMIO page itself is fixed at reset
-      } else if (ecx == 0xc0000100 || ecx == 0xc0000101) {
-        // long-mode FS/GS bases: no architectural effect on this machine
-        // (QEMU accepts the write; the kvm boot programs GS base)
-        s->msr_fs_gs_base[ecx - 0xc0000100] = v;
-      } else if (ecx == 0xc0000080) {
-        // IA32_EFER: only NXE changes translation (the PAE NX bit). Long mode
-        // is not implemented; the other bits are stored and ignored.
-        s->efer = v;
-        TlbFlushAll(s);
-      } else {
-        gp_fault(0);  // an MSR this machine does not implement
-      }
+      MsrWrite(ecx, ((uint64_t)edx << 32) | eax);
       break;
     }
-    case 0x31:  // rdtsc — unimplemented, D13 (AGENTS.md 简化登记)
-      ud();
+    case 0x31: {  // rdtsc (SDM vol.2): EDX:EAX = TSC
+      fr->rec.mnemonic = "rdtsc";
+      if ((s->cr4 & kCr4Tsd) && cpl() != 0) gp_fault(0);
+      uint64_t t = TscNow();
+      eax = (uint32_t)t;
+      edx = (uint32_t)(t >> 32);
+      break;
+    }
     case 0x32: {  // rdmsr MSR[ECX] -> EDX:EAX (SDM vol.2 0F 32; privileged)
       fr->rec.mnemonic = "rdmsr";
       if (cpl() != 0) gp_fault(0);
-      if (ecx == 0x1b) {
-        eax = (uint32_t)s->msr_apic_base;
-        edx = (uint32_t)(s->msr_apic_base >> 32);
-      } else if (ecx == 0xc0000100 || ecx == 0xc0000101) {
-        uint64_t v = s->msr_fs_gs_base[ecx - 0xc0000100];
-        eax = (uint32_t)v;
-        edx = (uint32_t)(v >> 32);
-      } else if (ecx == 0xc0000080) {
-        eax = (uint32_t)s->efer;
-        edx = (uint32_t)(s->efer >> 32);
-      } else if (ecx == 0x1a0) {
-        // IA32_MISC_ENABLE (SDM vol.4 table 2-24): fast strings on, PEBS/BTS
-        // report unavailable — the QEMU default policy for a machine with
-        // no performance-monitoring unit (the kvm debug test single-steps
-        // across this read).
-        eax = 0x1801;
-        edx = 0;
-      } else {
-        gp_fault(0);
-      }
+      uint64_t v = MsrRead(ecx);
+      eax = (uint32_t)v;
+      edx = (uint32_t)(v >> 32);
+      break;
+    }
+    case 0x34: {  // sysenter (SDM vol.2; flat ring-0 CS, no frame)
+      fr->rec.mnemonic = "sysenter";
+      if (!(s->cr0 & kCr0Pe) || (s->sysenter_cs & 0xfffc) == 0) gp_fault(0);
+      uint16_t cs = (uint16_t)(s->sysenter_cs & 0xfffc);
+      uint16_t ss = (uint16_t)(cs + 8);
+      s->sreg[cs_i] = cs;
+      s->base[cs_i] = 0;
+      s->limit[cs_i] = 0xffffffff;
+      s->ar[cs_i] = 0x9b;  // present, DPL0, code, readable, accessed
+      s->dbit[cs_i] = 1;
+      s->sreg[ss_i] = ss;
+      s->base[ss_i] = 0;
+      s->limit[ss_i] = 0xffffffff;
+      s->ar[ss_i] = 0x93;
+      s->dbit[ss_i] = 1;
+      s->r[esp_i].e = s->sysenter_esp;
+      eip = s->sysenter_eip;
+      fl->word &= ~(0x100u | 0x10000u | 0x20000u);  // TF, RF, VM
+      fl->if_ = 0;
+      break;
+    }
+    case 0x35: {  // sysexit: return to ring 3 at EDX:EIP / ECX:ESP
+      fr->rec.mnemonic = "sysexit";
+      if (!(s->cr0 & kCr0Pe) || cpl() != 0 || (s->sysenter_cs & 0xfffc) == 0) gp_fault(0);
+      uint16_t cs = (uint16_t)((s->sysenter_cs + 16) | 3);
+      uint16_t ss = (uint16_t)((s->sysenter_cs + 24) | 3);
+      s->sreg[cs_i] = cs;
+      s->base[cs_i] = 0;
+      s->limit[cs_i] = 0xffffffff;
+      s->ar[cs_i] = 0xfb;  // present, DPL3, code, readable, accessed
+      s->dbit[cs_i] = 1;
+      s->sreg[ss_i] = ss;
+      s->base[ss_i] = 0;
+      s->limit[ss_i] = 0xffffffff;
+      s->ar[ss_i] = 0xf3;
+      s->dbit[ss_i] = 1;
+      eip = edx;
+      s->r[esp_i].e = ecx;
       break;
     }
     case 0x80:
@@ -3035,18 +4510,113 @@ static void run_op2(uint8_t op2) {
       fr->rec.mnemonic = "pop";
       load_data(gs_i, (uint16_t)pop_w());
       break;      // pop gs
-    case 0xa2: {  // cpuid
+    case 0xae: {  // 0f ae group: FXSAVE/FXRSTOR/LDMXCSR/STMXCSR/CLFLUSH
+      modrm();
+      // The state-image and MXCSR forms are #UD unless the OS enabled the
+      // FXSAVE context (CR4.OSFXSR, SDM vol.3 13.5).
+      if (d.reg <= 3 && !(s->cr4 & kCr4Osfxsr)) ud();
+      switch (d.reg) {
+        case 0: {  // fxsave m512 (16-byte aligned, SDM FXSAVE)
+          fr->rec.mnemonic = "fxsave";
+          if (!d.is_mem) ud();
+          if (d.mlin & 15) gp_fault(0);
+          uint8_t buf[512];
+          fpu_fxsave(&s->fpu, buf);
+          wr_bytes(d.mlin, buf, 512);
+          break;
+        }
+        case 1: {  // fxrstor
+          fr->rec.mnemonic = "fxrstor";
+          if (!d.is_mem) ud();
+          if (d.mlin & 15) gp_fault(0);
+          uint8_t buf[512];
+          rd_bytes(d.mlin, buf, 512);
+          uint32_t mx = (uint32_t)buf[24] | ((uint32_t)buf[25] << 8) | ((uint32_t)buf[26] << 16) |
+                        ((uint32_t)buf[27] << 24);
+          if (mx & ~s->fpu.mxcsr_mask) gp_fault(0);  // reserved MXCSR bits
+          fpu_fxrstor(&s->fpu, buf);
+          break;
+        }
+        case 2: {  // ldmxcsr
+          fr->rec.mnemonic = "ldmxcsr";
+          if (!d.is_mem) ud();
+          uint32_t mx = (uint32_t)rd32(d.mlin);
+          if (mx & ~s->fpu.mxcsr_mask) gp_fault(0);
+          s->fpu.mxcsr = mx;
+          break;
+        }
+        case 3:  // stmxcsr
+          fr->rec.mnemonic = "stmxcsr";
+          if (!d.is_mem) ud();
+          wr32(d.mlin, s->fpu.mxcsr);
+          break;
+        case 7:
+          if (!d.is_mem) {
+            // SFENCE (F8), LFENCE (E8, reg=5) and MFENCE (F0, reg=6): the
+            // interpreter commits in program order, so the ordering they
+            // promise is already the machine's. With the 66 prefix F8 is
+            // PCOMMIT, which this CPUID does not advertise.
+            if (d.reg == 7 && d.rm == 0) {
+              if (d.p66) ud();  // 66 F8 = PCOMMIT
+              fr->rec.mnemonic = "sfence";
+            } else if (d.rm != 0) {
+              ud();
+            } else {
+              fr->rec.mnemonic = "lfence";  // reg=5
+            }
+            break;
+          }
+          // clflush: no cache to write back. The 66 prefix selects
+          // CLFLUSHOPT (not implemented), which the CPUID leaf does not
+          // advertise either.
+          fr->rec.mnemonic = "clflush";
+          if (d.p66) ud();  // 66 /7 = CLFLUSHOPT
+          break;
+        case 5:  // LFENCE (0F AE E8: mod=3, rm=0)
+          if (d.is_mem || d.rm != 0 || d.p66) ud();
+          fr->rec.mnemonic = "lfence";
+          break;
+        case 6:  // MFENCE (0F AE F0); 66 F0 is the invalid "fake clwb"
+          if (d.is_mem || d.rm != 0 || d.p66) ud();
+          fr->rec.mnemonic = "mfence";
+          break;
+        default:
+          ud();
+      }
+      break;
+    }
+    case 0xa2: {  // cpuid (SDM vol.2 CPUID; the advertisement follows what
+                  // this machine implements, not what a Pentium III had)
       fr->rec.mnemonic = "cpuid";
       uint32_t leaf = eax;
       if (leaf == 0) {
-        eax = 1;
+        eax = 0x0a;  // highest basic leaf (0x0a performance monitoring)
         ebx = 0x756e6547;
         edx = 0x49656e69;
         ecx = 0x6c65746e;
       } else if (leaf == 1) {
-        // Family 6, model 3, stepping 3; no FPU, no TSC.
+        // Family 6, model 3, stepping 3.
         eax = 0x633;
+        ecx = 0;
+        // EDX: FPU, DE, PSE, TSC, MSR, PAE, MCE, CX8, SEP, MTRR, PGE, MCA,
+        // CMOV, PAT, PSE36, CLFSH, MMX, FXSR, SSE, SSE2. Every bit here has
+        // an execution path in this file (the SSE/MMX engine below); VME and
+        // the rest are advertised only once their behaviour is complete.
+        edx = 0x078bf9fdu;
+      } else if (leaf == 0x0a) {
+        // Architectural performance monitoring, version 1: two general
+        // counters and three fixed counters (SDM vol.3 19.2).
+        eax = 0x0101;
+        ebx = 0;
+        ecx = 0;
+        edx = 2;
+      } else if (leaf == 0x80000000) {
+        eax = 0x80000001;
         ebx = ecx = edx = 0;
+      } else if (leaf == 0x80000001) {
+        // NX (implemented in the PAE walk) and RDTSCP.
+        eax = ebx = ecx = 0;
+        edx = 0x08100000u;
       } else {
         eax = ebx = ecx = edx = 0;
       }
@@ -3378,6 +4948,511 @@ static void run_op2(uint8_t op2) {
     default:
       ud();
   }
+}
+
+// ---- x87 (D8-DF) ------------------------------------------------------------
+
+static const char* const kX87Arith[8] = {"fadd", "fmul", "fcom", "fcomp",
+                                         "fsub", "fsubr", "fdiv", "fdivr"};
+
+// FSTENV/FNSAVE's memory operand is a destination for the whole environment,
+// not the data operand the instruction records; FXSAVE likewise. Every other
+// memory form updates the data pointer (SDM FSTENV: "the data pointer is not
+// affected").
+static void X87MemPtr(void) {
+  s->fpu.fdp = (uint32_t)d.mlin;
+  s->fpu.fds = s->sreg[d.mseg];
+}
+
+static extFloat80_t RdF80(void) {
+  extFloat80_t v;
+  v.signif = rd64(d.mlin);
+  v.signExp = rd16(d.mlin + 8);
+  return v;
+}
+
+static void WrF80(extFloat80_t v) {
+  wr64(d.mlin, v.signif);
+  wr16(d.mlin + 8, v.signExp);
+}
+
+// #MF is a fault with no error code (SDM vol.3 table 6-1); CR0.NE=0 routes
+// x87 errors to the external FERR# pin instead, which this chipset does not
+// model (no IRQ13), so the status bits are the only report then.
+static void X87FaultCheck(void) {
+  if (s->fpu.pending_mf && (s->cr0 & kCr0Ne)) raise_(fr, vec_mf, 0);
+}
+
+static void X87ClearExceptions(void) {
+  s->fpu.sw &= 0x7f00;  // keep TOP and C0-C3, clear ES/SF/exception flags
+  s->fpu.pending_mf = 0;
+}
+
+static void X87LoadEnv(int wide) {
+  uint8_t buf[28];
+  rd_bytes(d.mlin, buf, wide ? 28 : 14);
+  fpu_load_env(&s->fpu, buf, wide);
+}
+
+static void X87StoreEnv(int wide) {
+  uint8_t buf[28];
+  fpu_store_env(&s->fpu, buf, wide);
+  wr_bytes(d.mlin, buf, wide ? 28 : 14);
+}
+
+static void X87LoadState(int wide) {
+  uint8_t buf[108];
+  rd_bytes(d.mlin, buf, wide ? 108 : 94);
+  fpu_load_state(&s->fpu, buf, wide);
+}
+
+static void X87StoreState(int wide) {
+  uint8_t buf[108];
+  fpu_store_state(&s->fpu, buf, wide);
+  wr_bytes(d.mlin, buf, wide ? 108 : 94);
+  fpu_finit(&s->fpu);  // FNSAVE resets the FPU (SDM FNSAVE)
+}
+
+static void X87CompareMem(extFloat80_t b, int pop) {
+  fpu_compare(&s->fpu, b, 0);
+  if (pop) fpu_pop(&s->fpu);
+}
+
+static void X87IntegerMemArith(int op, extFloat80_t b, int pop) {
+  if (op == 2 || op == 3) {
+    X87CompareMem(b, pop);
+  } else {
+    fpu_arith(&s->fpu, op, 0, b);
+  }
+}
+
+static void X87Fcmov(int i, int cond, int invert) {
+  if (invert) cond = !cond;
+  if (cond) fpu_set(&s->fpu, 0, fpu_get(&s->fpu, i));
+}
+
+static void X87Fcomi(int i, int quiet, int pop) {
+  extFloat80_t b = fpu_get(&s->fpu, i);
+  uint32_t cc = fpu_compare_i(&s->fpu, b, quiet);
+  // FCOMI/FUCOMI set CF/PF/ZF from the comparison and clear OF/SF/AF
+  // (SDM FCOMI); the rest of EFLAGS is untouched.
+  fl->word = (fl->word & ~0x8d5u) | cc;
+  if (pop) fpu_pop(&s->fpu);
+}
+
+static void X87MemForm(uint8_t op) {
+  // Only value operands update the x87 data pointer; FSTENV/FNSAVE's save
+  // area is not the data the instruction records (SDM FSTENV/FSAVE).
+  int value_mem = op == 0xd8 || op == 0xda || op == 0xdc || op == 0xde ||
+                  (op == 0xd9 && (d.reg == 0 || d.reg == 2 || d.reg == 3)) ||
+                  (op == 0xdb && d.reg != 4 && d.reg != 6) ||
+                  (op == 0xdd && d.reg < 4) || op == 0xdf;
+  if (value_mem) X87MemPtr();
+  switch (op) {
+    case 0xd8: {  // m32fp arithmetic
+      fr->rec.mnemonic = kX87Arith[d.reg];
+      extFloat80_t b = fpu_load_f32(&s->fpu, (uint32_t)rd32(d.mlin));
+      X87IntegerMemArith(d.reg, b, d.reg == 3);
+      break;
+    }
+    case 0xd9:
+      switch (d.reg) {
+        case 0:
+          fr->rec.mnemonic = "fld";
+          fpu_push(&s->fpu, fpu_load_f32(&s->fpu, (uint32_t)rd32(d.mlin)));
+          break;
+        case 2:
+          fr->rec.mnemonic = "fst";
+          wr32(d.mlin, fpu_store_f32(&s->fpu, fpu_get(&s->fpu, 0)));
+          break;
+        case 3:
+          fr->rec.mnemonic = "fstp";
+          wr32(d.mlin, fpu_store_f32(&s->fpu, fpu_get(&s->fpu, 0)));
+          fpu_pop(&s->fpu);
+          break;
+        case 4:
+          fr->rec.mnemonic = "fldenv";
+          X87LoadEnv(d.w32);
+          break;
+        case 5:
+          fr->rec.mnemonic = "fldcw";
+          s->fpu.cw = rd16(d.mlin);
+          fpu_refresh(&s->fpu);
+          break;
+        case 6:
+          fr->rec.mnemonic = "fnstenv";
+          X87StoreEnv(d.w32);
+          break;
+        case 7:
+          fr->rec.mnemonic = "fnstcw";
+          wr16(d.mlin, s->fpu.cw);
+          break;
+        default:
+          ud();
+      }
+      break;
+    case 0xda: {  // m32int arithmetic
+      fr->rec.mnemonic = kX87Arith[d.reg];
+      extFloat80_t b = fpu_load_i32(&s->fpu, (int32_t)rd32(d.mlin));
+      X87IntegerMemArith(d.reg, b, d.reg == 3);
+      break;
+    }
+    case 0xdb:
+      switch (d.reg) {
+        case 0:
+          fr->rec.mnemonic = "fild";
+          fpu_push(&s->fpu, fpu_load_i32(&s->fpu, (int32_t)rd32(d.mlin)));
+          break;
+        case 1:
+          fr->rec.mnemonic = "fisttp";
+          wr32(d.mlin, (uint32_t)fpu_store_i32_trunc(&s->fpu, fpu_get(&s->fpu, 0)));
+          fpu_pop(&s->fpu);
+          break;
+        case 2:
+          fr->rec.mnemonic = "fist";
+          wr32(d.mlin, (uint32_t)fpu_store_i32(&s->fpu, fpu_get(&s->fpu, 0)));
+          break;
+        case 3:
+          fr->rec.mnemonic = "fistp";
+          wr32(d.mlin, (uint32_t)fpu_store_i32(&s->fpu, fpu_get(&s->fpu, 0)));
+          fpu_pop(&s->fpu);
+          break;
+        case 5:
+          fr->rec.mnemonic = "fld";
+          fpu_push(&s->fpu, RdF80());
+          break;
+        case 7:
+          fr->rec.mnemonic = "fstp";
+          WrF80(fpu_get(&s->fpu, 0));
+          fpu_pop(&s->fpu);
+          break;
+        default:
+          ud();
+      }
+      break;
+    case 0xdc: {  // m64fp arithmetic
+      fr->rec.mnemonic = kX87Arith[d.reg];
+      extFloat80_t b = fpu_load_f64(&s->fpu, rd64(d.mlin));
+      X87IntegerMemArith(d.reg, b, d.reg == 3);
+      break;
+    }
+    case 0xdd:
+      switch (d.reg) {
+        case 0:
+          fr->rec.mnemonic = "fld";
+          fpu_push(&s->fpu, fpu_load_f64(&s->fpu, rd64(d.mlin)));
+          break;
+        case 1:
+          fr->rec.mnemonic = "fisttp";
+          wr64(d.mlin, (uint64_t)fpu_store_i64_trunc(&s->fpu, fpu_get(&s->fpu, 0)));
+          fpu_pop(&s->fpu);
+          break;
+        case 2:
+          fr->rec.mnemonic = "fst";
+          wr64(d.mlin, fpu_store_f64(&s->fpu, fpu_get(&s->fpu, 0)));
+          break;
+        case 3:
+          fr->rec.mnemonic = "fstp";
+          wr64(d.mlin, fpu_store_f64(&s->fpu, fpu_get(&s->fpu, 0)));
+          fpu_pop(&s->fpu);
+          break;
+        case 4:
+          fr->rec.mnemonic = "frstor";
+          X87LoadState(d.w32);
+          break;
+        case 6:
+          fr->rec.mnemonic = "fnsave";
+          X87StoreState(d.w32);
+          break;
+        case 7:
+          fr->rec.mnemonic = "fnstsw";
+          wr16(d.mlin, s->fpu.sw);
+          break;
+        default:
+          ud();
+      }
+      break;
+    case 0xde: {  // m16int arithmetic
+      fr->rec.mnemonic = kX87Arith[d.reg];
+      extFloat80_t b = fpu_load_i16(&s->fpu, (int16_t)rd16(d.mlin));
+      X87IntegerMemArith(d.reg, b, d.reg == 3);
+      break;
+    }
+    case 0xdf:
+      switch (d.reg) {
+        case 0:
+          fr->rec.mnemonic = "fild";
+          fpu_push(&s->fpu, fpu_load_i16(&s->fpu, (int16_t)rd16(d.mlin)));
+          break;
+        case 1:
+          fr->rec.mnemonic = "fisttp";
+          wr16(d.mlin, (uint16_t)fpu_store_i16_trunc(&s->fpu, fpu_get(&s->fpu, 0)));
+          fpu_pop(&s->fpu);
+          break;
+        case 2:
+          fr->rec.mnemonic = "fist";
+          wr16(d.mlin, (uint16_t)fpu_store_i16(&s->fpu, fpu_get(&s->fpu, 0)));
+          break;
+        case 3:
+          fr->rec.mnemonic = "fistp";
+          wr16(d.mlin, (uint16_t)fpu_store_i16(&s->fpu, fpu_get(&s->fpu, 0)));
+          fpu_pop(&s->fpu);
+          break;
+        case 4: {
+          fr->rec.mnemonic = "fbld";
+          uint8_t bcd[10];
+          rd_bytes(d.mlin, bcd, 10);
+          fpu_push(&s->fpu, fpu_load_bcd(&s->fpu, bcd));
+          break;
+        }
+        case 5:
+          fr->rec.mnemonic = "fild";
+          fpu_push(&s->fpu, fpu_load_i64(&s->fpu, (int64_t)rd64(d.mlin)));
+          break;
+        case 6: {
+          fr->rec.mnemonic = "fbstp";
+          uint8_t bcd[10];
+          fpu_store_bcd(&s->fpu, fpu_get(&s->fpu, 0), bcd);
+          wr_bytes(d.mlin, bcd, 10);
+          fpu_pop(&s->fpu);
+          break;
+        }
+        case 7:
+          fr->rec.mnemonic = "fistp";
+          wr64(d.mlin, (uint64_t)fpu_store_i64(&s->fpu, fpu_get(&s->fpu, 0)));
+          fpu_pop(&s->fpu);
+          break;
+        default:
+          ud();
+      }
+      break;
+    default:
+      ud();
+  }
+}
+
+// D8/DA/DC/DE register forms share the arithmetic encoding; DC and DE put
+// ST(i) in the destination, and the sub/div operand order follows (SDM
+// FSUB/FSUBR/FDIV/FDIVR: "DEST <- DEST - SRC" for the ST(i) forms). DE pops.
+static void X87RegisterArith(uint8_t op, int i) {
+  int grp = d.reg;
+  fr->rec.mnemonic = kX87Arith[grp];
+  if (op == 0xde && grp == 2) ud();  // DE D0-D7 are reserved (FCOMPP is DE D9)
+  if (grp >= 2 && grp <= 3) {
+    X87CompareMem(fpu_get(&s->fpu, i), grp == 3);
+    return;
+  }
+  int aop = grp;
+  int dst = 0;
+  if (op == 0xdc || op == 0xde) {
+    dst = i;
+    if (grp == kFSub) aop = kFSubR;
+    else if (grp == kFSubR) aop = kFSub;
+    else if (grp == kFDiv) aop = kFDivR;
+    else if (grp == kFDivR) aop = kFDiv;
+  }
+  fpu_arith(&s->fpu, aop, dst, fpu_get(&s->fpu, i));
+  if (op == 0xde) fpu_pop(&s->fpu);
+}
+
+static void x87_exec(uint8_t op) {
+  // CR0.EM turns every escape into #NM, and CR0.TS does too (SDM vol.3 2.5:
+  // the TS check is the lazy-context-switch mechanism for the FPU).
+  if (s->cr0 & (kCr0Em | kCr0Ts)) nm();
+  s->fpu.fip = (uint32_t)(s->base[cs_i] + fr->rec.pc);
+  s->fpu.fcs = s->sreg[cs_i];
+  modrm();
+  s->fpu.fop = (uint16_t)((op << 8) | d.enc);
+  if (!d.is_mem) {
+    int i = d.rm;
+    switch (op) {
+      case 0xd8:
+      case 0xdc:
+        X87RegisterArith(op, i);
+        break;
+      case 0xda:
+        if (d.reg < 4) {
+          fr->rec.mnemonic = "fcmov";
+          X87Fcmov(i, d.reg == 0 ? fl->cf : d.reg == 1 ? fl->zf : d.reg == 2 ? (fl->cf || fl->zf) : fl->pf, 0);
+        } else if (d.reg == 5 && i == 1) {
+          fr->rec.mnemonic = "fucompp";
+          X87CompareMem(fpu_get(&s->fpu, 1), 1);
+          fpu_pop(&s->fpu);
+        } else {
+          ud();
+        }
+        break;
+      case 0xde:
+        if (d.reg == 3) {
+          if (i != 1) ud();
+          fr->rec.mnemonic = "fcompp";
+          X87CompareMem(fpu_get(&s->fpu, 1), 1);
+          fpu_pop(&s->fpu);
+        } else {
+          X87RegisterArith(op, i);
+        }
+        break;
+      case 0xd9:
+        switch (d.reg) {
+          case 0:
+            fr->rec.mnemonic = "fld";
+            fpu_push(&s->fpu, fpu_get(&s->fpu, i));
+            break;
+          case 1:
+            fr->rec.mnemonic = "fxch";
+            fpu_exchange(&s->fpu, i);
+            break;
+          case 2:
+            if (i != 0) ud();
+            fr->rec.mnemonic = "fnop";
+            break;
+          case 3:
+            fr->rec.mnemonic = "fstp";
+            fpu_set(&s->fpu, i, fpu_get(&s->fpu, 0));
+            fpu_pop(&s->fpu);
+            break;
+          case 4:
+            switch (i) {
+              case 0: fr->rec.mnemonic = "fchs"; fpu_change_sign(&s->fpu); break;
+              case 1: fr->rec.mnemonic = "fabs"; fpu_abs(&s->fpu); break;
+              case 4: fr->rec.mnemonic = "ftst"; fpu_test(&s->fpu); break;
+              case 5: fr->rec.mnemonic = "fxam"; fpu_examine(&s->fpu); break;
+              default: ud();
+            }
+            break;
+          case 5:
+            if (i == 7) ud();
+            fr->rec.mnemonic = "fld";
+            fpu_load_const(&s->fpu, i);
+            break;
+          case 6:
+            switch (i) {
+              case 0: fr->rec.mnemonic = "f2xm1"; fpu_f2xm1(&s->fpu); break;
+              case 1: fr->rec.mnemonic = "fyl2x"; fpu_fyl2x(&s->fpu); break;
+              case 2: fr->rec.mnemonic = "fptan"; fpu_fptan(&s->fpu); break;
+              case 3: fr->rec.mnemonic = "fpatan"; fpu_fpatan(&s->fpu); break;
+              case 4: fr->rec.mnemonic = "fxtract"; fpu_fxtract(&s->fpu); break;
+              case 5: fr->rec.mnemonic = "fprem1"; fpu_fprem(&s->fpu, 1); break;
+              case 6: fr->rec.mnemonic = "fdecstp"; fpu_fdecstp(&s->fpu); break;
+              case 7: fr->rec.mnemonic = "fincstp"; fpu_fincstp(&s->fpu); break;
+            }
+            break;
+          case 7:
+            switch (i) {
+              case 0: fr->rec.mnemonic = "fprem"; fpu_fprem(&s->fpu, 0); break;
+              case 1: fr->rec.mnemonic = "fyl2xp1"; fpu_fyl2xp1(&s->fpu); break;
+              case 2: fr->rec.mnemonic = "fsqrt"; fpu_fsqrt(&s->fpu); break;
+              case 3: fr->rec.mnemonic = "fsincos"; fpu_fsincos(&s->fpu); break;
+              case 4: fr->rec.mnemonic = "frndint"; fpu_frndint(&s->fpu); break;
+              case 5: fr->rec.mnemonic = "fscale"; fpu_fscale(&s->fpu); break;
+              case 6: fr->rec.mnemonic = "fsin"; fpu_fsin(&s->fpu); break;
+              case 7: fr->rec.mnemonic = "fcos"; fpu_fcos(&s->fpu); break;
+            }
+            break;
+        }
+        break;
+      case 0xdb:
+        switch (d.reg) {
+          case 0:
+          case 1:
+          case 2:
+          case 3:
+            fr->rec.mnemonic = "fcmov";
+            X87Fcmov(i, d.reg == 0 ? fl->cf : d.reg == 1 ? fl->zf : d.reg == 2 ? (fl->cf || fl->zf) : fl->pf, 1);
+            break;
+          case 4:
+            if (i == 2) {
+              fr->rec.mnemonic = "fnclex";
+              X87ClearExceptions();
+            } else if (i == 3) {
+              fr->rec.mnemonic = "fninit";
+              fpu_finit(&s->fpu);
+            } else {
+              ud();
+            }
+            break;
+          case 5:
+            fr->rec.mnemonic = "fucomi";
+            X87Fcomi(i, 1, 0);
+            break;
+          case 6:
+            fr->rec.mnemonic = "fcomi";
+            X87Fcomi(i, 0, 0);
+            break;
+          default:
+            ud();
+        }
+        break;
+      case 0xdd:
+        switch (d.reg) {
+          case 0:
+            fr->rec.mnemonic = "ffree";
+            fpu_free(&s->fpu, i);
+            break;
+          case 1:
+            fr->rec.mnemonic = "fxch";
+            fpu_exchange(&s->fpu, i);
+            break;
+          case 2:
+            fr->rec.mnemonic = "fst";
+            fpu_set(&s->fpu, i, fpu_get(&s->fpu, 0));
+            break;
+          case 3:
+            fr->rec.mnemonic = "fstp";
+            fpu_set(&s->fpu, i, fpu_get(&s->fpu, 0));
+            fpu_pop(&s->fpu);
+            break;
+          case 4:
+            fr->rec.mnemonic = "fucom";
+            X87CompareMem(fpu_get(&s->fpu, i), 0);
+            break;
+          case 5:
+            fr->rec.mnemonic = "fucomp";
+            X87CompareMem(fpu_get(&s->fpu, i), 1);
+            break;
+          default:
+            ud();
+        }
+        break;
+      case 0xdf:
+        switch (d.reg) {
+          case 0:
+            fr->rec.mnemonic = "ffreep";
+            fpu_free(&s->fpu, i);
+            fpu_pop(&s->fpu);
+            break;
+          case 1:
+            fr->rec.mnemonic = "fxch";
+            fpu_exchange(&s->fpu, i);
+            break;
+          case 2:
+          case 3:
+            fr->rec.mnemonic = "fstp";
+            fpu_set(&s->fpu, i, fpu_get(&s->fpu, 0));
+            fpu_pop(&s->fpu);
+            break;
+          case 4:
+            if (i != 0) ud();
+            fr->rec.mnemonic = "fnstsw";
+            ax = s->fpu.sw;
+            break;
+          case 5:
+            fr->rec.mnemonic = "fucomip";
+            X87Fcomi(i, 1, 1);
+            break;
+          case 6:
+            fr->rec.mnemonic = "fcomip";
+            X87Fcomi(i, 0, 1);
+            break;
+          default:
+            ud();
+        }
+        break;
+    }
+  } else {
+    X87MemForm(op);
+  }
+  X87FaultCheck();
 }
 
 // The one-byte opcodes, manual order. The comment names the encoding; body
@@ -4383,29 +6458,58 @@ void run_op(uint8_t op) {
       pm_far(sel, off, 1, (uint32_t)(fr->rec.pc + d.nxt));
       break;
     }
-    case 0x9b:
+    case 0x9b: {
+      // WAIT/FWAIT: #NM if CR0.TS (the lazy-switch check; EM is not part of
+      // WAIT's check, SDM WAIT), then report a standing unmasked x87 exception.
       fr->rec.mnemonic = "wait";
-      break;  // wait: no x87 in this machine
-    case 0x9c:
+      if (s->cr0 & kCr0Ts) nm();
+      if (s->fpu.pending_mf && (s->cr0 & kCr0Ne)) raise_(fr, vec_mf, 0);
+      break;
+    }
+    case 0x9c: {
       fr->rec.mnemonic = "pushf";
-      // VM86 without VME may push the flags only at IOPL=3 (SDM vol.2 PUSHF
-      // Operation); the image never carries VM or RF.
-      if (fl->vm && fl->iopl != 3) gp_fault(0);
-      push_w((fl->word & ~0x30000u) | 2);
+      // VM86 without VME/PVI may push the flags only at IOPL=3 (SDM vol.2
+      // PUSHF Operation). With VME/PVI virtual interrupts the image's IF bit
+      // carries VIF and bit 20 carries VIP; the image never carries VM or RF.
+      int vme = fl->vm && fl->iopl != 3 && (s->cr4 & (kCr4Vme | kCr4Pvi));
+      if (fl->vm && fl->iopl != 3 && !vme) gp_fault(0);
+      uint32_t img = (fl->word & ~0x30000u) | 2;
+      if (vme) {
+        img = (img & ~0x200u) | (fl->vif ? 0x200u : 0);
+        img = (img & ~0x100000u) | (fl->vip ? 0x100000u : 0);
+        img &= ~0x80000u;  // VIF itself is not part of the image
+      }
+      push_w(img);
       break;      // pushf
+    }
     case 0x9d: {  // popf: which bits the image may change depends on the mode
                   // (SDM vol.2 POPF Operation, table 4-16). VM never loads and
                   // RF is 0 after POPF; a 16-bit pop touches only the low half.
       fr->rec.mnemonic = "popf";
       uint32_t v = pop_w();
+      int vme = fl->vm && fl->iopl != 3 && (s->cr4 & (kCr4Vme | kCr4Pvi));
+      if (vme) {
+        // Virtual-8086: IF and VIP bits update VIF/VIP; IF itself stays 1
+        // and IOPL/VM are untouched.
+        fl->vif = (v & 0x200u) != 0;
+        fl->vip = (v & 0x100000u) != 0;
+        fl->if_ = 1;
+        break;
+      }
       // IOPL loads only at CPL 0 (real mode counts as CPL 0) and IF only at
       // CPL <= IOPL; VM86 without VME needs IOPL=3 and keeps IOPL put.
       uint32_t mask = 0x7fd7u;  // CF PF AF ZF SF TF IF DF OF IOPL NT
+      // EFLAGS.AC is writable at CPL 0, and at CPL 3 when CR0.AM enables the
+      // alignment check (SDM vol.2 POPF: "the AC flag is modified if ... AM=1").
+      if ((s->cr0 & 1) == 0 || cpl() == 0 || (s->cr0 & kCr0Am)) mask |= 0x40000u;
       if (fl->vm) {
         if (fl->iopl != 3) gp_fault(0);
         mask = 0x4fd7u;
       } else if ((s->cr0 & 1) && cpl() != 0) {
         mask = cpl() > fl->iopl ? 0x4dd7u : 0x4fd7u;
+        // The CPL-3 mask above is rebuilt here, so re-add AC when CR0.AM
+        // lets a user-mode POPF change it (SDM vol.2 POPF).
+        if (s->cr0 & kCr0Am) mask |= 0x40000u;
       }
       if (!d.w32) mask &= 0xffffu;
       fl->word = (fl->word & ~(mask | 0x10000u)) | (v & mask) | 2;
@@ -4752,21 +6856,9 @@ void run_op(uint8_t op) {
     case 0xdc:
     case 0xdd:
     case 0xde:
-    case 0xdf: {  // x87 escape
-      fr->rec.mnemonic = "x87";
-      // This machine has no x87 FPU and says so in CPUID (EDX.FPU = 0, D13).
-      // With CR0.TS or CR0.EM set the escape raises #NM before any decode
-      // (SDM vol.3 2.5); otherwise the opcode is decoded and executed as a
-      // NOP -- tiny386's ESC() macro (i386.c) does exactly that when cpu->fpu
-      // is NULL, and the Linux boot FPU probe depends on it: arch/x86/boot/
-      // setup.S pre-fills two stack words with 0xffff, runs fninit, fnstsw and
-      // fnstcw, and reads "no FPU" out of the untouched words (which is how a
-      // 386SX/486SX boots Linux). Faulting here instead put the probe into a
-      // #UD storm: 34.6M traps per 100M instructions, no progress.
-      if (s->cr0 & 0xc) nm();
-      modrm();
+    case 0xdf:  // x87 escape (SDM vol.1 ch.8; decode in x87_exec above)
+      x87_exec(op);
       break;
-    }
     case 0xe0:
     case 0xe1:
     case 0xe2: {  // loopne/loope/loop rel8
@@ -4887,15 +6979,24 @@ void run_op(uint8_t op) {
       break;  // stc
     case 0xfa:
       fr->rec.mnemonic = "cli";
-      // CLI needs CPL <= IOPL, and in VM86 (no VME on this machine) IOPL=3
-      // (SDM vol.2 CLI Operation).
-      if ((s->cr0 & 1) && (fl->vm ? fl->iopl != 3 : cpl() > fl->iopl)) gp_fault(0);
-      fl->if_ = 0;
+      // CLI needs CPL <= IOPL. In VM86 with VME/PVI and IOPL<3 the instruction
+      // is legal and clears the virtual interrupt flag instead (SDM vol.3
+      // 20.3.1, 21.3); without them only IOPL=3 allows it.
+      if ((s->cr0 & 1) && fl->vm && fl->iopl != 3 && (s->cr4 & (kCr4Vme | kCr4Pvi))) {
+        fl->vif = 0;
+      } else {
+        if ((s->cr0 & 1) && (fl->vm ? fl->iopl != 3 : cpl() > fl->iopl)) gp_fault(0);
+        fl->if_ = 0;
+      }
       break;    // cli
     case 0xfb:  // sti: the next instruction is not interruptible (SDM)
       fr->rec.mnemonic = "sti";
-      if ((s->cr0 & 1) && (fl->vm ? fl->iopl != 3 : cpl() > fl->iopl)) gp_fault(0);
-      fl->if_ = 1;
+      if ((s->cr0 & 1) && fl->vm && fl->iopl != 3 && (s->cr4 & (kCr4Vme | kCr4Pvi))) {
+        fl->vif = 1;
+      } else {
+        if ((s->cr0 & 1) && (fl->vm ? fl->iopl != 3 : cpl() > fl->iopl)) gp_fault(0);
+        fl->if_ = 1;
+      }
       s->intr_inhibit = 1;
       break;
     case 0xfc:
@@ -5051,6 +7152,7 @@ void x86_init(CpuState* c) {
     st = (x86_state*)c->priv;
     memset(st, 0, sizeof(*st));
   }
+  fpu_init(&st->fpu);
   st->r = (cell*)c->gpr;
   st->fl.word = 0x202;  // IF set, reserved bit 1 on (SDM reset state)
   // Debug-register reset state (SDM vol.3 17.2.2/17.2.4): DR6's reserved

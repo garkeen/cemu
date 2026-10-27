@@ -62,8 +62,8 @@ static uint32_t Le32Get(const uint8_t** p) {
 
 // gdb's i386 core register file (org.gnu.gdb.i386.core): eax..edi, eip,
 // eflags, cs ss ds es fs gs — 16 registers, 4 bytes each — plus the x87
-// group gdb keeps in the same feature (st0-7 at 10 bytes, fctrl..fop at 4;
-// this machine has no FPU, D13, so those read as zeros and ignore writes).
+// group gdb keeps in the same feature (st0-7 at 10 bytes in stack order,
+// fctrl..fop at 4).
 // The address gdb names the program counter by, and the address the stub
 // matches breakpoints against: CS's base plus the committed offset — the same
 // linear space its memory packets read (cpu/step.h gdb_pc). Reporting the
@@ -91,8 +91,23 @@ static int x86_gdb_read_regs(CpuState* cpu, uint8_t* buf, int cap) {
   Le32Put(&p, s->fl.word);
   static const int order[6] = {cs_i, ss_i, ds_i, es_i, fs_i, gs_i};
   for (int i = 0; i < 6; i++) Le32Put(&p, s->sreg[order[i]]);
-  memset(p, 0, 8 * 10 + 8 * 4);  // st0-7, fctrl..fop: no x87 state (D13)
-  p += 8 * 10 + 8 * 4;
+  // gdb's x87 tail: st0-7 as 10-byte extended values in stack order, then
+  // fctrl/fstat/ftag/fiseg/fioff/foseg/fooff/fop (org.gnu.gdb.i386.core).
+  for (int i = 0; i < 8; i++) {
+    extFloat80_t v = s->fpu.st[(fpu_top(&s->fpu) + i) & 7];
+    memcpy(p, &v.signif, 8);
+    p[8] = (uint8_t)v.signExp;
+    p[9] = (uint8_t)(v.signExp >> 8);
+    p += 10;
+  }
+  Le32Put(&p, s->fpu.cw);
+  Le32Put(&p, s->fpu.sw);
+  Le32Put(&p, s->fpu.tw);
+  Le32Put(&p, s->fpu.fcs);
+  Le32Put(&p, s->fpu.fip);
+  Le32Put(&p, s->fpu.fds);
+  Le32Put(&p, s->fpu.fdp);
+  Le32Put(&p, s->fpu.fop);
   return (int)(p - buf);
 }
 
@@ -132,7 +147,34 @@ static int x86_gdb_write_regs(CpuState* cpu, const uint8_t* buf, int len) {
   // the base the CPU will actually fetch from (the real-mode case this seam was
   // added for), not the one it had before the packet.
   cpu->pc = (uint64_t)(lin - (uint32_t)s->base[cs_i]);
-  return 0;  // the x87 tail (if present) has no state to write into
+  // The x87 tail, when the packet carries it. The stack image is in ST order,
+  // so it loads into (TOP+i); the tag word then follows the packet verbatim
+  // if it is present, otherwise the values' own classes.
+  if (len >= 16 * 4 + 8 * 10 + 8 * 4) {
+    for (int i = 0; i < 8; i++) {
+      extFloat80_t v;
+      memset(&v, 0, sizeof(v));
+      memcpy(&v.signif, p, 8);
+      v.signExp = (uint16_t)(p[8] | (p[9] << 8));
+      p += 10;
+      int phys = (fpu_top(&s->fpu) + i) & 7;
+      s->fpu.st[phys] = v;
+      fpu_mark(&s->fpu, phys);
+    }
+    s->fpu.cw = (uint16_t)Le32Get(&p);
+    s->fpu.sw = (uint16_t)Le32Get(&p);
+    uint16_t tw = (uint16_t)Le32Get(&p);
+    s->fpu.fcs = (uint16_t)Le32Get(&p);
+    s->fpu.fip = Le32Get(&p);
+    s->fpu.fds = (uint16_t)Le32Get(&p);
+    s->fpu.fdp = Le32Get(&p);
+    s->fpu.fop = (uint16_t)Le32Get(&p);
+    // The tag word is authoritative when gdb sends one; a zero tag image
+    // would otherwise claim every register is valid.
+    if (tw != 0) fpu_set_tags(&s->fpu, tw);
+    fpu_refresh(&s->fpu);
+  }
+  return 0;
 }
 
 static int x86_gdb_last_trap(CpuState* cpu, uint64_t* seq) {
