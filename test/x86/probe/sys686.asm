@@ -77,6 +77,47 @@ _start:
   cmp edx, 2
   jne fail1
 
+  ; APIC advertisement and topology: leaf 1 names one logical processor with
+  ; APIC ID 0, leaf 0x0b walks SMT -> core -> end, and the LAPIC's ID
+  ; register agrees (device/intc/lapic.c).
+  mov eax, 1
+  cpuid
+  test edx, 1 << 9
+  jz fail10
+  mov eax, ebx
+  shr eax, 24
+  test eax, eax
+  jnz fail10
+  shr ebx, 16
+  and ebx, 0xff
+  cmp ebx, 1
+  jne fail10
+  mov eax, 0x0b
+  xor ecx, ecx
+  cpuid
+  cmp ebx, 1
+  jne fail10
+  cmp ecx, 0x0100        ; level 0, type 1 = SMT
+  jne fail10
+  mov eax, 0x0b
+  mov ecx, 1
+  cpuid
+  cmp ebx, 1
+  jne fail10
+  mov edx, ecx
+  and edx, 0xff00
+  cmp edx, 0x0200
+  jne fail10
+  mov eax, 0x0b
+  mov ecx, 2
+  cpuid
+  test ebx, ebx
+  jnz fail10
+  mov eax, [0xfee00020]
+  shr eax, 24
+  test eax, eax
+  jnz fail10
+
   ; RDTSC monotonic.
   rdtsc
   mov [B], eax
@@ -300,6 +341,8 @@ fail7:  mov al, 8
 fail8:  mov al, 9
         jmp fail
 fail9:  mov al, 10
+        jmp fail
+fail10: mov al, 11
 fail:
   out 0xf4, al
   hlt

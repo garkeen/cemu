@@ -96,6 +96,8 @@ enum { kPfPresent = 1u, kPfWrite = 2u, kPfUser = 4u, kPfRsvd = 8u, kPfInstr = 0x
 // fig 4-4). A set reserved bit is a page fault; the 386-class #PF error code
 // carries no RSVD flag, so the fault reads as an ordinary present fault.
 enum { kPde4mReserved = 0x00200000u };
+// SGDT/SIDT/LGDT/LIDT with a 16-bit operand size keep only 24 base bits.
+enum { kDescBase16Mask = 0x00ffffffu };
 
 // One general-purpose bank cell, named exactly the way the architecture
 // names its parts: a 32-bit register, whose low half is the 16-bit one,
@@ -140,9 +142,14 @@ typedef union eflags {
 // Tags are linear page numbers; CR3 changes flush non-global entries, and
 // INVLPG flushes a page, so no ASID is needed on a 32-bit machine.
 enum {
-  kTlbSets = 1024,
+  kTlbSets = 4096,
   kTlbWays = 2,
   kTlbValid = 1u << 31,
+  // Bits 30:21 of a tag hold a 10-bit flush generation: TlbFlushAll bumps it
+  // instead of clearing the whole cache, and a tag only matches while its
+  // generation equals the live one (wraparound clears the array).
+  kTlbGenShift = 21,
+  kTlbGenMask = 0x3ffu,
   kTlbWritable = 1u << 0,
   kTlbUser = 1u << 1,
   kTlbNx = 1u << 2,
@@ -198,11 +205,16 @@ typedef struct x86_state {
   uint64_t perf_evtsel[2], perf_pmc[2];
   uint64_t perf_fixed_ctrl, perf_global_ctrl, perf_global_status, perf_global_ovf;
   uint64_t perf_fixed_ctr[3];
+  // Bit i = general counter i; bit 2+i = fixed counter i. Rebuilt whenever a
+  // controlling MSR changes, so the step commit tests one word before the
+  // counter loop (the hot path for every guest that never enables PMU).
+  uint32_t perf_active;
   // Translation cache and the single-page fetch shortcut. Both are
   // architecture-invisible caches; every TLB invalidation also drops the
   // fetch shortcut. The fetch pointer aims at RAM, so a guest writing code
   // sees its own bytes (no I-cache to invalidate).
   x86_tlb_entry tlb[kTlbSets * kTlbWays];
+  uint32_t tlb_gen;  // current flush generation (kTlbGenMask + 1 states)
   uint32_t fetch_page;  // linear page the shortcut describes
   uint8_t* fetch_host;
   int fetch_valid;
@@ -226,8 +238,10 @@ typedef struct x86_state {
   // vector normally (step.c's debug-trap block).
   uint32_t gdb_watch_mask;
   uint32_t watch_hits;
+  int dr_active;     // DR7 has at least one breakpoint enable (step.c fast gate)
   int bt_pending;    // the incoming task's TSS.T: deliver #DB before its
                      // first instruction (SDM vol.3 7.2.1)
+  int ferr_level;    // FERR# line state when CR0.NE=0 (the board drives IRQ13)
   int a20;           // A20 gate line state: bit 20 of every physical address is
                      // forced low while it is off (PC/AT); the board drives it
                      // through CpuState.set_a20

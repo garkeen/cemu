@@ -114,13 +114,20 @@ void x86_step(CpuState* c) {
   d.a32 = d.w32;
   // The 64K instruction-pointer wrap is not latched here: it is decided after
   // the instruction, from the segment it leaves the CPU in (see the commit).
+  // The instruction's start address is live state, not debug data: the
+  // commit compares it and gate/task returns push "start + length". The rest
+  // of the record only feeds the debug hub, so it is filled only when a
+  // category or watchpoint is on.
   fr->rec.pc = cpu->pc;
-  fr->rec.dnpc = cpu->pc;
-  fr->rec.pc_lin = s->base[cs_i] + fr->rec.pc;
-  fr->rec.dnpc_lin = fr->rec.pc_lin;
-  fr->rec.raw_len = 0;
-  fr->rec.len = 0;
-  fr->rec.mnemonic = NULL;
+  int dbg = g_dbg_any;
+  if (dbg) {
+    fr->rec.dnpc = cpu->pc;
+    fr->rec.pc_lin = s->base[cs_i] + fr->rec.pc;
+    fr->rec.dnpc_lin = fr->rec.pc_lin;
+    fr->rec.raw_len = 0;
+    fr->rec.len = 0;
+    fr->rec.mnemonic = NULL;
+  }
 
   if (setjmp(fr->raise)) {
     // Faults re-deliver through the interrupt table at the raised vector and
@@ -159,7 +166,7 @@ void x86_step(CpuState* c) {
   // Instruction breakpoints (SDM vol.3 17.3.1): a #DB FAULT on the fetched
   // linear address, before the instruction runs — priority above the pending
   // INTR (vol.3 table 6-2). RF suppresses the match for one instruction.
-  if (s->dr[7] & 0xff) {
+  if (s->dr_active) {
     uint64_t lin = s->base[cs_i] + (uint32_t)cpu->pc;
     for (int i = 0; i < 4; i++) {
       if (!(s->dr[7] & (3u << (2 * i)))) continue;          // Li/Gi enable
@@ -189,7 +196,7 @@ void x86_step(CpuState* c) {
     delivering_vec = vec_nmi;
     do_int(vec_nmi, (uint32_t)cpu->pc, kIntExternal, 0);
     delivering_vec = -1;
-    if (g_dbg_any) DebugInsn(fr);
+    if (dbg) DebugInsn(fr);
     return;
   }
 
@@ -221,7 +228,7 @@ void x86_step(CpuState* c) {
     delivering_vec = vec;
     do_int(vec, (uint32_t)cpu->pc, kIntExternal, 0);
     delivering_vec = -1;
-    if (g_dbg_any) DebugInsn(fr);
+    if (dbg) DebugInsn(fr);
     return;
   }
 
@@ -248,11 +255,13 @@ void x86_step(CpuState* c) {
   // jump — truncating on the old segment's D bit turns 0xfc9e4 into 0xc9e4 and
   // the CPU walks off into whatever happens to sit at the bottom of RAM).
   if (!((s->cr0 & kCr0Pe) && s->dbit[cs_i])) cpu->pc &= 0xffff;
-  fr->rec.dnpc = cpu->pc;
-  // The next instruction lives in the segment the CPU is in after the step
-  // (a far jump changed CS), so its linear address uses that base. This is
-  // what makes `->` the same address as the next row's `pc=`.
-  fr->rec.dnpc_lin = s->base[cs_i] + cpu->pc;
+  if (dbg) {
+    fr->rec.dnpc = cpu->pc;
+    // The next instruction lives in the segment the CPU is in after the step
+    // (a far jump changed CS), so its linear address uses that base. This is
+    // what makes `->` the same address as the next row's `pc=`.
+    fr->rec.dnpc_lin = s->base[cs_i] + cpu->pc;
+  }
   // RF clears after the instruction it protected completed successfully —
   // unless this instruction itself loaded an EFLAGS image (iret/popf/task
   // switch), whose RF is the authoritative one (SDM vol.3 17.3.1).
@@ -265,8 +274,10 @@ void x86_step(CpuState* c) {
   fl->word = (fl->word & ~kEflagsZero) | kEflagsOne;
   // The architectural performance counters advance once per retired
   // instruction (SDM vol.3 19.6): this is the commit point, after the
-  // instruction's own state changes and before a post-instruction #DB.
-  x86_count_perf();
+  // instruction's own state changes and before a post-instruction #DB. The
+  // mask is one word when no counter is armed, so the default path pays a
+  // test and no call.
+  if (s->perf_active) x86_count_perf();
   // Debug traps (SDM vol.3 17.3.1, priority table 6-2): the task-switch trap
   // (TSS.T), data/I-O watchpoints and single-step all fire after the
   // instruction completes, reporting the next instruction's address in one
@@ -292,12 +303,12 @@ void x86_step(CpuState* c) {
     s->dr[6] |= dr6set;
     s->bt_pending = 0;
     cpu->wait = 0;  // a #DB after hlt wakes the processor
-    if (g_dbg_any) DebugInsn(fr);
+    if (dbg) DebugInsn(fr);
     do_int(vec_db, (uint32_t)cpu->pc, kIntException, 0);
     s->trap_seq++;
     s->trap_signal = (uint8_t)GdbTrapSignal(vec_db);
     DebugTrap(fr);
     return;
   }
-  if (g_dbg_any) DebugInsn(fr);
+  if (dbg) DebugInsn(fr);
 }

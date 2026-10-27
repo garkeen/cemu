@@ -1,0 +1,21 @@
+# Dual run of test/x86/probe/lgdt16.asm, 2026-10-27, the same 512-byte boot
+# sector on both models (no firmware; the probe sets up its own segments):
+#
+#   cemu --machine x86 --isa x86 lgdt16.bin
+#   qemu-system-i386 -machine pc -m 32 \
+#       -drive file=lgdt16.bin,format=raw,if=floppy -boot a \
+#       -display none -no-reboot \
+#       -chardev file,id=dbg,path=lgdt16_qemu.txt \
+#       -device isa-debugcon,iobase=0x402,chardev=dbg \
+#       -device isa-debug-exit,iobase=0xf4,iosize=0x4
+#
+# The pseudo-descriptor is limit 0x2f, base bytes 34 12 f0 5a. LGDT/LIDT with
+# a 16-bit operand keep only the low 24 base bits (SDM vol.2 Operation), so
+# SGDT/SIDT read back 0x00f01234; with o32 both directions keep 0x5af01234.
+# The 16-bit load is the one SeaBIOS int 15h AH=87h depends on: it passes a
+# data descriptor (access byte 0x93 at offset 5) as the pseudo-descriptor, and
+# a 32-bit load makes GDTR base 0x93076c34, losing the protected-mode CS
+# descriptor load that follows (observed as a triple fault in DOS7's IO.SYS).
+# Exit: debug-exit 5 -> status 11 on both.
+cemu lgdt16 ok
+qemu lgdt16 ok

@@ -196,6 +196,14 @@ probe_cell addr16_matrix 11 ref
 # exit 5.
 probe_cell addr16_seg 11 ref
 
+# SGDT/SIDT/LGDT/LIDT operand size (test/x86/probe/lgdt16.asm): a 16-bit
+# operand keeps only the low 24 base bits, a 32-bit one all 32. SeaBIOS's int
+# 15h AH=87h passes a data descriptor as the pseudo-descriptor (access byte
+# 0x93 at offset 5), so the 16-bit load is what makes its protected-mode far
+# jump resolvable; loading 32 bits there triple-faulted DOS7's IO.SYS. ref
+# cell: both models print one line and exit 5.
+probe_cell lgdt16 11 ref
+
 # Mode 6's aperture (test/x86/probe/vga_cga.asm): SeaBIOS's stdvgamodes shape
 # -- one plane, odd/even addressing, the window at 0xB8000, graphics mode --
 # programmed by the probe itself (no firmware). The probe fills 4KB a byte at a
@@ -730,7 +738,7 @@ else
 fi
 
 # The D13/D39 feature probes: x87 (stack, arithmetic, control words, FXSAVE,
-# #NM), MMX/SSE/SSE2 (moves, float/packed arithmetic, conversions, MXCSR),
+# #NM, FERR#/IRQ13), MMX/SSE/SSE2 (moves, float/packed arithmetic, conversions, MXCSR),
 # the i686 system MSRs (TSC/RDTSCP, SYSENTER, MTRR/PAT, MCE, performance
 # counters), PSE-36's 4MB PDE decode and the CPL-3 alignment check (#AC).
 # All are self-contained multiboot images exiting through 0xF4 with payload 5

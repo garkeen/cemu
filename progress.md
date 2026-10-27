@@ -2567,9 +2567,71 @@ VIF/VIP（CLI/STI/PUSHF/POPF/IRET 与硬件 INTR 按 VIF 门控，VIP 置位；
 软件中断重定向位图未做，见 D39）、CR4 WARL 掩码。FPU/SSE 的 gdb
 st0-7/fctrl 段已接上；realmode 的 fninit 由“预期失败”转为 PASS。
 
-验收：新增自足探针 x87（12 项，含 #NM/栈溢出/FXSAVE）、sse（18 项）、
+验收：新增自足探针 x87（13 项，含 #NM/栈溢出/FXSAVE/FERR#→IRQ13）、sse（18 项）、
 sys686（TSC/RDTSCP/MSR/PMU/SYSENTER）、pse36（4MB 位段与 bit21）、ac
 （CPL3 对齐检查）；`bash test/x86/run.sh` 42/0（KUT 7 镜像、pm 26、paging32、
 realmode 127 PASS/0 FAIL）；riscv64 136/0、riscv32 104/0、dep ok。残留
 D39：VME/PVI 重定向位图、PMU 其余事件；长模式未立项。图像（win101/
 JSLinux/Oberon）按用户要求未启动。
+
+
+## FERR#/IRQ13、APIC CPUID 与首批热路径优化（2026-10-27，片 41）
+
+**CR0.NE=0 的 x87 异常**：CpuState 新增 `ferr/ferr_dev` 输出钩子；x86 状态按
+“未屏蔽异常 && NE=0”导出 FERR# 电平，板级把线接到 8259 的 IRQ13（slave
+IRQ5）；FNCLEX/FNINIT 清状态即撤销，CR0.NE=1 仍走 #MF。x87 探针新增
+IRQ13 项：重映射 8259、只开级联与 IRQ13、NE=0/ZE 未屏蔽、1/0 后由
+`ferr_handler` 收中断并 FNCLEX+EOI，mark 流可见 `isa a=13`、
+`inta=0x2d`、`isa a=13 b=0`。port 0xF0/IGNNE# 仍未建模，登记在 D19。
+
+**APIC CPUID**：leaf 1 报 EDX.APIC、EBX=0x00010800（APIC ID 0、1 个逻辑
+处理器、64B CLFLUSH），leaf 0x0B 依次返回 SMT(level 0)、core(level 1)、
+终止子叶；LAPIC 的 ID 寄存器同为 0。sys686 探针把这些与 LAPIC MMIO
+读数一起钉住。CPUID 最高基本叶改为 0x0B，EDX=0x078bfbfd。
+
+**首批优化**：PMU 计数改为 MSR 写入时维护 `perf_active` 掩码，step 提交只
+测一个字；DR7 断点启用缓存为 `dr_active`；AC 检查先测 CR0.AM。TLB 扩到
+4096 组，并把 tag 的 30:21 位改成 10 位 flush 代际：TlbFlushAll 只递增代际
+（回绕时清一次），CR3 写入不再 memset 256KB；membench 中位数由 ~1.79s 降到
+~1.69–1.70s（约 5%），alubench 中位数由 ~2.55s 降到 ~2.47s。step 的调试记录
+只在 `g_dbg_any` 时填充（pc 仍保留，控制流要用），trace/state 输出不变。
+x86 套件 42/0，dep ok；riscv64 136/0、riscv32 104/0。
+
+## SPDOS 软盘引导：16 位 LGDT/LIDT 的 24 位基址（2026-10-27，片 42）
+
+用户拿 `v86images/spdos/spdos.img`（网友自制的 DOS7 启动盘，AUTOEXEC 依次跑
+chlib/cross/spdos/wbx）在 cemu 上引导，SeaBIOS 打出 `Booting from 0000:7c00`
+后立刻 `[fatal] x86: triple fault`。
+
+- **定位**：`CEMU_DEBUG=trap` 给出同一 PC `0xf7714` 的三连 #GP（错误码
+  0x20、0x6a、0x42）；`pcshot` 显示 `cr0=1`、CS=0xf000——正是 SeaBIOS
+  int 15h AH=87h 的 16 位保护模式窗口。`mark` 的 `lgdt` 行显示
+  `base=0x93076c34`：DOS7 的 IO.SYS 用 AH=87h 搬内存，SeaBIOS 把调用者
+  GDT 的 1 号描述符直接当伪描述符（`lgdtw %es:8(%eax)`），该 6 字节的第 5
+  字节是访问权字节 0x93；16 位 LGDT 按 SDM 只取低 24 位基址，cemu 原样装了
+  32 位，GDTR 基址被污染，切换保护模式后的 `ljmp $0x20` 读不到 CS 描述符。
+  之后 SeaBIOS 的 dummy IDT（limit=0）按设计把 #GP 升级成 #DF 与 triple。
+- **修复**：`exec.c` 的 LGDT/LIDT 装入与 SGDT/SIDT 存出在 16 位操作数下按
+  SDM Operation 截到 24 位（`kDescBase16Mask`）；v86 的
+  `instr16_0F01_*` 用同一个 0xffffff 掩码。32 位操作数不受影响。
+- **验收**：新自足引导扇区探针 `test/x86/probe/lgdt16.asm`（16 位读出
+  `0x00f01234`、32 位读出 `0x5af01234`，LGDT/SGDT/LIDT/SIDT 四个方向）
+  cemu 与 QEMU 同一条 `lgdt16 ok`、同为 status 11（校准文件
+  `lgdt16_qemu.txt`）。修后该软盘经 SeaBIOS 进 DOS7（`Starting Windows 98...`
+  → AUTOEXEC），SPDOS 把 VGA 切到 640×350（`vga-mode a=640 b=0x15e`），
+  机器保持运行到外层 timeout。pm_smoke 26/26、realmode 以 debug-exit 0 退出。
+
+**WPS 卡死的归因（同日续）**：敲 `wps` 后整机停住不是 cemu 的 CPU 缺陷，
+QEMU/SeaBIOS 在同一张盘上给出**逐项相同**的结果。CHLIB 的读字库例程先取
+`int 13h AH=08 DL=0x80`（硬盘）的几何，再用它去读 DL=0 的软盘；没有硬盘时
+SeaBIOS 返回失败并把 CL/DH 留成残值，CHLIB 存下 spt=4、sectors/cyl=4，算出的
+柱面 627 越界，DOS/CHLIB 的 int13 重试循环永不结束（BIOS 磁盘临界区 IF=0，
+8254 时钟中断进不来，所以 SPDOS 时钟也停了）。QEMU 的 `[0x40bc]=4/[0x40bf]=4`
+与卡死 PC `f000:d3cd` 与 cemu 相同。把查询驱动器改成软盘（guest 侧补丁副本）
+后，字库读通过，但 CHLIB 的 `int 15h AH=87h` 又以 `ES=0xF000` 调用：DOS 的
+int21 读文件里的 int13 调用把 ES 留成了 BIOS 段、DOS 未恢复；QEMU 在同一
+指令（`1672:44b3` 返回后）同样 `ES=0xF000`。两条都是 CHLIB 依赖 PC BIOS 传统
+约定（0x80 可用的几何、段寄存器跨调用保持），SeaBIOS 不提供；Virtual PC/
+真机 BIOS 提供。原盘未改，诊断副本在 `build/spdos_wps*.img`。
+调试设施补缺：`CEMU_DEBUG=regs=N` 原先只设周期不置类别位，`DebugInsn` 从不
+触发；现在同时置 `kDbgRegs`（周期表与退出表都能出）。

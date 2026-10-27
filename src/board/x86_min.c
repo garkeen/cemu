@@ -348,6 +348,10 @@ static void OnIsaIrq(void* ctx, int line, int level) {
   if (DebugOn(kDbgMark)) DebugMark("isa", line, level);
 }
 
+// FERR# is the coprocessor-error line: on a PC/AT it reaches the slave 8259's
+// IRQ5, i.e. IRQ13 (SDM vol.1 8.7.2; IBM PC/AT technical reference).
+static void OnFerr(void* ctx, int level) { OnIsaIrq(ctx, 13, level); }
+
 // Host keys -> the keyboard device -> the 8042: the device turns the host's
 // set-1 triple into whatever the guest's scancode set and the controller's
 // translation bit call for, and its bytes land in the controller's keyboard
@@ -860,6 +864,10 @@ static void WireDevices(X86Board* xm) {
   I8042SetResetSink(&xm->kbd, RequestReset, xm);
   m->cpu.int_ack = OnIntAck;
   m->cpu.ack_dev = xm;
+  // CR0.NE=0 x87 errors drive FERR# into the coprocessor-error IRQ13; the
+  // CPU model owns the line level and calls this sink.
+  m->cpu.ferr = OnFerr;
+  m->cpu.ferr_dev = &xm->irqbus;
 }
 
 // The machine's reset. Devices first, so the firmware that starts at the reset

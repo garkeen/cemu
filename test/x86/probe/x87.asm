@@ -19,6 +19,7 @@ bits 32
 %define FX      0x81000
 %define M       0x80400
 %define NMFLAG  0x80404
+%define IRQFLAG 0x80408
 
 section .multiboot
 align 4
@@ -66,6 +67,8 @@ _start:
   call set_gate13
   mov eax, bad_handler
   call set_gate14
+  mov eax, ferr_handler
+  call set_gate2d
   lidt [IDTPTR]
 
   fninit
@@ -190,6 +193,53 @@ _start:
   test ax, 0x41          ; IE | SF
   jz fail12
 
+  ; CR0.NE=0: an unmasked x87 exception drives FERR# into IRQ13. Remap the
+  ; 8259 pair, leave only the cascade and slave IRQ5 (IRQ13) unmasked, enable
+  ; interrupts and divide by zero with ZE unmasked.
+  fninit
+  mov al, 0x11
+  out 0x20, al
+  out 0xa0, al
+  mov al, 0x20
+  out 0x21, al
+  mov al, 0x28
+  out 0xa1, al
+  mov al, 0x04
+  out 0x21, al
+  mov al, 0x02
+  out 0xa1, al
+  mov al, 0x01
+  out 0x21, al
+  out 0xa1, al
+  mov al, 0xfb          ; master: IRQ2 (cascade) open, the rest masked
+  out 0x21, al
+  mov al, 0xdf          ; slave: IRQ13 (line 5) open
+  out 0xa1, al
+  mov byte [IRQFLAG], 0
+  mov eax, cr0
+  and eax, ~0x20        ; NE=0
+  mov cr0, eax
+  mov ax, 0x037b        ; ZE unmasked, the rest masked
+  mov [B], ax
+  fldcw [B]
+  sti
+  nop
+  fld1
+  fldz
+  db 0xde, 0xf1         ; FDIVP ST(1),ST(0): 1 / 0 -> #ZE, then FERR# -> IRQ13
+  nop
+  nop
+  nop
+  cli
+  cmp byte [IRQFLAG], 1
+  jne fail13
+  mov eax, cr0
+  or eax, 0x20
+  mov cr0, eax
+  mov ax, 0x037f
+  mov [B], ax
+  fldcw [B]
+
   mov al, 5
   out 0xf4, al
   hlt
@@ -234,10 +284,26 @@ set_gate14:
   shr eax, 16
   mov [IDT + 14 * 8 + 6], ax
   ret
+set_gate2d:
+  mov [IDT + 0x2d * 8], ax
+  mov word [IDT + 0x2d * 8 + 2], 0x08
+  mov byte [IDT + 0x2d * 8 + 4], 0
+  mov byte [IDT + 0x2d * 8 + 5], 0x8e
+  shr eax, 16
+  mov [IDT + 0x2d * 8 + 6], ax
+  ret
 
 nm_handler:
   clts
   mov byte [NMFLAG], 1
+  iret
+
+ferr_handler:
+  fnclex                 ; clears the exception flags, dropping FERR#
+  mov al, 0x20
+  out 0xa0, al           ; EOI the slave (IRQ13)
+  out 0x20, al           ; then the master (cascade)
+  mov byte [IRQFLAG], 1
   iret
 
 mf_handler:
@@ -273,6 +339,8 @@ fail10: mov al, 12
 fail11: mov al, 13
         jmp fail
 fail12: mov al, 14
+        jmp fail
+fail13: mov al, 15
 fail:
   out 0xf4, al
   hlt

@@ -102,6 +102,8 @@ static x86_tlb_entry* TlbLookup(uint64_t lin, int write);
 static x86_tlb_entry* TlbFill(uint64_t lin, int write, int fetch, int user);
 static void TlbCheck(x86_tlb_entry* e, uint64_t lin, int write, int fetch, int user);
 static void AcCheckSlow(uint64_t lin, int size, int user, int fetch, int write);
+static void X87UpdateFerr(void);
+static void PerfUpdateActive(void);
 
 static uint64_t bus_load(uint64_t lin, int size) {
   return lin_load(lin, size, cpl() == 3, 0);
@@ -212,6 +214,7 @@ static void DrWrite(int reg, uint32_t v) {
     s->dr[6] = kDr6Rsvd1 | (v & (kDr6Bd | kDr6Bs | kDr6Bt));
   } else if (reg == 7) {
     s->dr[7] = (v & 0xffff23ffu) | kDr7Rsvd1;
+    s->dr_active = (s->dr[7] & kDr7AnyEnable) != 0;
   } else {
     s->dr[reg] = v;
   }
@@ -964,7 +967,8 @@ static uint64_t page_translate_as(uint64_t lin, int write, int user, int fetch) 
 
 static uint32_t TlbSet(uint32_t vpn) { return (vpn ^ (vpn >> 10)) & (kTlbSets - 1); }
 static uint32_t TlbTag(uint32_t vpn, int write) {
-  return kTlbValid | (vpn << 1) | (uint32_t)(write != 0);
+  return kTlbValid | (vpn << 1) | (s->tlb_gen << kTlbGenShift) |
+         (uint32_t)(write != 0);
 }
 static x86_tlb_entry* TlbSlot(uint32_t vpn, int write) {
   return &s->tlb[TlbSet(vpn) * kTlbWays + (write ? 1 : 0)];
@@ -1007,7 +1011,14 @@ static x86_tlb_entry* TlbFill(uint64_t lin, int write, int fetch, int user) {
 }
 
 static void TlbFlushAll(x86_state* st) {
-  memset(st->tlb, 0, sizeof(st->tlb));
+  // Bump the generation instead of touching 2^13 entries (CR3 is written on
+  // every context switch). A wrapped generation has to clear once so old
+  // tags cannot alias.
+  st->tlb_gen = (st->tlb_gen + 1) & kTlbGenMask;
+  if (st->tlb_gen == 0) {
+    memset(st->tlb, 0, sizeof(st->tlb));
+    st->tlb_gen = 1;
+  }
   st->fetch_valid = 0;
 }
 
@@ -1150,7 +1161,9 @@ static uint64_t TscNow(void) {
 // or permission fault keeps its architectural priority; the walk only happens
 // for the rare unaligned user case.
 static void AcCheckSlow(uint64_t lin, int size, int user, int fetch, int write) {
-  if (fetch || !user || !(s->cr0 & kCr0Am) || !fl->ac) return;
+  // CR0.AM is clear on every guest that is not running an AC test; test it
+  // before the load-side conditions so the hot path is one branch.
+  if (!(s->cr0 & kCr0Am) || fetch || !user || !fl->ac) return;
   if (size != 2 && size != 4 && size != 8) return;
   if ((lin & (uint64_t)(size - 1)) == 0) return;
   if (s->cr0 & kCr0Pg) {
@@ -1214,6 +1227,7 @@ static void MsrWrite(uint32_t idx, uint64_t v) {
     s->mcg_ctl = v;
   } else if (idx == 0x186 || idx == 0x187) {
     s->perf_evtsel[idx - 0x186] = (uint32_t)v;
+    PerfUpdateActive();
   } else if (idx == 0xc1 || idx == 0xc2) {
     s->perf_pmc[idx - 0xc1] = v;
   } else if (idx >= 0x200 && idx <= 0x20f) {
@@ -1228,8 +1242,10 @@ static void MsrWrite(uint32_t idx, uint64_t v) {
     s->mtrr_def_type = v & 0xc07u;
   } else if (idx == 0x38d) {
     s->perf_fixed_ctrl = v & 0x7ffu;
+    PerfUpdateActive();
   } else if (idx == 0x38f) {
     s->perf_global_ctrl = v & 0x700000003ULL;
+    PerfUpdateActive();
   } else if (idx == 0x390) {
     // IA32_PERF_GLOBAL_OVF_CTRL: write-1-to-clear the status bits.
     s->perf_global_status &= ~v;
@@ -1253,17 +1269,32 @@ static void MsrWrite(uint32_t idx, uint64_t v) {
   }
 }
 
+// Rebuild the one-word enable mask the step commit tests. General counter i
+// needs IA32_PERF_GLOBAL_CTRL[i] and IA32_PERFEVTSEL[i].EN; fixed counter i
+// needs GLOBAL_CTRL[32+i] and a nonzero FIXED_CTR_CTRL[i] mode (OS/USR/any).
+static void PerfUpdateActive(void) {
+  uint32_t m = 0;
+  for (int i = 0; i < 2; i++)
+    if ((s->perf_global_ctrl & (1ull << i)) && (s->perf_evtsel[i] & (1u << 22)))
+      m |= 1u << i;
+  for (int i = 0; i < 3; i++)
+    if ((s->perf_global_ctrl & (1ull << (32 + i))) &&
+        ((s->perf_fixed_ctrl >> (2 * i)) & 7))
+      m |= 1u << (2 + i);
+  s->perf_active = m;
+}
+
 // Retired-instruction accounting for the architectural performance counters
 // (SDM vol.3 ch.19). Event 0xC0 is instructions retired and 0x3C unhalted
 // core cycles; on this single-threaded interpreter both advance once per
 // retired instruction. USR/OS select the privilege levels, EN arms the
-// counter.
+// counter, and the any-thread bit counts in both rings.
 void x86_count_perf(void) {
+  if (!s->perf_active) return;
   int ring = cpl();
   for (int i = 0; i < 2; i++) {
+    if (!(s->perf_active & (1u << i))) continue;
     uint64_t sel = s->perf_evtsel[i];
-    if (!(s->perf_global_ctrl & (1ull << i))) continue;  // global enable
-    if (!(sel & (1u << 22))) continue;
     if (!((sel & (1u << 16)) && ring == 0) && !((sel & (1u << 17)) && ring != 0))
       continue;
     uint32_t ev = (uint32_t)sel & 0xff;
@@ -1272,9 +1303,10 @@ void x86_count_perf(void) {
     }
   }
   for (int i = 0; i < 3; i++) {
-    int mode = (int)((s->perf_fixed_ctrl >> (2 * i)) & 3);
-    int on = (mode & 1 && ring == 0) || (mode & 2 && ring != 0);
-    if (on && (s->perf_global_ctrl & (1ull << (32 + i)))) {
+    if (!(s->perf_active & (1u << (2 + i)))) continue;
+    int mode = (int)((s->perf_fixed_ctrl >> (2 * i)) & 7);
+    int on = (mode & 1 && ring == 0) || (mode & 2 && ring != 0) || (mode & 4);
+    if (on) {
       if (++s->perf_fixed_ctr[i] == 0) s->perf_global_status |= 1ull << (32 + i);
     }
   }
@@ -4198,15 +4230,19 @@ static void run_op2(uint8_t op2) {
           uint64_t base = d.reg == 0 ? s->gdtr : s->idtr;
           uint16_t limit = d.reg == 0 ? s->gdtr_limit : s->idtr_limit;
           wr16(d.mlin, limit);
-          wr32(d.mlin + 2, (uint32_t)base);
+          wr32(d.mlin + 2, (uint32_t)base & (d.w32 ? 0xffffffffu : kDescBase16Mask));
           break;
         }
         case 2:
         case 3: {  // lgdt/lidt (privileged: SDM vol.2)
           fr->rec.mnemonic = d.reg == 2 ? "lgdt" : "lidt";
           if (cpl() != 0) gp_fault(0);
+          // A 16-bit operand size loads only the low 24 base bits (SDM
+          // LGDT/LIDT Operation; v86 lgdt/lidt mask 0xffffff). SeaBIOS's
+          // int 15h AH=87h relies on it: the pseudo-descriptor is the first
+          // six bytes of a data descriptor, whose byte 5 is the access byte.
           uint16_t limit = rd16(d.mlin);
-          uint64_t base = rd32(d.mlin + 2);
+          uint64_t base = rd32(d.mlin + 2) & (d.w32 ? 0xffffffffu : kDescBase16Mask);
           if (d.reg == 2) {
             s->gdtr = base;
             s->gdtr_limit = limit;
@@ -4241,6 +4277,7 @@ static void run_op2(uint8_t op2) {
           uint16_t v = rm16();
           s->cr0 = (s->cr0 & ~0xfu) | (v & 0xfu) | (s->cr0 & kCr0Pe);
           TlbFlushAll(s);
+          X87UpdateFerr();
           break;
         }
         case 7: {  // invlpg, or RDTSCP in the register form (0F 01 F9)
@@ -4318,6 +4355,7 @@ static void run_op2(uint8_t op2) {
         // PG/PE/WP changes all alter translation or its permission check;
         // dropping the cache is cheap and always safe.
         TlbFlushAll(s);
+        X87UpdateFerr();  // NE selects #MF vs the FERR# pin
       } else if (d.reg == 2) {
         s->cr2 = s->r[d.rm].e;
       } else if (d.reg == 3) {
@@ -4535,6 +4573,7 @@ static void run_op2(uint8_t op2) {
                         ((uint32_t)buf[27] << 24);
           if (mx & ~s->fpu.mxcsr_mask) gp_fault(0);  // reserved MXCSR bits
           fpu_fxrstor(&s->fpu, buf);
+          X87UpdateFerr();
           break;
         }
         case 2: {  // ldmxcsr
@@ -4589,20 +4628,41 @@ static void run_op2(uint8_t op2) {
                   // this machine implements, not what a Pentium III had)
       fr->rec.mnemonic = "cpuid";
       uint32_t leaf = eax;
+      uint32_t sub = ecx;
       if (leaf == 0) {
-        eax = 0x0a;  // highest basic leaf (0x0a performance monitoring)
+        eax = 0x0b;  // highest basic leaf (0x0b APIC topology)
         ebx = 0x756e6547;
         edx = 0x49656e69;
         ecx = 0x6c65746e;
       } else if (leaf == 1) {
         // Family 6, model 3, stepping 3.
         eax = 0x633;
+        // EBX: brand index 0; CLFLUSH line size 8 (64 bytes); one logical
+        // processor; the BSP's APIC ID 0 (device/intc/lapic.c kLapicId).
+        ebx = 0x00010800u;
         ecx = 0;
-        // EDX: FPU, DE, PSE, TSC, MSR, PAE, MCE, CX8, SEP, MTRR, PGE, MCA,
-        // CMOV, PAT, PSE36, CLFSH, MMX, FXSR, SSE, SSE2. Every bit here has
-        // an execution path in this file (the SSE/MMX engine below); VME and
-        // the rest are advertised only once their behaviour is complete.
-        edx = 0x078bf9fdu;
+        // EDX: FPU, DE, PSE, TSC, MSR, PAE, MCE, CX8, APIC, SEP, MTRR, PGE,
+        // MCA, CMOV, PAT, PSE36, CLFSH, MMX, FXSR, SSE, SSE2. Every bit here
+        // has an execution path in this file; VME and the rest are advertised
+        // only once their behaviour is complete.
+        edx = 0x078bfbfdu;
+      } else if (leaf == 0x0b) {
+        // APIC topology (SDM vol.2 CPUID.0BH): the one SMT thread is level 0,
+        // the one core is level 1, and subleaf 2 terminates the walk. The
+        // x2APIC ID field is the APIC ID even without x2APIC.
+        if (sub == 0) {
+          eax = 0;      // shift to the next level (none)
+          ebx = 1;      // logical processors at this level
+          ecx = 0x0100;  // level 0, type 1 = SMT
+          edx = 0;      // APIC ID 0
+        } else if (sub == 1) {
+          eax = 0;
+          ebx = 1;
+          ecx = 0x0201;  // level 1, type 2 = core
+          edx = 0;
+        } else {
+          eax = ebx = ecx = edx = 0;
+        }
       } else if (leaf == 0x0a) {
         // Architectural performance monitoring, version 1: two general
         // counters and three fixed counters (SDM vol.3 19.2).
@@ -4976,10 +5036,21 @@ static void WrF80(extFloat80_t v) {
   wr16(d.mlin + 8, v.signExp);
 }
 
-// #MF is a fault with no error code (SDM vol.3 table 6-1); CR0.NE=0 routes
-// x87 errors to the external FERR# pin instead, which this chipset does not
-// model (no IRQ13), so the status bits are the only report then.
+// #MF is a fault with no error code (SDM vol.3 table 6-1). With CR0.NE=0 the
+// processor instead drives FERR# low for as long as an unmasked x87 exception
+// stands; the board wires that line to the coprocessor-error IRQ13. FNCLEX/
+// FNINIT clears the exception flags and therefore drops the line (SDM vol.1
+// 8.7.2). The level is derived, not latched: no separate acknowledgement
+// state exists beyond the FPU's own status word.
+static void X87UpdateFerr(void) {
+  int level = !(s->cr0 & kCr0Ne) && s->fpu.pending_mf;
+  if (level == s->ferr_level) return;
+  s->ferr_level = level;
+  if (cpu->ferr) cpu->ferr(cpu->ferr_dev, level);
+}
+
 static void X87FaultCheck(void) {
+  X87UpdateFerr();
   if (s->fpu.pending_mf && (s->cr0 & kCr0Ne)) raise_(fr, vec_mf, 0);
 }
 
@@ -7159,6 +7230,7 @@ void x86_init(CpuState* c) {
   // bits read 1; DR7's bit 10 reads 1 and every breakpoint is disabled.
   st->dr[6] = kDr6Rsvd1;
   st->dr[7] = kDr7Rsvd1;
+  st->dr_active = 0;
   // A reset disables every breakpoint (SDM vol.3 17.2), the stub's with the
   // guest's: the ownership mask goes with the registers it names.
   st->gdb_watch_mask = 0;

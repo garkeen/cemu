@@ -28,9 +28,11 @@ VBE/DISPI、链式 256 色与 EDID，PS/2 键盘鼠标与串口鼠标，8259/825
 移动）、**xv6-riscv 未开始**（镜像与 OpenSBI fw_jump 素材未取）。
 x86 CPU 已到 i686 功能面：x87（Berkeley SoftFloat 3e）、MMX/SSE/SSE2、RDTSC(P)、
 SYSENTER/SYSEXIT、MTRR/PAT、MCE 寄存器组、性能计数器、AC、PSE-36、FXSAVE/FXRSTOR；
-余下 VME/PVI 重定向与 PMU 细节记在 D39。
-回归：x86 42 格（新增 `paging32` PAE/PGE/NX 与 `x87`/`sse`/`sys686`/`pse36`/`ac`
-五个自足探针；KUT/pm/realmode/新探针逐格通过，realmode 127 PASS/0 FAIL）、
+APIC 的 CPUID/leaf 0x0B 拓扑已广告，CR0.NE=0 的 FERR# 接到 8259 IRQ13；
+余下 VME/PVI 重定向与 PMU 细节记在 D39，port 0xF0/IGNNE# 记在 D19。
+回归：x86 43 格（新增 `paging32` PAE/PGE/NX 与 `x87`/`sse`/`sys686`/`pse36`/`ac`
+五个自足探针，以及 `lgdt16` 的 16/32 位操作数描述符表基址语义；KUT/pm/realmode/
+新探针逐格通过，realmode 127 PASS/0 FAIL）、
 riscv64 136/0、riscv32 104/0、依赖边 ok。
 逐轮记录见 [progress.md](progress.md)。
 x86 固件（SeaBIOS + 显卡 option ROM）来自库外的一棵源码树，其现状、重建步骤与配置

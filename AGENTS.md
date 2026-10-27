@@ -396,14 +396,14 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 | D7 | LR/SC 单核预留集 | 无多核冲突语义 | spike 单核同款；规格允许 SC 假失败 | 多核引入时 | 登记中 |
 | D11 | htif.c HTIF syscall（dev0/cmd0）报错退出 | 无 fesvr syscall 设备 | fesvr htif_t::handle_syscall | 阶段 5 cesdk | 登记中 |
 | D17 | vga.c 渲染与显示通道 | DISPI/VBE（含 BANK、GETCAPS、模式寄存器联动）、链式 256 色（mode 13h 与 VBE 8/15/16/24/32bpp）、EDID（256 字节基础块 + DTA 扩展，QEMU 默认值的实测副本）、行比较/分屏、AR13 水平 pel 平移、按 CRTC 场周期推出的闪烁/光标相位均已实现。剩下：**CRTC R17 bit5 的 64K 地址回绕（AW）未建模**（QEMU 的 vga_draw_graphic 同样不读）；**过扫描边框不渲染**（显示通道发布活动画面，QEMU 也不把它画进 framebuffer）；**CGA 复合 NTSC 伪色未做**（没有宿主可见的监视器类型开关，QEMU 不建模）；光笔/开关感应/外部时钟在本卡上没有对应输入，输入状态 0 只报复位值 | IBM VGA Technical Reference；FreeVGA/VGAREGS；QEMU hw/display/vga.c（vbe_fixup_regs/vbe_update_vgaregs、line_compare、hpel、bank_offset）；seabios vgasrc/bochsvga.{h,c}；EDID 1.4（qemu_edid_generate 的默认 1280x800 两块的实测副本，test/x86/probe/edid_dump.asm 与 vbe_mode/PM 探针） | AW 在需要字模式回绕的客户机出现时；边框在需要模拟过扫描的显示通道出现时；NTSC 在出现宿主可选的复合监视器模式且色表可溯源时 | 登记中 |
-| D19 | PIIX3/IDE/IOAPIC/PM | ATA 侧 LBA-48（READ/WRITE SECTORS/DMA EXT，48 位任务文件高字节先写）、READ/WRITE MULTIPLE、SET MULTIPLE 已实现；PM1a 状态/使能/控制（含 GBL_RLS、W1C、SCI_EN）、PM 定时器溢出事件、SCI IRQ9、S5 关机已实现；IOAPIC NMI 交付已实现，ExtINT 由同一条 ISA 线上的 8259 通路承担；BMDMA 已实现。剩下：**IOAPIC 的 SMI/INIT 交付不投递**（本机无 SMM、无第二个 APIC）；**PIRQ 路由字节 0x60-0x63 无消费者**（没有 PCI 设备拉 INTx，IDE 跑兼容模式）；**XBCS 未实现**；**SMBus 主机控制器未实现**；PM 的 S3/S4 睡眠没有唤醒路径。ACPI 表（DSDT/FADT）由 SeaBIOS 生成，不属于芯片组模型 | ATA/ATAPI-7 §6.2.2（48 位任务文件序列）、§7.10.4、§8.10；ACPI 4.8（PM1_STS/PM1_EN/PM1_CNT 位段）；PIIX4 datasheet（PMBASE/PMREGMISC）；82093AA datasheet §3.2.4；QEMU hw/acpi/piix4.c、hw/intc/ioapic.c、hw/ide/core.c；test/x86/probe/ata_multi.asm、pm_sci.asm、nmi_ioapic.asm 及对应 calibration | SMI/INIT 在需要 SMM 或多 APIC 的客户机出现时；PIRQ 在出现拉 INTx 的 PCI 设备时；XBCS/SMBus 在出现依赖它们的客户机时；S3/S4 在需要睡眠/唤醒时 | 登记中 |
+| D19 | PIIX3/IDE/IOAPIC/PM | ATA 侧 LBA-48（READ/WRITE SECTORS/DMA EXT，48 位任务文件高字节先写）、READ/WRITE MULTIPLE、SET MULTIPLE 已实现；PM1a 状态/使能/控制（含 GBL_RLS、W1C、SCI_EN）、PM 定时器溢出事件、SCI IRQ9、S5 关机已实现；IOAPIC NMI 交付已实现，ExtINT 由同一条 ISA 线上的 8259 通路承担；BMDMA 已实现。剩下：**IOAPIC 的 SMI/INIT 交付不投递**（本机无 SMM、无第二个 APIC）；**PIRQ 路由字节 0x60-0x63 无消费者**（没有 PCI 设备拉 INTx，IDE 跑兼容模式）；**XBCS 未实现**；**SMBus 主机控制器未实现**；PM 的 S3/S4 睡眠没有唤醒路径；**port 0xF0 的 IGNNE#/FERR 锁存未建模**（CPU 的 FERR# 已接 8259 IRQ13，FNCLEX/FNINIT 清状态即撤销）。ACPI 表（DSDT/FADT）由 SeaBIOS 生成，不属于芯片组模型 | ATA/ATAPI-7 §6.2.2（48 位任务文件序列）、§7.10.4、§8.10；ACPI 4.8（PM1_STS/PM1_EN/PM1_CNT 位段）；PIIX4 datasheet（PMBASE/PMREGMISC）；82093AA datasheet §3.2.4；QEMU hw/acpi/piix4.c、hw/intc/ioapic.c、hw/ide/core.c；test/x86/probe/ata_multi.asm、pm_sci.asm、nmi_ioapic.asm 及对应 calibration | SMI/INIT 在需要 SMM 或多 APIC 的客户机出现时；PIRQ 在出现拉 INTx 的 PCI 设备时；XBCS/SMBus 在出现依赖它们的客户机时；S3/S4 在需要睡眠/唤醒时 | 登记中 |
 | D21 | i8042.c 软驱数据线 | 8042 侧的软驱数据线（键盘控制器输出端口上那条给软驱控制器的数据线）没有建模；本机的软驱路径由 8272A + 8237 通道 2 承担，固件不经过这条线 | PC/AT Technical Reference（8042 输出端口）；IBM 8042 数据表 | 需要复现"经 8042 传盘"的硬件时 | 登记中 |
 | D32 | uart16550.c 接收侧 FIFO 语义 | `PushRx` 无视 FCR.FE 一直缓存 16 字节：实机 16550 在 FIFO 关闭时只保留 1 字节（RBR），后续字节按溢出丢弃并置 LSR.OE，本机不丢。后果：不开 FIFO 的客户机驱动在本机也能收全突发（sermouse 探针原先正是靠这处偏差通过的），在实机/QEMU 上会丢字节 | 16550D datasheet（FCR.FE、RBR 单字节与 OE）；QEMU hw/char/serial.c `serial_receive1` | 需要精确接收溢出语义的客户机出现时（sermouse 探针已改为开 FIFO，销账无阻塞） | 登记中 |
 | D34 | mmu.c Sv39 PTE 高位 | **Svnapot 与 Svpbmt 未实现**：叶 PTE 的 bit63:54（N 与 PBMT）任一位置起即按保留位报 page fault，本机不解释 NAPOT 大页也不解释 PBMT 内存类型。后果要说清楚：`rv64ssvnapot-p-napot` 那格走的是**验收件自带的 skip 分支**（件源 `riscv-tests/isa/rv64ssvnapot/napot.S` 的 `mtvec_handler` 见 store page fault + `mepc=napot_store` + `mtval=MY_VA` 就跳 `pass`），所以它在套件里是绿的，但**没钉任何东西**——64KB NAPOT 区间与 PBMT 属性在本机无验证。别和已实现的那半混淆：PMP 的 NAPOT 区间编码是实现了的（mmu.c 的 PMP 段） | 特权规范 4.3.2（叶 PTE 保留位与 N/PBMT 字段）；Svnapot v1.0、Svpbmt v1.0；QEMU target/riscv 的 RV_PTE_NAPOT 与 pbmt 解码；件源 riscv-tests isa/rv64ssvnapot/napot.S | 出现依赖 NAPOT 大页或 PBMT 的客户机时（当前 Linux 0.11/2.6.34 都不用；riscv 侧 xv6-riscv 验收时若 OpenSBI 要求再核） | 登记中 |
 | D35 | riscv64/csr.c、riscv32/csr.c 的 misa 写路径 | `csrw misa` 的掩码 `(val & kMisaSupported) \| kMisaI` 只挡"未实现的位"，不挡"只读位"：客机写 0 能把 S 与 U 位清掉，而清掉之后本机照样进 U 模式、照样按 PTE.U 判权限（状态与自述脱钩）。这两位在规范里是否强制只读**缺手册 §3.1.1 的原文**，未据裁决（先例：DAS 的 18 处分歧按实机、计数器抑制只实现有测试覆盖的一侧——这里两侧都无证据，故不猜） | 特权规范 3.1.1 misa 的 WARL 措辞（原文待核）；dearchap-tinyemu riscv_cpu.c:1306 只组装 misa、无 csrw misa 路径可参照 | 核到手册原文后：若 S/U 强制只读，则把这两位从可改掩码里摘出并补一个自足探针（写 misa 后读回） | 登记中 |
 | D36 | riscv64/csr.c、riscv32/csr.c 的 MHPM 计数器 | **MHPM 计数器只存储不自增**：`mhpmcounter3..18` 在 cemu 里没有事件源，写进去的值能读回，但从不增长；`mhpmevent3..18` 同样只存储。mcycle/minstret 不受影响（step.c 每步自增）。OpenSBI 按 CSR 存在探测计数器数量，拿到的是"能读但不动"的计数器 | QEMU target/riscv/csr.c 的 pmu 计数（Zihpm 允许实现定义事件）；特权规范 3.1.11 | 出现依赖性能计数器/剖析的客户机或工具时 | 登记中 |
 | D38 | x86_min.c 绝对指针（PS/2） | **PS/2 鼠标只有相对计数，没有绝对包**。窗口的绝对位置由 x86 板换算成 PS/2 位移：首次/换模式时发负向回零包把客人光标钉到 (0,0)，之后按板级模型逐包走向目标；包按 AUX 队列空位与 100 Hz 限速，按键转换排队到点击位置再发。模型假设客人 1:1 应用计数、在屏幕边缘钳位；客人若做鼠标加速、自己 warp 光标，会漂移；PS/2 2:1 缩放由设备的逆变换补偿，单包在途（AUX 队列清空才发下一包）。`-mouse serial` 仍是相对设备 | PS/2 鼠标协议（相对计数，9 位二补码）；QEMU 对 PS/2 用相对 + 指针 grab，绝对输入另走 USB tablet/vmmouse；真实绝对需要客人驱动 | 出现支持 USB tablet/vmmouse 的 x86 客人驱动时换真绝对设备；当前模式为 best-effort，漂移时以相对模式兜底 | 登记中 |
-| D39 | x86 后端（exec.c / fpu.c / x86.h） | 已实现 AC 对齐检查（#AC 在页走查之后、只查 2/4/8 字节 CPL-3 访问）、PSE-36、SYSENTER/SYSEXIT、MMX/SSE/SSE2、FXSAVE/FXRSTOR、MTRR/PAT、MCE 寄存器组、架构性能计数器（0x3C/0xC0）、RDTSC/RDTSCP、CR4 WARL 与 CPUID 广告（EDX 含 FPU/MMX/FXSR/SSE/SSE2/PSE36/PAT/MTRR/MCE/SEP/TSC）。剩下：**VME/PVI 的软件中断重定向位图未实现**（CLI/STI/PUSHF/POPF/IRET 的 VIF/VIP 与硬件中断门控已在；未广告 CPUID.VME）；**性能计数器只计数 0x3C/0xC0，其余 event select、PEBS/PMI 未实现**；长模式另立项 | SDM vol.2/vol.3（20.3 VME、21 PVI、19 PMU）；QEMU target/i386；v86 cpu.rs/instructions_0f.rs；`test/x86/probe/sys686.asm`、`sse.asm`、`ac.asm`、`pse36.asm` | VME/PVI 位图在出现依赖它的 V86 客户机时；PMU 其余事件在出现剖析工具时 | 登记中 |
+| D39 | x86 后端（exec.c / fpu.c / x86.h） | 已实现 AC 对齐检查（#AC 在页走查之后、只查 2/4/8 字节 CPL-3 访问）、PSE-36、SYSENTER/SYSEXIT、MMX/SSE/SSE2、FXSAVE/FXRSTOR、MTRR/PAT、MCE 寄存器组、架构性能计数器（0x3C/0xC0）、RDTSC/RDTSCP、CR4 WARL 与 CPUID 广告（EDX 含 FPU/MMX/FXSR/SSE/SSE2/APIC/PSE36/PAT/MTRR/MCE/SEP/TSC，leaf 0x0B 报单线程/单核拓扑）。剩下：**VME/PVI 的软件中断重定向位图未实现**（CLI/STI/PUSHF/POPF/IRET 的 VIF/VIP 与硬件中断门控已在；未广告 CPUID.VME）；**性能计数器只计数 0x3C/0xC0，其余 event select、PEBS/PMI 未实现**；长模式另立项 | SDM vol.2/vol.3（20.3 VME、21 PVI、19 PMU）；QEMU target/i386；v86 cpu.rs/instructions_0f.rs；`test/x86/probe/sys686.asm`、`sse.asm`、`ac.asm`、`pse36.asm` | VME/PVI 位图在出现依赖它的 V86 客户机时；PMU 其余事件在出现剖析工具时 | 登记中 |
 | E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中 |
 
 ## 十一、显示窗口指针契约（所有主板）
@@ -497,3 +497,22 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
   `lin_load/lin_store` 退回逐次走查 + `phys_load/phys_store` 事件路径，保证
   观测流与 TLB 引入前一致；`trace/state` 不改变访存路径，只打开 `g_record_raw`
   与 `DebugInsn` 门控。
+
+- **x87 CR0.NE=0 的 FERR#**：未屏蔽 x87 异常在 NE=0 时拉高 FERR#，板级接到
+  8259 的 IRQ13；FNCLEX/FNINIT 清异常状态即撤销（电平由状态字导出，不另设
+  锁存）。CR0.NE=1 仍走 #MF。port 0xF0/IGNNE# 见 D19。
+  验收：`test/x86/probe/x87.asm` 的 IRQ13 项。
+
+- **APIC CPUID**：LAPIC ID 为 0（BSP），leaf 1 EDX.APIC=1、EBX=0x00010800
+  （APIC ID 0、1 逻辑处理器、64B CLFLUSH），leaf 0x0B 依次返回
+  SMT(type 1, level 0)、core(type 2, level 1)、终止子叶；与
+  `device/intc/lapic.c` 的 ID 寄存器一致。
+  验收：`test/x86/probe/sys686.asm`。
+
+- **16 位 LGDT/LIDT/SGDT/SIDT 只带 24 位基址**：操作数为 16 位时，基址按
+  SDM vol.2 各指令的 Operation 截到低 24 位（32 位操作数不截）。SeaBIOS 的
+  int 15h AH=87h 把调用者 GDT 的 1 号数据描述符当伪描述符用——该 6 字节的
+  第 5 字节是访问权 0x93，装 32 位会把 GDTR 基址变成 0x93076c34，切换保护
+  模式后的 `ljmp $0x20` 随即 #GP（DOS7 的 IO.SYS 一启动就走这条服务）。
+  v86 的 `instr16_0F01_*` 用 0xffffff 掩码。验收：`test/x86/probe/lgdt16.asm`
+  （双向各测 16/32 位，QEMU 同 transcript 同 status）。

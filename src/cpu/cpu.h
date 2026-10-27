@@ -53,6 +53,11 @@ typedef struct CpuState {
   // mode is its only source on this machine). Same hook shape as set_irq;
   // NULL for ISAs without one.
   void (*set_nmi)(struct CpuState* cpu);
+  // FERR# output (x86 CR0.NE=0 numeric-error reporting): the board wires this
+  // to the coprocessor-error IRQ13 line, the CPU calls it when the level
+  // changes. NULL for ISAs without one.
+  void (*ferr)(void* dev, int level);
+  void* ferr_dev;
 } CpuState;
 
 #endif

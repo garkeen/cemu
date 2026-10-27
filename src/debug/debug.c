@@ -561,8 +561,12 @@ void DebugInit(void) {
       g_mask |= kDbgScreen;
     else if (!strcmp(tok, "vga-io"))
       g_mask |= kDbgVgaIo;
-    else if (!strncmp(tok, "regs=", 5))
+    else if (!strncmp(tok, "regs=", 5)) {
       g_regs_period = atoi(tok + 5);
+      // The period alone would never be tested: DebugInsn only runs when a
+      // category (or a watchpoint) is on, and this bit also arms the exit dump.
+      g_mask |= kDbgRegs;
+    }
     else if (!strncmp(tok, "watch=", 6))
       AddWatch(tok + 6);
     else if (!strncmp(tok, "dump=", 5))
