@@ -200,6 +200,23 @@ enum {
   kExStorePageFault = 15,
 };
 
+// Sv32 translation cache, mirroring the riscv64 backend: an entry records
+// every context its decision depended on (satp, privilege, SUM/MXR, ADUE,
+// PMP generation and sfence generation) and the host backing of a plain RAM
+// page. A miss on any field simply refills. Permissions are per access class,
+// so `acc` is part of the tag.
+enum { kTlbSets = 512, kTlbWays = 2 };
+typedef struct Riscv32TlbEntry {
+  uint64_t vpn, pbase;
+  uint8_t* host;
+  uint64_t gen;       // sfence generation
+  uint64_t satp;
+  uint64_t mstatus;   // SUM|MXR
+  uint64_t menvcfg;   // ADUE
+  uint32_t pmp_gen;
+  uint8_t priv, eff, acc, pad;
+} Riscv32TlbEntry;
+
 typedef struct Riscv32State {
   uint64_t misa;
   uint64_t mstatus;
@@ -248,6 +265,10 @@ typedef struct Riscv32State {
   // Device-driven interrupt inputs (CLINT MSIP/MTIP, PLIC MEIP/SEIP); ORed
   // into mip for every observation, mirroring how wires drive the CSR bits.
   uint64_t ext_irq;
+  Riscv32TlbEntry tlb[kTlbSets * kTlbWays];
+  uint64_t tlb_gen;   // sfence.vma bumps this
+  uint32_t tlb_clock;  // 2-way replacement clock
+  uint32_t pmp_gen;    // PMP CSR writes bump this
   int res_valid;  // the LR reservation (single hart)
   uint64_t res_addr;
   // gdb stub (stage 3.5): bumped on every delivered trap; signal is the gdb
@@ -311,6 +332,10 @@ uint64_t riscv32_trap(CpuState* cpu, Riscv32State* s, uint64_t cause, uint64_t t
 // (priority order MEI, MSI, MTI, SEI, SSI, STI; target-mode gating through
 // delegation and the xIE stack) and injects it as a trap into cpu->pc.
 void riscv32_deliver_interrupt(CpuState* cpu, Riscv32State* s);
+// Sstc: samples the host clock and drives the STIP line from stimecmp. Called
+// at the board's batch boundaries (and every step while sleeping), not per
+// instruction — the line is a timer input, not an instruction-stream fact.
+void riscv32_sync_timer(CpuState* cpu, Riscv32State* s);
 // xRET helpers return the target PC; the caller routes it through next_pc.
 uint64_t riscv32_mret(Riscv32State* s);
 uint64_t riscv32_sret(Riscv32State* s);
@@ -318,8 +343,10 @@ uint64_t riscv32_sret(Riscv32State* s);
 // mmu.c — Sv32 address translation and PMP enforcement. On failure it raises
 // the matching trap through the frame (page fault for translation failures,
 // access fault for PMP) and longjmps to the step landing pad; success
-// returns the physical address through *paddr.
-int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int acc, uint64_t* paddr);
+// returns the physical address through *paddr, and for a plain RAM page the
+// host backing of its 4 KiB page through *host (NULL for devices/unmapped).
+int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int size, int acc,
+                     uint64_t* paddr, uint8_t** host);
 // PMP check for a physical range under a privilege mode; 0 = allowed.
 int Riscv32PmpAllowed(const Riscv32State* s, uint64_t addr, uint64_t len, int acc, int mode);
 

@@ -25,6 +25,9 @@ void riscv32_init(CpuState* cpu) {
   s->tdata1[0] = kTrigTypeMcontrol6;  // both triggers are mcontrol6 (Sdtrig)
   s->tdata1[1] = kTrigTypeMcontrol6;
   s->stimecmp = ~0ULL;               // Sstc: no S-level timer interrupt until programmed
+  // A zeroed cache entry has gen 0; the first generation is 1 so no entry is
+  // valid before its fill.
+  s->tlb_gen = 1;
   // How boards drive our interrupt lines: line is a mip bit (platform.h).
   // Boards call this hook instead of naming a CPU-model function.
   cpu->set_irq = riscv32_set_ext_irq;

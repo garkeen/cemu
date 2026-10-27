@@ -55,13 +55,17 @@ uint64_t riscv32_trap(CpuState* cpu, Riscv32State* s, uint64_t cause, uint64_t t
   }
 }
 
-void riscv32_deliver_interrupt(CpuState* cpu, Riscv32State* s) {
+void riscv32_sync_timer(CpuState* cpu, Riscv32State* s) {
   // Sstc: when the machine provides mtime, stimecmp drives the STIP line
   // (QEMU target/riscv does not gate the CSR on menvcfg.STCE). Skipped
   // while stimecmp holds its reset all-ones value so the common path costs
-  // no host clock reads.
+  // no host clock reads. step.c calls this at batch boundaries, not per
+  // instruction.
   if (cpu->timer_read && s->stimecmp != ~0ULL)
     riscv32_set_ext_irq(cpu, kIrqStip, cpu->timer_read(cpu->timer_dev) >= s->stimecmp);
+}
+
+void riscv32_deliver_interrupt(CpuState* cpu, Riscv32State* s) {
   uint64_t pending = MipAll(s) & s->mie;
   if (!pending) return;
   // Strict priority order (priv spec 3.1.9): MEI, MSI, MTI, SEI, SSI, STI.
@@ -378,6 +382,7 @@ static void WritePmpCfg(Riscv32State* s, int which, uint64_t val) {
     out |= (uint32_t)cfg << (8 * b);
   }
   s->pmpcfg[which] = out;
+  s->pmp_gen++;  // cached PMP decisions are stale
 }
 
 static void WritePmpAddr(Riscv32State* s, int i, uint64_t val) {
@@ -389,6 +394,7 @@ static void WritePmpAddr(Riscv32State* s, int i, uint64_t val) {
   // is locked and TOR (it forms the successor's lower bound).
   if ((cfg & kPmpL) || ((next_cfg & kPmpL) && (next_cfg & kPmpAMask) == kPmpATor)) return;
   s->pmpaddr[i] = (uint32_t)val;  // the CSR is XLEN=32 bits wide
+  s->pmp_gen++;                   // cached PMP decisions are stale
 }
 
 int riscv32_csr_write(Riscv32State* s, uint64_t addr, uint64_t val, uint64_t next_pc) {

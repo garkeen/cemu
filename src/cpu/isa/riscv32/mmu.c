@@ -5,8 +5,11 @@
 // reserved high PTE bits. PMP keeps the reference's lowest-match-wins rule
 // with the RV32 CSR layout (four entries per pmpcfg, 32-bit pmpaddr).
 //
-// The interpreter walks page tables on every access — there is no translation
-// cache, so sfence.vma has nothing to flush beyond its permission checks.
+// The interpreter caches successful translations (Riscv32TlbEntry): page
+// walk, PMP and A/D handling all happen at fill time, and the cache stores
+// the host backing of plain RAM pages so the hot load/store path is a direct
+// memcpy. sfence.vma bumps the generation; a satp/PMP/context change makes
+// entries miss because every field they depended on is part of the tag.
 //
 // Faults raise through the frame (raise_): translation failures page-fault,
 // PMP and unmapped-physical failures access-fault, each with the faulting
@@ -131,7 +134,9 @@ static uint32_t PteRead(frame* f, Riscv32State* s, uint64_t pte_addr, int acc) {
   return (uint32_t)BusRead(f->cpu->bus, pte_addr, kSv32PteSize);
 }
 
-int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int acc, uint64_t* paddr) {
+int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int size, int acc,
+                     uint64_t* paddr, uint8_t** host) {
+  if (host) *host = NULL;
   vaddr &= kXlenMask;  // RV32: the virtual address is 32 bits wide
   // Effective privilege for data accesses under MPRV uses MPP (priv spec
   // 3.1.6.6); instruction fetch always uses the current mode.
@@ -141,7 +146,30 @@ int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int acc, uint64_
   uint64_t satp_mode = (s->satp >> 31) & 1;
   if (eff == kPrivMachine || satp_mode == kSatpModeBare) {
     *paddr = vaddr;
+    if (!Riscv32PmpAllowed(s, vaddr, (uint64_t)size, acc, s->priv))
+      raise_paddr_(f, AccessFaultCause(acc), vaddr, vaddr);
+    if (host) BusRamPage(f->cpu->bus, vaddr & ~kSv32OffsetMask, host);
     return 0;
+  }
+
+  // Translation cache: a hit skips the walk, its PMP checks and the A/D
+  // writes. Set index mixes the access class in because permissions are per
+  // access type (a page can be readable but not writable/fetchable).
+  uint64_t vpn_page = vaddr >> kSv32PageShift;
+  uint64_t msb = s->mstatus & (kMstatusSum | kMstatusMxr);
+  uint64_t menv = s->menvcfg & kMenvcfgAdue;
+  uint32_t set = (uint32_t)(vpn_page ^ ((uint64_t)acc * 0x9E3779B97F4A7C15ULL)) &
+                 (kTlbSets - 1);
+  Riscv32TlbEntry* ways = &s->tlb[(size_t)set * kTlbWays];
+  for (int w = 0; w < kTlbWays; w++) {
+    Riscv32TlbEntry* e = &ways[w];
+    if (e->gen == s->tlb_gen && e->vpn == vpn_page && e->acc == (uint8_t)acc &&
+        e->satp == s->satp && e->priv == s->priv && e->eff == (uint8_t)eff &&
+        e->mstatus == msb && e->menvcfg == menv && e->pmp_gen == s->pmp_gen) {
+      *paddr = e->pbase | (vaddr & kSv32OffsetMask);
+      if (host) *host = e->host;
+      return 0;
+    }
   }
 
   // Sv32 has no canonical-address check: every 32-bit VA is valid.
@@ -212,6 +240,29 @@ int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int acc, uint64_
   } else {
     *paddr = (ppn << kSv32PageShift) | (vaddr & kSv32OffsetMask);
   }
+  // PMP for the final physical access is decided once, at fill time: a cache
+  // hit may then skip the 16-entry scan. The entry records pmp_gen, so a PMP
+  // CSR write makes every old decision miss.
+  if (!Riscv32PmpAllowed(s, *paddr, (uint64_t)size, acc, s->priv))
+    raise_paddr_(f, AccessFaultCause(acc), vaddr, *paddr);
+  uint8_t* h = NULL;
+  BusRamPage(f->cpu->bus, *paddr & ~kSv32OffsetMask, &h);
+  // Prefer a slot invalidated by sfence; otherwise alternate ways so one hot
+  // page cannot pin a set forever.
+  int w = ways[0].gen != s->tlb_gen ? 0 : ways[1].gen != s->tlb_gen ? 1 : (int)(s->tlb_clock++ & 1);
+  Riscv32TlbEntry* te = &ways[w];
+  te->vpn = vpn_page;
+  te->pbase = *paddr & ~kSv32OffsetMask;
+  te->host = h;
+  te->acc = (uint8_t)acc;
+  te->gen = s->tlb_gen;
+  te->satp = s->satp;
+  te->priv = s->priv;
+  te->eff = (uint8_t)eff;
+  te->mstatus = msb;
+  te->menvcfg = menv;
+  te->pmp_gen = s->pmp_gen;
+  if (host) *host = h;
   return 0;
 
 page_fault:

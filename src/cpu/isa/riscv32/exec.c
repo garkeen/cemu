@@ -95,10 +95,17 @@ uint64_t riscv32_mem_load(frame* fr, uint64_t vaddr, int size, int acc) {
   // in the ldst templates before the rtl memory op). Fetches don't qualify.
   if (acc != acc_ifetch) Riscv32TriggerCheck(fr, rs, kTrigOpLoad, vaddr);
   uint64_t paddr;
-  Riscv32Translate(fr, rs, vaddr, acc, &paddr);  // raises the page fault itself
+  uint8_t* host = NULL;
+  // Translation enforces PMP for this access; its cache stores the host
+  // backing of plain RAM pages, which is the fast path below.
+  Riscv32Translate(fr, rs, vaddr, size, acc, &paddr, &host);
+  if (host && (vaddr & 0xfff) + (uint64_t)size <= 0x1000 && !DebugOn(kDbgMem)) {
+    uint64_t v = 0;
+    memcpy(&v, host + (vaddr & 0xfff), (size_t)size);
+    return v;
+  }
   BusRegion* r;
-  if (!Riscv32PmpAllowed(rs, paddr, (uint64_t)size, acc, rs->priv) ||
-      BusProbe(rv32_cpu->bus, paddr, size, &r) != 0)
+  if (BusProbe(rv32_cpu->bus, paddr, size, &r) != 0)
     raise_paddr_(fr, fault_cause(acc), vaddr, paddr);
   uint64_t v = BusRead(rv32_cpu->bus, paddr, size);
   // The bus category reports device accesses (MMIO and port hits); an
@@ -112,10 +119,14 @@ uint64_t riscv32_mem_load(frame* fr, uint64_t vaddr, int size, int acc) {
 void riscv32_mem_store(frame* fr, uint64_t vaddr, int size, uint64_t val) {
   Riscv32TriggerCheck(fr, rs, kTrigOpStore, vaddr);  // before the store commits
   uint64_t paddr;
-  Riscv32Translate(fr, rs, vaddr, acc_write, &paddr);
+  uint8_t* host = NULL;
+  Riscv32Translate(fr, rs, vaddr, size, acc_write, &paddr, &host);
+  if (host && (vaddr & 0xfff) + (uint64_t)size <= 0x1000 && !DebugOn(kDbgMem)) {
+    memcpy(host + (vaddr & 0xfff), &val, (size_t)size);
+    return;
+  }
   BusRegion* r;
-  if (!Riscv32PmpAllowed(rs, paddr, (uint64_t)size, acc_write, rs->priv) ||
-      BusProbe(rv32_cpu->bus, paddr, size, &r) != 0)
+  if (BusProbe(rv32_cpu->bus, paddr, size, &r) != 0)
     raise_paddr_(fr, kExStoreFault, vaddr, paddr);
   if (DebugOn(kDbgBus) && !r->host) {
     DebugBus(fr, r->ops->name, paddr, size, 0, val);
@@ -218,9 +229,10 @@ static uint64_t system_op(frame* fr, uint32_t i) {
       fr->rec.mnemonic = "sfence.vma";
       if (rd(i)) illegal(fr, i);
       // TVM: S-mode fences trap (priv spec 3.1.6.8); U-mode always traps.
-      // No translation cache exists: every access walks the tables.
       if (rs->priv == kPrivUser || (rs->priv == kPrivSupervisor && (rs->mstatus & kMstatusTvm)))
         illegal(fr, i);
+      // One hart and no ASID filtering: every cached translation dies.
+      rs->tlb_gen++;
       return (uint32_t)(rv32_cpu->pc + 4);
     default:
       illegal(fr, i);
