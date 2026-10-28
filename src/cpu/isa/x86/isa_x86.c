@@ -37,10 +37,23 @@ static int x86_has_fpr(frame* f) {
 
 static void x86_debug_state_line(char* buf, int cap, frame* f) {
   x86_state* s = (x86_state*)f->priv;
+  // The system registers belong in the canonical stream next to CR0 and the
+  // segment selectors: a protected-mode fault (limit/type/DPL on a table the
+  // guest just loaded, or a page walk under a switched CR3) is undecidable
+  // from the visible selectors alone — the table base and limit are what the
+  // failing lookup actually used.
   snprintf(buf, (size_t)cap,
-           "x: cr0=%08llx cs=%04x ss=%04x ds=%04x es=%04x fs=%04x gs=%04x dr6=%08x dr7=%08x",
-           (unsigned long long)s->cr0, s->sreg[cs_i], s->sreg[ss_i], s->sreg[ds_i], s->sreg[es_i],
-           s->sreg[fs_i], s->sreg[gs_i], s->dr[6], s->dr[7]);
+           "x: cr0=%08llx cr3=%08llx cr4=%08llx "
+           "gdtr=%08llx:%04x idtr=%08llx:%04x ldtr=%04x:%08llx:%04x tr=%04x:%08llx:%04x "
+           "eflags=%08x cpl=%d cs=%04x ss=%04x ds=%04x es=%04x fs=%04x gs=%04x "
+           "dr6=%08x dr7=%08x",
+           (unsigned long long)s->cr0, (unsigned long long)s->cr3,
+           (unsigned long long)s->cr4, (unsigned long long)s->gdtr, s->gdtr_limit,
+           (unsigned long long)s->idtr, s->idtr_limit, s->ldtr,
+           (unsigned long long)s->ldtr_base, s->ldtr_limit, s->tr,
+           (unsigned long long)s->tr_base, s->tr_limit, s->fl.word,
+           (s->ar[cs_i] >> 5) & 3, s->sreg[cs_i], s->sreg[ss_i], s->sreg[ds_i],
+           s->sreg[es_i], s->sreg[fs_i], s->sreg[gs_i], s->dr[6], s->dr[7]);
 }
 
 // ---- gdb stub (stage 3.5) -----------------------------------------------------
