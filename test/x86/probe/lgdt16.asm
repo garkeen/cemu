@@ -91,8 +91,8 @@ puts:
 .done:
   ret
 
-msg_ok:   db "lgdt16 ok", 0
-msg_fail: db "lgdt16 FAIL", 0
+msg_ok:   db "lgdt16 ok", 13, 10, 0
+msg_fail: db "lgdt16 FAIL", 13, 10, 0
 
   times 510 - ($ - $$) db 0
   dw 0xaa55

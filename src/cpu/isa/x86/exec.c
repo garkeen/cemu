@@ -301,18 +301,25 @@ _Noreturn static void pf_fault(uint64_t lin, uint32_t code) {
 // faults on use), the access type must fit (writes go through writable data
 // segments only; execute-only code is unreadable), and the offset must lie
 // inside the limit — expand-up below the limit, expand-down data above it.
-// A B=0 segment bounds offsets at 64K however big the expanded limit is.
+// A stack-segment violation is #SS(0), every other segment #GP(0) (SDM vol.3
+// table 6-1). B bounds no ordinary data segment: it selects the 16/32-bit
+// stack pointer (handled by stack_push/stack_pop) and an expand-down
+// segment's upper bound only (SDM vol.3 3.4.5).
+_Noreturn static void seg_fault(int seg, uint32_t code) {
+  if (seg == ss_i) ss_fault(code);
+  gp_fault(code);
+}
+
 static void seg_use(int seg, uint32_t off, int size, int write) {
   if (!(s->cr0 & 1)) return;
   uint8_t ar = s->ar[seg];
   if (ar == 0) gp_fault(0);
-  if (write ? (ar & 0x1a) != 0x12 : (ar & 0x1a) == 0x18) gp_fault(0);
-  if ((ar & 0x1c) == 0x04) {  // expand-down data: S=1, E=0, DC=1
+  if (write ? (ar & 0x1a) != 0x12 : (ar & 0x1a) == 0x18) seg_fault(seg, 0);
+  if ((ar & 0x1c) == 0x14) {  // expand-down data: S=1, E=0, DC=1
     uint32_t upper = s->dbit[seg] ? 0xffffffffu : 0xffffu;
-    if (off <= s->limit[seg] || (uint64_t)off + size - 1 > upper) gp_fault(0);
+    if (off <= s->limit[seg] || (uint64_t)off + size - 1 > upper) seg_fault(seg, 0);
   } else {
-    if (off > s->limit[seg] || (uint64_t)off + size - 1 > s->limit[seg]) gp_fault(0);
-    if (!s->dbit[seg] && off > 0xffff) gp_fault(0);
+    if (off > s->limit[seg] || (uint64_t)off + size - 1 > s->limit[seg]) seg_fault(seg, 0);
   }
 }
 
@@ -1706,8 +1713,10 @@ static void pm_iret(void) {
   // this is a CPL-0 return, so the frame is the VM86 one a delivery pushed —
   // ESP, SS, ES, DS, FS and GS above the flags image — and the whole EFLAGS
   // image loads (VM=1 among it, which is what puts the processor back in VM86).
-  // CPL becomes 3 with the new CS (SDM vol.2 IRET Operation).
-  if ((flv & 0x20000u) && cpl() == 0) {
+  // CPL becomes 3 with the new CS (SDM vol.2 IRET Operation). A VM=1 image at
+  // any other CPL is #GP(0): only ring 0 can re-enter VM86.
+  if (flv & 0x20000u) {
+    if (cpl() != 0) gp_fault(0);
     uint32_t new_esp = stack_peek(w, 3 * (uint32_t)w);
     uint16_t new_ss = (uint16_t)stack_peek(w, 4 * (uint32_t)w);
     uint16_t new_es = (uint16_t)stack_peek(w, 5 * (uint32_t)w);
@@ -1957,6 +1966,15 @@ static void pm_ret(uint32_t n) {
   eip = new_eip;
 }
 
+// SDM vol.3 table 6-1: #DE/#BR/#UD/#NM/#TS/#NP/#SS/#GP/#PF/#MF/#AC/#XM/
+// #VE/#CP are faults, #DB/#BP/#OF are traps and #DF/#MC are aborts. A fault's
+// saved EFLAGS image carries RF=1 so an instruction breakpoint cannot fault
+// again when the instruction restarts (SDM vol.3 17.3.1.1; QEMU
+// do_interrupt_protected's exception_is_fault + "eflags |= RF_MASK").
+static int int_is_fault(int vec) {
+  return vec != 1 && vec != 3 && vec != 4 && vec != 8 && vec != 18;
+}
+
 // Delivers a vector. Real mode: the IVT at IDTR (SDM vol.3 16.3). Protected
 // mode: the IDT gate — interrupt/trap gates push flags/CS/IP, switching to the
 // TSS SS0:ESP0 stack on a privilege change (SDM vol.2 INT Operation; behavior
@@ -1971,6 +1989,8 @@ static void pm_ret(uint32_t n) {
 void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
   int soft = origin == kIntSoft;
   int ext = origin == kIntExternal;
+  uint32_t eflags_img = fl->word | 2;
+  if (origin == kIntException && int_is_fault(vec)) eflags_img |= 0x10000;
   if (!(s->cr0 & 1)) {
     uint64_t tbl = s->idtr + (uint64_t)vec * 4;
     uint32_t off = krd16(tbl);
@@ -1991,7 +2011,7 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
       GateArgs(&a);
       DebugGateCall(vec, &a, ((uint32_t)s->sreg[cs_i] << 16) | (ret_eip & 0xffff));
     }
-    kpush16(fl->word | 2);
+    kpush16(eflags_img);
     kpush16(s->sreg[cs_i]);
     kpush16((uint16_t)ret_eip);
     fl->if_ = 0;
@@ -2053,6 +2073,15 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
   int conf = cv.ar & 4;
   int tdpl = (cv.ar >> 5) & 3;
   if (tdpl > cpl()) gp_fault(code_sel & ~3u);
+  // SDM vol.2 INT n, TRAP-OR-INTERRUPT-GATE: a gate taken while EFLAGS.VM=1
+  // must name a non-conforming ring-0 code segment; every other target --
+  // a ring-1/2 segment or any conforming one -- is #GP(selector). The gate's
+  // own DPL (the software-INT permission) was checked above and is unrelated.
+  if (fl->vm && (conf || tdpl != 0)) gp_fault(code_sel & ~3u);
+  // The gate itself must be 32-bit: the VM86 frame it pushes carries the
+  // 32-bit ESP and the segment images RETURN-TO-VIRTUAL-8086-MODE restores, so
+  // a 16-bit gate cannot express the return context (SDM vol.3 17.3.3).
+  if (fl->vm && gate16) gp_fault(code_sel & ~3u);
   int newpl = !conf && tdpl < cpl() ? tdpl : cpl();
   int switched = newpl < cpl();
 
@@ -2087,7 +2116,7 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
       kpush16((uint16_t)old_ss);
       kpush16((uint16_t)old_esp);
     }
-    kpush16(fl->word | 2);
+    kpush16(eflags_img);
     kpush16((uint16_t)old_cs);
     kpush16((uint16_t)ret_eip);
     // Only a CPU-raised exception carries the vector's error code: a software
@@ -2105,10 +2134,23 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
       kpush32(old_ss);
       kpush32(old_esp);
     }
-    kpush32(fl->word | 2);
+    kpush32(eflags_img);
     kpush32(old_cs);
     kpush32(ret_eip);
     if (vec_has_ec(vec) && origin == kIntException) kpush32(ec);
+  }
+  // SDM vol.2 INT n, INTERRUPT-FROM-VIRTUAL-8086-MODE: the V86 segment
+  // registers were pushed on the frame above, and the handler now runs with
+  // GS/FS/DS/ES null. The V86 values are segment numbers, not selectors, and
+  // would fault on first use in protected mode; EMM386's exception
+  // dispatcher pushes DS on entry and restores it with a bare `pop ds`, so
+  // leaving the V86 value cached is a #GP(0x298) storm on a DOS boot.
+  if (fl->vm) {
+    seg_view z = {0, 0, 0, 0, 0};
+    seg_commit(gs_i, 0, &z);
+    seg_commit(fs_i, 0, &z);
+    seg_commit(ds_i, 0, &z);
+    seg_commit(es_i, 0, &z);
   }
   fl->tf = 0;
   fl->nt = 0;
@@ -2888,6 +2930,8 @@ static void MmxEmms(void) {
 static void SimdSrc(uint8_t out[16], int membytes, int xmmreg) {
   memset(out, 0, 16);
   if (d.is_mem) {
+    seg_use(d.mseg, d.moff, membytes, 0);
+    WatchData(d.mlin, membytes, 0);
     for (int i = 0; i < membytes; i += 8) {
       int n = membytes - i > 8 ? 8 : membytes - i;
       uint64_t v = rd64(d.mlin + (uint64_t)i);
@@ -3158,6 +3202,8 @@ static void SimdMov(uint8_t op2) {
   uint8_t tmp[16];
   if (!store) {
     if (d.is_mem) {
+      seg_use(d.mseg, d.moff, bytes, 0);
+      WatchData(d.mlin, bytes, 0);
       memset(tmp, 0, 16);
       for (int i = 0; i < bytes; i += 8) {
         int n = bytes - i > 8 ? 8 : bytes - i;
@@ -3174,6 +3220,8 @@ static void SimdMov(uint8_t op2) {
   } else {
     memcpy(tmp, s->fpu.xmm[d.reg], 16);
     if (d.is_mem) {
+      seg_use(d.mseg, d.moff, bytes, 1);
+      WatchData(d.mlin, bytes, 1);
       for (int i = 0; i < bytes; i += 8) {
         int n = bytes - i > 8 ? 8 : bytes - i;
         uint64_t v = 0;
@@ -3227,10 +3275,14 @@ static void SimdMovHalf(uint8_t op2) {
   int store = op2 == 0x13 || op2 == 0x17;
   if (store && !d.is_mem) ud();
   if (store) {
+    seg_use(d.mseg, d.moff, 8, 1);
+    WatchData(d.mlin, 8, 1);
     uint64_t v;
     memcpy(&v, s->fpu.xmm[d.reg] + (high ? 8 : 0), 8);
     wr64(d.mlin, v);
   } else if (d.is_mem) {
+    seg_use(d.mseg, d.moff, 8, 0);
+    WatchData(d.mlin, 8, 0);
     uint64_t v = 0;
     for (int i = 0; i < 8; i += 8) v = rd64(d.mlin);
     memcpy(s->fpu.xmm[d.reg] + (high ? 8 : 0), &v, 8);
@@ -3246,10 +3298,13 @@ static void SimdMovQ(uint8_t op2) {
     if (d.p66) {      // MOVQ m64, xmm
       uint64_t v;
       memcpy(&v, s->fpu.xmm[d.reg], 8);
-      if (d.is_mem)
+      if (d.is_mem) {
+        seg_use(d.mseg, d.moff, 8, 1);
+        WatchData(d.mlin, 8, 1);
         wr64(d.mlin, v);
-      else
+      } else {
         memcpy(s->fpu.xmm[d.rm], &v, 8);
+      }
     } else if (d.pf3) {  // MOVQ2DQ xmm, mm
       uint64_t v = MmxGet(d.rm);
       memset(s->fpu.xmm[d.reg], 0, 16);
@@ -3267,6 +3322,8 @@ static void SimdMovQ(uint8_t op2) {
   if (op2 == 0x6e) {
     uint32_t v;
     if (d.is_mem) {
+      seg_use(d.mseg, d.moff, 4, 0);
+      WatchData(d.mlin, 4, 0);
       v = (uint32_t)rd32(d.mlin);
     } else {
       v = s->r[d.rm].e;
@@ -3282,7 +3339,13 @@ static void SimdMovQ(uint8_t op2) {
   if (op2 == 0x7e) {
     if (d.pf3) {  // MOVQ xmm, r/m64 (low half, high zero)
       uint64_t v = 0;
-      v = d.is_mem ? rd64(d.mlin) : s->r[d.rm].q;
+      if (d.is_mem) {
+        seg_use(d.mseg, d.moff, 8, 0);
+        WatchData(d.mlin, 8, 0);
+        v = rd64(d.mlin);
+      } else {
+        v = s->r[d.rm].q;
+      }
       memset(s->fpu.xmm[d.reg], 0, 16);
       memcpy(s->fpu.xmm[d.reg], &v, 8);
       return;
@@ -3290,16 +3353,22 @@ static void SimdMovQ(uint8_t op2) {
     uint32_t v;
     memcpy(&v, s->fpu.xmm[d.reg], 4);
     if (xmm) {  // 66 0F 7E MOVD r/m32, xmm
-      if (d.is_mem)
+      if (d.is_mem) {
+        seg_use(d.mseg, d.moff, 4, 1);
+        WatchData(d.mlin, 4, 1);
         wr32(d.mlin, v);
-      else
+      } else {
         s->r[d.rm].e = v;
+      }
     } else {  // 0F 7E MOVD r/m32, mm
       uint32_t mv = (uint32_t)MmxGet(d.reg);
-      if (d.is_mem)
+      if (d.is_mem) {
+        seg_use(d.mseg, d.moff, 4, 1);
+        WatchData(d.mlin, 4, 1);
         wr32(d.mlin, mv);
-      else
+      } else {
         s->r[d.rm].e = mv;
+      }
     }
     return;
   }
@@ -3310,6 +3379,8 @@ static void SimdMovQ(uint8_t op2) {
   if (!store) {
     uint8_t tmp[16];
     if (d.is_mem) {
+      seg_use(d.mseg, d.moff, bytes, 0);
+      WatchData(d.mlin, bytes, 0);
       memset(tmp, 0, 16);
       for (int i = 0; i < bytes; i += 8) {
         int n = bytes - i > 8 ? 8 : bytes - i;
@@ -3334,6 +3405,8 @@ static void SimdMovQ(uint8_t op2) {
       memcpy(tmp, &v, 8);
     }
     if (d.is_mem) {
+      seg_use(d.mseg, d.moff, bytes, 1);
+      WatchData(d.mlin, bytes, 1);
       for (int i = 0; i < bytes; i += 8) {
         int n = bytes - i > 8 ? 8 : bytes - i;
         uint64_t v = 0;
@@ -3365,10 +3438,13 @@ static void SimdMovmsk(void) {
 static void SimdShuf(uint8_t imm) {
   if (!d.p66 && !d.pf2 && !d.pf3) {  // PSHUFW mm, mm/m64, imm8
     uint64_t v = 0, r = 0;
-    if (d.is_mem)
+    if (d.is_mem) {
+      seg_use(d.mseg, d.moff, 8, 0);
+      WatchData(d.mlin, 8, 0);
       v = rd64(d.mlin);
-    else
+    } else {
       v = MmxGet(d.rm);
+    }
     for (int i = 0; i < 4; i++) {
       uint64_t e = (v >> (((imm >> (2 * i)) & 3) * 16)) & 0xffff;
       r |= e << (16 * i);
@@ -3420,10 +3496,13 @@ static void SimdInsExtrWord(uint8_t op2, uint8_t imm) {
   int xmm = d.p66;
   if (op2 == 0xc4) {
     uint16_t v;
-    if (d.is_mem)
+    if (d.is_mem) {
+      seg_use(d.mseg, d.moff, 2, 0);
+      WatchData(d.mlin, 2, 0);
       v = rd16(d.mlin);
-    else
+    } else {
       v = (uint16_t)s->r[d.rm].x;
+    }
     if (xmm) {
       SimdSetElem(s->fpu.xmm[d.reg], 2, sel, v);
     } else {
@@ -3498,10 +3577,13 @@ static void SimdInteger(uint8_t op2) {
     s->r[d.reg].e = m;
     return;
   }
-  if (op2 == 0xe7) {  // MOVNTQ / MOVNTDQ
+  if (op2 == 0xe7) {  // MOVNTQ / MOVNTDQ, memory only
     modrm();
     fr->rec.mnemonic = "movnt";
+    if (!d.is_mem) ud();
     int bytes = d.p66 ? 16 : 8;
+    seg_use(d.mseg, d.moff, bytes, 1);
+    WatchData(d.mlin, bytes, 1);
     uint8_t b[16];
     if (d.p66) {
       memcpy(b, s->fpu.xmm[d.reg], 16);
@@ -3534,8 +3616,14 @@ static void SimdInteger(uint8_t op2) {
       memcpy(mask, &b, 8);
     }
     uint32_t dioff = d.a32 ? s->r[edi_i].e : s->r[edi_i].x;
-    for (int i = 0; i < n; i++)
-      if (mask[i] & 0x80) wr8(s->base[es_i] + dioff + (uint32_t)i, src[i]);
+    for (int i = 0; i < n; i++) {
+      if (!(mask[i] & 0x80)) continue;
+      // Only the selected bytes are stored, so only they are checked: an
+      // unselected byte past the ES limit is not accessed (SDM MASKMOVQ).
+      seg_use(es_i, dioff + (uint32_t)i, 1, 1);
+      WatchData(s->base[es_i] + dioff + (uint32_t)i, 1, 1);
+      wr8(s->base[es_i] + dioff + (uint32_t)i, src[i]);
+    }
     fr->rec.mnemonic = "maskmov";
     return;
   }
@@ -3799,7 +3887,14 @@ static void SimdConvert(uint8_t op2) {
   memcpy(r, a, 16);
   if (op2 == 0x2a) {  // CVTSI2SS/SD, CVTPI2PS/PD
     if (ss || sd) {
-      uint32_t iv = d.is_mem ? (uint32_t)rd32(d.mlin) : s->r[d.rm].e;
+      uint32_t iv;
+      if (d.is_mem) {
+        seg_use(d.mseg, d.moff, 4, 0);
+        WatchData(d.mlin, 4, 0);
+        iv = (uint32_t)rd32(d.mlin);
+      } else {
+        iv = s->r[d.rm].e;
+      }
       fpu_sse_begin(&s->fpu);
       if (ss) {
         float32_t f = i32_to_f32((int32_t)iv);
@@ -3811,7 +3906,14 @@ static void SimdConvert(uint8_t op2) {
       memcpy(s->fpu.xmm[d.reg], r, 16);
       SimdCheckSse();
     } else {
-      uint64_t m = d.is_mem ? rd64(d.mlin) : MmxGet(d.rm);
+      uint64_t m;
+      if (d.is_mem) {
+        seg_use(d.mseg, d.moff, 8, 0);
+        WatchData(d.mlin, 8, 0);
+        m = rd64(d.mlin);
+      } else {
+        m = MmxGet(d.rm);
+      }
       int pd = d.p66;
       fpu_sse_begin(&s->fpu);
       for (int i = 0; i < 2; i++) {
@@ -4017,6 +4119,8 @@ static void SimdOp(uint8_t op2) {
       modrm();
       fr->rec.mnemonic = "movntps";
       if (!d.is_mem) ud();
+      seg_use(d.mseg, d.moff, 16, 1);
+      WatchData(d.mlin, 16, 1);
       for (int i = 0; i < 16; i += 8) {
         uint64_t v;
         memcpy(&v, s->fpu.xmm[d.reg] + i, 8);
@@ -4060,13 +4164,15 @@ static void SimdOp(uint8_t op2) {
       SimdCmp(imm);
       break;
     }
-    case 0xc3: {  // MOVNTI m32/m64, r32
+    case 0xc3: {  // MOVNTI m32, r32 (SDM vol.2): a 32-bit store to memory is
+                  // the only form; a 16-bit operand size and the register
+                  // encoding are #UD (QEMU checks dflag == 2 the same way).
       modrm();
       fr->rec.mnemonic = "movnti";
-      if (d.w32)
-        wr32(d.mlin, s->r[d.reg].e);
-      else
-        wr64(d.mlin, s->r[d.reg].q);
+      if (!d.is_mem || !d.w32) ud();
+      seg_use(d.mseg, d.moff, 4, 1);
+      WatchData(d.mlin, 4, 1);
+      wr32(d.mlin, s->r[d.reg].e);
       break;
     }
     case 0xc4: case 0xc5: {
@@ -4229,6 +4335,10 @@ static void run_op2(uint8_t op2) {
           fr->rec.mnemonic = d.reg == 0 ? "sgdt" : "sidt";
           uint64_t base = d.reg == 0 ? s->gdtr : s->idtr;
           uint16_t limit = d.reg == 0 ? s->gdtr_limit : s->idtr_limit;
+          // The pseudo-descriptor is one memory operand and owes its segment
+          // its limit check like any other access (SDM vol.3 5.3).
+          seg_use(d.mseg, d.moff, 6, 1);
+          WatchData(d.mlin, 6, 1);
           wr16(d.mlin, limit);
           wr32(d.mlin + 2, (uint32_t)base & (d.w32 ? 0xffffffffu : kDescBase16Mask));
           break;
@@ -4237,6 +4347,8 @@ static void run_op2(uint8_t op2) {
         case 3: {  // lgdt/lidt (privileged: SDM vol.2)
           fr->rec.mnemonic = d.reg == 2 ? "lgdt" : "lidt";
           if (cpl() != 0) gp_fault(0);
+          seg_use(d.mseg, d.moff, 6, 0);
+          WatchData(d.mlin, 6, 0);
           // A 16-bit operand size loads only the low 24 base bits (SDM
           // LGDT/LIDT Operation; v86 lgdt/lidt mask 0xffffff). SeaBIOS's
           // int 15h AH=87h relies on it: the pseudo-descriptor is the first
@@ -4259,10 +4371,15 @@ static void run_op2(uint8_t op2) {
         case 4:  // smsw: CR0 at the rm width
           fr->rec.mnemonic = "smsw";
           if (d.is_mem) {
-            if (d.w32)
+            if (d.w32) {
+              seg_use(d.mseg, d.moff, 4, 1);
+              WatchData(d.mlin, 4, 1);
               wr32(d.mlin, s->cr0);
-            else
+            } else {
+              seg_use(d.mseg, d.moff, 2, 1);
+              WatchData(d.mlin, 2, 1);
               wr16(d.mlin, (uint16_t)s->cr0);
+            }
           } else {
             if (d.w32)
               set_rm32(s->cr0);
@@ -4558,6 +4675,8 @@ static void run_op2(uint8_t op2) {
           fr->rec.mnemonic = "fxsave";
           if (!d.is_mem) ud();
           if (d.mlin & 15) gp_fault(0);
+          seg_use(d.mseg, d.moff, 512, 1);
+          WatchData(d.mlin, 512, 1);
           uint8_t buf[512];
           fpu_fxsave(&s->fpu, buf);
           wr_bytes(d.mlin, buf, 512);
@@ -4567,6 +4686,8 @@ static void run_op2(uint8_t op2) {
           fr->rec.mnemonic = "fxrstor";
           if (!d.is_mem) ud();
           if (d.mlin & 15) gp_fault(0);
+          seg_use(d.mseg, d.moff, 512, 0);
+          WatchData(d.mlin, 512, 0);
           uint8_t buf[512];
           rd_bytes(d.mlin, buf, 512);
           uint32_t mx = (uint32_t)buf[24] | ((uint32_t)buf[25] << 8) | ((uint32_t)buf[26] << 16) |
@@ -4579,6 +4700,8 @@ static void run_op2(uint8_t op2) {
         case 2: {  // ldmxcsr
           fr->rec.mnemonic = "ldmxcsr";
           if (!d.is_mem) ud();
+          seg_use(d.mseg, d.moff, 4, 0);
+          WatchData(d.mlin, 4, 0);
           uint32_t mx = (uint32_t)rd32(d.mlin);
           if (mx & ~s->fpu.mxcsr_mask) gp_fault(0);
           s->fpu.mxcsr = mx;
@@ -4587,6 +4710,8 @@ static void run_op2(uint8_t op2) {
         case 3:  // stmxcsr
           fr->rec.mnemonic = "stmxcsr";
           if (!d.is_mem) ud();
+          seg_use(d.mseg, d.moff, 4, 1);
+          WatchData(d.mlin, 4, 1);
           wr32(d.mlin, s->fpu.mxcsr);
           break;
         case 7:
@@ -4696,12 +4821,20 @@ static void run_op2(uint8_t op2) {
       uint32_t v, bit, pos;
       if (d.w32) {
         bit = reg32();
-        if (d.is_mem) d.mlin += 4 * (bit >> 5);
+        // The bit string walks the operand base on by whole operands; the
+        // segment check must see the walked offset, not the encoding's.
+        if (d.is_mem) {
+          d.moff += 4 * (bit >> 5);
+          d.mlin += 4 * (bit >> 5);
+        }
         v = RM32();
         pos = bit & 31;
       } else {
         bit = reg16();
-        if (d.is_mem) d.mlin += 2 * (bit >> 4);
+        if (d.is_mem) {
+          d.moff += 2 * (bit >> 4);
+          d.mlin += 2 * (bit >> 4);
+        }
         v = RM16();
         pos = bit & 15;
       }
@@ -4944,12 +5077,14 @@ static void run_op2(uint8_t op2) {
       modrm();
       if (d.reg != 1 || !d.is_mem) ud();
       seg_use(d.mseg, d.moff, 8, 0);
+      WatchData(d.mlin, 8, 0);
       uint64_t old = (uint64_t)rd32(d.mlin) | ((uint64_t)rd32(d.mlin + 4) << 32);
       uint64_t acc = ((uint64_t)edx << 32) | eax;
       if (old == acc) {
         fl->zf = 1;
         uint64_t nv = ((uint64_t)ecx << 32) | ebx;
         seg_use(d.mseg, d.moff, 8, 1);
+        WatchData(d.mlin, 8, 1);
         wr32(d.mlin, (uint32_t)nv);
         wr32(d.mlin + 4, (uint32_t)(nv >> 32));
       } else {
@@ -5024,7 +5159,16 @@ static void X87MemPtr(void) {
   s->fpu.fds = s->sreg[d.mseg];
 }
 
+// The x87 escape addresses memory through the linear address directly, so
+// each form states its footprint here and earns the segment-limit check and
+// watchpoint report every other memory operand performs (SDM vol.3 5.3).
+static void X87Access(int size, int write) {
+  seg_use(d.mseg, d.moff, size, write);
+  WatchData(d.mlin, size, write);
+}
+
 static extFloat80_t RdF80(void) {
+  X87Access(10, 0);
   extFloat80_t v;
   v.signif = rd64(d.mlin);
   v.signExp = rd16(d.mlin + 8);
@@ -5032,6 +5176,7 @@ static extFloat80_t RdF80(void) {
 }
 
 static void WrF80(extFloat80_t v) {
+  X87Access(10, 1);
   wr64(d.mlin, v.signif);
   wr16(d.mlin + 8, v.signExp);
 }
@@ -5060,24 +5205,28 @@ static void X87ClearExceptions(void) {
 }
 
 static void X87LoadEnv(int wide) {
+  X87Access(wide ? 28 : 14, 0);
   uint8_t buf[28];
   rd_bytes(d.mlin, buf, wide ? 28 : 14);
   fpu_load_env(&s->fpu, buf, wide);
 }
 
 static void X87StoreEnv(int wide) {
+  X87Access(wide ? 28 : 14, 1);
   uint8_t buf[28];
   fpu_store_env(&s->fpu, buf, wide);
   wr_bytes(d.mlin, buf, wide ? 28 : 14);
 }
 
 static void X87LoadState(int wide) {
+  X87Access(wide ? 108 : 94, 0);
   uint8_t buf[108];
   rd_bytes(d.mlin, buf, wide ? 108 : 94);
   fpu_load_state(&s->fpu, buf, wide);
 }
 
 static void X87StoreState(int wide) {
+  X87Access(wide ? 108 : 94, 1);
   uint8_t buf[108];
   fpu_store_state(&s->fpu, buf, wide);
   wr_bytes(d.mlin, buf, wide ? 108 : 94);
@@ -5122,6 +5271,7 @@ static void X87MemForm(uint8_t op) {
   switch (op) {
     case 0xd8: {  // m32fp arithmetic
       fr->rec.mnemonic = kX87Arith[d.reg];
+      X87Access(4, 0);
       extFloat80_t b = fpu_load_f32(&s->fpu, (uint32_t)rd32(d.mlin));
       X87IntegerMemArith(d.reg, b, d.reg == 3);
       break;
@@ -5130,14 +5280,17 @@ static void X87MemForm(uint8_t op) {
       switch (d.reg) {
         case 0:
           fr->rec.mnemonic = "fld";
+          X87Access(4, 0);
           fpu_push(&s->fpu, fpu_load_f32(&s->fpu, (uint32_t)rd32(d.mlin)));
           break;
         case 2:
           fr->rec.mnemonic = "fst";
+          X87Access(4, 1);
           wr32(d.mlin, fpu_store_f32(&s->fpu, fpu_get(&s->fpu, 0)));
           break;
         case 3:
           fr->rec.mnemonic = "fstp";
+          X87Access(4, 1);
           wr32(d.mlin, fpu_store_f32(&s->fpu, fpu_get(&s->fpu, 0)));
           fpu_pop(&s->fpu);
           break;
@@ -5147,6 +5300,7 @@ static void X87MemForm(uint8_t op) {
           break;
         case 5:
           fr->rec.mnemonic = "fldcw";
+          X87Access(2, 0);
           s->fpu.cw = rd16(d.mlin);
           fpu_refresh(&s->fpu);
           break;
@@ -5156,6 +5310,7 @@ static void X87MemForm(uint8_t op) {
           break;
         case 7:
           fr->rec.mnemonic = "fnstcw";
+          X87Access(2, 1);
           wr16(d.mlin, s->fpu.cw);
           break;
         default:
@@ -5164,6 +5319,7 @@ static void X87MemForm(uint8_t op) {
       break;
     case 0xda: {  // m32int arithmetic
       fr->rec.mnemonic = kX87Arith[d.reg];
+      X87Access(4, 0);
       extFloat80_t b = fpu_load_i32(&s->fpu, (int32_t)rd32(d.mlin));
       X87IntegerMemArith(d.reg, b, d.reg == 3);
       break;
@@ -5172,19 +5328,23 @@ static void X87MemForm(uint8_t op) {
       switch (d.reg) {
         case 0:
           fr->rec.mnemonic = "fild";
+          X87Access(4, 0);
           fpu_push(&s->fpu, fpu_load_i32(&s->fpu, (int32_t)rd32(d.mlin)));
           break;
         case 1:
           fr->rec.mnemonic = "fisttp";
+          X87Access(4, 1);
           wr32(d.mlin, (uint32_t)fpu_store_i32_trunc(&s->fpu, fpu_get(&s->fpu, 0)));
           fpu_pop(&s->fpu);
           break;
         case 2:
           fr->rec.mnemonic = "fist";
+          X87Access(4, 1);
           wr32(d.mlin, (uint32_t)fpu_store_i32(&s->fpu, fpu_get(&s->fpu, 0)));
           break;
         case 3:
           fr->rec.mnemonic = "fistp";
+          X87Access(4, 1);
           wr32(d.mlin, (uint32_t)fpu_store_i32(&s->fpu, fpu_get(&s->fpu, 0)));
           fpu_pop(&s->fpu);
           break;
@@ -5203,6 +5363,7 @@ static void X87MemForm(uint8_t op) {
       break;
     case 0xdc: {  // m64fp arithmetic
       fr->rec.mnemonic = kX87Arith[d.reg];
+      X87Access(8, 0);
       extFloat80_t b = fpu_load_f64(&s->fpu, rd64(d.mlin));
       X87IntegerMemArith(d.reg, b, d.reg == 3);
       break;
@@ -5211,19 +5372,23 @@ static void X87MemForm(uint8_t op) {
       switch (d.reg) {
         case 0:
           fr->rec.mnemonic = "fld";
+          X87Access(8, 0);
           fpu_push(&s->fpu, fpu_load_f64(&s->fpu, rd64(d.mlin)));
           break;
         case 1:
           fr->rec.mnemonic = "fisttp";
+          X87Access(8, 1);
           wr64(d.mlin, (uint64_t)fpu_store_i64_trunc(&s->fpu, fpu_get(&s->fpu, 0)));
           fpu_pop(&s->fpu);
           break;
         case 2:
           fr->rec.mnemonic = "fst";
+          X87Access(8, 1);
           wr64(d.mlin, fpu_store_f64(&s->fpu, fpu_get(&s->fpu, 0)));
           break;
         case 3:
           fr->rec.mnemonic = "fstp";
+          X87Access(8, 1);
           wr64(d.mlin, fpu_store_f64(&s->fpu, fpu_get(&s->fpu, 0)));
           fpu_pop(&s->fpu);
           break;
@@ -5237,6 +5402,7 @@ static void X87MemForm(uint8_t op) {
           break;
         case 7:
           fr->rec.mnemonic = "fnstsw";
+          X87Access(2, 1);
           wr16(d.mlin, s->fpu.sw);
           break;
         default:
@@ -5245,6 +5411,7 @@ static void X87MemForm(uint8_t op) {
       break;
     case 0xde: {  // m16int arithmetic
       fr->rec.mnemonic = kX87Arith[d.reg];
+      X87Access(2, 0);
       extFloat80_t b = fpu_load_i16(&s->fpu, (int16_t)rd16(d.mlin));
       X87IntegerMemArith(d.reg, b, d.reg == 3);
       break;
@@ -5253,24 +5420,29 @@ static void X87MemForm(uint8_t op) {
       switch (d.reg) {
         case 0:
           fr->rec.mnemonic = "fild";
+          X87Access(2, 0);
           fpu_push(&s->fpu, fpu_load_i16(&s->fpu, (int16_t)rd16(d.mlin)));
           break;
         case 1:
           fr->rec.mnemonic = "fisttp";
+          X87Access(2, 1);
           wr16(d.mlin, (uint16_t)fpu_store_i16_trunc(&s->fpu, fpu_get(&s->fpu, 0)));
           fpu_pop(&s->fpu);
           break;
         case 2:
           fr->rec.mnemonic = "fist";
+          X87Access(2, 1);
           wr16(d.mlin, (uint16_t)fpu_store_i16(&s->fpu, fpu_get(&s->fpu, 0)));
           break;
         case 3:
           fr->rec.mnemonic = "fistp";
+          X87Access(2, 1);
           wr16(d.mlin, (uint16_t)fpu_store_i16(&s->fpu, fpu_get(&s->fpu, 0)));
           fpu_pop(&s->fpu);
           break;
         case 4: {
           fr->rec.mnemonic = "fbld";
+          X87Access(10, 0);
           uint8_t bcd[10];
           rd_bytes(d.mlin, bcd, 10);
           fpu_push(&s->fpu, fpu_load_bcd(&s->fpu, bcd));
@@ -5278,10 +5450,12 @@ static void X87MemForm(uint8_t op) {
         }
         case 5:
           fr->rec.mnemonic = "fild";
+          X87Access(8, 0);
           fpu_push(&s->fpu, fpu_load_i64(&s->fpu, (int64_t)rd64(d.mlin)));
           break;
         case 6: {
           fr->rec.mnemonic = "fbstp";
+          X87Access(10, 1);
           uint8_t bcd[10];
           fpu_store_bcd(&s->fpu, fpu_get(&s->fpu, 0), bcd);
           wr_bytes(d.mlin, bcd, 10);
@@ -5290,6 +5464,7 @@ static void X87MemForm(uint8_t op) {
         }
         case 7:
           fr->rec.mnemonic = "fistp";
+          X87Access(8, 1);
           wr64(d.mlin, (uint64_t)fpu_store_i64(&s->fpu, fpu_get(&s->fpu, 0)));
           fpu_pop(&s->fpu);
           break;
@@ -6295,14 +6470,17 @@ void run_op(uint8_t op) {
     case 0x69: {  // imul r, rm, imm
       fr->rec.mnemonic = "imul";
       modrm();
+      // The immediate is instruction bytes and is fetched first; the r/m side
+      // goes through the shared accessors so its segment check and watchpoint
+      // hook apply like every other memory operand.
       if (d.w32) {
-        int64_t prod =
-            (int64_t)(int32_t)(d.is_mem ? rd32(d.mlin) : s->r[d.rm].e) * (int32_t)imm32();
+        int32_t imm = (int32_t)imm32();
+        int64_t prod = (int64_t)RM32() * imm;
         set_reg32((uint32_t)prod);
         flags_imul(prod, 4);
       } else {
-        int32_t prod =
-            (int32_t)(int16_t)(d.is_mem ? rd16(d.mlin) : s->r[d.rm].x) * (int16_t)imm16();
+        int16_t imm = (int16_t)imm16();
+        int32_t prod = (int32_t)(int16_t)RM16() * imm;
         set_reg16((uint16_t)prod);
         flags_imul(prod, 2);
       }
@@ -6316,11 +6494,13 @@ void run_op(uint8_t op) {
       fr->rec.mnemonic = "imul";
       modrm();
       if (d.w32) {
-        int64_t prod = (int64_t)(int32_t)(d.is_mem ? rd32(d.mlin) : s->r[d.rm].e) * (int8_t)imm8();
+        int8_t imm = (int8_t)imm8();
+        int64_t prod = (int64_t)RM32() * imm;
         set_reg32((uint32_t)prod);
         flags_imul(prod, 4);
       } else {
-        int32_t prod = (int32_t)(int16_t)(d.is_mem ? rd16(d.mlin) : s->r[d.rm].x) * (int8_t)imm8();
+        int8_t imm = (int8_t)imm8();
+        int32_t prod = (int32_t)(int16_t)RM16() * imm;
         set_reg16((uint16_t)prod);
         flags_imul(prod, 2);
       }
@@ -6433,10 +6613,14 @@ void run_op(uint8_t op) {
     case 0x8c: {
       fr->rec.mnemonic = "mov";
       modrm();
-      if (d.w32)
-        SET_RM32(s->sreg[d.reg]);
-      else
-        SET_RM16(s->sreg[d.reg]);
+      // MOV r/m16,Sreg (SDM vol.2): a MEMORY destination is always written as
+      // 16 bits whatever the operand size; only a 32-bit register destination
+      // takes the selector zero-extended. The reg field's 6/7 encodings are
+      // reserved and #UD (a 32-bit store into a 16-bit slot clobbered the
+      // field above it — EMM386's 32-bit monitor saves V86 segments with
+      // exactly this instruction form).
+      if (d.reg > gs_i) ud();
+      set_sys_sel(s->sreg[d.reg]);
       break;
     }             // mov rm16, sreg
     case 0x8d: {  // lea r, m
@@ -7027,6 +7211,9 @@ void run_op(uint8_t op) {
     }  // icebp
     case 0xf4: {  // hlt: sleeps until an unmasked external interrupt (SDM)
       fr->rec.mnemonic = "hlt";
+      // HLT is privileged: #GP(0) unless CPL = 0, which also covers VM86's
+      // CPL 3 (SDM vol.2 HLT; tiny386 HLT raises EX_GP the same way).
+      if (cpl() != 0) gp_fault(0);
       if (fl->if_ && cpu->int_ack) {
         cpu->wait = 1;
       } else {
@@ -7132,9 +7319,14 @@ void run_op(uint8_t op) {
         case 3: {  // call far m16:16/32
           fr->rec.mnemonic = "lcall";
           if (!d.is_mem) ud();
-          uint32_t t = d.w32 ? rd32(d.mlin) : rd16(d.mlin);
-          seg_use(d.mseg, d.moff + (d.w32 ? 4 : 2), 2, 0);
-          uint16_t sel = rd16(d.mlin + (d.w32 ? 4 : 2));
+          // Offset and selector are one memory operand: every byte of it lies
+          // inside the segment (SDM vol.3 5.3). Checking only the selector
+          // half lets a pointer that straddles the limit through.
+          int w = d.w32 ? 4 : 2;
+          seg_use(d.mseg, d.moff, w + 2, 0);
+          WatchData(d.mlin, w + 2, 0);
+          uint32_t t = w == 4 ? rd32(d.mlin) : rd16(d.mlin);
+          uint16_t sel = rd16(d.mlin + w);
           pm_far(sel, t, 1, (uint32_t)(fr->rec.pc + d.nxt));
           break;
         }
@@ -7145,9 +7337,11 @@ void run_op(uint8_t op) {
         case 5: {  // jmp far m16:16/32
           fr->rec.mnemonic = "ljmp";
           if (!d.is_mem) ud();
-          uint32_t t = d.w32 ? rd32(d.mlin) : rd16(d.mlin);
-          seg_use(d.mseg, d.moff + (d.w32 ? 4 : 2), 2, 0);
-          uint16_t sel = rd16(d.mlin + (d.w32 ? 4 : 2));
+          int w = d.w32 ? 4 : 2;
+          seg_use(d.mseg, d.moff, w + 2, 0);
+          WatchData(d.mlin, w + 2, 0);
+          uint32_t t = w == 4 ? rd32(d.mlin) : rd16(d.mlin);
+          uint16_t sel = rd16(d.mlin + w);
           pm_far(sel, t, 0, (uint32_t)(fr->rec.pc + d.nxt));
           break;
         }
@@ -7301,7 +7495,7 @@ void x86_init(CpuState* c) {
 
 void x86_dump_regs(const CpuState* c) {
   const x86_state* st = (const x86_state*)c->priv;
-  char buf[160];
+  char buf[224];
   static const char names[8][4] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
   for (int i = 0; i < 8; i += 4) {
     int n = snprintf(buf, sizeof(buf), "%s=%08x %s=%08x %s=%08x %s=%08x\n", names[i], st->r[i].e,
@@ -7311,9 +7505,10 @@ void x86_dump_regs(const CpuState* c) {
   }
   static const char snames[6][3] = {"es", "cs", "ss", "ds", "fs", "gs"};
   int n = snprintf(buf, sizeof(buf),
-                   "eip=%08x eflags=%08x cr0=%08x %s=%04x %s=%04x %s=%04x "
+                   "eip=%08x eflags=%08x cr0=%08x cr3=%08x cr4=%08x %s=%04x %s=%04x %s=%04x "
                    "%s=%04x %s=%04x %s=%04x\n",
-                   (unsigned)c->pc, st->fl.word, st->cr0, snames[0], st->sreg[0], snames[1],
+                   (unsigned)c->pc, st->fl.word, st->cr0, (unsigned)st->cr3, (unsigned)st->cr4,
+                   snames[0], st->sreg[0], snames[1],
                    st->sreg[1], snames[2], st->sreg[2], snames[3], st->sreg[3], snames[4],
                    st->sreg[4], snames[5], st->sreg[5]);
   HostWriteErr(buf, (size_t)n);
