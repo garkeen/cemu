@@ -41,6 +41,7 @@ typedef struct PitChannel {
   uint8_t gate;
   uint64_t count_load_time;  // HostTimerNow() us at last (re)load; 0 = unarmed
   uint64_t last_irq_count;   // tick count at last edge
+  int out_level;             // last driven OUT level; the PIC sees the rising edges
   int armed;                 // set after the first load; later loads anchor now
   int irq;                   // -1 if none (channels 1/2 in the PC)
 } PitChannel;
@@ -98,7 +99,27 @@ static int PitGetOut(PitChannel* s) {
   }
 }
 
-static void PitLoadCount(PitChannel* s, int val) {
+// Drive the IRQ line to the current OUT level. A rising edge is the tick the
+// PIC latches (edge-triggered): QEMU's pit_irq_timer_update does exactly this
+// with qemu_set_irq(pit_get_out()). Mode 3's OUT is high as soon as the count
+// loads, so the first tick lands at the load, not one period later -- and the
+// following rising edges stay at full-count boundaries.
+static void PitRaiseIfRising(PitDevice* pit, PitChannel* s) {
+  int o = PitGetOut(s);
+  if (o == s->out_level) return;
+  s->out_level = o;
+  if (!o) return;
+  if (s->irq != -1 && pit->set_irq) {
+    pit->set_irq(pit->irq_ctx, s->irq, 1);
+    pit->set_irq(pit->irq_ctx, s->irq, 0);
+  }
+  if (s->mode == 3) {
+    uint64_t d = PitElapsed(s);
+    s->last_irq_count = (d / s->count) * s->count;
+  }
+}
+
+static void PitLoadCount(PitDevice* pit, PitChannel* s, int val) {
   if (val == 0) val = 0x10000;
   // 0 = unarmed: the anchor is armed on the first Poll after this load so
   // that machine construction / image loading wall time is not counted as
@@ -107,6 +128,7 @@ static void PitLoadCount(PitChannel* s, int val) {
   s->last_irq_count = 0;
   s->count = (uint32_t)val;
   s->armed = 1;
+  if (s->mode == 3) PitRaiseIfRising(pit, s);
 }
 
 static void PitLatchCount(PitChannel* s) {
@@ -150,17 +172,17 @@ static void PitIoWrite(PitDevice* pit, uint16_t addr, uint8_t val) {
   PitChannel* s = &pit->channels[addr];
   switch (s->write_state) {
     case kRwLsb:
-      PitLoadCount(s, val);
+      PitLoadCount(pit, s, val);
       break;
     case kRwMsb:
-      PitLoadCount(s, val << 8);
+      PitLoadCount(pit, s, val << 8);
       break;
     case kRwWord0:
       s->write_latch = val;
       s->write_state = kRwWord1;
       break;
     case kRwWord1:
-      PitLoadCount(s, s->write_latch | (val << 8));
+      PitLoadCount(pit, s, s->write_latch | (val << 8));
       s->write_state = kRwWord0;
       break;
   }
@@ -210,7 +232,8 @@ static void PitReset(PitDevice* pit) {
     s->mode = 3;
     s->gate = (i != 2);
     s->irq = -1;
-    PitLoadCount(s, 0);
+    s->out_level = 0;
+    PitLoadCount(pit, s, 0);
   }
 }
 
@@ -218,24 +241,26 @@ void PitPoll(PitDevice* pit) {
   // Only channel 0 carries an IRQ in the standard PC wiring.
   PitChannel* s = &pit->channels[0];
   if (s->irq == -1) return;
+  if (s->mode == 3) {
+    // Square wave: the line level itself carries the edges (high right after
+    // the load, low after the half period, high again at each full count).
+    PitRaiseIfRising(pit, s);
+    return;
+  }
   uint64_t d = PitElapsed(s);
   switch (s->mode) {
-    case 2:
-    case 3: {
-      // QEMU: assert an edge whenever the period boundary is crossed since
-      // the last delivery. last_irq_count is in the same tick domain as d.
-      // Detect wrap of (d - last_irq_count) past 0x80000000 of uint32 ticks.
-      uint32_t delta = (uint32_t)(d - s->last_irq_count);
-      // QEMU uses (s->count - d + last_irq_count) wrap test; we mirror it:
+    case 2: {
+      // Rate generator: OUT is a one-clock pulse at each terminal count, too
+      // narrow to sample, so assert the edge when the boundary is crossed.
+      // last_irq_count is in the same tick domain as d.
       if ((int32_t)(s->last_irq_count + s->count - (uint32_t)d) < 0) {
         if (pit->set_irq) {
           pit->set_irq(pit->irq_ctx, s->irq, 1);
           pit->set_irq(pit->irq_ctx, s->irq, 0);
         }
         s->last_irq_count += s->count;
-        if (HostTimerNow() - s->count_load_time > (1ULL << 31)) PitLoadCount(s, s->count);
+        if (HostTimerNow() - s->count_load_time > (1ULL << 31)) PitLoadCount(pit, s, s->count);
       }
-      (void)delta;
       break;
     }
     default:
