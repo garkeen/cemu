@@ -15,17 +15,20 @@
 #include "exec.h"  // last: it defines the short register macros x/f/eax/...
 #include "util/log.h"
 
-// Consumes the prefix stream then dispatches the opcode. Prefixes flip
-// w32/a32, pick a segment override and a rep mode; LOCK is a single-hart
-// no-op. The first non-prefix byte is the opcode (d.nxt backs up over it).
+// Consumes the prefix stream then dispatches the opcode. 66/67 select the
+// opposite of the code segment's default size; a prefix is idempotent, so a
+// repeated one has the same effect as a single occurrence (SDM vol.2 2.1.1).
+// The segment and rep prefixes set their mode; LOCK is a single-hart no-op.
+// The first non-prefix byte is the opcode (d.nxt already counts it).
 static void do_step(void) {
+  int dflt = (s->cr0 & 1) && s->dbit[cs_i];
   for (;;) {
     uint8_t b = fetch8();
     if (b == 0x66) {
-      d.w32 = !d.w32;
+      d.w32 = !dflt;
       d.p66 = 1;  // also the mandatory SSE2 prefix
     } else if (b == 0x67)
-      d.a32 = !d.a32;
+      d.a32 = !dflt;
     else if (b == 0x26)
       d.seg = es_i;
     else if (b == 0x2e)
@@ -103,6 +106,7 @@ void x86_step(CpuState* c) {
   g.op2 = 0;
   g.rep = 0;
   g.nxt = 0;
+  g.eip_set = 0;
   g.p66 = g.pf2 = g.pf3 = 0;
   // The watchpoint report the stub reads after the step (cpu/step.h): per step,
   // so a hit reported once cannot be reported again.
@@ -244,10 +248,11 @@ void x86_step(CpuState* c) {
   int tf0 = fl->tf;
   do_step();
   // The one commit. d.nxt counts consumed bytes from the instruction start;
-  // relative jumps rewrote it relatively, absolute cases set eip themselves.
-  // EIP is 32 bits — the sum wraps at 2^32 (a negative rel32 rides on the
-  // wrap); 16-bit code then wraps the instruction pointer at 64K.
-  if (eip == fr->rec.pc) cpu->pc = (uint32_t)(fr->rec.pc + d.nxt);
+  // relative jumps rewrote it, and an explicit target (SetEip) is kept even
+  // when it equals the start. EIP is 32 bits — the sum wraps at 2^32 (a
+  // negative rel32 rides on the wrap); 16-bit code then wraps the instruction
+  // pointer at 64K.
+  if (!d.eip_set) cpu->pc = (uint32_t)(fr->rec.pc + d.nxt);
   // In a 16-bit code segment the instruction pointer wraps at 64K (SDM vol.1
   // 3.7.1). The test reads the segment the CPU is in *after* the instruction,
   // not the one it entered with: a far jump that lands in a 32-bit segment

@@ -405,6 +405,14 @@ void flags_imul(int64_t prod, int size) {
 // the `d` spelling live in exec.h (step.c shares them).
 dec g;
 
+// A control transfer sets its target explicitly. The commit cannot detect
+// this by comparing eip with the instruction's start: a transfer to that same
+// address is indistinguishable from an instruction that named no target.
+static void SetEip(uint32_t v) {
+  eip = v;
+  d.eip_set = 1;
+}
+
 // The instruction stream. fetch8 also records raw bytes for the trace.
 uint8_t fetch8(void) {
   uint32_t off = (uint32_t)(eip + d.nxt);
@@ -1627,7 +1635,7 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
 
   s->cr0 |= 0x8;  // CR0.TS: the FPU state is per-task (SDM 7.2.1)
   if (has_ec) kpush32(ec);  // an exception's error code lands on the new stack
-  eip = tss16 ? krd16(v.base + 0x0e) : krd32(v.base + 0x20);
+  SetEip(tss16 ? krd16(v.base + 0x0e) : krd32(v.base + 0x20));
 }
 
 // The registers a BIOS/DOS service reads as its arguments, handed to the hub in
@@ -1683,7 +1691,7 @@ static void pm_iret(void) {
     }
     esp = s->dbit[ss_i] ? esp + (uint32_t)w * 3
                         : (esp & 0xffff0000u) | (uint16_t)(esp + (uint32_t)w * 3);
-    eip = new_eip;
+    SetEip(new_eip);
     return;
   }
 
@@ -1727,7 +1735,6 @@ static void pm_iret(void) {
     fl->word = flv | 2;  // VM=1: seg_synth below caches DPL 3 from it
     seg_view cv;
     seg_synth(sel, &cv);
-    if (new_eip > cv.limit) gp_fault(0);
     seg_commit(cs_i, sel, &cv);
     seg_view sv;
     seg_synth(new_ss, &sv);
@@ -1741,7 +1748,9 @@ static void pm_iret(void) {
     seg_synth(new_gs, &sv);
     seg_commit(gs_i, new_gs, &sv);
     esp = new_esp;
-    eip = new_eip;
+    // V86 fetches with a 16-bit IP; the image's upper bits are not part of
+    // the next address (SDM vol.2 IRET, vol.1 3.7.1).
+    SetEip(new_eip & 0xffffu);
     return;
   }
 
@@ -1780,7 +1789,7 @@ static void pm_iret(void) {
     esp = s->dbit[ss_i] ? esp + (uint32_t)w * 3
                         : (esp & 0xffff0000u) | (uint16_t)(esp + (uint32_t)w * 3);
   }
-  eip = new_eip;
+  SetEip(new_eip);
   // The answer half, paired with the gatecall row that shares this caller's
   // CS:IP (debug.h DebugGateCall). Everything has committed, so no fault can
   // follow and leave the row describing a return that never happened.
@@ -1873,7 +1882,7 @@ static void call_gate(uint16_t sel, uint64_t desc, int is_call, uint32_t ret_eip
   }
   if (conf) cv.ar = (uint8_t)((cv.ar & ~0x60u) | (newpl << 5));
   seg_commit(cs_i, (uint16_t)((code_sel & ~3u) | newpl), &cv);
-  eip = gate16 ? (off & 0xffff) : off;
+  SetEip(gate16 ? (off & 0xffff) : off);
 }
 
 // The far CALL/JMP target (SDM vol.2 CALL/JMP far Operation): protected mode
@@ -1891,7 +1900,7 @@ static void pm_far(uint16_t sel, uint32_t off, int is_call, uint32_t ret_eip) {
       push_w(ret_cs);
       push_w(ret_eip);
     }
-    eip = off;
+    SetEip(off);
     return;
   }
   if ((sel & 0xfffc) == 0) gp_fault(0);
@@ -1925,7 +1934,7 @@ static void pm_far(uint16_t sel, uint32_t off, int is_call, uint32_t ret_eip) {
     push_w(ret_cs);
     push_w(ret_eip);
   }
-  eip = off;
+  SetEip(off);
 }
 
 // Protected-mode far RET (SDM vol.2 RET far Operation): a same-privilege
@@ -1963,7 +1972,7 @@ static void pm_ret(uint32_t n) {
     seg_commit(ss_i, new_ss, &sv);
     esp += n;  // release the parameters from the caller's stack
   }
-  eip = new_eip;
+  SetEip(new_eip);
 }
 
 // SDM vol.3 table 6-1: #DE/#BR/#UD/#NM/#TS/#NP/#SS/#GP/#PF/#MF/#AC/#XM/
@@ -2019,7 +2028,7 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
     seg_view v;
     seg_synth((uint16_t)seg, &v);
     seg_commit(cs_i, (uint16_t)seg, &v);
-    eip = off;
+    SetEip(off);
     d.delivered = 1;  // the TF trap postpones to the handler's first insn
     return;
   }
@@ -2159,7 +2168,7 @@ void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
   // TF|VM|RF|NT here.
   fl->vm = 0;
   if (gt == 6 || gt == 0xe) fl->if_ = 0;  // interrupt gates clear IF
-  eip = gate16 ? (off & 0xffff) : off;
+  SetEip(gate16 ? (off & 0xffff) : off);
   d.delivered = 1;  // the TF trap postpones to the handler's first insn
 }
 
@@ -4556,7 +4565,7 @@ static void run_op2(uint8_t op2) {
       s->ar[ss_i] = 0x93;
       s->dbit[ss_i] = 1;
       s->r[esp_i].e = s->sysenter_esp;
-      eip = s->sysenter_eip;
+      SetEip(s->sysenter_eip);
       fl->word &= ~(0x100u | 0x10000u | 0x20000u);  // TF, RF, VM
       fl->if_ = 0;
       break;
@@ -4576,7 +4585,7 @@ static void run_op2(uint8_t op2) {
       s->limit[ss_i] = 0xffffffff;
       s->ar[ss_i] = 0xf3;
       s->dbit[ss_i] = 1;
-      eip = edx;
+      SetEip(edx);
       s->r[esp_i].e = ecx;
       break;
     }
@@ -6890,7 +6899,7 @@ void run_op(uint8_t op) {
     case 0xc2: {  // ret imm16
       fr->rec.mnemonic = "ret";
       uint32_t n = imm16();
-      eip = pop_w();
+      SetEip(pop_w());
       if (d.w32)
         esp += n;
       else
@@ -6899,7 +6908,7 @@ void run_op(uint8_t op) {
     }
     case 0xc3:
       fr->rec.mnemonic = "ret";
-      eip = pop_w();
+      SetEip(pop_w());
       break;  // ret
     case 0xc4:
     case 0xc5: {  // les/lds r, m16:16/32
@@ -6982,7 +6991,7 @@ void run_op(uint8_t op) {
         pm_ret(n);
         break;
       }
-      eip = pop_w();
+      SetEip(pop_w());
       load_cs((uint16_t)pop_w());
       if (d.w32)
         esp += n;
@@ -6996,7 +7005,7 @@ void run_op(uint8_t op) {
         pm_ret(0);
         break;
       }
-      eip = pop_w();
+      SetEip(pop_w());
       load_cs((uint16_t)pop_w());
       break;  // retf
     case 0xcc:
@@ -7038,7 +7047,7 @@ void run_op(uint8_t op) {
       seg_view v;
       seg_synth(sel, &v);
       seg_commit(cs_i, sel, &v);
-      eip = new_eip;
+      SetEip(new_eip);
       d.rf_load = 1;
       if (d.w32)
         fl->word = (flv & ~(0x20000u)) | 2;
@@ -7313,7 +7322,7 @@ void run_op(uint8_t op) {
           fr->rec.mnemonic = "call";
           uint32_t t = d.w32 ? RM32() : RM16();
           push_w((uint32_t)(fr->rec.pc + d.nxt));
-          eip = t;
+          SetEip(t);
           break;
         }
         case 3: {  // call far m16:16/32
@@ -7332,7 +7341,7 @@ void run_op(uint8_t op) {
         }
         case 4:
           fr->rec.mnemonic = "jmp";
-          eip = d.w32 ? RM32() : RM16();
+          SetEip(d.w32 ? RM32() : RM16());
           break;   // jmp near rm
         case 5: {  // jmp far m16:16/32
           fr->rec.mnemonic = "ljmp";

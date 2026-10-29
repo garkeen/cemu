@@ -78,6 +78,10 @@ typedef struct dec {
   uint32_t watch_hit;
   int rf_load;
   int delivered;  // the instruction delivered an exception frame (do_int)
+  // A control transfer wrote eip. The commit must keep that target even when
+  // it equals the instruction's own address; an equality test against the
+  // start cannot tell that from "no transfer" and would add the length.
+  int eip_set;
 } dec;
 
 // One decode context for the instruction being executed; `d` is the short
