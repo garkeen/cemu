@@ -313,36 +313,6 @@ void Ps2MouseEvent(Ps2MouseDevice* d, int dx, int dy, int dz, int buttons) {
   Sync(d);
 }
 
-int Ps2MouseCanReport(const Ps2MouseDevice* d) {
-  return d->st && d->st->enabled && !d->st->remote;
-}
-
-int Ps2MouseScaling(const Ps2MouseDevice* d) { return d->st && d->st->scale21; }
-
-int Ps2MouseScale21(int n) { return Scale21(n); }
-
-int Ps2MouseScale21Inverse(int d) {
-  int sign = d < 0 ? -1 : 1;
-  int a = d < 0 ? -d : d;
-  int n;
-  switch (a) {
-    case 0: n = 0; break;
-    case 1: n = 1; break;
-    case 2: n = 1; break;   // Scale21(1) = 1
-    case 3: n = 3; break;
-    case 4: n = 3; break;   // 3
-    case 5: n = 4; break;   // 6
-    case 6: n = 4; break;
-    case 7: n = 4; break;   // 6
-    case 8: n = 5; break;   // 9
-    case 9: n = 5; break;
-    case 10: n = 5; break;  // 9
-    case 11: n = 6; break;  // 12
-    default: n = a / 2; break;  // 2*n or 2*n-1
-  }
-  return sign * n;
-}
-
 void Ps2MouseInit(Ps2MouseDevice* d) {
   if (!d->st) {
     d->st = (struct Ps2MouseState*)calloc(1, sizeof(struct Ps2MouseState));

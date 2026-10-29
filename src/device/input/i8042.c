@@ -387,7 +387,3 @@ void I8042AuxByte(I8042Device* d, uint8_t byte) {
   QueuePush(&d->st->aux, byte);
   I8042SyncIrq(d);
 }
-
-int I8042AuxPending(const I8042Device* d) { return QueueCount(&d->st->aux); }
-
-int I8042AuxEnabled(const I8042Device* d) { return !(d->st->cmd_byte & kModeDisAux); }

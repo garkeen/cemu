@@ -132,15 +132,6 @@ typedef struct IrqBus {
   IoapicDevice* ioapic;
 } IrqBus;
 
-// One host button transition in the PS/2 absolute model: the state after the
-// event and the picture position where it happened. Quick press/release pairs
-// must both survive the packet pacing; the service reaches the position first
-// and then emits the transition, so a click lands where it was made.
-typedef struct AbsButtonEvent {
-  int buttons, x, y;
-} AbsButtonEvent;
-enum { kAbsButtonQueue = 16 };
-
 typedef struct X86Board {
   Board base;
   Uart16550 uart;
@@ -181,23 +172,6 @@ typedef struct X86Board {
   uint8_t* vgabios;
   uint32_t vgabios_size;
   // Absolute pointer integration over the relative PS/2 mouse (D38). The
-  // window reports picture pixels; the board keeps a model of the guest cursor
-  // and sends the PS/2 deltas that reach the host target. PS/2 has no absolute
-  // protocol, so the model assumes the guest applies counts 1:1 and clamps at
-  // the screen edges; a first-use homing sequence drives it to (0,0), and
-  // packets are paced by the AUX queue's free space and the 100 Hz PS/2
-  // sample rate. Guest-side acceleration or cursor warping would make it
-  // drift (registered as D38).
-  int abs_state;   // 0 idle, 1 homing, 2 tracking
-  int abs_home_left;  // homing packets still owed
-  int abs_w, abs_h;   // picture size the model is valid for
-  int abs_x, abs_y;   // modelled guest cursor (picture pixels, Y down)
-  int abs_tx, abs_ty;  // latest host target
-  int abs_buttons, abs_sent_buttons, abs_dz;
-  int abs_host_buttons;  // previous host state, for transition detection
-  AbsButtonEvent abs_btnq[kAbsButtonQueue];
-  int abs_btnq_head, abs_btnq_count;
-  int64_t abs_next_us;  // packet pacing (host time)
 } X86Board;
 
 static uint64_t UnclaimedRead(void* dev, uint64_t addr, int size) {
@@ -402,170 +376,6 @@ static void OnHostMouse(void* ctx, int dx, int dy, int dz, int buttons) {
   X86Board* xm = (X86Board*)ctx;
   if (DebugOn(kDbgMark)) DebugMark("hostmouse", dx, dy);
   Ps2MouseEvent(&xm->mouse, dx, dy, dz, buttons);
-  // A synthetic relative event invalidates the absolute model's idea of where
-  // the guest cursor is; the next window event re-homes.
-  if (xm->abs_state) {
-    xm->abs_state = 0;
-    xm->abs_btnq_head = xm->abs_btnq_count = 0;
-    xm->abs_host_buttons = -1;
-  }
-}
-
-// ---- absolute pointer over the relative PS/2 mouse (D38) ----------------------
-//
-// The window's absolute channel hands us picture pixels. PS/2 has no absolute
-// packet, so the board keeps a model of the guest cursor and emits the deltas
-// that move it to the host target. The model is exact only while the guest
-// applies counts 1:1 and clamps at the screen edges: the first use (and every
-// picture-size change) sends a negative run long enough to pin the cursor at
-// (0,0), after which the model starts from a known point. Packets are paced by
-// the PS/2 mouse's 100 Hz default sample rate and by the AUX queue's free
-// space, so a long jump cannot overrun the controller's 15-byte queue.
-//
-// Button transitions are queued with the picture position where they happened:
-// the service first moves the model to that position and only then emits the
-// transition, so a click lands where it was made and a quick press/release pair
-// survives the pacing.
-enum {
-  kAbsPaceUs = 10000,     // 100 packets/s, the PS/2 default sample rate
-  kPs2MaxDelta = 255,     // 9-bit two's complement maximum
-};
-
-static void MouseAbsRestart(X86Board* xm, int w, int h) {
-  xm->abs_w = w;
-  xm->abs_h = h;
-  xm->abs_state = 1;
-  xm->abs_home_left = (w > h ? w : h) / kPs2MaxDelta + 2;
-  xm->abs_x = xm->abs_y = 0;
-  xm->abs_sent_buttons = 0;
-  xm->abs_dz = 0;
-  xm->abs_btnq_head = xm->abs_btnq_count = 0;
-  xm->abs_host_buttons = 0;
-  xm->abs_next_us = 0;
-}
-
-static void AbsQueueButton(X86Board* xm, int buttons, int x, int y) {
-  if (xm->abs_btnq_count == kAbsButtonQueue) {
-    // Queue full (a burst no human produces): coalesce into the tail so the
-    // latest state is still delivered.
-    int tail = (xm->abs_btnq_head + xm->abs_btnq_count - 1) % kAbsButtonQueue;
-    xm->abs_btnq[tail].buttons = buttons;
-    xm->abs_btnq[tail].x = x;
-    xm->abs_btnq[tail].y = y;
-    return;
-  }
-  int tail = (xm->abs_btnq_head + xm->abs_btnq_count) % kAbsButtonQueue;
-  xm->abs_btnq[tail].buttons = buttons;
-  xm->abs_btnq[tail].x = x;
-  xm->abs_btnq[tail].y = y;
-  xm->abs_btnq_count++;
-}
-
-static void OnHostMouseAbs(void* ctx, int x, int y, int dz, int buttons) {
-  X86Board* xm = (X86Board*)ctx;
-  Board* m = &xm->base;
-  if (!m->display_ops) return;
-  int w = m->display_ops->Width(m->display_dev);
-  int h = m->display_ops->Height(m->display_dev);
-  if (w <= 0 || h <= 0) return;
-  if (x < 0) x = 0;
-  if (x >= w) x = w - 1;
-  if (y < 0) y = 0;
-  if (y >= h) y = h - 1;
-  xm->abs_tx = x;
-  xm->abs_ty = y;
-  xm->abs_buttons = buttons & 0x07;
-  if (dz) xm->abs_dz += dz;
-  if (xm->abs_state == 0 || xm->abs_w != w || xm->abs_h != h)
-    MouseAbsRestart(xm, w, h);
-  if (xm->abs_buttons != xm->abs_host_buttons) {
-    AbsQueueButton(xm, xm->abs_buttons, x, y);
-    xm->abs_host_buttons = xm->abs_buttons;
-  }
-}
-
-// Called from the board poll. One packet per service at most; the target can
-// move while the model catches up, and the next packet aims at the latest one.
-static void X86MouseService(X86Board* xm) {
-  Board* m = &xm->base;
-  if (xm->abs_state == 0 || !m->display_ops) return;
-  int w = m->display_ops->Width(m->display_dev);
-  int h = m->display_ops->Height(m->display_dev);
-  if (w <= 0 || h <= 0) return;
-  if (w != xm->abs_w || h != xm->abs_h) {
-    MouseAbsRestart(xm, w, h);
-    return;
-  }
-  if (!Ps2MouseCanReport(&xm->mouse)) return;  // reporting off or remote mode
-  if (!I8042AuxEnabled(&xm->kbd)) return;      // 0xa7 shut: bytes would be dropped
-  int64_t now = HostTimeRealtime();
-  if (now < xm->abs_next_us) return;
-  // One packet outstanding: wait until the guest has read the previous one
-  // (the controller's AUX queue is empty). This keeps the model one packet
-  // ahead at most instead of letting a burst accumulate and lag the cursor.
-  if (I8042AuxPending(&xm->kbd) != 0) return;
-
-  if (xm->abs_state == 1) {
-    // Home: enough negative runs to clamp any in-screen position at (0,0).
-    Ps2MouseEvent(&xm->mouse, -kPs2MaxDelta, -kPs2MaxDelta, 0, 0);
-    if (--xm->abs_home_left <= 0) {
-      xm->abs_x = xm->abs_y = 0;
-      xm->abs_state = 2;
-    }
-    xm->abs_next_us = now + kAbsPaceUs;
-    return;
-  }
-
-  int have_event = xm->abs_btnq_count > 0;
-  int hd = xm->abs_btnq_head;
-  int tx = have_event ? xm->abs_btnq[hd].x : xm->abs_tx;
-  int ty = have_event ? xm->abs_btnq[hd].y : xm->abs_ty;
-  int dz = xm->abs_dz;
-  int dx = tx - xm->abs_x;
-  int dy = ty - xm->abs_y;
-  if (dx < -kPs2MaxDelta) dx = -kPs2MaxDelta;
-  if (dx > kPs2MaxDelta) dx = kPs2MaxDelta;
-  if (dy < -kPs2MaxDelta) dy = -kPs2MaxDelta;
-  if (dy > kPs2MaxDelta) dy = kPs2MaxDelta;
-
-  if (dx == 0 && dy == 0) {
-    if (have_event) {
-      // The model is at the click position: emit the transition now.
-      int b = xm->abs_btnq[hd].buttons;
-      Ps2MouseEvent(&xm->mouse, 0, 0, dz, b);
-      xm->abs_sent_buttons = b;
-      xm->abs_dz = 0;
-      xm->abs_btnq_head = (hd + 1) % kAbsButtonQueue;
-      xm->abs_btnq_count--;
-      xm->abs_next_us = now + kAbsPaceUs;
-      return;
-    }
-    if (dz || xm->abs_buttons != xm->abs_sent_buttons) {
-      Ps2MouseEvent(&xm->mouse, 0, 0, dz, xm->abs_buttons);
-      xm->abs_sent_buttons = xm->abs_buttons;
-      xm->abs_dz = 0;
-      xm->abs_next_us = now + kAbsPaceUs;
-    }
-    return;
-  }
-  // Movement carries the button state from *before* the pending transition, so
-  // the press/release happens only after the model reaches the click position.
-  int actual_x = dx, actual_y = dy;
-  if (Ps2MouseScaling(&xm->mouse)) {
-    // The guest turned on 2:1 scaling: send the inverse count and track the
-    // value the device will actually put in the packet.
-    int nx = Ps2MouseScale21Inverse(dx);
-    int ny = Ps2MouseScale21Inverse(dy);
-    Ps2MouseEvent(&xm->mouse, nx, -ny, dz, xm->abs_sent_buttons);
-    actual_x = Ps2MouseScale21(nx);
-    actual_y = Ps2MouseScale21(ny);
-  } else {
-    Ps2MouseEvent(&xm->mouse, dx, -dy, dz, xm->abs_sent_buttons);  // PS/2 Y grows up
-  }
-  xm->abs_x += actual_x;
-  xm->abs_y += actual_y;
-  xm->abs_dz = 0;
-  xm->abs_next_us = now + kAbsPaceUs;
 }
 
 // The 8042's auxiliary wire, both directions: command 0xd4 hands the device a
@@ -783,7 +593,6 @@ static void X86Poll(Board* m) {
   CmosPoll(&xm->cmos);
   // The PM timer's 32-bit overflow is a fixed ACPI event (PM1_STS bit 0).
   Piix4PmPoll(&xm->pm);
-  X86MouseService(xm);
 }
 
 // The next moment a device wakes the processor on its own: the PC's two
@@ -900,11 +709,6 @@ static void X86Reset(Board* m) {
   I8042Init(&xm->kbd);
   Ps2KbdInit(&xm->ps2kbd);
   Ps2MouseInit(&xm->mouse);
-  // The reset discards the guest's cursor position; the next absolute pointer
-  // event starts a fresh homing run.
-  xm->abs_state = 0;
-  xm->abs_btnq_head = xm->abs_btnq_count = 0;
-  xm->abs_host_buttons = -1;
   MsMouseInit(&xm->msmouse);
   Port92Init(&xm->port92);
   TestDevInit(&xm->testdev);
@@ -1094,15 +898,17 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   // enters it at COM1's receiver, which is where a terminal belongs on a PC.
   m->key_in = OnHostKey;
   m->key_ctx = xm;
-  // One host pointer, one guest device: -mouse picks which (board.h). The
-  // PS/2 device also gets the absolute channel (the board turns it into
-  // paced relative packets); the serial mouse is relative-only.
+  // One host pointer, one guest device: -mouse picks which (board.h). A PS/2
+  // mouse is a relative device, so the window's movement deltas go straight to
+  // it -- the same way QEMU drives a PS/2 mouse. There is deliberately no
+  // absolute channel on this machine: steering the guest cursor from a model of
+  // where it is only holds while the guest applies counts 1:1 and clamps at the
+  // screen edges, and Windows 1.01 breaks both (it scales, it clips, it resets
+  // its driver at mode changes), which made the pointer fly around. Absolute
+  // positioning belongs to a device that carries it (USB tablet, VMware
+  // backdoor), not to this one.
   m->mouse_in = opts->mouse == kMouseSerial ? OnHostMouseSerial : OnHostMouse;
   m->mouse_ctx = xm;
-  if (opts->mouse != kMouseSerial) {
-    m->mouse_abs = OnHostMouseAbs;
-    m->mouse_abs_ctx = xm;
-  }
   m->serial_in = OnHostSerial;
   m->serial_ctx = xm;
 

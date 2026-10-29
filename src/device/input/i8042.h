@@ -76,11 +76,5 @@ void I8042SetTranslateSink(I8042Device* d, void (*set_translate)(void* ctx, int 
 void I8042KbdByte(I8042Device* d, uint8_t scancode);
 // One byte from the auxiliary device (the mouse) into the AUX output queue.
 void I8042AuxByte(I8042Device* d, uint8_t byte);
-// Bytes waiting in the AUX queue. The board's absolute pointer integration
-// paces its packets with this so a long move cannot overrun the 15-byte queue.
-int I8042AuxPending(const I8042Device* d);
-// Whether the controller is forwarding the auxiliary wire (not 0xa7-shut). A
-// packet sent while it is off is dropped at the controller's door.
-int I8042AuxEnabled(const I8042Device* d);
 
 #endif
