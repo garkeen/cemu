@@ -64,6 +64,38 @@ static uint64_t g_emitted[kCatSlots];
 static uint64_t g_suppressed[kCatSlots];
 static uint64_t g_traps;
 
+// ---- the instruction in progress (DebugSetFrame) ---------------------------
+// One pointer store per step, the same shape as QEMU's global current CPU: it
+// is what lets a row with no instruction frame still name the guest code that
+// caused it (debug.h).
+static frame* g_frame;
+enum { kHistDefault = 32, kHistMax = 64 };
+static struct {
+  uint64_t pc;
+  const char* mnem;
+  uint8_t raw[8];
+  uint8_t raw_len;
+} g_hist[kHistMax];
+static int g_hist_len;  // ring depth from `hist[=N]`; 0 = category off
+static int g_hist_at;
+static int g_hist_filled;
+
+// ---- `bus:ADDR` / `bus:NAME` -----------------------------------------------
+// Unfiltered, the bus category opens with a boot's ROM shadow copy: tens of
+// thousands of rows before the guest's first interesting access, and the
+// session output cap then eats the window the diagnosis needed. Filtering is
+// what QEMU's -trace event patterns do for its own log.
+enum { kBusAll = 0, kBusAddr = 1, kBusName = 2 };
+static int g_bus_kind;
+static uint64_t g_bus_addr;
+static char g_bus_name[40];
+
+static int BusWanted(const char* dev_name, uint64_t addr) {
+  if (g_bus_kind == kBusAddr) return addr == g_bus_addr;
+  if (g_bus_kind == kBusName) return dev_name && !strcmp(dev_name, g_bus_name);
+  return 1;
+}
+
 // ---- watchpoints ----------------------------------------------------------
 
 enum { kMaxWatches = 16 };
@@ -547,8 +579,25 @@ void DebugInit(void) {
       g_mask |= kDbgMem;
     else if (!strcmp(tok, "trap"))
       g_mask |= kDbgTrap;
-    else if (!strcmp(tok, "bus"))
+    else if (!strcmp(tok, "bus") || !strncmp(tok, "bus:", 4)) {
       g_mask |= kDbgBus;
+      if (tok[3] == ':') {
+        uint64_t v = 0;
+        if (ParseUint(tok + 4, &v)) {
+          g_bus_kind = kBusAddr;
+          g_bus_addr = v;
+        } else {
+          g_bus_kind = kBusName;
+          snprintf(g_bus_name, sizeof(g_bus_name), "%s", tok + 4);
+        }
+      }
+    }
+    else if (!strcmp(tok, "hist") || !strncmp(tok, "hist=", 5)) {
+      g_mask |= kDbgHist;
+      g_hist_len = tok[4] == '=' ? atoi(tok + 5) : kHistDefault;
+      if (g_hist_len < 1) g_hist_len = 1;
+      if (g_hist_len > kHistMax) g_hist_len = kHistMax;
+    }
     else if (!strcmp(tok, "gdb"))
       g_mask |= kDbgGdb;
     else if (!strcmp(tok, "mark"))
@@ -602,7 +651,7 @@ void DebugInit(void) {
   // byte of every instruction; a category that needs the event-emitting path
   // disables the fast memory path wholesale.
   g_mem_slow = ((g_mask & (kDbgMem | kDbgBus)) != 0) || g_nwatch != 0;
-  g_record_raw = (g_mask & (kDbgTraceLine | kDbgTraceTable)) != 0;
+  g_record_raw = (g_mask & (kDbgTraceLine | kDbgTraceTable | kDbgHist)) != 0;
   g_dbg_any = (g_mask != 0) || g_nwatch != 0;
 }
 
@@ -731,6 +780,67 @@ static uint64_t FrameDnpc(frame* f) {
   return f->isa->gdb_pc ? f->rec.dnpc_lin : f->rec.dnpc;
 }
 
+// ---- the instruction in progress, and the ones before it --------------------
+// Definitions; the contract and the reasoning live in debug.h.
+
+void DebugSetFrame(frame* f) { g_frame = f; }
+
+// " pc=<linear>": the address of the instruction the machine was running when
+// the event fired, appended to a row that has no frame of its own.
+static void AppendCtx(char* det, size_t cap) {
+  if (!g_frame) return;
+  size_t n = strlen(det);
+  if (n + 24 >= cap) return;
+  snprintf(det + n, cap - n, " pc=%llx", (unsigned long long)FramePc(g_frame));
+}
+
+// Ring record, called after the commit (DebugInsn) rather than from
+// DebugSetFrame: the frame published at fetch time still has no mnemonic and no
+// instruction bytes, and a ring of blank entries answers nothing.
+static void HistRecord(frame* f) {
+  if (!g_hist_len) return;
+  int slot = g_hist_at;
+  int n = f->rec.raw_len;
+  if (n > (int)sizeof(g_hist[slot].raw)) n = (int)sizeof(g_hist[slot].raw);
+  g_hist[slot].pc = FramePc(f);
+  g_hist[slot].mnem = f->rec.mnemonic;
+  g_hist[slot].raw_len = (uint8_t)n;
+  for (int i = 0; i < n; i++) g_hist[slot].raw[i] = f->rec.raw[i];
+  g_hist_at = (slot + 1) % g_hist_len;
+  if (g_hist_filled < g_hist_len) g_hist_filled++;
+}
+
+// The ring, oldest first, one plain line each: a detail cell cannot carry a
+// chain, and the chain is what says whether an event came from the guest's own
+// code or from an interrupt taken in the middle of something else.
+static void HistDump(void) {
+  if (!(g_mask & kDbgHist) || !g_hist_filled) return;
+  // No window of its own: the ring rides on rows the caller already admitted, so
+  // a `skip=N` of its own could never fill (the rows it would count were
+  // suppressed before reaching here, and the dump then stayed silent for the
+  // whole run). The budget still applies, and the counters stay in this
+  // category's own slot so the session summary reports it honestly.
+  int slot_i = CatIdx(kDbgHist);
+  if (g_emitted[slot_i] >= (uint64_t)g_budget) {
+    g_suppressed[slot_i]++;
+    return;
+  }
+  g_emitted[slot_i]++;
+  for (int i = 0; i < g_hist_filled; i++) {
+    int slot = ((g_hist_at - g_hist_filled + i) % g_hist_len + g_hist_len) % g_hist_len;
+    char line[128];
+    int n = snprintf(line, sizeof(line), "hist %016llx %-10s",
+                     (unsigned long long)g_hist[slot].pc,
+                     g_hist[slot].mnem ? g_hist[slot].mnem : "-");
+    for (int b = 0; b < g_hist[slot].raw_len; b++)
+      n += snprintf(line + n, sizeof(line) - (size_t)n, " %02x", g_hist[slot].raw[b]);
+    if (n > (int)sizeof(line) - 2) n = (int)sizeof(line) - 2;
+    line[n++] = '\n';
+    line[n] = 0;
+    if (DebugAccountOut((size_t)n)) HostWriteErr(line, (size_t)n);
+  }
+}
+
 static void RowBegin(Table* t, char kind, frame* f) {
   TableRowBegin(t);
   char k[2] = {kind, 0};
@@ -775,6 +885,7 @@ static void StateRow(frame* f) {
 
 void DebugInsn(frame* f) {
   if (!g_inited) return;
+  if (g_mask & kDbgHist) HistRecord(f);
   if (g_mask & kDbgTraceLine) {
     // Compact one-line form: pc, raw bytes, mnemonic, next pc. Greppable,
     // no table chrome. The skip window is in instructions (AllowTrace).
@@ -844,6 +955,7 @@ void DebugTrap(frame* f) {
   TableRowCell(g_tbl, det);
   CellFlags(g_tbl, f);
   TableRowEnd(g_tbl);
+  HistDump();
 }
 
 void DebugMem(frame* f, uint64_t addr, uint64_t watch_addr, int size, int acc,
@@ -877,11 +989,14 @@ void DebugMem(frame* f, uint64_t addr, uint64_t watch_addr, int size, int acc,
     TableRowCell(g_tbl, det);
     CellFlags(g_tbl, f);
     TableRowEnd(g_tbl);
+    HistDump();
   }
 }
 
 void DebugBus(frame* f, const char* dev_name, uint64_t addr, int size, int is_load, uint64_t val) {
-  if (!DebugOn(kDbgBus) || !Allow(kDbgBus)) return;
+  // The filter runs before the budget: a row the caller narrowed away must not
+  // spend the window that the rows it asked for need.
+  if (!DebugOn(kDbgBus) || !BusWanted(dev_name, addr) || !Allow(kDbgBus)) return;
   RowBegin(g_tbl, 'B', f);
   char det[64];
   snprintf(det, sizeof(det), "%s %s:%llx:%d %s %llx", is_load ? "io-ld" : "io-st",
@@ -890,6 +1005,7 @@ void DebugBus(frame* f, const char* dev_name, uint64_t addr, int size, int is_lo
   TableRowCell(g_tbl, det);
   CellFlags(g_tbl, f);
   TableRowEnd(g_tbl);
+  HistDump();
 }
 
 // gdb stub protocol packets (stage 3.5): tx/rx rows, no frame — the stub is
@@ -921,21 +1037,25 @@ void DebugGdbNote(const char* note) {
 void DebugMark(const char* what, int a, int b) {
   if (!DebugOn(kDbgMark) || !Allow(kDbgMark)) return;
   RowBeginBare(g_tbl, 'K');
-  char det[80];
+  char det[112];
   snprintf(det, sizeof(det), "%s a=%d b=0x%x", what, a, (unsigned)b);
+  AppendCtx(det, sizeof(det));
   TableRowCell(g_tbl, det);
   TableRowEnd(g_tbl);
+  HistDump();
 }
 
 void DebugVirtio(const char* what, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
   if (!DebugOn(kDbgVirtio) || !Allow(kDbgVirtio)) return;
   RowBeginBare(g_tbl, 'K');
-  char det[112];
+  char det[144];
   snprintf(det, sizeof(det), "virtio %s a=%llx b=%llx c=%llx d=%llx", what,
            (unsigned long long)a, (unsigned long long)b, (unsigned long long)c,
            (unsigned long long)d);
+  AppendCtx(det, sizeof(det));
   TableRowCell(g_tbl, det);
   TableRowEnd(g_tbl);
+  HistDump();
 }
 
 void DebugPmpDeny(uint64_t addr, int len, int acc, int mode, int idx, unsigned cfg,
@@ -943,7 +1063,7 @@ void DebugPmpDeny(uint64_t addr, int len, int acc, int mode, int idx, unsigned c
   if (!DebugOn(kDbgPmp) || !Allow(kDbgPmp)) return;
   static const char kAcc[] = "irwa";
   RowBeginBare(g_tbl, 'K');
-  char det[112];
+  char det[144];
   if (idx < 0)
     snprintf(det, sizeof(det), "pmp-deny addr=%llx len=%d %c %c entry=none",
              (unsigned long long)addr, len, kAcc[acc & 3],
@@ -954,8 +1074,10 @@ void DebugPmpDeny(uint64_t addr, int len, int acc, int mode, int idx, unsigned c
              (unsigned long long)addr, len, kAcc[acc & 3],
              mode == 3 ? 'M' : mode == 1 ? 'S' : 'U', idx, cfg, (unsigned long long)base,
              (unsigned long long)size);
+  AppendCtx(det, sizeof(det));
   TableRowCell(g_tbl, det);
   TableRowEnd(g_tbl);
+  HistDump();
 }
 
 // See debug.h: a software INT n gets one frameless row per half, like every
@@ -1016,16 +1138,25 @@ void DebugVgaIo(uint32_t port, uint32_t val, int is_read) {
 // Frameless text row (kDbgScreen): a guest console line read back from the
 // video device. Linux prints only to VRAM (its `console=` came later), so the
 // text mirror is the only way to read its console without a display window.
-// A console line is 80 columns of the guest's own text, with nothing to put in
-// the table's PC/RAW/MNEMONIC/FLAGS cells, so this category prints whole lines
-// rather than a row of chrome around them.
+// A console line is the guest's own text, with nothing to put in the table's
+// PC/RAW/MNEMONIC/FLAGS cells, so this category prints whole lines rather than
+// a row of chrome around them.
+//
+// The buffer holds a whole console row, not just a sentence: the display's
+// text grid is up to 132 cells and a CP437 glyph is three UTF-8 bytes, so 396
+// bytes of text plus the kind and the newline. A shorter buffer would truncate
+// exactly the full-screen rows this facility exists to read.
+enum { kDebugTextMax = 512 };
 void DebugText(const char* kind, const char* text) {
   if (!DebugOn(kDbgScreen) || !Allow(kDbgScreen)) return;
-  char line[160];
+  char line[kDebugTextMax];
   int n = snprintf(line, sizeof(line), "%s %s\n", kind, text);
   if (n < 0) return;
+  if ((size_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;  // truncated
   if (DebugAccountOut((size_t)n)) HostWriteErr(line, (size_t)n);
 }
+
+int DebugUtf8(void) { return !g_ascii; }
 
 void DebugSessionEnd(const frame* f, const char* stop_reason) {
   if (!g_inited) return;

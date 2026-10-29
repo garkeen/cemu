@@ -47,6 +47,9 @@ void riscv_step(CpuState* c) {
   // Watchpoints are not a mask bit: DebugOn(kDbgMem) also reports them, and
   // their rows carry the instruction bytes, so keep the record filled then.
   int dbg = DebugOn(kDbgAny) || DebugOn(kDbgMem);
+  // Live frame for the debug hub (debug.h): rows with no frame of their own
+  // report this instruction's linear PC.
+  if (dbg) DebugSetFrame(fr);
 
   // Sstc STIP is a timer line, not an instruction-stream fact: sampling the
   // host clock on every step was pure cost. Refresh it at the same batch

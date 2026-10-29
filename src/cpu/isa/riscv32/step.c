@@ -47,6 +47,9 @@ void riscv32_step(CpuState* c) {
   // Watchpoints are not a mask bit: DebugOn(kDbgMem) also reports them, and
   // their rows carry the instruction bytes, so keep the record filled then.
   int dbg = DebugOn(kDbgAny) || DebugOn(kDbgMem);
+  // Live frame for the debug hub (debug.h): rows with no frame of their own
+  // report this instruction's linear PC.
+  if (dbg) DebugSetFrame(fr);
 
   // Every architectural address is 32 bits: a stale high half (a debugger
   // write, a loader image entry) must not leak into fetch arithmetic.

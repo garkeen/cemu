@@ -65,8 +65,11 @@ enum {
   kVgaFbHeight = 1600,
   // The text mirror's grid: enough for 132x60 (the largest text mode the CRTC
   // registers can describe here); the mirror prints the current mode's grid.
+  // A cell reaches the log as one to three bytes: CP437's box drawing and
+  // blocks encode to three UTF-8 bytes (CEMU_DEBUG=screen,utf8).
   kVgaMirrorCols = 132,
   kVgaMirrorRows = 60,
+  kVgaMirrorGlyphBytes = 3,
 };
 
 // DISPI, the register pair the option ROM probes to decide the card can offer
@@ -205,9 +208,23 @@ typedef struct VgaDevice {
   int marked_height;
   uint64_t last_render_us;
   uint32_t rendered_blink_tick;
-  // The text grid the `screen` mirror last printed, so only changed rows are
-  // emitted.
-  char mirror[kVgaMirrorRows][kVgaMirrorCols + 1];
+  // The `screen` mirror's two grids: `mirror` is the text last emitted, `seen`
+  // the text the screen held on the previous render. Both are needed because a
+  // console line is reported only once the guest has stopped writing into it --
+  // a row that still changes between two renders is a line in flight, and
+  // printing it prints a prefix (the earlier one-grid version emitted on every
+  // render, which chopped each line into fragments and re-sent a whole screen
+  // whenever the console scrolled). Rows are compared as trimmed text, which is
+  // what lets a scroll be recognised as the same lines moved up rather than as
+  // a screenful of changed rows. Each array is padded to the widest row a mode
+  // can produce, glyphs included.
+  char mirror[kVgaMirrorRows][kVgaMirrorCols * kVgaMirrorGlyphBytes + 1];
+  char seen[kVgaMirrorRows][kVgaMirrorCols * kVgaMirrorGlyphBytes + 1];
+  uint32_t seen_hash[kVgaMirrorRows];
+  uint32_t mirror_hash[kVgaMirrorRows];
+  int mirror_cols;     // grid shape the two arrays were filled for; a mode
+  int mirror_rows;     // change restarts the diff instead of comparing shapes
+  int mirror_pending;  // a line on screen has not settled into the log yet
   // DISPI: the VESA BIOS Extension's register block, an index/data I/O pair at
   // 0x1CE/0x1CF (seabios/vgasrc/bochsvga.h; QEMU hw/display/vga.c's 0x1ce/0x1cf
   // case is the behavioural reference). An option ROM probes it by writing one

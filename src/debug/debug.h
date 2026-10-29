@@ -27,7 +27,8 @@ enum {
   kDbgPcShot = 1 << 12,     // canonical state row at a linear PC checkpoint
   kDbgPmp = 1 << 13,        // PMP denials: the entry that decided the access
   kDbgVirtio = 1 << 14,     // virtio-mmio queue notify / chain parse / backend
-  kDbgAny = 0x7fff,
+  kDbgHist = 1 << 15,       // the last N instructions, dumped when an event row fires
+  kDbgAny = 0xffff,
 };
 
 int DebugOn(uint32_t cat);
@@ -170,6 +171,11 @@ int DebugNextInjection(uint64_t inst_count, DebugInjection* out);
 // video device, for guests that print only to VRAM.
 void DebugText(const char* kind, const char* text);
 
+// True when the caller may emit UTF-8 glyphs (`utf8` in CEMU_DEBUG). The
+// default is ASCII, because a Windows console in its own code page mangles
+// UTF-8: the table borders and the text mirror's CP437 glyphs both read this.
+int DebugUtf8(void);
+
 // True when a watchpoint matches (funnels ask before doing the access so
 // the row prints even when the access itself faults).
 int DebugWatchHit(uint64_t addr, int size, int is_load);
@@ -210,21 +216,49 @@ void DebugSetFbReader(DebugFbInfoFn info, DebugFbPixelsFn pixels, void* ctx);
 // brings the guest's state back through dump=.
 void DebugSetClock(const uint64_t* inst_count);
 
+// ---- the guest instruction behind a frameless row ---------------------------
+// A device-side row has no instruction frame, and cannot get one: the device
+// vtable carries no CPU (device/ must not include cpu/isa/, AGENTS.md §七), so
+// a console byte, an interrupt edge or a host-input packet used to be
+// unplaceable in the guest's own code — the row could say *that* it happened
+// and at which retired-instruction count, but not which instruction caused it.
+// QEMU answers the same question with a global current-CPU pointer and
+// cpu_get_pc(); this is the same one store per step: the interpreter hands the
+// hub the frame it is executing, and every frameless row then reports that
+// instruction's linear PC (`pc=`) in its detail cell. With `hist` on, the same
+// store also feeds the instruction ring below.
+void DebugSetFrame(struct frame* f);
+
+// ---- `hist[=N]`: the instructions that led to an event ----------------------
+// The ring holds the last N (default 32, max 64) committed instructions —
+// linear PC, mnemonic and raw bytes — and is dumped, oldest first, right after
+// any frameless row that reports an event (mark/watch/bus/trap/pmp/virtio). A
+// detail cell is 88 columns wide and cannot carry a call chain; the chain is
+// exactly what separates "the guest's own code did this" from "an interrupt
+// landed in the middle of something else". Counterparts: Intel PT, Bochs'
+// instruction trace, NEMU's ftrace. The ring records the *committed* step, so
+// an event fired during instruction k shows instructions up to k-1, and the
+// step in progress is the row's own `pc=`.
+
 // Halt/exit: the final regs table + session summary (always, once debug is
 // active at all).
 void DebugSessionEnd(const struct frame* f, const char* stop_reason);
 
 // CEMU_DEBUG grammar this hub implements (AGENTS.md §X):
-//   trace[:line|table][=N], state, mem[:ld|st], trap, bus, regs=N,
+//   trace[:line|table][=N], state, mem[:ld|st], trap, bus[:ADDR|:NAME], regs=N,
+//   mark, hist[=N], screen, vga-io, pmp, virtio, utf8,
 //   watch=ADDR:SIZE[:r|w|rw] (repeatable), dump=ADDR:SIZE:FILE (repeatable),
 //   fbdump=FILE (repeatable, binary PPM of the display card's picture),
 //   pcshot=ADDR[:COUNT] (repeatable; state row when the next linear PC is
 //   ADDR), budget=N (per-category cap), skip=N (per-category silent window
-//   before printing), utf8. Addresses are physical except pcshot's, which is
+//   before printing). Addresses are physical except pcshot's, which is
 //   the linear PC the ISA's gdb_pc reports; that is the address a QEMU gdb
 //   breakpoint names, so a checkpoint can be compared across the two models
 //   without an instruction-count window (which REP loops and timer drift make
-//   unusable).
+//   unusable). `bus:ADDR` / `bus:NAME` narrow the bus category to one address
+//   or one device name (QEMU's -trace event patterns play the same role):
+//   unfiltered, a boot's ROM shadow copy alone is tens of thousands of rows
+//   and the session output cap eats the window the diagnosis needed.
 
 // Session output cap (bytes). All debug writes (table rows, state stream,
 // line trace, session summary) are accounted here; once the cap is hit,

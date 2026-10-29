@@ -1659,10 +1659,105 @@ static void VgaRenderGraphics(VgaDevice* d, const VgaPicture* p) {
 // --- observation and refresh ------------------------------------------------------
 // The guest prints by writing the text plane, so a guest whose console never
 // touches the serial port can only be read back through the screen mirror
-// (CEMU_DEBUG=screen, AGENTS.md §X). It diffs the character plane of the current
-// text picture each render and emits the rows that changed.
+// (CEMU_DEBUG=screen, AGENTS.md §X). A cell of that plane holds an IBM glyph
+// code, not ASCII: 0x7f-0xff are CP437's accented letters, box drawing and
+// blocks (IBM PC code page 437). They reach the log as UTF-8 only under `utf8`,
+// because the default ASCII output is what keeps a Windows console in its own
+// code page from mangling the log — the rule the table borders follow as well.
+// Without `utf8` a glyph is a space. 0x00-0x1f are console attributes rather
+// than characters (the guest positions its own text), so they are spaces either
+// way. Table: Unicode's CP437.TXT.
+static const uint16_t kCp437[0x81] = {
+    0x2302,                                                          // 0x7f
+    0x00c7, 0x00fc, 0x00e9, 0x00e2, 0x00e4, 0x00e0, 0x00e5, 0x00e7,  // 0x80
+    0x00ea, 0x00eb, 0x00e8, 0x00ef, 0x00ee, 0x00ec, 0x00c4, 0x00c5,
+    0x00c9, 0x00e6, 0x00c6, 0x00f4, 0x00f6, 0x00f2, 0x00fb, 0x00f9,
+    0x00ff, 0x00d6, 0x00dc, 0x00a2, 0x00a3, 0x00a5, 0x20a7, 0x0192,
+    0x00e1, 0x00ed, 0x00f3, 0x00fa, 0x00f1, 0x00d1, 0x00aa, 0x00ba,  // 0xa0
+    0x00bf, 0x2310, 0x00ac, 0x00bd, 0x00bc, 0x00a1, 0x00ab, 0x00bb,
+    0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556,
+    0x2555, 0x2563, 0x2551, 0x2557, 0x255d, 0x255c, 0x255b, 0x2510,
+    0x2514, 0x2534, 0x252c, 0x251c, 0x2500, 0x253c, 0x255e, 0x255f,  // 0xc0
+    0x255a, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256c, 0x2567,
+    0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256b,
+    0x256a, 0x2518, 0x250c, 0x2588, 0x2584, 0x258c, 0x2590, 0x2580,
+    0x03b1, 0x00df, 0x0393, 0x03c0, 0x03a3, 0x03c3, 0x00b5, 0x03c4,  // 0xe0
+    0x03a6, 0x0398, 0x03a9, 0x03b4, 0x221e, 0x03c6, 0x03b5, 0x2229,
+    0x2261, 0x00b1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00f7, 0x2248,
+    0x00b0, 0x2219, 0x00b7, 0x221a, 0x207f, 0x00b2, 0x25a0, 0x00a0,
+};
+
+enum { kMirrorRowMax = kVgaMirrorCols * kVgaMirrorGlyphBytes + 1 };
+
+// One glyph to UTF-8 (RFC 3629). CP437's highest code point is U+25a0, so three
+// bytes is the ceiling — which is what kVgaMirrorGlyphBytes reserves per cell.
+static int GlyphUtf8(uint8_t ch, char* out) {
+  const uint32_t cp = ch < 0x7f ? ch : kCp437[ch - 0x7f];
+  if (cp < 0x80) {
+    out[0] = (char)cp;
+    return 1;
+  }
+  if (cp < 0x800) {
+    out[0] = (char)(0xc0 | (cp >> 6));
+    out[1] = (char)(0x80 | (cp & 0x3f));
+    return 2;
+  }
+  out[0] = (char)(0xe0 | (cp >> 12));
+  out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+  out[2] = (char)(0x80 | (cp & 0x3f));
+  return 3;
+}
+
+// FNV-1a over a row's text. The shift search compares rows pairwise, so it
+// compares hashes first and looks at the text again only when a hash agrees.
+static uint32_t TextHash(const char* s) {
+  uint32_t h = 2166136261u;
+  for (; *s; s++) h = (h ^ (uint8_t)*s) * 16777619u;
+  return h;
+}
+
+// One console row as the guest shows it: glyphs translated, trailing blanks
+// trimmed (a scroll moves text without changing it, so rows compare by what is
+// visible on them), and `hash` set for the shift search.
+static void MirrorRowText(const VgaDevice* d, const VgaPicture* p, int row, int cols,
+                          char* out, uint32_t* hash) {
+  int len = 0;
+  for (int col = 0; col < cols; col++) {
+    const uint8_t ch = d->vram[(p->start + row * p->line_bytes + col) * 4];
+    if (ch >= 0x20 && ch < 0x7f)
+      out[len++] = (char)ch;
+    else if (ch >= 0x7f && DebugUtf8())
+      len += GlyphUtf8(ch, out + len);
+    else
+      out[len++] = ' ';
+  }
+  while (len > 0 && out[len - 1] == ' ') len--;
+  out[len] = 0;
+  *hash = TextHash(out);
+}
+
+// A row without text is a row with nothing to report.
+static void EmitScreenRow(const char* text) {
+  if (text[0]) DebugText("screen", text);
+}
+
+// Records a row as reported, text and hash together so the shift search never
+// re-hashes a row.
+static void MirrorSetRow(VgaDevice* d, int row, const char* text) {
+  memcpy(d->mirror[row], text, kMirrorRowMax);
+  d->mirror_hash[row] = TextHash(text);
+}
+
 static void ScreenMirror(VgaDevice* d, const VgaPicture* p) {
-  if (!DebugOn(kDbgScreen) || p->graphics) return;
+  if (!DebugOn(kDbgScreen) || p->graphics) {
+    // A picture that is not text has no console rows behind it. Forgetting the
+    // grid shape makes a return to text mode start a fresh comparison; the
+    // shape alone cannot tell the two apart, since a programmable mode between
+    // two 80x25 text modes leaves the same rows and columns behind.
+    d->mirror_rows = 0;
+    d->mirror_pending = 0;
+    return;
+  }
   static int once;
   if (!once) {
     once = 1;
@@ -1670,18 +1765,66 @@ static void ScreenMirror(VgaDevice* d, const VgaPicture* p) {
   }
   const int cols = p->cols < kVgaMirrorCols ? p->cols : kVgaMirrorCols;
   const int rows = p->rows < kVgaMirrorRows ? p->rows : kVgaMirrorRows;
+  if (cols != d->mirror_cols || rows != d->mirror_rows) {
+    d->mirror_cols = cols;
+    d->mirror_rows = rows;
+    memset(d->mirror, 0, sizeof d->mirror);
+    memset(d->mirror_hash, 0, sizeof d->mirror_hash);
+    memset(d->seen, 0, sizeof d->seen);
+    memset(d->seen_hash, 0, sizeof d->seen_hash);
+    d->mirror_pending = 0;
+  }
+  // Zeroed first: a row is written over the head of its buffer and the rest
+  // stays zero, so copying a row whole copies a defined tail.
+  char cur[kVgaMirrorRows][kMirrorRowMax];
+  uint32_t cur_hash[kVgaMirrorRows];
+  memset(cur, 0, sizeof cur);
+  // A console line is reported once the grid that carries it is final: a row
+  // that still differs from the previous render is a line being written, and a
+  // prefix of a line is not the line. Requiring the whole grid (not just the
+  // changed row) to settle is also what lets the shift below be verified — a
+  // half-written grid matches no shift.
+  int changed = 0;
   for (int row = 0; row < rows; row++) {
-    char line[kVgaMirrorCols + 1];
-    for (int col = 0; col < cols; col++) {
-      uint8_t ch = d->vram[(p->start + row * p->line_bytes + col) * 4];
-      line[col] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : ' ';
+    MirrorRowText(d, p, row, cols, cur[row], &cur_hash[row]);
+    if (cur_hash[row] != d->seen_hash[row] || strcmp(cur[row], d->seen[row])) changed = 1;
+  }
+  if (!changed) {
+    // A console that scrolled holds the same lines one row higher, and those
+    // rows have already been reported one row lower: the reference is the grid
+    // last reported, so only the text that entered at the cursor is new.
+    //
+    // The comparison stops at the last row that carries text. A console that is
+    // not full scrolls only the rows above its cursor: the new line lands at the
+    // cursor and the rows below it stay blank.
+    int used = 0;
+    for (int row = 0; row < rows; row++)
+      if (cur[row][0]) used = row + 1;
+    int shift = 0;
+    for (int k = 1; k < rows && !shift; k++) {
+      if (used <= k) break;  // no text left to tell a scroll from a redraw
+      int match = 1;
+      for (int i = 0; i + k < used && match; i++)
+        if (cur_hash[i] != d->mirror_hash[i + k] || strcmp(cur[i], d->mirror[i + k]))
+          match = 0;
+      if (match) shift = k;
     }
-    line[cols] = 0;
-    int len = cols;
-    while (len > 0 && line[len - 1] == ' ') line[--len] = 0;
-    if (strcmp(d->mirror[row], line) == 0) continue;
-    strcpy(d->mirror[row], line);
-    DebugText("screen", line);
+    if (shift > 0)
+      for (int row = 0; row < rows - shift; row++) MirrorSetRow(d, row, cur[row]);
+    for (int row = 0; row < rows; row++) {
+      if (cur_hash[row] == d->mirror_hash[row] && strcmp(cur[row], d->mirror[row]) == 0)
+        continue;
+      EmitScreenRow(cur[row]);
+      MirrorSetRow(d, row, cur[row]);
+    }
+  }
+  // Text still in flight keeps the render gate running, so a line reaches the
+  // log on the render after it settles instead of waiting for the guest to write
+  // again.
+  d->mirror_pending = changed;
+  for (int row = 0; row < rows; row++) {
+    memcpy(d->seen[row], cur[row], kMirrorRowMax);
+    d->seen_hash[row] = cur_hash[row];
   }
 }
 
@@ -1753,7 +1896,11 @@ void VgaPoll(VgaDevice* d) {
   VgaPicture p;
   VgaComputePicture(d, &p);
   VgaMarkMode(d, &p);
-  if (!d->dirty && blink_tick == d->rendered_blink_tick) return;
+  // A line still waiting to settle is a reason to render even when the guest
+  // has stopped writing: the mirror reports a row one render after its last
+  // change, and without this the last line of a burst would wait for the next
+  // guest write (or for the blink phase) instead of reaching the log.
+  if (!d->dirty && !d->mirror_pending && blink_tick == d->rendered_blink_tick) return;
   if (now - d->last_render_us < kRenderIntervalUs) return;  // batch guest writes
   // The framebuffer holds the current picture's own rows back to back: the
   // display channel publishes fb_width x fb_height and fbdump writes that many

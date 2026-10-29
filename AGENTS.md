@@ -200,8 +200,12 @@ CEMU_DEBUG = item[,item...]
                             g0..g31/f0..f31/x）
   mem[:ld|:st][=N]          访存事件
   trap                      异常/中断/陷入事件
-  bus                       MMIO / IO 端口命中（**不含指令取指**：固件在 ROM 窗口
-                           执行时取指行会淹没一切）
+  bus[:ADDR|:NAME]          MMIO / IO 端口命中（**不含指令取指**：固件在 ROM 窗口
+                           执行时取指行会淹没一切）。`bus:ADDR` 只留该端口/MMIO 地址，
+                           `bus:NAME` 只留该设备（`DeviceOps.name`，如 `bus:i8042`）——
+                           对应 QEMU `-trace` 的事件模式匹配。不带过滤时一次引导的前
+                           几万行全是 ROM 影子拷贝，5MB 输出硬顶会把要看的窗口吃掉；
+                           被滤掉的行不占 budget，也不占 skip 窗口
   pmp                       PMP 拒绝事件（每次拒绝一行）：
                            `pmp-deny addr=<物理地址> len=4 w S entry=0 cfg=18 base=... size=...`
                            —— 被拒绝的访问不会到达总线，`bus` 一行都不出；这一行给出
@@ -253,6 +257,15 @@ CEMU_DEBUG = item[,item...]
   skip=N                    类别静默窗口：该类别的前 N 个单位不打印。**trace 类目按
                             指令计**，其余类目按自己的事件计（trace 不为每条退休指令
                             都发射事件，按事件计会在没人要的指令号上开窗）
+  hist[=N]                  环形缓冲里最后 N 条已退休指令（默认 32，上限 64）：
+                            `<线性 PC> <助记符> <机器码>`。**任何无帧事件行触发时**
+                            从旧到新整段打印（mark/watch/bus/trap/pmp/virtio）：
+                            88 列的 DETAIL 装不下调用链，而调用链正是"客人自己干的，
+                            还是中断插进了别的事"的分界（对照物：Intel PT、Bochs 指令
+                            trace、NEMU ftrace）。**没有自己的 skip 窗口**：环只跟着
+                            已放行的行打印，给它一个 skip 会让它永远攒不满（行被抑制，
+                            dump 也就永不发生）。记的是**已提交**的指令，所以第 k 条
+                            指令里发生的事件显示到 k-1 为止，当条指令就看行里的 `pc=`
   mark                      无帧事件行：板级/设备级/解释器级观测，`a` 十进制、
                             `b` 十六进制（位掩码与地址要能直接读）。现有 name：
                             isa(中断线) intr(CPU INTR 线) inta(INTA 向量)
@@ -276,6 +289,9 @@ CEMU_DEBUG = item[,item...]
                             fdc-rw fdc-xfer(实际搬运字节) dma-xfer(计数寄存器/
                             mode&lt;&lt;8|道号&lt;&lt;4|masked) dma-reg
                             hostserial hostbyte inputopen inputpoll
+                            debugcon-tx(客人写调试口 0x402 的字节) uart-tx(客人写 COM1
+                            的字节) —— 客人对宿主的两个输出字节流各一行；客人打出的
+                            每个字节都能追到引发它的指令
                             vga-mode(宽,高) vga-shapes(AR10图形位|chain4<<1|
                             odd_even<<2|双扫描<<3|移位<<4|平面<<6, 起始偏移)
                             vga-timing(R9|R18<<8|R7<<16, R13|GR6<<8|GR5<<16)
@@ -294,8 +310,11 @@ CEMU_DEBUG = item[,item...]
                             键盘交给 sink 的那个三元组。@N 必填：缺省的节奏
                             等于替调用方做决定
   screen                    无帧文本行：客机控制台镜像，**整行输出**（控制台一行
-                            80 列，套进事件表只剩列框，call trace 就读不出来了）
-  utf8                      UTF-8 边框（默认 ASCII，Windows 代码页安全）
+                            80 列，套进事件表只剩列框，call trace 就读不出来了）。
+                            一行与上一次渲染相同（已稳定）才发；向上滚动只发进入
+                            视口的新行。字形按 CP437 解码，`utf8` 下转成 UTF-8，
+                            否则降为空格
+  utf8                      UTF-8 边框与字形（默认 ASCII，Windows 代码页安全）
 ```
 
 - 输出走 stderr，`2>file` 留档；热路径零成本（发射点一个位测试，
@@ -317,6 +336,11 @@ CEMU_DEBUG = item[,item...]
   指令帧可依赖，此前它们不带任何时刻，两行之间无法排序、也无法在下一轮复现。板级
   把 `inst_count` 交给中枢（`DebugSetClock`）后，看到的一行 `inst=N` 就能用
   `--max-inst=N` 重跑到同一刻，会话收尾再按 `dump=` 把客机状态取回来。
+- **这些行的地址在 DETAIL 的 `pc=` 里**：设备/中断/输入行都没有指令帧（设备 vtable
+  不带 CPU，见 §七），所以解释器每步把当前 `frame*` 交给中枢
+  （`DebugSetFrame`，与 QEMU 的 `first_cpu` + `cpu_get_pc()` 同形），无帧行于是能
+  说出是**哪条指令**引发了它；配 `hist` 的环形缓冲就得到"谁调的、从哪条指令来"。
+  `pc=` 是线性地址，与 `pcshot=` 同一口径。
 - 症状 → 命令配方速查：
 
 ```bash
@@ -334,6 +358,12 @@ CEMU_DEBUG="trace:line,watch=c0e4:4:w" ./cemu.exe ... img 2> w.txt
 # 异常去向不明 / 设备寄存器被谁读写
 CEMU_DEBUG="trap,trace:line" ./cemu.exe ... img 2> t.txt
 CEMU_DEBUG="bus,trace:line" ./cemu.exe ... img 2> b.txt
+# 设备/端口里出现怪东西，要问"是哪条指令干的"：bus 按端口或设备名收窄，
+# 每行自带线性 PC 与本条指令；再接 hist 就得到它之前的整段来路
+CEMU_DEBUG="mark,bus:0x402,hist=16" ./cemu.exe ... img 2> d.txt
+
+# 客人对宿主的输出字节（调试口 0x402 / COM1）逐字节归因
+CEMU_DEBUG="mark,hist=8,budget=40" ./cemu.exe ... img 2> c.txt   # 看 debugcon-tx/uart-tx 行
 
 # 访问故障（load/store access fault）：trap 行先给 paddr；若总线里明明有
 # 这个设备，就是 PMP 拒绝，再用 pmp 看命中的是哪个条目、解码成了什么区间

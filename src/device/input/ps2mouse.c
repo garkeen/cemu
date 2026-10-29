@@ -60,6 +60,7 @@ struct Ps2MouseState {
   int id;          // 0x00 or 0x03
   int detect;      // the wheel handshake state
   int buttons;     // bit 0 left, bit 1 right, bit 2 middle (the packet's order)
+  int reported;    // the button state the last packet carried
   int dx, dy, dz;  // movement the host reported and the guest has not read
   int command;     // -1, or the command waiting for its parameter byte
 };
@@ -114,18 +115,27 @@ static void SendPacket(Ps2MouseDevice* d, int dx, int dy, int dz) {
 }
 
 // The device reports on its own while it is in stream mode: one packet per
-// host event, carrying the movement that has accumulated since the last one.
-// In remote mode the movement waits for the host's 0xeb poll (QEMU
-// ps2_mouse_sync; v86 keeps the delta in mouse_delta_x until then).
+// host event that carries movement, or one that changes the button state — a
+// report is due when either changed since the last one (PS/2 mouse protocol,
+// stream mode). In remote mode the movement waits for the host's 0xeb poll
+// (QEMU ps2_mouse_sync; v86 keeps the delta in mouse_delta_x until then).
+//
+// An event that reports neither is not a report: a zero-movement packet with
+// unchanged buttons says nothing, and a guest waiting for another device's
+// answer counts the unsolicited traffic as stray data (SeaBIOS's ps2_recvbyte
+// discards it and takes its "Discarding ps2 data" path, which in this ROM
+// prints into its own padding — see progress.md).
 static void Sync(Ps2MouseDevice* d) {
   struct Ps2MouseState* st = d->st;
   if (st->remote) return;
+  if (st->dx == 0 && st->dy == 0 && st->dz == 0 && st->buttons == st->reported) return;
   int dx = st->dx, dy = st->dy;
   if (st->scale21) {
     dx = Scale21(dx);
     dy = Scale21(dy);
   }
   SendPacket(d, dx, dy, st->dz);
+  st->reported = st->buttons;
   st->dx = st->dy = st->dz = 0;
 }
 
@@ -241,6 +251,7 @@ void Ps2MouseWrite(Ps2MouseDevice* d, uint8_t val) {
       // whatever movement has accumulated, enabled or not (QEMU's AUX_POLL).
       Tx(d, kReplyAck);
       SendPacket(d, st->dx, st->dy, st->dz);
+      st->reported = st->buttons;
       st->dx = st->dy = st->dz = 0;
       break;
     case kCmdSetWrap:
@@ -272,6 +283,7 @@ void Ps2MouseWrite(Ps2MouseDevice* d, uint8_t val) {
       st->id = kIdStandard;
       st->detect = kDetectIdle;
       st->buttons = 0;
+      st->reported = 0;
       st->dx = st->dy = st->dz = 0;
       Tx(d, kReplyAck);
       Tx(d, kReplyBat);

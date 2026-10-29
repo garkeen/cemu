@@ -1,5 +1,125 @@
 # cemu 当前状态（progress.md）
 
+## 控制台"烫烫烫"的根因与修复：SeaBIOS 16 位段的字符串地址在 lld 合并后失效（2026-10-30）
+
+现象：`-display win32` 跑 msdos622 到 `Booting from 0000:7c00` 之后，宿主终端吐出几千个
+`0xCC`（GBK 下显示成"烫"）。取证与修复：
+
+- 字节是客人写端口 **0x402** 的：`fc31c` 的 `dprintf` 压入格式串 `0xd4f3`，
+  `vsnprintf` 用 `mov al,cs:[ecx]` 读物理 `0xFD4F3`，那里是 ROM 填充，于是把填充当串
+  打出来直到第一个 0。调用链见 `hist` 输出：`ps2_recvbyte` 的"丢弃意外字节"分支
+  （`cmp cl,0xfa` / `cmp eax,0xfe`）→ `bprintf` → `qemu_debug_putc`。
+- 该串在镜像里唯一一份在 f 段 **0x315**；`rom16.o` 的 `.rodata.str1.1` 却在
+  **0xd46f**（0xd4f3 = 0xd46f+0x84）。最终镜像把这一节放在 0x254 起，**16 位代码里
+  的绝对引用全部偏差 0xD21B**（12 处 `push imm32` 逐一验证）。
+- 机制：lld 会把三份 `.rodata.str1.1`（16bit/32seg/32flat）合并成一份，最终只能落一个
+  地址；而 16 位/32seg 是独立链接，串地址在链接时就被烧进指令。`layoutrom.py` 原来的
+  折叠模型只放大了 32flat 那份的尺寸，没有让 16 位/32seg 用合并后的地址。
+- 修复（都在 SeaBIOS 侧，两处）：
+  1. `build.ninja`：新增 `cc16nomerge` / `cc32segnomerge` 两条编译规则，编译 `out/ccode16.o`
+     与 `out/code32seg.o` 之后用 `objcopy --set-section-flags
+     .rodata.str1.1=alloc,load,readonly,contents` 去掉该节的 **MERGE/STRINGS** 标志。lld 只对
+     SHF_MERGE 的同名节做折叠，标志去掉后它无从合并：每个链接按自己的脚本放置自己的副本，
+     16 位/32seg 链接烧进 `push $str` 的地址就是最终镜像里的地址。
+  2. `scripts/layoutrom.py`：删掉原来"把三份 `.rodata.str1.1` 折成一份并放大 32flat 尺寸"的
+     模型（折叠已不存在，留着只会多占空间），并把 `_rodata<fileid>` 符号的生成条件从固定两个
+     名字放宽为任意 `.rodata*` 前缀。
+- 自证（不依赖"现象消失"）：镜像里 `0x3c316` 的 `push imm32` 立即数现在解析到
+  `Discarding ps2 data ...` 字符串；运行到该分支时 stdout 打印的是原文
+  **`Discarding ps2 data 01 (status=29)`**；`-icount shift=6` 与不带 icount 两种配置下
+  0xCC 计数都是 **0**（修复前 2974）。
+- 失败的尝试（均已撤回）：删折叠模型（最终链接报 `location counter backward`）；
+  `-fno-merge-constants`（这个 clang 不支持）；`-fwritable-strings`（字面量进 `.data`，
+  被 SeaBIOS 的 `/DISCARD/ *(.data*)` 判错）；在 noexec 阶段改名（地址此时已烧死）。
+- 副作用：`seabios/out` 整体重建，`vgabios.bin` 由 38400 变为 **38912** 字节（与原产物不同源）。
+
+## 无帧事件的归因设施：`DebugSetFrame` / `hist` / `bus:过滤器` / `debugcon-tx`·`uart-tx`（2026-10-30）
+
+起因是查"客人写调试口 0x402 打出几千个 0xCC"时，设备侧的观测行**只有已退休指令数、
+没有地址**：设备 vtable 不带 CPU（§七 的依赖边），`mark` 那一行说不出是哪条指令干的。
+`watch=` 量的是内存读写、`pcshot=` 要我猜地址，两次观测都因此落空。补的是设施：
+
+- `DebugSetFrame(frame*)`：三个解释器（x86/riscv64/riscv32）每步把当前帧交给中枢，
+  与 QEMU 的 `first_cpu` + `cpu_get_pc()` 同形。无帧行（mark/watch/bus/trap/pmp/virtio）
+  的 DETAIL 因此带上 `pc=<线性地址>`。只有 debug 打开时才调用（`g_dbg_any`）。
+- `hist[=N]`：环形缓冲存最后 N 条（默认 32，上限 64）**已提交**指令的线性 PC、助记符与
+  机器码，任何无帧事件行触发时从旧到新整段打印。记录点在 `DebugInsn`（提交后），因为
+  取指时 mnemonics/raw 还没填；`hist` 会连带打开机器码记录。对照物：Intel PT、
+  Bochs 指令 trace、NEMU ftrace。
+- `bus:ADDR` / `bus:NAME`：bus 类目按端口地址或 `DeviceOps.name` 过滤（QEMU `-trace`
+  事件模式匹配同形）。过滤在 budget 之前，被滤掉的行不占窗口；不带上限时一次引导的
+  前几万行全是 ROM 影子拷贝，5MB 硬顶会把要看的窗口吃掉。
+- `debugcon-tx` / `uart-tx` 两个 mark：客人写 0x402 与写 COM1 的每个字节一行（带 `pc=`），
+  客人对宿主的输出从此可逐字节归因。
+
+验收：`cmake --build build` 零告警；`cmake --build build --target check` → `dep: ok`。
+实测（`test/x86/probe/ps2kbd.elf`，秒级）：
+
+```
+| K | 0000000000000014 | | | kbd-byte a=250 b=0x0 pc=104f8 |
+hist 000000000001058f xor  30 c0
+hist 0000000000010591 out  ee
+hist 0000000000010592 ret  c3
+hist 0000000000010016 mov  b0 f0
+hist 0000000000010018 call e8 db 04 00 00
+| B | 00000000000104f8 | | out | io-st i8042:60:1 = f0 |
+```
+
+`bus:i8042` 只出 8042 的行，`bus:0x61` 一行不出（探针不碰 PIT 端口），过滤两路都验过。
+上一节"未解决"里列的"给 bus 加过滤入口 / 给 mark 补当前指令 PC"两项即由此落地。
+
+## CEMU_DEBUG=screen：整行稳定发射、滚动去重与 CP437 字形（2026-10-29）
+
+用户报 `screen` 日志"乱码"（半行、整屏重复、大段替换字符）。取证结论分两半：
+
+- **替换字符不是镜像的输出，是客人写调试口的字节**。`screen` 那条流（stderr）里
+  ≥0x80 的字节数始终是 0；那些 `�`／`烫` 全在 **stdout**，即 debugcon(0x402) 的
+  直通字节。`烫` 是 GBK 对 0xCC 0xCC 的显示，UTF-8 控制台下同一段字节显示成
+  U+FFFD。实测该段为 **3502 个 0xCC**（另一轮 1487+1609+406），写在 DOS 引导
+  期间、int13 读盘窗口内（`mark` 的 `gate a=13 b=0x258` 与 `debugcon-tx a=204`
+  行交错，约 3754–3815 万条指令），最后一个字节是 0xE0。
+- **是 cemu 与 QEMU 的分歧，不是客人一定会写的**。同一份镜像、同一份 SeaBIOS，
+  QEMU 侧 `-device isa-debugcon,iobase=0x402,chardev=file` 收到 4133 字节、
+  **0 个 0xCC**，且止于 `Booting from 0000:7c00`；cemu 侧同一时刻起写入 3502 个
+  0xCC。因此这段是 cemu 特有的路径，不是镜像内容、也不是控制台/粘贴的解码问题。
+  另外它依赖宿主时序：不带 `-display win32` 的若干次运行一个字节都没有。
+- **真实的缺陷是发射时机**。镜像原来每个渲染帧（4ms）逐行 diff，行内任一字符
+  变化就整行重发，因此一行被发很多次、且每次是前缀；滚屏让所有行"变化"，整屏
+  重发。用同一份镜像度量：修复前 194 行 `screen`，修复后 **29 行**（唯一行
+  22），且不再有半行。
+
+改动（`src/device/video/vga.c`、`vga.h`）：
+
+- 两套网格：`mirror`（上次已报告）与 `seen`（上一次渲染）。**整屏稳定**（与上
+  一次渲染逐行相同）才判定"这屏是终态"，此前一律不发，只把
+  `mirror_pending` 置位让渲染门再跑一次，因此行的最后一个字符落地的那一帧之后
+  就发出，不必等客人再写。
+- 滚动识别：对 `mirror` 找最小 `k`，使 `cur[0..used-k)` 与 `mirror[k..used)`
+  相同（`used` = 最后一行有文本的行号 +1，因为控制台未写满时新行落在光标处、
+  其下仍为空白）。命中则把前 `rows-k` 行记为已报告，只让新进入的行按稳定规则
+  发出。
+- 字形：CP437（IBM 码页 437，表源 Unicode CP437.TXT）经 `GlyphUtf8` 编码，**只
+  在 `utf8` 下启用**（默认仍 ASCII，理由同表框：Windows 控制台代码页）；否则
+  字形仍降为空格。`DebugText` 缓冲 160 → 512（132 列 × 3 字节 + 前缀），并修正
+  截断时按 `snprintf` 返回值写出越界长度的问题；`debug.c` 新增 `DebugUtf8()`。
+
+**未解决**（两项）：
+
+1. 那 3502 个 0xCC：端口（0x402）、时机（int13 读盘窗口）、与 QEMU 的分歧都已确定，
+   但**客人哪段代码在写、以及 cemu 的哪一处 I/O 行为把它引到这条路径**还没定。障碍
+   在设施：设备不见 CPU，`debugcon-tx` 只给已退休指令数、没有 PC；`bus` 类目带 PC，
+   但它的前九百多万个事件是 BIOS ROM 影子拷贝，5MB 落盘上限只够扫一个窗口。下一步
+   应给 `bus` 一个按设备名/地址过滤的入口，或给 `mark` 补一个"当前指令 PC"。
+2. `screen` 还剩一段 6 行整块重复（`OTI-91X … Installed at PS/2 port`），位置固定：
+   客人在这段让整屏内容重新出现，而重画结果与"上次报告"的网格既不相等也不是一次
+   整行位移，于是按"每行都变了"发出。
+
+本轮全部运行都限时（≤110s），未跑整包套件。
+
+验收：`cmake --build build` 零告警；`cmake --build build --target check` 依赖边
+ok；`vga_core`（`vga-core ok`）与 `vga_split`（`vga-split ok`）两个探针 exit=11
+通过。
+
 ## x86 内存路径一次性优化：TLB + PAE/PGE/NX + 热路径（2026-10-27）
 
 用户裁决：优化一次做到 32 位终态，之后加 x87/SSE 等功能不再回头改内存快路径；

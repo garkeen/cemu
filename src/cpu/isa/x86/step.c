@@ -132,6 +132,10 @@ void x86_step(CpuState* c) {
     fr->rec.len = 0;
     fr->rec.mnemonic = NULL;
   }
+  // The frame is live state for the debug hub: a device row fired from inside
+  // this instruction (a console byte, an interrupt edge) has no frame of its
+  // own, and this is what lets it name the guest code that caused it (debug.h).
+  if (dbg) DebugSetFrame(fr);
 
   if (setjmp(fr->raise)) {
     // Faults re-deliver through the interrupt table at the raised vector and
