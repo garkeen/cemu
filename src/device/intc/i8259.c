@@ -196,6 +196,11 @@ static void PicIoWrite(PicDevice* pic, PicState* s, uint16_t addr, uint8_t val) 
       s->init4 = val & 1;
       s->single_mode = val & 2;
       s->ltim = (val >> 3) & 1;  // level-sensitive lines for the whole chip
+      // The init handshake also clears irq_base (PicReset) until ICW2 reprograms
+      // it, and ICW1's LTIM bit is what decides whether a line request is an
+      // edge in IRR or a level the controller follows: both are invisible from
+      // the INTR pin alone (kDbgMark).
+      PicMark(s, "icw1", val);
     } else if (val & 0x08) {
       // OCW3.
       if (val & 0x04) s->poll = 1;
@@ -348,11 +353,14 @@ void PicInit(PicDevice* pic) {
 }
 
 void PicRegister(Bus* io, PicDevice* pic, uint16_t master_base, uint16_t slave_base) {
-  // Each chip's full 16-byte window decodes only the low bit; bytes 2..15
-  // are aliases of 0..1 (legacy PC behavior, mirrored by the QEMU model's
-  // addr&1).
-  BusAddRegion(io, master_base, 16, &kPicMasterOps, pic);
-  BusAddRegion(io, slave_base, 16, &kPicSlaveOps, pic);
+  // Each chip answers only at its two ports (A0 selects command or data); the
+  // PC/AT decodes no further aliases (tiny386 pc.c dispatches exactly
+  // 0x20/0x21/0xA0/0xA1, QEMU's i8259 registers a two-byte region). A wider
+  // window hands the PIC every port in the block: firmware that probes an
+  // unrelated port in it (0x22/0x23 are a common chipset probe) resets the
+  // controller through a write the real machine never delivers to it.
+  BusAddRegion(io, master_base, 2, &kPicMasterOps, pic);
+  BusAddRegion(io, slave_base, 2, &kPicSlaveOps, pic);
 }
 
 void PicSetIrqSink(PicDevice* pic, void (*set_irq)(void*, int, int), void* ctx) {

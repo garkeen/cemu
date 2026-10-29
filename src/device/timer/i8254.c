@@ -99,21 +99,21 @@ static int PitGetOut(PitChannel* s) {
   }
 }
 
-// Drive the IRQ line to the current OUT level. A rising edge is the tick the
-// PIC latches (edge-triggered): QEMU's pit_irq_timer_update does exactly this
-// with qemu_set_irq(pit_get_out()). Mode 3's OUT is high as soon as the count
-// loads, so the first tick lands at the load, not one period later -- and the
-// following rising edges stay at full-count boundaries.
-static void PitRaiseIfRising(PitDevice* pit, PitChannel* s) {
+// Drive the IRQ line to the current OUT level, both edges: QEMU's
+// pit_irq_timer_update does exactly this with qemu_set_irq(pit_get_out()).
+// The line must be a level, not a one-call pulse: an edge-triggered 8259
+// latches the rise in its IRR on the call, while a controller a guest has put
+// in level-sensitive mode (ICW1.LTIM or the ELCR) follows the line itself, so
+// a raise and a lower inside the same call leave neither a latched request nor
+// an asserted level for the CPU's INTR sampling to see. Mode 3's OUT is high
+// as soon as the count loads, so the first tick lands at the load, not one
+// period later -- and the following rising edges stay at full-count boundaries.
+static void PitDriveOut(PitDevice* pit, PitChannel* s) {
   int o = PitGetOut(s);
   if (o == s->out_level) return;
   s->out_level = o;
-  if (!o) return;
-  if (s->irq != -1 && pit->set_irq) {
-    pit->set_irq(pit->irq_ctx, s->irq, 1);
-    pit->set_irq(pit->irq_ctx, s->irq, 0);
-  }
-  if (s->mode == 3) {
+  if (s->irq != -1 && pit->set_irq) pit->set_irq(pit->irq_ctx, s->irq, o);
+  if (o && s->mode == 3) {
     uint64_t d = PitElapsed(s);
     s->last_irq_count = (d / s->count) * s->count;
   }
@@ -128,7 +128,7 @@ static void PitLoadCount(PitDevice* pit, PitChannel* s, int val) {
   s->last_irq_count = 0;
   s->count = (uint32_t)val;
   s->armed = 1;
-  if (s->mode == 3) PitRaiseIfRising(pit, s);
+  if (s->mode == 3) PitDriveOut(pit, s);
 }
 
 static void PitLatchCount(PitChannel* s) {
@@ -244,22 +244,38 @@ void PitPoll(PitDevice* pit) {
   if (s->mode == 3) {
     // Square wave: the line level itself carries the edges (high right after
     // the load, low after the half period, high again at each full count).
-    PitRaiseIfRising(pit, s);
+    PitDriveOut(pit, s);
     return;
   }
   uint64_t d = PitElapsed(s);
   switch (s->mode) {
     case 2: {
-      // Rate generator: OUT is a one-clock pulse at each terminal count, too
-      // narrow to sample, so assert the edge when the boundary is crossed.
-      // last_irq_count is in the same tick domain as d.
-      if ((int32_t)(s->last_irq_count + s->count - (uint32_t)d) < 0) {
+      // Rate generator: OUT is high except for one input clock at the terminal
+      // count, too narrow to sample, so the boundary crossing is the edge.
+      // last_irq_count is in the same tick domain as d, and the tick is due at
+      // d == last_irq_count + count: that is the transition QEMU's
+      // pit_get_next_transition_time names, so a run warp that lands exactly on
+      // the deadline fires here instead of needing one more microsecond.
+      if ((int32_t)(s->last_irq_count + s->count - (uint32_t)d) <= 0) {
+        // The tick itself: OUT dips and rises (8254 mode 2). Both levels are
+        // driven so an edge-triggered 8259 latches the rise while a
+        // level-sensitive one sees the asserted line; the level stays up until
+        // the next poll (below) so the CPU samples it at an instruction
+        // boundary -- QEMU's qemu_set_irq(1) likewise survives until the OUT
+        // transition that lowers it.
+        s->out_level = 1;
         if (pit->set_irq) {
-          pit->set_irq(pit->irq_ctx, s->irq, 1);
           pit->set_irq(pit->irq_ctx, s->irq, 0);
+          pit->set_irq(pit->irq_ctx, s->irq, 1);
         }
         s->last_irq_count += s->count;
         if (HostTimerNow() - s->count_load_time > (1ULL << 31)) PitLoadCount(pit, s, s->count);
+      } else if (s->out_level) {
+        // A poll later OUT is low again: drop the line so the next terminal
+        // count is a fresh rising edge (and a level-sensitive controller does
+        // not hold a request the guest has already acknowledged).
+        s->out_level = 0;
+        if (pit->set_irq) pit->set_irq(pit->irq_ctx, s->irq, 0);
       }
       break;
     }

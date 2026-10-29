@@ -256,7 +256,7 @@ CEMU_DEBUG = item[,item...]
   mark                      无帧事件行：板级/设备级/解释器级观测，`a` 十进制、
                             `b` 十六进制（位掩码与地址要能直接读）。现有 name：
                             isa(中断线) intr(CPU INTR 线) inta(INTA 向量)
-                            pic0/pic1-imr|eoi|base ioapic lapic-irr|ack|eoi
+                            pic0/pic1-imr|eoi|base|icw1 ioapic lapic-irr|ack|eoi
                             lidt/lgdt gate(门描述符) hostkey kbd-byte kbd-irq
                             aux-byte aux-irq(IRQ12) hostmouse mouse-inj key-inj
                             gatecall int=<向量> ax= bx= cx= dx= ds= es= at=<cs:ip>
