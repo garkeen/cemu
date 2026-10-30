@@ -1995,11 +1995,54 @@ static int int_is_fault(int vec) {
 // Operation, vol.3 table 6-1 — a software INT n and the external interrupt pin
 // push a bare flags/CS/IP frame); the EXT bit of gate-fault error codes is set
 // for external events only; and only INT n/INT3/INTO check the gate DPL.
+// SDM vol.3 20.3.3: with CR4.VME the TSS carries a 32-byte software interrupt
+// redirection bitmap at offset 0 -- 256 bits, one for every vector. Bit n
+// decides whether INT n executed in virtual-8086 mode is taken as a *virtual*
+// interrupt (the 8086 handler runs on the caller's stack) or reflected to the
+// monitor through the IDT. A TSS whose limit stops short of the map has no
+// bitmap at all: every bit reads 0 (SDM vol.3 20.3.3.1), so every software
+// interrupt goes to the monitor.
+static int vme_redirected(uint32_t vec) {
+  uint32_t byte = (vec & 0xff) >> 3;
+  if ((uint64_t)byte + 1 > s->tr_limit) return 0;
+  return (int)((kbus_load(s->tr_base + byte, 1) >> (vec & 7)) & 1);
+}
+
 void do_int(int vec, uint32_t ret_eip, int origin, uint32_t ec) {
   int soft = origin == kIntSoft;
   int ext = origin == kIntExternal;
   uint32_t eflags_img = fl->word | 2;
+  // VIF is not part of a saved flags image -- IRET restores it from the image's
+  // IF bit (SDM vol.3 20.3.3.5), which is also what the PUSHF path in this file
+  // does. A virtual-8086 delivery that reflects to the monitor pushes the image
+  // QEMU pushes: VM and IOPL set, no VIF bit.
+  if (fl->vm) eflags_img &= ~0x80000u;
   if (origin == kIntException && int_is_fault(vec)) eflags_img |= 0x10000;
+  // A software INT n raised in virtual-8086 mode under VME whose redirection
+  // bit is set is a virtual interrupt: the IVT entry runs in V86 mode on the
+  // caller's stack, with the image's IF carrying VIF and bit 20 carrying VIP
+  // (SDM vol.3 20.3.3.1). The frame is the 32-bit one -- the image has to hold
+  // VIF/VIP, which a 16-bit word cannot -- and the handler runs with VIF=0
+  // (virtual interrupts masked) while VIP keeps its previous value.
+  if (soft && fl->vm && (s->cr4 & kCr4Vme) && vme_redirected((uint32_t)vec)) {
+    uint32_t img = (fl->word & ~(0x200u | 0x100u | 0x100000u | 0x80000u)) | 2;
+    if (fl->vif) img |= 0x200u;
+    if (fl->vip) img |= 0x100000u;
+    uint64_t tbl = s->idtr + (uint64_t)vec * 4;
+    uint32_t off = krd16(tbl);
+    uint32_t seg = krd16(tbl + 2);
+    kpush32(img);
+    kpush32(s->sreg[cs_i]);
+    kpush32(ret_eip);
+    fl->vif = 0;
+    fl->tf = 0;
+    seg_view v;
+    seg_synth((uint16_t)seg, &v);
+    seg_commit(cs_i, (uint16_t)seg, &v);
+    SetEip(off);
+    d.delivered = 1;  // the TF trap postpones to the handler's first insn
+    return;
+  }
   if (!(s->cr0 & 1)) {
     uint64_t tbl = s->idtr + (uint64_t)vec * 4;
     uint32_t off = krd16(tbl);
@@ -4777,8 +4820,10 @@ static void run_op2(uint8_t op2) {
         ecx = 0;
         // EDX: FPU, DE, PSE, TSC, MSR, PAE, MCE, CX8, APIC, SEP, MTRR, PGE,
         // MCA, CMOV, PAT, PSE36, CLFSH, MMX, FXSR, SSE, SSE2. Every bit here
-        // has an execution path in this file; VME and the rest are advertised
-        // only once their behaviour is complete.
+        // has an execution path in this file; VME's redirection bitmap now has
+        // one too (do_int), but its bit stays clear until the dual run against
+        // QEMU pins the frame shape (SDM vol.3 20.3.3.1), so the rest are
+        // advertised only once their behaviour is complete.
         edx = 0x078bfbfdu;
       } else if (leaf == 0x0b) {
         // APIC topology (SDM vol.2 CPUID.0BH): the one SMT thread is level 0,
