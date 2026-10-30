@@ -635,6 +635,15 @@ elf_cell pm_sci 0 lock
 # deferral that INTREN decides. ref cell: the transcript is byte-identical.
 elf_cell smbus 11 ref
 
+# PIIX3/4 XBCS (test/x86/probe/xbcs.asm): configuration offset 0x4E of the ISA
+# bridge -- its reset image 0x03 (BIOSWE | BLE) and the fact that every bit
+# stores what is written, plus 00:01.3's same offset being a different register.
+# The datasheet's write-one-to-set BIOSWE and the BLE lock are not modelled
+# because the reference keeps the byte as plain storage (QEMU hw/isa/piix.c) and
+# nothing on this machine consumes it; §X D19 carries that gap.
+# ref cell: the transcript is byte-identical.
+elf_cell xbcs 11 ref
+
 # I/O APIC NMI delivery (test/x86/probe/nmi_ioapic.asm), PIT IRQ0 -> I/O APIC
 # pin 0 -> NMI. Lock cell: QEMU 11 accepts the entry but does not raise the
 # CPU NMI flag in this configuration; cemu follows 82093AA §3.2.4.

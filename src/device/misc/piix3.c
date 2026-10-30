@@ -12,6 +12,9 @@ enum {
   kCfgSubClass = 0x0a,
   kCfgClass = 0x0b,
   kCfgHeaderType = 0x0e,
+  // XBCS: the extended BIOS control byte (PIIX4 datasheet's register 4Eh) that
+  // lives on the ISA bridge, not on the power-management function.
+  kCfgXbcs = 0x4e,
 };
 enum {
   kVendorIntel = 0x8086,
@@ -23,6 +26,9 @@ enum {
   // Bit 7 marks a multi-function device: firmware only looks at function 1 when
   // function 0 says so (seabios src/hw/pci.c pci_next).
   kHeaderTypeMultiFunction = 0x80,
+  // The XBCS byte the device starts with: BIOSWE | BLE, the value QEMU's
+  // piix_reset leaves in pci_conf[0x4e] (hw/isa/piix.c).
+  kXbcsReset = 0x03,
 };
 
 static void Put16(uint8_t* p, uint16_t v) {
@@ -81,4 +87,13 @@ void Piix3BridgeInit(Piix3BridgeDevice* d, uint8_t bus, uint8_t dev) {
   d->pci.config[kCfgSubClass] = kSubClassIsa;
   d->pci.config[kCfgClass] = kClassBridge;
   d->pci.config[kCfgHeaderType] = kHeaderTypeMultiFunction;
+  // XBCS. The datasheet makes bit 0 BIOSWE a write-one-to-set bit that bit 1
+  // BLE then locks until reset, but nothing on this machine consumes it: the
+  // E/F segment's write permission comes from the host bridge's PAM bits
+  // (device/misc/i440fx.c I440fxRamWritable, the same rule QEMU's
+  // hw/pci-host/i440fx.c applies), QEMU's own model of this bridge keeps the
+  // byte as plain storage (hw/isa/piix.c), and SeaBIOS never touches it. The
+  // model therefore matches the reference: reset 0x03, every bit storing what
+  // is written. The datasheet's lock semantics stay registered (D19).
+  d->pci.config[kCfgXbcs] = kXbcsReset;
 }

@@ -1,5 +1,20 @@
 # cemu 当前状态（progress.md）
 
+## XBCS（ISA 桥配置 0x4E）：D19 里最后一个"寄存器未实现"（2026-10-30）
+
+- 参考：QEMU `hw/isa/piix.c` 的 `piix_reset` 只写 `pci_conf[0x4e] = 0x03`，之后这个
+  字节没有处理器（`piix_write_config` 只看 PIRQ 0x60-0x63）；`hw/pci-host/i440fx.c`
+  里决定 BIOS 区能不能写的是 PAM 位（`pam_update`），没有 BIOSWE 这一项。
+- 落点 `src/device/misc/piix3.c`：配置 0x4E 复位值 0x03，八个位都按写入存储 ——
+  与 QEMU 同。**手册的 BIOSWE 写 1 置位 / BLE 锁定到复位没有实现**：参考实现没有，
+  本机也没有可门控对象（E/F 段写许可由 `I440fxRamWritable` 的 PAM 位决定，与
+  QEMU 同一条规则），SeaBIOS 从不碰这个字节。缺口按 §二 登记在 §X D19。
+- 验证：`test/x86/probe/xbcs.asm` 双跑，两模型逐字节相同
+  `xbcs r0=03 w2=02 w1=01 w0=00 wf=ff pm=00`。顺带钉住一件事：0x4E 属于 function 0
+  （ISA 桥），function 3 同偏移读 0（它的 0x40 是 PMBASE），所以这个寄存器不会被
+  PM 功能抢走。
+- 套件：`elf_cell xbcs 11 ref`，`check-x86` 44 → **45 passed, 0 failed**。
+
 ## PIIX4 SMBus 主机控制器：D19 的最后一块在册缺口（2026-10-30）
 
 照 QEMU 参考实现把 00:01.3 的 SMBus 侧补齐（AGENTS §X D19 里"**SMBus 主机控制器

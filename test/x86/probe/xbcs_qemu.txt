@@ -1,0 +1,34 @@
+Dual run of test/x86/probe/xbcs.asm, 2026-10-30:
+
+  cemu --machine x86 --isa x86 xbcs.elf                     -> status 11
+  qemu-system-i386 -machine pc -m 32 -cpu pentium -kernel xbcs.elf \
+      -display none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x4 \
+      -serial file:xbcs_qemu.txt                            -> status 11
+
+Both lines are identical, byte for byte. QEMU here is 10.2.92
+(v11.0.0-rc2-12119-gaa7f0eb8d8-dirty).
+
+  xbcs r0=03 w2=02 w1=01 w0=00 wf=ff pm=00 ok
+
+What each field pins:
+
+  r0        the reset image of configuration offset 0x4E on 00:01.0 (the ISA
+            bridge): 0x03, i.e. BIOSWE | BLE -- the value QEMU's piix_reset
+            writes (hw/isa/piix.c: pci_conf[0x4e] = 0x03).
+  w2/w1/w0  writes of 0x02, 0x01 and 0x00 read back unchanged. The datasheet
+            makes bit 0 (BIOSWE) write-one-to-set and bit 1 (BLE) a lock that
+            freezes it until reset, which would answer 0x03/0x02/0x02 here; the
+            reference model keeps the byte as plain storage, so this model does
+            too and the lock semantics stay registered (AGENTS.md §X D19).
+  wf        all eight bits store (a write of 0xFF reads back 0xFF).
+  pm        the same offset on 00:01.3 reads 0: that function's 0x40 is PMBASE
+            and it has no XBCS, so the register belongs to function 0 alone.
+
+Why BIOSWE gates nothing here: the E/F segment's write permission comes from the
+host bridge's PAM bits on both models (cemu device/misc/i440fx.c
+I440fxRamWritable; QEMU hw/pci-host/i440fx.c pam_update), and that calculation
+has no BIOSWE term -- QEMU has no reader of the byte at all, and SeaBIOS never
+writes it.
+
+cemu xbcs r0=03 w2=02 w1=01 w0=00 wf=ff pm=00 ok
+qemu xbcs r0=03 w2=02 w1=01 w0=00 wf=ff pm=00 ok
