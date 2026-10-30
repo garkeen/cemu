@@ -18,29 +18,50 @@ x86 已接入，之后 arm / mips），加载 `.bin` / `.elf` / `.img`，按真�
 阶段 0–3.5 完成（ISA 一致性、真实固件、x86 保护模式与分页、调试器与 GUI；
 gdb 的硬件观察点走 CPU 自己的 DR0-DR7，只读观察点因 DR7 没有该编码而拒接、
 riscv 侧尚未接 trigger 模块，两处记在 D6）。
-**阶段 4（设备全集与真实 OS）进行中**：PC 设备模型全集到位——VGA 家族核含
-VBE/DISPI、链式 256 色与 EDID，PS/2 键盘鼠标与串口鼠标，8259/8254，8272 FDC +
-8237 DMA，IDE/ATAPI 含 LBA-48 与 multi-sector，LAPIC/IOAPIC 含 NMI 交付，PIIX4 PM
-含 SCI 与 S5 关机；余下缺口按 AGENTS.md §X 的 D17/D19 在册。
-验收阶梯：**xv6-x86 ✅**（SeaBIOS → IDE 盘 → shell）、**Linux ✅**（引导越过
-`VFS: Mounted root (ext2 filesystem)`，控制台出提示符）、**Windows 1.01 ✅**（EGA
-640×350 的 MS-DOS Executive 桌面，`fbdump` 帧与 QEMU 基线逐像素相同，PS/2 指针可
-移动）、**xv6-riscv 未开始**（镜像与 OpenSBI fw_jump 素材未取）。
-x86 CPU 已到 i686 功能面：x87（Berkeley SoftFloat 3e）、MMX/SSE/SSE2、RDTSC(P)、
-SYSENTER/SYSEXIT、MTRR/PAT、MCE 寄存器组、性能计数器、AC、PSE-36、FXSAVE/FXRSTOR；
-APIC 的 CPUID/leaf 0x0B 拓扑已广告，CR0.NE=0 的 FERR# 接到 8259 IRQ13；
-余下 VME/PVI 重定向与 PMU 细节记在 D39，port 0xF0/IGNNE# 记在 D19。
-回归：x86 43 格（新增 `paging32` PAE/PGE/NX 与 `x87`/`sse`/`sys686`/`pse36`/`ac`
-五个自足探针，以及 `lgdt16` 的 16/32 位操作数描述符表基址语义；KUT/pm/realmode/
-新探针逐格通过，realmode 127 PASS/0 FAIL）、
-riscv64 136/0、riscv32 104/0、依赖边 ok。
-逐轮记录见 [progress.md](progress.md)。
+
+**阶段 4（设备全集与真实 OS）进行中。** x86 的 PC 设备模型全集到位：VGA 家族核
+（VBE/DISPI、链式 256 色、EDID）、PS/2 键鼠与串口鼠标、8259/8254、8272 FDC +
+8237 DMA、IDE/ATAPI（LBA-48、multi-sector）、LAPIC/IOAPIC（含 NMI 交付）、
+PIIX4 PM（SCI、S5）、SMBus 主机 + SPD EEPROM、XBCS、IGNNE#；riscv 侧 virt 板带
+virtio-mmio（blk/console/keyboard/tablet），oberon 板按参考模拟器逐契约复刻。
+余下规格缺口按 AGENTS.md §X 的 D17/D19 在册。
+
+验收阶梯（全部是真实软件，无 cemu 定制成分）：
+
+- **xv6-x86 ✅**：SeaBIOS → IDE 盘 → shell。
+- **Linux ✅**：引导越过 `VFS: Mounted root (ext2 filesystem)`，控制台出提示符。
+- **Windows 1.01 ✅**：EGA 640×350 的 MS-DOS Executive 桌面，`fbdump` 帧与
+  QEMU 基线逐像素相同，PS/2 指针可移动。
+- **Windows 2.0 ✅**：过 logo（此前卡死是 vgabios 的 int10 用客人栈写穿客人代码），
+  帧与 QEMU 逐色相同，详见 progress.log。
+- **Windows 3.1 ✅**：1024×768 桌面（此前的红花屏是 vgabios 用了"标准 VGA"构建、
+  与 Bochs stdvga 卡不匹配；重建为 Bochs VBE 后对上）。
+- **HelenOS 0.14.1 riscv64 ✅**：内核全量引导零异常，止于上游未实现的 S→U 交接
+  （QEMU 执行同一镜像停在同一处 `j .`）。
+- **SPDOS/DOS7 软盘 ✅**：经 SeaBIOS 进 DOS；WPS 卡死经 QEMU 对拍判为 CHLIB
+  依赖真机 BIOS 约定（0x80 的几何、段寄存器跨调用保持），不是 cemu 缺陷。
+- **Windows 95 进行中**：卡在两个 logo（`cs=0x9000` 的页帧被客人自己清零后仍被
+  `jmp` 进去），见 progress.log 最新一节。
+- **xv6-riscv 未开始**：镜像与 OpenSBI fw_jump 素材未取；riscv 侧的真实 OS 验收
+  目前由 HelenOS 承担。
+
+CPU 面：x86 到 i686（x87 走树内 Berkeley SoftFloat 3e、MMX/SSE/SSE2、RDTSC(P)、
+SYSENTER/SYSEXIT、MTRR/PAT、MCE 寄存器组、性能计数器、AC、PSE-36、FXSAVE/FXRSTOR）；
+APIC 的 CPUID/leaf 0x0B 拓扑已广告，CR0.NE=0 的 FERR# 接到 8259 IRQ13；余下
+VME/PVI 重定向与 PMU 细节记在 D39，port 0xF0/IGNNE# 记在 D19。riscv 侧
+RV64IMAFDC + Sv39/Sv48 + PMP，RV32 是独立后端（RV32IMAFDC + Sv32）。
+
+回归：**riscv64 136 格、riscv32 104 格、x86 47 格，全绿**（x86 = 39 个自足探针 +
+7 个 kvm-unit-tests 镜像 + realmode 1 格，127 PASS/0 FAIL；realmode 偶见对 PIT
+IRQ0 到达时机的敏感，见 progress.log）。依赖边 `dep: ok`。逐轮记录见
+[progress.log](progress.log)。
 x86 固件（SeaBIOS + 显卡 option ROM）来自库外的一棵源码树，其现状、重建步骤与配置
 快照见库外 `../seabios/firmware.md`（不随本仓库跟踪）。
 
 ## 构建
 
-依赖只有 clang 与 mingw-w64 sysroot（无第三方库）：
+依赖只有 clang 与 mingw-w64 sysroot；第三方代码只有树内 vendored 的 Berkeley
+SoftFloat 3e（BSD-3，x87 用，`src/cpu/isa/x86/softfloat/`），不引入外部库：
 
 ```sh
 cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE=tools/clang.cmake
@@ -58,7 +79,7 @@ PATH 时前置 `PATH=/d/ninja:$PATH`）。要求 `-Wall -Wextra` 零告警。
 build/cemu.exe [options] image.bin|image.elf
 ```
 
-不带参数运行会打印全部开关。三块主板按 QEMU 惯例用 `--machine` 选：
+不带参数运行会打印全部开关。四块主板按 QEMU 惯例用 `--machine` 选：
 
 ```sh
 # spike 主板：riscv-tests，HTIF 退出（ELF 的 EI_CLASS 决定 32/64 位）
@@ -76,15 +97,20 @@ build/cemu.exe --machine x86 -display win32 -cdrom linux.iso
 # （vgaroms/vgabios.bin 一般是 seabios 树按 CONFIG_NO_VGABIOS=0 构建的产物）
 build/cemu.exe --machine x86 -display win32 -bios bios.bin \
   -vgabios vgabios.bin -fda win101.img -mouse ps2
+
+# oberon 主板：Project Oberon（RV32）从 SD 卡启动，帧缓冲在窗口里
+build/cemu.exe --machine oberon -dsk disk.img -display win32
 ```
 
 `.bin` 需要 `--isa NAME`（ELF 自报 ISA）。常用：`--mem MB`、`--max-inst N`、
-`--skip-idle`、`-hdb`、`-fda`、`-vgabios`、`-mouse ps2|serial`、`-gdb tcp::PORT`
-/ `-s` / `-S`（gdb RSP stub，配套图形前端 `cemugui`）。
+`--skip-idle`、`-icount shift=N`（每条指令记 1<<N ns 的客机时间，定时器边缘
+因此只由指令流决定，复现性用）、`-kernel`/`-append`（virt）、`-hdb`、`-fda`、
+`-dsk`、`--switches N`（oberon）、`-vgabios`、`-mouse ps2|serial`、
+`-gdb tcp::PORT` / `-s` / `-S`（gdb RSP stub，配套图形前端 `cemugui`）。
 
-窗口鼠标统一按绝对位置映射：指针在画面内直接对应客人画面的像素位置，画面外的黑边
-钳到最近边缘，离开窗口停发；缩放窗口时画面矩形动态重算。virt/Oberon 是原生绝对设备，
-x86 的 PS/2 由板级换算（相对协议的近似与漂移边界见 AGENTS.md D38）。
+窗口指针按**设备原生语义**投递（契约见 AGENTS.md §十一）：virt 的 virtio-tablet
+与 Oberon 鼠标寄存器是原生绝对设备，客户区坐标直接映射到源画面像素；x86 的
+PS/2 与 `-mouse serial` 只有相对协议，投的是宿主指针的位移（漂移边界见 D38）。
 
 ## 测试
 
@@ -114,5 +140,5 @@ CEMU_DEBUG="trace:table,state,mem,budget=200" \
 |---|---|
 | [AGENTS.md](AGENTS.md) | 开发铁律（改代码前必读） |
 | [arch.md](arch.md) | 架构与阶段路线图 |
-| [progress.md](progress.md) | 现状与决策记录（最近的在最上） |
+| [progress.log](progress.log) | 开发日志：过程、证据与裁决（按时间倒序） |
 | [reference.md](reference.md) | 参考项目索引与语义裁决顺序 |

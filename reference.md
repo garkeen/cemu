@@ -22,11 +22,13 @@
 | byang1217-TQemu | byang1217-TQemu/ | 可移植哲学（OS 无关、单 mainloop、libc/libm only）；本 checkout 无 target 后端不可跑 | GPL-2 |
 | gem5 | gem5/ | 行为裁决第三票；ARM 阶段的行为规范 src/arch/arm/；riscv 侧 src/arch/riscv/ | BSD-3 |
 | v86 | v86/ | x86 设备/启动行为；tests/kvm-unit-tests（realmode 验收套件已入库 test/x86/realmode）、tests/nasm、tests/qemu 双跑方法论、tests/full（真实 OS 清单，阶段 4 用） | MIT |
+| v86images | v86images/ | 真实 OS 镜像素材（windows101/2/31/95、msdos622、spdos 等），阶段 4 手工验收与回归的取材地；引导不进套件（AGENTS.md §七） | 各方原许可 |
 | abstract-machine | abstract-machine/ | 阶段 3 cesdk 蓝本：am/src/platform/nemu/ 的 trm.c、include/nemu.h 设备图、scripts/linker.ld | Mulan PSL v2 |
 | opensbi | opensbi/ | 阶段 2 验收固件源码（fw_dynamic.h 等结构定义） | BSD-2 |
 | riscv-tests / riscv-test-env | riscv-tests/ riscv-test-env/ | riscv 验收套件；env/p/riscv_test.h 是 tohost/fromhost 退出契约 | MIT/BSD 系 |
 | seabios | seabios/ | 阶段 4 SeaBIOS 路线：自建 `out/bios.bin`（256KiB 窗口、有效内容 135232 字节，复位向量逐字节验证）+ 显卡 option ROM `out/vgabios.bin`（38400 字节，int10 视频服务的来源）。**该树在库外且不是 git 仓库**——它的现状、重建步骤与配置快照见库外 `../seabios/firmware.md`（不随本仓库跟踪） | LGPL 等 |
 | xv6-public | xv6-public/ | 阶段 4 x86 验收件源码（用户镜像即它构建的 i386 版）：ide.c/lapic.c/ioapic.c 是设备语义的现成判据 | MIT |
+| helenos | helenos/ | 阶段 4 riscv 侧的真实 OS 应力源（0.14.1 riscv64 发行镜像）：Sv48、PMP 零规则、非叶 PTE 的 A/D/U、srai 的 shamt 都由它暴露 | 见树内 LICENSE |
 | pintos | pintos/ | 阶段 5 及之后的 OS 候选验收件（线程/文件系统/驱动契约），当前尚未使用 | 见树内 LICENSE |
 | UcoreOS | UcoreOS/ | 同上：阶段 5+ 候选验收件，当前尚未使用 | 见树内 LICENSE |
 
@@ -65,7 +67,7 @@ QEMU 源码不在树中：QEMU 行为经 D:/qemu 的二进制实测校准
 | 机制 | cemu 已有 | 当初照谁写的 |
 |---|---|---|
 | riscv 指令语义 | cpu/isa/riscv64/exec.c（巨型 switch 直执） | xiangshanNEMU def_EHelper 逐条翻译 |
-| riscv CSR/特权 | cpu/isa/riscv64/csr.c + mmu.c（PMP/Sv39） | xiangshanNEMU system/*.c |
+| riscv CSR/特权 | cpu/isa/riscv64/csr.c + mmu.c（PMP/Sv39/Sv48） | xiangshanNEMU system/*.c |
 | riscv 步进协议 | cpu/isa/riscv64/step.c（wfi + 取指 + 单点提交 + 计数器） | priv spec + spike 单核语义 |
 | riscv32 指令语义/CSR/Sv32 | cpu/isa/riscv32/（独立后端：RV32IMAFDC、RV32 CSR 布局、Sv32） | dearchap-tinyemu riscv_cpu_template.h（MAX_XLEN=32）与 Sv32 页表走查；riscv-tests isa/rv32* p 套（test/riscv32） |
 | x86 指令语义 | cpu/isa/x86/exec.c（modrm/SIB→opcode 序直执） | tiny386 i386.c + SDM |
@@ -79,8 +81,14 @@ QEMU 源码不在树中：QEMU 行为经 D:/qemu 的二进制实测校准
 | spike 主板 | board/spike_min.c | spike 契约（tohost 从 ELF 符号表） |
 | 引导扇区契约 | board/x86_min.c（0x7C00、DL=0x80） | QEMU seabios 交接契约实测 |
 | 目录依赖检查 | tools/depcheck.sh（`cmake --build build --target check`） | 自订；规则见 AGENTS.md 第七节 |
-| PC 芯片组与固件接口 | device/misc/{i440fx,piix3,pci,cmos,port92,fwcfg,debugcon}.c | QEMU hw/i386/*、seabios src/fw/pciinit.c（progress 片 1 逐项记录） |
+| PC 芯片组与固件接口 | device/misc/{i440fx,piix3,pci,cmos,port92,fwcfg,debugcon}.c | QEMU hw/i386/*、seabios src/fw/pciinit.c（progress.log 片 1 逐项记录） |
 | PIIX IDE 与 ATAPI | device/storage/ide.c | ATA/ATAPI-7 §6.3/§7.10/§9.6（PIO 与 PACKET）；QEMU hw/ide/core.c（经 tiny386/ide.c 转述）+ SeaBIOS src/hw/ata.c 的实际用法（片 9） |
 | PS/2 键盘（i8042） | device/input/i8042.c | PC/AT Technical Reference；QEMU ps2.c/pckbd.c（片 5-7） |
+| PS/2 鼠标与串口鼠标 | device/input/ps2mouse.c / msmouse.c | PS/2 鼠标协议（相对计数、滚轮握手）；QEMU ps2.c、hw/input/msmouse.c |
+| 软盘 FDC + 8237 DMA | device/storage/fdc.c + device/dma/i8237.c | 82077AA 与 8237A 数据表（命令/结果相位、模式、页面锁存）；QEMU hw/block/fdc.c、hw/dma/i8257.c |
+| PIIX4 PM / SMBus / XBCS / IGNNE# | device/misc/{piix4pm,smbus_eeprom,piix3,portf0}.c | PIIX4 datasheet（PMBASE/PMREGMISC、SMBus、XBCS 4Eh）；ACPI 4.8；SMBus 2.0；QEMU hw/acpi/piix4.c、hw/i2c/*、hw/isa/piix.c、hw/i386/pc.c |
+| virtio-mmio（blk/console/keyboard/tablet） | device/virtio/ | QEMU hw/virtio 的 split queue 与 virtio-mmio 传输；virt DTB 的槽位/PLIC 中断号 |
+| x86 功能面（x87/MMX/SSE/SSE2） | cpu/isa/x86/fpu.c + softfloat/ | Intel SDM；Berkeley SoftFloat 3e（树内合并版，BSD-3） |
+| Oberon 主板与外设 | board/oberon.c + device/{misc/oberon_io,storage/oberon_sd,char/oberon_pclink,video/ramfb}.c | oberon-riscv-emu 逐契约复刻（片 37） |
 
 新设备/新机器动手前，先按"当初照谁写的"列找到参考原型读一遍。

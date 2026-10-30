@@ -124,7 +124,7 @@ static void SendPacket(Ps2MouseDevice* d, int dx, int dy, int dz) {
 // unchanged buttons says nothing, and a guest waiting for another device's
 // answer counts the unsolicited traffic as stray data (SeaBIOS's ps2_recvbyte
 // discards it and takes its "Discarding ps2 data" path, which in this ROM
-// prints into its own padding — see progress.md).
+// prints into its own padding — see progress.log).
 static void Sync(Ps2MouseDevice* d) {
   struct Ps2MouseState* st = d->st;
   if (st->remote) return;

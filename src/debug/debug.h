@@ -15,6 +15,7 @@ struct frame;
 enum {
   kDbgTraceLine = 1 << 0,   // one-line per-insn format
   kDbgTraceTable = 1 << 1,  // full-column event table
+  kDbgWatch = 1 << 2,       // watch= hits: one row per read/write of a pinned address
   kDbgState = 1 << 3,       // canonical state stream (diff baseline)
   kDbgMem = 1 << 4,         // ld/st events
   kDbgTrap = 1 << 5,        // exceptions/interrupts
@@ -28,7 +29,8 @@ enum {
   kDbgPmp = 1 << 13,        // PMP denials: the entry that decided the access
   kDbgVirtio = 1 << 14,     // virtio-mmio queue notify / chain parse / backend
   kDbgHist = 1 << 15,       // the last N instructions, dumped when an event row fires
-  kDbgAny = 0xffff,
+  kDbgExec = 1 << 16,       // exec=: the fetch that crosses into a linear range
+  kDbgAny = 0x3ffff,
 };
 
 int DebugOn(uint32_t cat);
@@ -61,7 +63,6 @@ void DebugTrap(struct frame* f);
 // In the ISA memory funnels: ld/st + watch rows. addr is linear.
 void DebugMem(struct frame* f, uint64_t addr, uint64_t watch_addr, int size, int acc,
               uint64_t val_or_result, int is_load);
-
 // MMIO/device hit row: called by the funnels when the winning region has no
 // RAM backing. name comes from DeviceOps.
 void DebugBus(struct frame* f, const char* dev_name, uint64_t addr, int size, int is_load,
@@ -249,9 +250,9 @@ void DebugSessionEnd(const struct frame* f, const char* stop_reason);
 //   mark, hist[=N], screen, vga-io, pmp, virtio, utf8,
 //   watch=ADDR:SIZE[:r|w|rw] (repeatable), dump=ADDR:SIZE:FILE (repeatable),
 //   fbdump=FILE (repeatable, binary PPM of the display card's picture),
-//   pcshot=ADDR[:COUNT] (repeatable; state row when the next linear PC is
-//   ADDR), budget=N (per-category cap), skip=N (per-category silent window
-//   before printing). Addresses are physical except pcshot's, which is
+//   pcshot=ADDR[:COUNT], pcshot=LO-HI[:COUNT] (repeatable; state row when the
+//   next linear PC is ADDR or lands inside [LO,HI), plus the history ring when
+//   `hist` is on), budget=N (per-category cap), skip=N (per-category silent window
 //   the linear PC the ISA's gdb_pc reports; that is the address a QEMU gdb
 //   breakpoint names, so a checkpoint can be compared across the two models
 //   without an instruction-count window (which REP loops and timer drift make

@@ -10,7 +10,7 @@
 ; pixel bytes the linear framebuffer path will render.
 ;
 ; The render itself is not observable through a guest port; it is judged by
-; CEMU_DEBUG=fbdump against QEMU's screendump (progress.md's VGA precedent).
+; CEMU_DEBUG=fbdump against QEMU's screendump (progress.log's VGA precedent).
 ;
 ; Build: nasm -f elf32 -o vbe_mode.o vbe_mode.asm
 ;        ld.lld -m elf_i386 -T vbe_mode.ld -o vbe_mode.elf vbe_mode.o

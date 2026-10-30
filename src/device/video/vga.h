@@ -9,7 +9,7 @@
 
 // IBM VGA family core (阶段 4 图形切片). CGA, EGA and VGA are three faces of
 // one card family, so they are three compatibility layers of this core rather
-// than three separate cards (user ruling, progress.md 片 25): one plane-based
+// than three separate cards (user ruling, progress.log 片 25): one plane-based
 // VRAM, the four register groups at 0x3C0-0x3DF, planar and chained
 // addressing, and a 256-entry colour DAC. EGA 640x350 — the mode Windows
 // 1.01's display driver asks for (acceptance 4) — is the same register model

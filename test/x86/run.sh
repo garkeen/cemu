@@ -330,7 +330,7 @@ fi
 # Dual run against qemu-system-i386 -kernel (monitor: `mouse_button 1` then
 # `mouse_move 10 10 -1` — its Y/Z axes are screen-oriented, so the same host
 # movement is spelled with the signs flipped) passes with the same status 11 and
-# a byte-identical packet. Three divergences, all recorded in progress.md and
+# a byte-identical packet. Three divergences, all recorded in progress.log and
 # all in the report line rather than asserted: the power-on command byte (41 vs
 # 47), an unknown command's answer (nothing vs the resend QEMU's own source
 # has), and 0xa7 (QEMU keeps queueing the device's answer while this model stops
@@ -847,8 +847,11 @@ done
 # behavior, reproduced on every run); cemu runs the full suite. The goldens
 # agree on every test QEMU actually reports.
 #
-# The process does NOT terminate on its own (the suite ends in a spin), so the
-# run.sh judge works on output captured under a timeout.
+# The suite exits on its own via debug-exit in under a second (no spin); the
+# timeout is only the hang guard. The verdict is the PASS/FAIL counts in the
+# output, not the exit status: an IRQ0 delivered inside a test window can
+# perturb one case (a single "FAIL: imul 4" in 30+ runs, progress.log
+# 2026-10-30).
 expected_pass=127
 out=$(timeout 60 "$CEMU" --machine x86 --isa x86 "$dir/realmode/realmode.elf" 2>&1)
 # Note: cemu's [info] loader line has no trailing newline, gluing the first

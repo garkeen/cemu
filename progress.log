@@ -1,4 +1,62 @@
-# cemu 当前状态（progress.md）
+# cemu 开发日志（progress.log）
+
+按时间倒序，最新在最上。本文件只记过程、证据与裁决；当前状态摘要见
+README.md，架构与阶段见 arch.md，规格缺口台账见 AGENTS.md §X。
+
+## docs: 五份文档按实际状态对齐；progress.md → progress.log（2026-10-30）
+
+- `progress.md` 更名为 `progress.log`：它记的一直是按轮追加的过程与证据，不是
+  "当前状态"。改的是文件语义与全部引用（README/arch/AGENTS/reference 与
+  `src/`、`test/` 里 6 处注释），日志内容不动。
+- 以本机实测重订数字与结构（此前多处停在 2026-09/10 中途）：
+  - `cmake --build build --clean-first`：`-Wall -Wextra` 零告警；
+    `tools/depcheck.sh`：`dep: ok`。
+  - `bash test/run.sh`：riscv64 136/0、riscv32 104/0、x86 **47/0**
+    （47 = 39 个自足探针 + 7 个 kvm-unit-tests 镜像 + realmode 1 格；
+    README 原写 43 格，AGENTS §七 原写 36 格/28 单格）。
+  - 主板是**四块**（spike / virt / oberon / x86_min），README 原写"三块"。
+- 文档漂移（逐条与源码对照后修正）：
+  - AGENTS §十 还列着 V3 已删除的 `ops`（IR 操作转储）与事件类型 `O`，而
+    `debug.c` 的解析器里没有这个键；`trace`/`mem` 的 `[=N]` 也不存在（体量
+    只由 `budget=`/`skip=` 控制）；`virtio`/`gdb` 两个已实现的类目反倒漏记。
+    整段按解析器重写。
+  - AGENTS §九 第 4 条仍用 V2 μIR 的"op 语义 / 表定义"措辞；§七 的设备目录表
+    缺 `input/ storage/ dma/ virtio/`。
+  - arch.md 目录树缺 `device/{input,storage,dma,virtio}`、
+    `cpu/isa/x86/softfloat`、`host/clipboard_win.c`；阶段 4 的现状停在
+    2026-10-21，未记 Win 2.0/3.1、HelenOS、SPDOS；"三块主板"同样过时。
+  - README 的"三块主板"、x86 43 格、以及"窗口鼠标统一按绝对位置映射"
+    （与 §十一 的 PS/2 相对契约冲突）一并改正。
+- 一次偶发（记录在案，未改代码）：全量回归首跑 realmode 报 `FAIL: imul 4`
+  （126 PASS/1 FAIL），同二进制随后直跑 33 次全部 127/0；暂存未提交的
+  `debug.c/h` 后按 HEAD 构建对照也 2 次 127/0。判为套件对 PIT IRQ0 到达时机
+  的敏感性（该格前后就是自带 millicycles 的计时段落），非语义回归；若复现率
+  升高，按 §九用 `watch=`/`pcshot=` 开观测窗口再定。
+- 本轮只改文档与注释里的日志路径，无行为改动；构建与三套回归在收尾重跑。
+
+## Windows 95 卡在两个 logo：cs=0x9000 的页帧被清零后仍被 jmp 进去（2026-10-30）
+
+现象：`-hda windows95.img` 在控制台 `pnp call arg1=5` 之后不再动（宿主看是两个 logo）。
+
+- 现状（**未修**）：300M 指令处 `cs=0x9000`（基址 0x90000）、`cr0=0`（实模式），
+  PC 逐字节跑在 0x91f8e..0x953d2 的 `00 00`（`add [bx+si],al`）上，`traps=0`。
+  `dump=0x8d920:0x10000` 取回该段：段内偏移 0x0d57-0x53d2（18KB）全零。
+- 跨界归因（新设施 `exec=`）：19979 次跨越里 **17927 次是同一条 `jmp e9 3c 9e`**
+  （线性 0x9814f → 段内偏移 0x1f8e），每轮约 6709 条指令 —— 跑飞是结构性循环，
+  不是随机乱跳；循环体把零字节当指令执行，所以不产生任何异常。
+- 谁清的：`watch=0x91840:3:w` 给出 `f3 66 a5`（rep movsd，pc=0x37a0）把该处写 0；
+  在此之前是 `f3 a5`（movsw，pc=0x86acd）把代码拷进去。客人自己在反复清零这段。
+- 本轮补的设施（都按 §九第 10 条落在已门控的钩子上，fetch/译码路径零改动，
+  `git diff` 里没有任何 `cpu/isa/` 文件）：
+  - `pcshot=` 支持 `LO-HI[:COUNT]` 区间，命中打 canonical state 行 + `hist`，
+    并纳入 `budget=`/`skip=`（同一区间可能被命中上万次）；
+  - `watch=` 命中行自成类别（`kDbgWatch`），吃 `budget=`/`skip=`。此前它们绕过
+    预算，一片频繁写入的区域直接撞 5MB 硬顶（实测写出 5.2MB，违反 §七）；
+  - `exec=LO-HI`：区间跨越行，PC/MNEMONIC 是产生跨越的指令，命中带 `hist`。
+    匹配点在 `DebugInsn`（每步一次、已由 `g_dbg_any` 门控），不在 `fetch8`。
+- 下一步（未做）：判断 0x9000 段的清空是客人的正常释放，还是我们某条语义
+  （rep movsd 的 ES:EDI/ECX、段限、EMM386 页帧）越界写坏。证据面：`pcshot=0x37a0`
+  直接给写者的寄存器现场。
 
 ## port 0xF0 IGNNE#：D19 里最后一个 CPU 侧缺口（2026-10-30）
 

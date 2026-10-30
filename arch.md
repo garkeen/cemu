@@ -1,6 +1,6 @@
 # cemu 架构与路线图（arch.md）
 
-本文是原 任务与计划.md 的架构与计划部分。当前状态与债务见 progress.md；
+本文是原 任务与计划.md 的架构与计划部分。当前状态与债务见 progress.log；
 开发铁律见 AGENTS.md。
 
 ## 一、目标
@@ -37,7 +37,7 @@
 cemu/
   AGENTS.md        开发铁律（agent 必读）
   arch.md          本文档
-  progress.md      进度与决策记录
+  progress.log     开发日志（按时间倒序；过程与证据）
   reference.md     参考项目与用法
   tools/           depcheck.sh  依赖边检查
                    clang.cmake  clang/mingw-w64 工具链文件（AGENTS.md 第七节）
@@ -52,10 +52,11 @@ cemu/
         isa.h        ISA 侧汇聚头
         registry.c   k_isa_table：有哪些型号
         riscv64/     riscv.h  exec.h  platform.h  exec.c  step.c
-                     csr.c  mmu.c  fp.c  trigger.c  isa_riscv64.c
+                     csr.c  mmu.c(Sv39/Sv48 + PMP)  fp.c  trigger.c  isa_riscv64.c
         riscv32/     同形状的 RV32 后端：riscv32.h  exec.h  platform.h  exec.c  step.c
                      csr.c  mmu.c(Sv32)  fp.c  trigger.c  isa_riscv32.c
-        x86/         x86.h  exec.h  exec.c  step.c  isa_x86.c
+        x86/         x86.h  exec.h  exec.c  step.c  fpu.h/.c  isa_x86.c
+                     softfloat/（Berkeley SoftFloat 3e 合并版，BSD-3，x87 用）
     bus/           bus.h/.c     地址空间与译码
     mem/           ram.h/.c     内存
     device/        外设，按类分
@@ -64,12 +65,14 @@ cemu/
       intc/         i8259  lapic  ioapic  plic
       input/        i8042（PS/2 键盘控制器） ps2kbd  ps2mouse  msmouse
       storage/      ide（PIIX ATA/ATAPI） fdc  oberon_sd（Oberon 机的 SD 卡）
+      dma/          i8237（软盘通道 2）
       video/        vga（VGA 家族核，CGA/EGA 是其兼容模式；+ display.h 显示后端
-                    契约） ramfb（RAM 内单色帧缓冲视图）
-      misc/         htif  sifive_test  debug_exit  i440fx  piix3  pci
-                    cmos  port92  fwcfg  debugcon  oberon_io（Oberon 机外设块）
-                    oberon_clipboard（Oberon 机的宿主剪贴板通道）
-      board/         主板：设备布局 + 复位态 + 接线 + 装载 + 运行循环
+                    契约） ramfb / ramfb32（RAM 内帧缓冲视图）
+      virtio/       virtio（mmio 传输） virtio_blk  virtio_console  virtio_input
+      misc/         htif  sifive_test  debug_exit  i440fx  piix3  piix4pm  pci
+                    cmos  port92  portf0  fwcfg  debugcon  smbus_eeprom  testdev
+                    oberon_io（Oberon 机外设块） oberon_clipboard（宿主剪贴板通道）
+    board/         主板：设备布局 + 复位态 + 接线 + 装载 + 运行循环
       board.h/.c    Board 契约 + 工厂
       run.c         运行循环 + 销毁
       loader.h/.c   装载（按 e_machine + EI_CLASS 选 ISA）
@@ -77,7 +80,7 @@ cemu/
       spike_min.c  virt.c(+virt_dtb.h)  x86_min.c  oberon.c(+oberon_rom.h)
     debug/         debug.h/.c  CEMU_DEBUG 观测中枢；gdbstub.h/.c  RSP 服务端
     host/          host.h  console_win.c  file_win.c  time_win.c
-                   display_win.c  input_win.c  sock_win.c
+                   display_win.c  input_win.c  sock_win.c  clipboard_win.c
     util/          log.h/.c  table.h/.c  type.h
   test/            run.sh  riscv64/  riscv32/  x86/
 ```
@@ -124,11 +127,11 @@ ISA 一份的 `execute.c` 大循环重写为 `exec.c`），遵循"代码简单�
 - **规范出处注释**：csrrw 恒写、RV64 shamt 6 位、jalr rd==rs1 先读后写、
   SDM 各组编码位、popf/iret 的 RF|VM 屏蔽等，全部注来源。
 
-## 五、三块主板
+## 五、四块主板
 
 主板只是一张设备表加复位状态：spike 同时跑 riscv64 与 riscv32，virt 的复位
-ROM 是 RV64（riscv32 的 virt32 尚未建），x86_min 装第三种 ISA。类型是 `Board`，
-CLI 仍是 `--machine`（QEMU 惯例）。
+ROM 是 RV64（riscv32 的 virt32 尚未建），oberon 是 RV32，x86_min 装第三种 ISA。
+类型是 `Board`，CLI 仍是 `--machine`（QEMU 惯例）。
 
 | 主板 | 布局 | 用途 |
 |---|---|---|
@@ -152,7 +155,8 @@ qemu-system-i386（D:/qemu）。seabios bios.bin 已从源码构建成功（256K
 `-bios` 时指过去即可；x86 的软盘/光盘引导都靠它的 INT 13h/10h/16h）。
 
 ### 阶段 1：ISA 一致性 ✅
-RV64IMAFDC + Zicsr + Zifencei + M 态 CSR。riscv-tests 127 项全绿曾达成。
+RV64IMAFDC + Zicsr + Zifencei + M 态 CSR。riscv-tests 全绿（当前 riscv64 136 格、
+riscv32 104 格）。
 已知坑已裁决：F 寄存器 NaN boxing、mcause/mtval 精确值、计数器抑制
 （见 AGENTS.md 附录）。
 
@@ -161,7 +165,7 @@ RV64IMAFDC + Zicsr + Zifencei + M 态 CSR。riscv-tests 127 项全绿曾达成�
 编译通过 = 结构证明。含 PM 平段入口（multiboot 契约：EAX=0x2BADB002、
 内置平 GDT、CR0.PE）、段描述符缓存（翻译恒用缓存 base——PE=0 后缓存存续
 即 big real mode）、open-bus 内存语义、串操作 + REP、IVT 异常分发。
-realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
+realmode（kvm-unit-tests 官方实模式套件）127 PASS/0 FAIL。
 
 ### 阶段 2：真实固件 ✅
 - riscv 侧：virt 机器 + CLINT/PLIC/sifive_test + OpenSBI fw_jump 引导。
@@ -219,10 +223,10 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   微秒时基因此切到 PM timer，见库外 `../seabios/firmware.md`）。片 30–36 重做把显示形状压平（渲染基线、
   PCI BAR、光栅/片选、线性 PC 的 trace 与 gdb），此后 D17/D19 落地：VBE/DISPI 与链式
   256 色渲染、EDID、行比较/分屏/pel 平移、ATA LBA-48 与 multi-sector、PM1_STS/EN/CNT
-  与 SCI IRQ9 及 S5 关机、IOAPIC 的 NMI 交付。余下的规格缺口（IOAPIC 的 SMI/INIT 交付、
-  PIRQ 消费者、XBCS、SMBus 主机控制器、PM 的 S3/S4 唤醒路径；显示侧的 CRTC R17 bit5
-  地址回绕、过扫描边框、CGA 复合 NTSC 伪色）按 AGENTS.md §X 台账在册。ACPI 表（DSDT/FADT）
-  由 SeaBIOS 生成，不属于芯片组模型。
+  与 SCI IRQ9 及 S5 关机、IOAPIC 的 NMI 交付；此后又补 SMBus 主机 + SPD EEPROM、
+  XBCS、IGNNE#。D19 剩下的是 IOAPIC 的 SMI/INIT 交付、PIRQ 消费者与 PM 的 S3/S4
+  唤醒路径；显示侧的 CRTC R17 bit5 地址回绕、过扫描边框、CGA 复合 NTSC 伪色仍按
+  AGENTS.md §X 台账在册。ACPI 表（DSDT/FADT）由 SeaBIOS 生成，不属于芯片组模型。
 - bin 路线：multiboot 等价的入口契约，xv6 去掉 bootasm.S/bootmain.c
   编为 .bin；SeaBIOS 路线：官方 bios.bin 映射内存顶端，复位 F000:FFF0
   （bios.bin 已备料；跑通 SeaBIOS 本体属本阶段设备集成，不前置）。
@@ -233,11 +237,13 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   EBX=multiboot info、CS=0x08/DS=0x10），否则当 BIOS 引导扇区（DL=0x80）。
   所以 kvm-unit-tests 的 `.elf` 不需要"编成 .bin"这一步；xv6 验收走的是
   SeaBIOS 路线，bin 路线未被使用。
-- 验收阶梯：xv6-x86 → Linux（参照 v86/tests/full 清单）；riscv 侧
-  xv6-riscv（OpenSBI fw_jump 引导）并行验收。
-- D13 剩余（x87 FPU）在 Linux 用户态销账。x87 ESC 已按"无 FPU
-  处理器"语义落地（CR0.TS/EM 先 #NM，否则当 NOP），内核启动期 FPU 探测因此通过；
-  仍缺 x87 算术与 RDTSC（0F 31 仍 #UD），前提是 CPUID 特性位如实为 0（EDX=0）。
+- 验收阶梯：xv6-x86 → Linux（参照 v86/tests/full 清单）；riscv 侧的真实 OS
+  验收由 HelenOS 0.14.1 承担（xv6-riscv 仍未开始，镜像与 OpenSBI fw_jump
+  素材未取）。
+- D13 已在片 40 销账：x87 算术走树内 Berkeley SoftFloat 3e（FXSAVE/FXRSTOR、#NM、
+  FERR#/IRQ13 同批），MMX/SSE/SSE2、RDTSC/RDTSCP、SYSENTER/SYSEXIT、MTRR/PAT、MCE
+  寄存器组、性能计数器（0x3C/0xC0）、AC、PSE-36 一并落地；余下 VME/PVI 与 PMU 细节
+  按 D39 在册。
   D14（VM86）已在片 18 按 SDM vol.3 17.3 实现并销账（IRET 返回 VM86、
   任务切换从 TSS 装载 VM、`seg_synth` 段合成、VM86 帧投递、TSS I/O 许可位图）。
 - **现状（2026-10-21）**：验收 1（xv6-x86）✅ SeaBIOS → IDE 盘 → xv6 到 shell，
@@ -261,8 +267,17 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   投递 IRQ12 边沿（此前 PS/2 指针不动；同一份自建固件在 QEMU 里指针同样不动的
   那半，根因在仓外 SeaBIOS 自身的 clang 8 位 farvar 误编译）。16 位寻址由
   `addr16_matrix`/`addr16_seg` 两格自足探针钉住（QEMU 同 transcript）。
-  取证链见 progress.md 2026-10-21 各节。
-  回归：riscv64 136/0、riscv32 104/0、x86 36/0、依赖边 ok。
+  取证链见 progress.log 2026-10-21 各节。
+  回归（2026-10-21）：riscv64 136/0、riscv32 104/0、x86 36/0、依赖边 ok。
+- **现状（2026-10-30）**：Windows 2.0 过 logo（vgabios 的 int10 缺 extra stack，直接
+  在客人栈上压栈写穿了客人的代码）、Windows 3.1 进 1024×768 桌面（此前红花屏的根因
+  是 vgabios 按"标准 VGA"构建、与 Bochs stdvga 卡不匹配，重建为 Bochs VBE）、
+  HelenOS 0.14.1 riscv64 全量引导（Sv48、PMP 零规则放行、非叶 PTE 的 A/D/U、srai 的
+  shamt 第 5 位四处修完；止于上游未实现的 S→U 交接，QEMU 同镜像同终点）、
+  SPDOS/DOS7 软盘进 DOS（16 位 LGDT/LIDT 只带 24 位基址）。验收 3（xv6-riscv）仍未
+  开始。Windows 95 卡在两个 logo（`cs=0x9000` 的页帧被客人自己清零后仍被 `jmp`
+  进去），见 progress.log 最新节。回归：riscv64 136/0、riscv32 104/0、x86 **47/0**、
+  依赖边 ok。
 - **验收 4（Windows 1.01）与显示实现形状**（2026-09-24 用户裁决；2026-09-29 落地）：验收件
   `build/windows/windows101.img`（1.44MB、MS-DOS 3.3 引导软盘，卷标 WIN101），QEMU
   基线是 **EGA 640×350** 下的 MS-DOS Executive 桌面（7 秒时截屏）。它给出两条硬前置：
@@ -281,9 +296,10 @@ realmode（kvm-unit-tests 官方实模式套件）曾达 122 PASS/0 FAIL。
   Region 2 是 4KB MMIO（0x000-0x3FF 给 EDID：BAR2 偏移 0 返回 256 字节 = QEMU 默认
   1280×800 监视器的基础块 + DTA 扩展实测副本，0x400-0x41F 1:1 映射
   0x3C0-0x3DF 端口，按 QEMU 标准 VGA 规范），但它**不带扩展 ROM**（0x30 的 ROM
-  地址寄存器读回 0），ROM 仍走上面这条 fw_cfg 通路。验收见
-  `test/x86/probe/vga_probe.asm`（int10 切 mode 3/0x10/0x04 后核对寄存器与平面寻址，
-  QEMU `-vga std` 同一镜像同样通过）。剩余显示缺口见 AGENTS.md D17（CRTC R17 bit5
+  地址寄存器读回 0），ROM 仍走上面这条 fw_cfg 通路。验收走**不引导固件的自足探针**
+  （`test/x86/probe/`）：`vga_core`（四组索引锁存/DAC）、`vga_dispi`（VBE 索引越过
+  寄存器文件即写进 PCI 配置空间的那个洞）、`vga_census`（开机寄存器普查）、
+  `vga_paint`/`vga_split`（写模式 2 的画面与分屏/pel 平移）。剩余显示缺口见 AGENTS.md D17（CRTC R17 bit5
   的 64K 地址回绕 AW、过扫描边框、CGA 复合 NTSC 伪色）。渲染结果的对拍通道是
   `CEMU_DEBUG=fbdump=FILE`：落二进制 P6 PPM，与 QEMU `screendump` 同格式可逐字节
   diff（win101 桌面帧与 QEMU 基线即以此核对）。

@@ -59,7 +59,7 @@ static Table* g_tbl;
 // ate each other's budget and skip window (a `mark` run whose slot was spent
 // by kDbgRegs' periodic register table stops printing marks, and `skip` for one
 // of them silently moved the others' windows).
-enum { kCatSlots = 16 };
+enum { kCatSlots = 18 };
 static uint64_t g_emitted[kCatSlots];
 static uint64_t g_suppressed[kCatSlots];
 static uint64_t g_traps;
@@ -115,6 +115,24 @@ int DebugWatchHit(uint64_t addr, int size, int is_load) {
   return 0;
 }
 
+// ---- exec= : the fetch that crosses into a linear range --------------------
+// A watch cannot answer this: the region may be read as data thousands of
+// times before the guest executes from it, and `pcshot=` fires on every
+// landing inside it rather than on the crossing. This item matches FETCHES
+// only (acc == 0 in the memory funnel), keeps one bit of state -- was the
+// previous fetch inside a range -- and reports the first fetch of each entry.
+// That is the crossing: the caller gets the history ring (the jump that did
+// it) and the landing point, which is what "who sent the control flow into
+// this memory" asks (AGENTS.md §九 rule 9). The region a runaway lands in is
+// data the guest cleared, so no address in it can be guessed from the map.
+enum { kMaxExec = 4 };
+static struct {
+  uint64_t lo;  // inclusive
+  uint64_t hi;  // exclusive
+} g_exec[kMaxExec];
+static int g_nexec;
+static int g_fetch_inside;  // the previous fetch was inside one of the ranges
+
 // ---- guest-memory dumps -----------------------------------------------------
 //
 // watch= reports that an address was touched; it cannot report what a guest
@@ -136,7 +154,7 @@ static void* g_mem_ctx;
 // repo writes, so an oversized region is refused rather than truncated.
 static const uint64_t kDumpLimit = 5ULL * 1024 * 1024;
 
-// ---- PC checkpoints (pcshot=ADDR[:COUNT]) ----------------------------------
+// ---- PC checkpoints (pcshot=ADDR[:COUNT], pcshot=LO-HI[:COUNT]) ------------
 // state= and trace= are indexed by retired-instruction count; REP loops eat a
 // window's budget and timer I/O moves the count between runs, so neither can
 // name "the state at this PC". The gdb stub can stop by linear PC but runs the
@@ -145,16 +163,23 @@ static const uint64_t kDumpLimit = 5ULL * 1024 * 1024;
 // commit, the frame's next linear PC is compared against the checkpoint, and
 // the canonical state row is printed when the guest is about to execute that
 // address. That is the boundary a QEMU gdb breakpoint stops on, so the two
-// states compare field for field (AGENTS.md §十).
+// states compare field for field (AGENTS.md §十). LO-HI names a range instead
+// of one address: "the first fetch inside this region" is what a runaway
+// control flow asks, and a guessed address cannot answer it (AGENTS.md §九
+// rule 9). A hit also dumps the history ring when `hist` is on, because the
+// jump that lands in the region is the row before the landing.
 enum { kMaxPcShots = 8 };
 static struct {
-  uint64_t addr;
+  uint64_t lo;  // inclusive
+  uint64_t hi;  // exclusive
   uint64_t max;
   uint64_t hits;
 } g_pcshot[kMaxPcShots];
 static int g_npcshot;
 
-// pcshot=ADDR[:COUNT]; ADDR is a C literal, COUNT defaults to 1.
+// pcshot=ADDR[:COUNT], pcshot=LO-HI[:COUNT]; the address parts are C literals,
+// COUNT defaults to 1. '-' never occurs inside a C literal, so the range form
+// is unambiguous.
 static void AddPcShot(const char* spec) {
   if (g_npcshot >= kMaxPcShots) {
     LogError("debug: too many pcshots, dropping '%s'", spec);
@@ -162,17 +187,31 @@ static void AddPcShot(const char* spec) {
   }
   const char* colon = strchr(spec, ':');
   size_t alen = colon ? (size_t)(colon - spec) : strlen(spec);
-  char addr_text[32];
+  char addr_text[64];
   if (alen == 0 || alen >= sizeof(addr_text)) {
-    LogError("debug: pcshot expects ADDR[:COUNT] ('%s')", spec);
+    LogError("debug: pcshot expects ADDR[:COUNT] or LO-HI[:COUNT] ('%s')", spec);
     return;
   }
   memcpy(addr_text, spec, alen);
   addr_text[alen] = 0;
-  uint64_t addr = 0, max = 1;
-  if (!ParseUint(addr_text, &addr)) {
-    LogError("debug: pcshot address '%s' is not a number", addr_text);
-    return;
+  uint64_t lo = 0, hi = 0, max = 1;
+  char* dash = strchr(addr_text, '-');
+  if (dash) {
+    *dash = 0;
+    if (!ParseUint(addr_text, &lo) || !ParseUint(dash + 1, &hi)) {
+      LogError("debug: pcshot range '%s' is not a pair of numbers", spec);
+      return;
+    }
+    if (hi <= lo) {
+      LogError("debug: pcshot range needs LO < HI ('%s')", spec);
+      return;
+    }
+  } else {
+    if (!ParseUint(addr_text, &lo)) {
+      LogError("debug: pcshot address '%s' is not a number", addr_text);
+      return;
+    }
+    hi = lo + 1;
   }
   if (colon && !ParseUint(colon + 1, &max)) {
     LogError("debug: pcshot count '%s' is not a number", colon + 1);
@@ -182,7 +221,8 @@ static void AddPcShot(const char* spec) {
     LogError("debug: pcshot count must be at least 1 ('%s')", spec);
     return;
   }
-  g_pcshot[g_npcshot].addr = addr;
+  g_pcshot[g_npcshot].lo = lo;
+  g_pcshot[g_npcshot].hi = hi;
   g_pcshot[g_npcshot].max = max;
   g_pcshot[g_npcshot].hits = 0;
   g_npcshot++;
@@ -423,8 +463,45 @@ static void AddWatch(const char* spec) {
   g_watch[g_nwatch].size = (int)size;
   g_watch[g_nwatch].rw = rw;
   g_nwatch++;
+  // Own category: hits obey `budget=`/`skip=` like every other event kind.
+  // Unbudgeted, a watch over a region the guest copies through fills the 5MB
+  // output cap before the crossing the caller asked about.
+  g_mask |= kDbgWatch;
 }
 
+// exec=LO-HI (repeatable, up to kMaxExec); LO and HI are C literals.
+static void AddExec(const char* spec) {
+  if (g_nexec >= kMaxExec) {
+    LogError("debug: too many exec ranges, dropping '%s'", spec);
+    return;
+  }
+  char text[64];
+  size_t n = strlen(spec);
+  if (n == 0 || n >= sizeof(text)) {
+    LogError("debug: exec expects LO-HI ('%s')", spec);
+    return;
+  }
+  memcpy(text, spec, n + 1);
+  char* dash = strchr(text, '-');
+  if (!dash) {
+    LogError("debug: exec expects LO-HI ('%s')", spec);
+    return;
+  }
+  *dash = 0;
+  uint64_t lo = 0, hi = 0;
+  if (!ParseUint(text, &lo) || !ParseUint(dash + 1, &hi)) {
+    LogError("debug: exec range '%s' is not a pair of numbers", spec);
+    return;
+  }
+  if (hi <= lo) {
+    LogError("debug: exec range needs LO < HI ('%s')", spec);
+    return;
+  }
+  g_exec[g_nexec].lo = lo;
+  g_exec[g_nexec].hi = hi;
+  g_nexec++;
+  g_mask |= kDbgExec;
+}
 // ---- synthetic host input (mouse=) -----------------------------------------
 
 enum { kMaxInj = 4 };
@@ -618,6 +695,8 @@ void DebugInit(void) {
     }
     else if (!strncmp(tok, "watch=", 6))
       AddWatch(tok + 6);
+    else if (!strncmp(tok, "exec=", 5))
+      AddExec(tok + 5);
     else if (!strncmp(tok, "dump=", 5))
       AddDump(tok + 5);
     else if (!strncmp(tok, "fbdump=", 7))
@@ -641,8 +720,8 @@ void DebugInit(void) {
   }
   if (g_mask &
           (kDbgTraceTable | kDbgMem | kDbgTrap | kDbgBus | kDbgGdb | kDbgMark |
-           kDbgScreen | kDbgVgaIo | kDbgPmp | kDbgVirtio) ||
-      g_nwatch) {
+           kDbgScreen | kDbgVgaIo | kDbgPmp | kDbgVirtio | kDbgExec) ||
+      g_nwatch || g_nexec) {
     g_tbl = TableOpen(kEventCols, 6, g_ascii, g_header_every);
     TableHeader(g_tbl);
   }
@@ -802,6 +881,16 @@ static void HistRecord(frame* f) {
   int slot = g_hist_at;
   int n = f->rec.raw_len;
   if (n > (int)sizeof(g_hist[slot].raw)) n = (int)sizeof(g_hist[slot].raw);
+  // A REP instruction retires once per iteration, so a `rep movsd` fills the
+  // whole ring with copies of itself and the call chain -- the only reason the
+  // dump exists -- is lost. A run of identical consecutive entries collapses
+  // to one. Free unless `hist` is on.
+  if (g_hist_filled) {
+    int last = (slot + g_hist_len - 1) % g_hist_len;
+    if (g_hist[last].pc == FramePc(f) && g_hist[last].raw_len == (uint8_t)n &&
+        memcmp(g_hist[last].raw, f->rec.raw, (size_t)n) == 0)
+      return;
+  }
   g_hist[slot].pc = FramePc(f);
   g_hist[slot].mnem = f->rec.mnemonic;
   g_hist[slot].raw_len = (uint8_t)n;
@@ -917,22 +1006,53 @@ void DebugInsn(frame* f) {
   // PC checkpoints are the PC-indexed counterpart of the state window: match
   // the boundary the commit lands on (next linear PC), then print the same
   // canonical row, so a gdb stop at that address in the reference model has a
-  // field-for-field counterpart here. Not budgeted: a checkpoint is a fixed
-  // number of rows chosen by the caller, and the hard output cap still holds.
+  // field-for-field counterpart here. Budgeted through this item's own
+  // category: a range the guest executes from the start of the boot is hit
+  // thousands of times before the crossing that matters, and `skip=` names
+  // that crossing without a guessed instruction count.
   if (g_mask & kDbgPcShot) {
     uint64_t next = FrameDnpc(f);
     for (int i = 0; i < g_npcshot; i++) {
-      if (g_pcshot[i].hits < g_pcshot[i].max && g_pcshot[i].addr == next) {
+      if (g_pcshot[i].hits < g_pcshot[i].max && next >= g_pcshot[i].lo &&
+          next < g_pcshot[i].hi) {
         char mark[96];
         g_pcshot[i].hits++;
+        if (!Allow(kDbgPcShot)) continue;
         int n = snprintf(mark, sizeof(mark), "P @lin=%016llx hit=%llu inst=%llu\n",
                          (unsigned long long)next,
                          (unsigned long long)g_pcshot[i].hits,
                          (unsigned long long)f->cpu->inst_count);
         if (DebugAccountOut((size_t)n)) HostWriteErr(mark, (size_t)n);
         StateRow(f);
+        HistDump();
       }
     }
+  }
+  // exec= : the crossing into a range, judged on the same boundary as the
+  // checkpoints (the next linear PC). The whole item lives inside this
+  // already-gated per-step hook, so a run without it pays nothing in the fetch
+  // path (AGENTS.md §九 rule 10). One row per crossing: a runaway that walks
+  // cleared memory stays inside the range and reports nothing more, and the row
+  // carries the instruction that produced the crossing.
+  if (g_nexec) {
+    uint64_t next = FrameDnpc(f);
+    int inside = 0;
+    for (int i = 0; i < g_nexec; i++)
+      if (next >= g_exec[i].lo && next < g_exec[i].hi) {
+        inside = 1;
+        break;
+      }
+    if (inside && !g_fetch_inside && Allow(kDbgExec)) {
+      char det[72];
+      snprintf(det, sizeof(det), "enter %016llx inst=%llu", (unsigned long long)next,
+               (unsigned long long)f->cpu->inst_count);
+      RowBegin(g_tbl, 'X', f);
+      TableRowCell(g_tbl, det);
+      CellFlags(g_tbl, f);
+      TableRowEnd(g_tbl);
+      HistDump();
+    }
+    g_fetch_inside = inside;
   }
   if (g_regs_period && (f->cpu->inst_count % (uint64_t)g_regs_period) == 0) {
     // Periodic register table reuses DumpRegs through a Frame-less path.
@@ -978,14 +1098,20 @@ void DebugMem(frame* f, uint64_t addr, uint64_t watch_addr, int size, int acc,
       TableRowEnd(g_tbl);
     }
   }
-  if (DebugWatchHit(watch_addr, size, is_load)) {
+  if (DebugWatchHit(watch_addr, size, is_load) && Allow(kDbgWatch)) {
     if (mid_fetch)
       RowBeginBare(g_tbl, 'W');
     else
       RowBegin(g_tbl, 'W', f);
-    char det[64];
-    snprintf(det, sizeof(det), "%c %llx:%d %s %llx", is_load ? 'r' : 'w', (unsigned long long)addr,
-             size, is_load ? "->" : "<-", (unsigned long long)(val_or_result & 0xffffffffULL));
+    // `inst=` orders several hits on the same address against each other: a
+    // loader writes the code, something else clears it later, and the row that
+    // decides the diagnosis is the one after the clear. Free when no watchpoint
+    // fires -- this row only runs on a match.
+    char det[96];
+    snprintf(det, sizeof(det), "%c %llx:%d %s %llx inst=%llu", is_load ? 'r' : 'w',
+             (unsigned long long)addr, size, is_load ? "->" : "<-",
+             (unsigned long long)(val_or_result & 0xffffffffULL),
+             (unsigned long long)f->cpu->inst_count);
     TableRowCell(g_tbl, det);
     CellFlags(g_tbl, f);
     TableRowEnd(g_tbl);

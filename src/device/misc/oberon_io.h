@@ -18,7 +18,7 @@
 //                            fetch reads the ROM; this bus serves fetch and
 //                            data alike, so the ROM answers both — a
 //                            well-formed Oberon guest never data-reads its
-//                            ROM (divergence noted in progress.md 片 37)
+//                            ROM (divergence noted in progress.log 片 37)
 //   [0xFFFFFFC0, 2^32)       the register block, offsets in the enum below:
 //     +0  r   millisecond counter of the emulated clock
 //     +4  r   front-panel switches (bit 0 = boot from RS232); w: LED row

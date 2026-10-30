@@ -22,4 +22,4 @@ The values are the card's answers, not a self-judgement: a model that ignores
 odd/even aliasing or that splits word writes differently prints a different
 line. This pins the mode 6 aperture; the display address generator that turns
 those bytes into scan lines is not guest-readable and is checked by
-fbdump/screendump instead (progress.md D33).
+fbdump/screendump instead (progress.log D33).

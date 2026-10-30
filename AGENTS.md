@@ -63,7 +63,7 @@ src/ 按被模拟机器的部件分目录：
 | `cpu/` | 处理器。`cpu.h` = CpuState（寄存器 bank + 提交点 pc + 主板钩子）；`step.h` = 步进契约 frame/isa_ops/raise_；`cpu/isa/<name>/` = 各 ISA 解释器 |
 | `bus/` | 互连：地址空间与译码 |
 | `mem/` | 内存子系统：RAM |
-| `device/` | 外设，按类分：`char/` `timer/` `intc/` `misc/` `video/` |
+| `device/` | 外设，按类分：`char/` `timer/` `intc/` `input/` `storage/` `dma/` `video/` `virtio/` `misc/` |
 | `board/` | 主板：设备布局、复位态、接线、装载（ELF）、运行循环 |
 | `debug/` | CEMU_DEBUG 观测中枢 |
 | `host/` | 宿主 OS 层，唯一可 include windows.h |
@@ -107,8 +107,8 @@ ISA 头，`virt.c` 仅引 `platform.h`。
   要用 Git Bash（非登录 shell 的 PATH 无 /usr/bin）。
 - 运行限时：**所有**运行一律限时——run.sh 用 `timeout` 包裹 cemu 调用；
   会话内的临时手跑（调试观测、state 对拍、探针复现）同样必须前置
-  `timeout <秒>`，防止被测程序死循环导致不退出的挂起（realmode 套件
-  尾部 fninit #UD 死循环即由 timeout+输出判据容纳）。
+  `timeout <秒>`，防止被测程序死循环导致不退出的挂起（任一格挂死都必须由
+  timeout 收住；realmode 现在自行以 debug-exit 收场，但判据仍只看输出）。
 - **测试只能跑探针，不许跑 bios/img/iso**（用户裁决）：套件里任何一格都不得
   引导固件镜像、软盘镜像或光盘镜像。理由是它们慢（一个 SeaBIOS 自举到 DOS 就要
   千万条指令、一分多钟），且依赖库外的产物（本仓的 `build/` 与 `../seabios/out/`
@@ -119,7 +119,7 @@ ISA 头，`virt.c` 仅引 `platform.h`。
   `floppy` 与 `vga` 两格（`-bios ../seabios/out/bios.bin -vgabios ... -fda`）已从
   `test/x86/run.sh` 删除，覆盖改由两个自足探针承担（`vga_core` 直接写 0x3C4/0x3CE/
   0x3C0 与孔径；`fdc_dma` 自己下 8272A/8237 命令与 DMA 编程，都不借 SeaBIOS 的手），
-  x86 套件 36 格（28 单格 + kvm 7 镜像 + realmode 1）。
+  x86 套件 47 格（39 个自足探针 + kvm-unit-tests 7 镜像 + realmode 1）。
 - 落盘体积：**任何**写入文件不得超过 5MB——测试对拍数据/捕获文件、
   CEMU_DEBUG 观测落盘（`2>file` 的 trace/state/mem/regs 等）一律算；
   超出即视为违规，须改用采样、截断或 CEMU_DEBUG `budget=` 抑制等
@@ -164,17 +164,17 @@ step 是纯函数式的状态转移（给定当前 CPU 状态，产出下一状�
 ## 九、调试与修复纪律（重构要求第二轮 + 调试方案）
 
 1. **禁止临时探针**：getenv 一次性打印（CEMU_DBG/[step]/[trap2]/ 等）不许
-   再出现。所有调试观测用常驻设施 `CEMU_DEBUG`（语法见第 X 节）。唯一例外：
+   再出现。所有调试观测用常驻设施 `CEMU_DEBUG`（语法见第十节）。唯一例外：
    语义本身在执行器里算错属于代码 bug 而非观测缺口，但发现它的路径也是
    state/trace 而非探针。若修 bug 时仍手写了探针，说明设施有观测缺口，必须
    回来补设施并登记。
 2. **禁止手动计算/手工模拟**：手动推演永远是错的。不许在脑内反汇编指令、
-   不许纸上演算状态；用 CEMU_DEBUG 的 ops/watch/state 对拍定位，到源码里
+   不许纸上演算状态；用 CEMU_DEBUG 的 state/trace/watch 对拍定位，到源码里
    找差异。
 3. **大重构错很多是正常的**：不案例驱动地逐个补丁。
 4. **禁止 if 特判式修复**：真正的 CPU 不做特判，都是固定的、简单的几个
-   RTL 微指令。修复必须落在统一的 op 语义 / 表定义 / 构造函数这一层；
-   如果一个 bug 看起来需要"对某指令加个 if"，说明 op 语义或表行写错了，
+   RTL 微指令。修复必须落在统一的 helper / 巨型 switch 的共用分支 / 状态结构
+   这一层；如果一个 bug 看起来需要"对某指令加个 if"，说明共用语义写错了，
    修那里，而不是加分支。
 5. **修复不对照旧实现**：旧解释器与对拍通道已删除。`state` 流的对拍对象是
    自己留档的基线文件。
@@ -185,20 +185,34 @@ step 是纯函数式的状态转移（给定当前 CPU 状态，产出下一状�
    即停（TaskStop），要它**直接输出报告**，不许自己一路翻拍文档、不许扩大阅读
    范围；只读式"代码审查"没有产出价值，别为它花时间。GUI 类改动的验证是
    **构建 + 启动 + 用户目验**，不是脑内推理，也不是子代理评审。
+9. **禁止二分定位**：不许靠反复改 `--max-inst` / `skip=` 一轮轮逼近来收窄
+   观测窗口，也不许"跑一次看看在不在"式试探。窗口由设施直接给出：
+   `pcshot=` 定点停、`watch=` 命中即带 `pc=` 与 `hist`、`trap`/`mark`/`bus`
+   自带归因。设施表达不了当前问题（例如"第一次取指进入某地址区间"、
+   "控制转移的落点由哪条指令产生"）时，按第 1 条**补设施**——加一类
+   `CEMU_DEBUG` 项目或扩一个已有项目——并登记到第十节语法与 progress.log，
+   然后一次跑出答案。补设施的成本永远低于试跑加猜，且设施留下的是可复用
+   的观测能力；试跑只留下时间。
+10. **补设施不许伤热路径**：观测成本必须落在**已经为调试打开的路径**上。禁止在
+   每字节译码、每次访存、每条指令的常路径里新增判定或函数调用——"每次译码都测
+   一个 `if`"就是 bug，哪怕它看起来只有一个位。正确做法二选一：
+   - 复用一次解析好的门控（`g_dbg_any` / `g_mem_slow` / `g_record_raw` 这类），
+     匹配挂在**已被门控的调用点**上（`DebugInsn` / `DebugMem` / `DebugTrap`）；
+   - 若确实需要落在取指/译码内部，先把该路径改成已门控（像 `g_record_raw` 那样
+     一次解析、热路径只读一个全局），并说明为什么既有门控不够用。
+   性能是验收项：加设施后要能说出"关闭该设施时热路径多了几条指令"，答案必须是
+   **零**。芝麻开关（`if (g_xxx)` 放在 `fetch8`/`phys_load`/每步取指里）一律驳回。
 
 ## 十、CEMU_DEBUG 语法（常驻调试设施，唯一调试入口）
 
 ```
 CEMU_DEBUG = item[,item...]
 
-  trace[:line|:table][=N]   逐指令事件行（line=单行式，table=全列式）
-  ops                       每条指令的 IR 操作转储（译码错 vs 执行错的分水岭：
-                            op 列表对而状态错 → 执行器/ISA verb bug；
-                            op 列表本身错 → 译码表/构造函数 bug）
+  trace[:line|:table]       逐指令事件行（line=单行式，table=全列式）
   state                     规范状态流（对拍基准；格式由 bank/cell 枚举序生成，
                             跨重构恒定；x86 打 g0..g7/s0..s5/x，riscv 打
                             g0..g31/f0..f31/x）
-  mem[:ld|:st][=N]          访存事件
+  mem[:ld|:st]              访存事件
   trap                      异常/中断/陷入事件
   bus[:ADDR|:NAME]          MMIO / IO 端口命中（**不含指令取指**：固件在 ROM 窗口
                            执行时取指行会淹没一切）。`bus:ADDR` 只留该端口/MMIO 地址，
@@ -211,12 +225,27 @@ CEMU_DEBUG = item[,item...]
                            —— 被拒绝的访问不会到达总线，`bus` 一行都不出；这一行给出
                            最低号命中条目的 cfg 与解码区间（`entry=none` = 无规则命中）。
                            riscv 的负载/存储/取指与页表走查都过 PMP，32/64 两个后端同款
+  virtio                    virtio-mmio 传输事件：notify 时的队列状态、解析失败的
+                            描述符链、后端调用。客人卡在 used-ring 等待时，`mem`
+                            看不出"宿主没收到 notify"与"收到但丢了链"，这几行能
+                            对应 QEMU 的 virtio_mmio trace 事件
   regs=N                    每 N 条指令打一次全寄存器表；halt/exit 必打
+  gdb                       gdb stub 的协议包（tx/rx）与状态机行（attach/detach、
+                            stop 原因）。排查"客人该停没停/停错地方"用
   watch=ADDR:SIZE[:r|w|rw]  地址观测（可重复逗号分隔；数字按 C 字面量解析，
                             **十六进制必须写 0x**，否则静默丢弃——现已改为报错）。
                             **地址按物理地址匹配**：x86 开分页后要看内核某个符号
                             必须先减去映射偏移（内核 .data 的 0xc02c0180 是物理
                             0x2c0180），写线性地址会一行都不出
+                            watch 的命中行同样吃 `budget=`/`skip=`（自成一类）：不设预算
+                            时，一片客人频繁拷贝的区域能在 5MB 硬顶之前写满磁盘
+  exec=LO-HI[:COUNT]       区间跨越行（可重复，上限 4 条）：下一条指令的**线性 PC
+                            落入 [LO,HI) 且上一步不在该区间**时打一行——PC/MNEMONIC
+                            给的是产生这次转移的指令，DETAIL 给落点与退休指令数，
+                            命中时连带打 `hist`。回答的是"执行流第一次跑进这片内存
+                            是哪条指令干的"：跑飞落点是被客人清零过的数据，地图上
+                            查不到，不许猜地址。匹配点在 `DebugInsn`（与 pcshot 同一
+                            个已门控的每步钩子），fetch 路径零成本（§九第 10 条）
   vga-io                   客人对 VGA 卡寄存器文件的一次端口访问一行，读写各一行：
                             `vga-io rd|wr port=0x3d5 val=0x28`。对应 QEMU 给自家测试用的
                             vga_std_read_io / vga_std_write_io trace 事件——**两个模型之间
@@ -238,9 +267,12 @@ CEMU_DEBUG = item[,item...]
                             交给中枢（D17 里缺的就是这个：无头核对渲染的唯一手段）。
                             同样要求会话自行结束。例：`fbdump=build/fb.ppm`
   pcshot=ADDR[:COUNT]       在**线性 PC** 触发的规范 state 行（可重复，上限 8 条；
-                            COUNT 默认 1）。命中点是"下一条指令的线性 PC 等于 ADDR"，
-                            也就是 CPU 即将执行 ADDR 时的状态——与 QEMU gdb 在 ADDR
-                            设断点停住的边界相同，两个模型的寄存器/段/内存可以逐字段
+  pcshot=LO-HI[:COUNT]      COUNT 默认 1）。命中点是"下一条指令的线性 PC 等于 ADDR
+                            或落在 [LO,HI) 内"，也就是 CPU 即将执行那里的状态。
+                            区间形式回答"执行流第一次跑进这片内存是哪条指令干的"
+                            （跑飞取证：入口地址未知时不猜，见 §九第 9 条），命中时
+                            连带打 `hist` 环形缓冲（`hist` 开着的话）。
+                            与 QEMU gdb 设断点停住的边界相同，两个模型的寄存器/段/内存可以逐字段
                             对照。存在的理由：`state`/`trace` 按退休指令数开窗，REP
                             循环会吃掉预算、定时器 I/O 又会让指令数在两次运行间漂移；
                             gdb 断点虽按线性 PC 停，但从复位跑完整启动要过每步回调，
@@ -283,7 +315,7 @@ CEMU_DEBUG = item[,item...]
                             配对。只对软件中断发（外部中断与 CPU 抛的异常里 AX 与
                             返回值无关）。QEMU 侧无对照物：它的 -d int 整块在
                             `if (cr0 & PE)` 里且只在入口触发，实模式一条不出、
-                            也没有返回值（见 progress.md 片 33）
+                            也没有返回值（见 progress.log 片 33）
                             reset-req(设备请求机器复位)
                             fdc-cmd(原始命令字/解码值) fdc-res(结果相位) fdc-irq
                             fdc-rw fdc-xfer(实际搬运字节) dma-xfer(计数寄存器/
@@ -322,7 +354,7 @@ CEMU_DEBUG = item[,item...]
 - 事件表统一列 `KIND │ PC │ RAW │ MNEMONIC │ DETAIL │ FLAGS`（DETAIL 宽 88：
   一行 BIOS 调用要装下 `int/ax/bx/cx/dx/ds/es/at`，宽度不够就等于为它加宽了列
   还是把它截了），KIND：
-  I 指令 / L 读 / S 写 / T 陷阱 / B 设备 / W 观测点 / O IR 操作转储 / K 标记
+  I 指令 / L 读 / S 写 / T 陷阱 / B 设备 / W 观测点 / K 标记
   （K 与 screen 都是无帧行：K 走事件表，screen 走整行文本）。T 行的 DETAIL 在
   访问故障时带 `paddr=`（被访问的物理地址；页表走查本身故障时是 PTE 地址）：
   tval 只给虚拟地址，PMP 拒绝与未映射设备在它上面分不开。
@@ -344,7 +376,7 @@ CEMU_DEBUG = item[,item...]
 - 症状 → 命令配方速查：
 
 ```bash
-# 语义对拍基线（重构/改 op 后）
+# 语义对拍基线（重构/改语义后）
 CEMU_DEBUG=state ./cemu.exe ... img >/dev/null 2> base.state   # 改动前
 CEMU_DEBUG=state ./cemu.exe ... img >/dev/null 2> new.state    # 改动后
 diff base.state new.state | head
@@ -409,7 +441,7 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
   `share/vgabios-stdvga.bin`。**对拍之前先核这一条**，否则两边跑的不是同一个 ROM。
   ⚠ **但 ROM 不同不等于原因**：2026-10-02 实测过，把 cemu 自己的 ROM 装进 QEMU
   之后 QEMU 照样 `set VGA mode 10` 进 640×350 桌面，而 cemu 用同一个 ROM 退回
-  mode 3 —— 所以 win101 的分歧**在机器上，不在固件构建上**。见 progress.md 片 33。
+  mode 3 —— 所以 win101 的分歧**在机器上，不在固件构建上**。见 progress.log 片 33。
 
 - 交互式调试器/REPL、反汇编器、GUI 输出立项为阶段 3.5（见 arch.md 阶段计划：
   gdb RSP stub / Win32 显示通道 / 图形调试前端；前端不内置反汇编，反汇编一律
@@ -418,7 +450,7 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 ## X、简化登记（在册的规格缺口台账）
 
 规格行为缺失按阶段恢复。**销账 = 整行删除**：不写"已完成 / 已销账"，不留日期、片号、
-过程或解释（过程只进 progress.md）；行内只写还缺什么。只有新功能才加行。
+过程或解释（过程只进 progress.log）；行内只写还缺什么。只有新功能才加行。
 
 | 编号 | 位置 | 缺失 | 参考出处 | 恢复阶段 | 状态 |
 |---|---|---|---|---|---|
