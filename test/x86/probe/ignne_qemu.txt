@@ -1,0 +1,46 @@
+Dual run of test/x86/probe/ignne.asm, 2026-10-30:
+
+  cemu --machine x86 --isa x86 ignne.elf                       -> status 11
+  qemu-system-i386 -machine pc -m 32 -cpu pentium -kernel ignne.elf \
+      -display none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x4 \
+      -serial file:ignne_qemu.txt                              -> status 11
+
+Both lines are identical, byte for byte. QEMU here is 10.2.92
+(v11.0.0-rc2-12119-gaa7f0eb8d8-dirty).
+
+  ignne a=01 b=01 c=02 ok
+
+CR0.NE is cleared, so an unmasked x87 exception reports through FERR# (and the
+board's IRQ13) instead of #MF. The probe counts IRQ13 deliveries through a real
+gate; the request register cannot show this line's level because the PIIX3's
+ELCR does not expose IRQ13 (both models carry the same mask, 0xde on the slave).
+
+  a   1/0 with IGNNE# released: the error is delivered once
+  b   port 0xF0 written (IGNNE# asserted) and a second 1/0: nothing is
+      delivered, the count stays at 1
+  c   FNCLEX clears the flags, FLDENV clears the latch, a third 1/0 is
+      delivered: the count becomes 2
+
+Why the cell exists: there was no port 0xF0 at all, so the write went to the
+unclaimed-port region and every error was delivered -- the same probe answered
+`a=01 b=02 c=03`. The delivery path is cemu's CPU side (X87DriveFerr driving
+FERR#) plus the new device/misc/portf0.c.
+
+Notes on the reference, both followed rather than invented:
+
+  * QEMU's ioportF0_write ignores the data byte ("if (tcg_enabled())
+    cpu_set_ignne()"). The 486 asserts IGNNE# on a write with bit 0 clear and
+    deasserts it on a write with bit 0 set; neither model distinguishes, and
+    this probe writes 0x00, which asserts under both readings.
+  * The latch is dropped by loading an FPU environment with no error in its
+    status word (QEMU cpu_clear_ignne, called from cpu_set_fpus -- which only
+    FLDENV/FRSTOR reach). FNCLEX and FINIT do not drop it on either model,
+    which is why phase c uses FLDENV. Both gaps stay registered in AGENTS.md
+    §X D19.
+  * With NE=0 QEMU raises the interrupt from WAIT/FWAIT (fpu_raise_exception is
+    called only there), while this machine raises it at the arithmetic
+    instruction. The probe executes FWAIT after every divide, so both models
+    are at the same point when the delivery is counted.
+
+cemu ignne a=01 b=01 c=02 ok
+qemu ignne a=01 b=01 c=02 ok

@@ -654,6 +654,16 @@ elf_cell xbcs 11 ref
 # from QEMU (its chardev holds a burst the device cannot take) is §X D32.
 elf_cell uart_rx 11 ref
 
+# IGNNE#, port 0xF0 (test/x86/probe/ignne.asm): with CR0.NE=0 an unmasked x87
+# error reports through FERR# and the board's IRQ13; a write to port 0xF0
+# asserts IGNNE#, which makes the processor ignore the error and withdraw the
+# line; loading an FPU environment that reports no error drops the latch again.
+# The probe counts real IRQ13 deliveries (the PIIX3's ELCR does not expose that
+# line for level-mode watching) and every phase ends in FWAIT, so both models
+# raise at the same point. ref cell: the transcript is byte-identical. Before
+# this existed the same probe answered `b=02 c=03` -- nothing was masked.
+elf_cell ignne 11 ref
+
 # I/O APIC NMI delivery (test/x86/probe/nmi_ioapic.asm), PIT IRQ0 -> I/O APIC
 # pin 0 -> NMI. Lock cell: QEMU 11 accepts the entry but does not raise the
 # CPU NMI flag in this configuration; cemu follows 82093AA §3.2.4.

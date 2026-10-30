@@ -22,6 +22,7 @@
 #include "device/misc/piix4pm.h"
 #include "device/misc/smbus_eeprom.h"
 #include "device/misc/port92.h"
+#include "device/misc/portf0.h"
 #include "device/misc/testdev.h"
 #include "device/storage/fdc.h"
 #include "device/storage/ide.h"
@@ -147,6 +148,7 @@ typedef struct X86Board {
   Ps2MouseDevice mouse;
   MsMouseDevice msmouse;
   Port92Device port92;
+  PortF0Device portf0;
   CmosDevice cmos;
   TestDevDevice testdev;
   PciBus pci;
@@ -426,6 +428,15 @@ static void OnA20(void* ctx, int on) {
   if (cpu->set_a20) cpu->set_a20(cpu, on);
 }
 
+// Chipset -> CPU: port 0xF0's IGNNE# latch. While it is asserted the processor
+// ignores a pending unmasked x87 exception, so the FERR# line above drops and
+// the coprocessor-error IRQ with it (SDM vol.1 8.7.2; QEMU cpu_set_ignne lowers
+// ferr_irq for the same reason).
+static void OnIgnne(void* ctx, int on) {
+  CpuState* cpu = (CpuState*)ctx;
+  if (cpu->set_ignne) cpu->set_ignne(cpu, on);
+}
+
 // Maps the -bios image into the ROM window. The image sits at the *top* of the
 // window (QEMU maps -bios at the end of the BIOS region), so a shorter image
 // is zero-padded below and the reset vector still lands at 0xffff0.
@@ -669,6 +680,9 @@ static void WireDevices(X86Board* xm) {
   IoapicSetNmiSink(&xm->ioapic, OnIoapicNmi, xm);
   I8042SetA20Sink(&xm->kbd, OnA20, &m->cpu);
   Port92SetA20Sink(&xm->port92, OnA20, &m->cpu);
+  // Port 0xF0's IGNNE# is a CPU input, so the sink lands on CpuState like the
+  // A20 line above (SDM vol.1 8.7.2).
+  PortF0SetIgnneSink(&xm->portf0, OnIgnne, &m->cpu);
   // The three ways a guest can reboot the machine on a PC (D18): port 0x92's
   // INIT_NOW line, the PIIX3 reset control register at 0xCF9, and the keyboard
   // controller's 0xFE command.
@@ -715,6 +729,7 @@ static void X86Reset(Board* m) {
   Ps2MouseInit(&xm->mouse);
   MsMouseInit(&xm->msmouse);
   Port92Init(&xm->port92);
+  PortF0Init(&xm->portf0);
   TestDevInit(&xm->testdev);
   CmosReset(&xm->cmos);
   I8237Reset(&xm->dma);
@@ -814,6 +829,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   Ps2MouseInit(mouse);
   MsMouseInit(&xm->msmouse);
   Port92Init(p92);
+  PortF0Init(&xm->portf0);
   CmosInit(cmos);
   TestDevInit(&xm->testdev);
   I8237Init(&xm->dma);
@@ -866,6 +882,9 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   FwCfgRegister(&m->io, fwcfg);
   I8042Register(&m->io, kbd);
   Port92Register(&m->io, p92);
+  // The chipset's IGNNE# latch (QEMU's PC machine puts ioportF0_io at 0xF0):
+  // one byte, read as all ones, whose every write asserts IGNNE#.
+  PortF0Register(&m->io, &xm->portf0);
   CmosRegister(&m->io, cmos);
   TestDevRegister(&m->io, &xm->testdev);
   CmosSetMemory(cmos, ram_size);

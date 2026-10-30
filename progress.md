@@ -1,5 +1,34 @@
 # cemu 当前状态（progress.md）
 
+## port 0xF0 IGNNE#：D19 里最后一个 CPU 侧缺口（2026-10-30）
+
+- 参考：SDM vol.1 8.7.2（CR0.NE=0 时未屏蔽的 x87 异常走 FERR#，IGNNE# 置位则
+  处理器忽略该异常）；QEMU `hw/i386/pc.c` 的 `ioportF0_write`（**任意写**都调
+  `cpu_set_ignne()`，数据字节不看）、`target/i386/tcg/system/fpu_helper.c`
+  （`fpu_check_raise_ferr_irq` 在 `HF2_IGNNE` 置位时不抬线、`cpu_set_ignne`
+  把 `ferr_irq` 拉低、`cpu_clear_ignne` 只在 `cpu_set_fpus` 里被调）。
+- 落点：`src/device/misc/portf0.c`（0xF0，读回全 1，任意写把 sink 拉高）、
+  `CpuState.set_ignne` 钩子、`cpu/isa/x86/exec.c` 的 `X87DriveFerr`
+  （电平 = NE=0 && 有待报异常 && !ignne）与 `X87AfterEnvLoad`（装载 FPU 环境且
+  状态字里没有异常时撤销锁存）、板级 `OnIgnne`。
+- **观察方法要绕两个坑**。一：IRQ13 在 PIIX3 的 ELCR 里**不可**设为电平
+  （两个模型的 slave mask 都是 `0xde`，bit5 恰好是 IRQ13），所以 IRR 里的位一旦
+  置起就再也看不出一根电平线的落下 —— 探针改成**真的交付中断并计数**（IDT +
+  8259 重定位 + 处理器里 `fnclex`/EOI）。二：multiboot 入口在 cemu 里没有真 GDT
+  （`gdtr=0:0`，用的是内建描述符），门描述符里的选择子过不了校验，第一次交付
+  直接 #GP（`intr cause=13 tval=8`）—— 探针因此自己建一个平坦 GDT 并 `lgdt`。
+- 还有一处模型差异要先对齐：NE=0 时 **QEMU 只在 WAIT/FWAIT 抬线**
+  （`fpu_raise_exception` 只有 `HELPER(fwait)` 一个调用点），而本机在算术指令
+  尾部就抬。探针每个阶段都以 `fwait` 结尾，两边在"计数"那一刻才对齐。
+- 验证：`test/x86/probe/ignne.asm` 双跑逐字节相同 `ignne a=01 b=01 c=02`：
+  ① 未屏蔽除零 → IRQ13 交付一次；② 写 0xF0（IGNNE#）后同一个错不再交付；
+  ③ FNCLEX 清异常、FLDENV 撤锁存后第三个错又交付。把 0xF0 从板上摘掉再跑，
+  同一探针给出 `b=02 c=03`（每个错都送），所以这格是真判据。
+- 仍在册（与 QEMU 同，已收窄）：0xF0 写的数据字节被忽略（486 用 bit0 区分置位
+  与撤销）；锁存只在装载 FPU 环境时撤销 —— FNCLEX/FINIT 在两张模型里都不撤销，
+  而硬件的撤销点是 FERR# 撤销时（QEMU 把这一步挂在 `cpu_set_fpus` 上）。
+- 套件：`elf_cell ignne 11 ref`，`check-x86` 46 → **47 passed, 0 failed**。
+
 ## 16550 接收侧：FCR.FE 的两种深度与 OE（D32 销账，2026-10-30）
 
 旧模型无视 FCR.FE，接收侧一律当 16 字节 FIFO：不开 FIFO 的驱动在本机也能收全

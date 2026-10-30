@@ -242,6 +242,9 @@ typedef struct x86_state {
   int bt_pending;    // the incoming task's TSS.T: deliver #DB before its
                      // first instruction (SDM vol.3 7.2.1)
   int ferr_level;    // FERR# line state when CR0.NE=0 (the board drives IRQ13)
+  int ignne;         // IGNNE# level, asserted by the chipset's port 0xF0: an
+                     // unmasked x87 exception is ignored while it stands and the
+                     // FERR# output stays low (SDM vol.1 8.7.2)
   int a20;           // A20 gate line state: bit 20 of every physical address is
                      // forced low while it is off (PC/AT); the board drives it
                      // through CpuState.set_a20

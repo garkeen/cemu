@@ -49,6 +49,12 @@ typedef struct CpuState {
   // while it is low. Same shape as set_irq — installed by the CPU model's
   // init, called by the board. NULL for ISAs without a gate.
   void (*set_a20)(struct CpuState* cpu, int on);
+  // IGNNE# input (x86 numeric-error reporting with CR0.NE=0): the chipset's
+  // port 0xF0 asserts it, and while it is asserted the processor ignores a
+  // pending unmasked x87 exception, which withdraws the FERR# output the board
+  // turns into IRQ13 (SDM vol.1 8.7.2). Same hook shape as set_a20; NULL for
+  // ISAs without one.
+  void (*set_ignne)(struct CpuState* cpu, int on);
   // Non-maskable interrupt input (x86 NMI pin; the I/O APIC's NMI delivery
   // mode is its only source on this machine). Same hook shape as set_irq;
   // NULL for ISAs without one.

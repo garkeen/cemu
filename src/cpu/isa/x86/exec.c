@@ -5205,18 +5205,34 @@ static void WrF80(extFloat80_t v) {
   wr16(d.mlin + 8, v.signExp);
 }
 
+// The FERR# line, driven from the error state. The CPU and its state are
+// explicit because the chipset's IGNNE# latch moves this line outside a step,
+// where the globals do not necessarily name this processor.
+static void X87DriveFerr(CpuState* c, x86_state* st) {
+  int level = !(st->cr0 & kCr0Ne) && st->fpu.pending_mf && !st->ignne;
+  if (level == st->ferr_level) return;
+  st->ferr_level = level;
+  if (c->ferr) c->ferr(c->ferr_dev, level);
+}
+
+// An environment loaded with no error in its status word drops the chipset's
+// IGNNE# latch with it (SDM vol.1 8.7.2: the latch lives as long as the error
+// does). QEMU puts the same clear in cpu_set_fpus, which only FLDENV and
+// FRSTOR reach -- FNCLEX and FINIT clear the flags without touching the latch
+// on either model, and the probe pins that.
+static void X87AfterEnvLoad(void) {
+  if (!s->fpu.pending_mf) s->ignne = 0;
+  X87DriveFerr(cpu, s);
+}
+
 // #MF is a fault with no error code (SDM vol.3 table 6-1). With CR0.NE=0 the
 // processor instead drives FERR# low for as long as an unmasked x87 exception
 // stands; the board wires that line to the coprocessor-error IRQ13. FNCLEX/
 // FNINIT clears the exception flags and therefore drops the line (SDM vol.1
-// 8.7.2). The level is derived, not latched: no separate acknowledgement
-// state exists beyond the FPU's own status word.
-static void X87UpdateFerr(void) {
-  int level = !(s->cr0 & kCr0Ne) && s->fpu.pending_mf;
-  if (level == s->ferr_level) return;
-  s->ferr_level = level;
-  if (cpu->ferr) cpu->ferr(cpu->ferr_dev, level);
-}
+// 8.7.2). The level is derived, not latched: the one latch in the path is the
+// chipset's IGNNE# input (port 0xF0), which makes the processor ignore the
+// error while it is asserted.
+static void X87UpdateFerr(void) { X87DriveFerr(cpu, s); }
 
 static void X87FaultCheck(void) {
   X87UpdateFerr();
@@ -5233,6 +5249,7 @@ static void X87LoadEnv(int wide) {
   uint8_t buf[28];
   rd_bytes(d.mlin, buf, wide ? 28 : 14);
   fpu_load_env(&s->fpu, buf, wide);
+  X87AfterEnvLoad();
 }
 
 static void X87StoreEnv(int wide) {
@@ -5247,6 +5264,7 @@ static void X87LoadState(int wide) {
   uint8_t buf[108];
   rd_bytes(d.mlin, buf, wide ? 108 : 94);
   fpu_load_state(&s->fpu, buf, wide);
+  X87AfterEnvLoad();
 }
 
 static void X87StoreState(int wide) {
@@ -7432,6 +7450,16 @@ static void x86_set_a20_line(CpuState* c, int on) {
   TlbFlushAll(st);
 }
 
+// IGNNE#, the chipset's port 0xF0 latch (QEMU hw/i386/pc.c's ioportF0_write
+// calls cpu_set_ignne). Asserting it makes the processor ignore a pending
+// unmasked x87 exception, and the FERR# line this model drives drops with it —
+// which is what QEMU does by lowering ferr_irq in cpu_set_ignne.
+static void x86_set_ignne_line(CpuState* c, int on) {
+  x86_state* st = (x86_state*)c->priv;
+  st->ignne = on ? 1 : 0;
+  X87DriveFerr(c, st);
+}
+
 void x86_init(CpuState* c) {
   x86_state* st;
   if (!c->priv) {
@@ -7458,6 +7486,7 @@ void x86_init(CpuState* c) {
   st->msr_apic_base = 0xFEE00000ULL | 0x800ULL | 0x100ULL;
   c->set_irq = x86_set_irq_line;
   c->set_a20 = x86_set_a20_line;
+  c->set_ignne = x86_set_ignne_line;
   c->set_nmi = x86_set_nmi;
   // The gate starts open (the reasoning lives in port92.h): every image cemu
   // accepts is handed flat memory above 1 MiB and never expects the alias.
