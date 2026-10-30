@@ -38,6 +38,75 @@
 // board to end the session — the two paths a guest exercises when it reads the
 // event block and shuts the machine down. S3/S4 have no wake path on this
 // machine and are not entered (简化登记 D19).
+//
+// SMBus host controller (PIIX4 datasheet §5 "SMBus"; QEMU hw/i2c/pm_smbus.c
+// carries the same register file inside this PCI function, hw/i2c/core.c the
+// bus, hw/i2c/smbus_slave.c the device side of the protocol).
+//
+// The block is a 64-byte window whose address lives in configuration offset
+// 0x90 (SMB_BASE, bit 0 = I/O-space indicator) and whose decode hangs off bit 0
+// of offset 0xD2. QEMU's pc machine leaves the base at 0xb100 with the gate
+// open (hw/i386/pc_piix.c passes smb_io_base=0xb100, hw/acpi/piix4.c writes
+// 0xb101 and 0xD2=0x09 at realize), so a guest finds the controller at 0xb100
+// before any firmware touches it.
+//
+// The interrupt this controller could raise reaches no pin on this machine
+// (QEMU leaves PMSMBus.set_irq NULL), so HST_CNT's INTREN decides only *when*
+// the transaction runs, never an IRQ line: with INTREN clear the transaction
+// waits for the guest's HST_STS read (the AMIBIOS workaround hw/i2c/pm_smbus.c
+// documents).
+enum {
+  // The window's size (piix4.c's memory_region_init_io(..., 64)) and the
+  // address field of SMB_BASE: bits 15:6.
+  kSmbusBlockSize = 64,
+  kSmbusBaseMask = 0xffc0,
+  // PM_SMBUS_MAX_MSG_SIZE (pm_smbus.h) and SMBUS_DATA_MAX_LEN (smbus_slave.h:
+  // command + count + 32 bytes of data).
+  kSmbusMaxMsgSize = 32,
+  kSmbusDataMax = 34,
+  // The devices QEMU's pc machine puts on this bus: eight SPD EEPROMs at
+  // 0x50-0x57 (hw/i386/pc_piix.c smbus_eeprom_init(pcms->smbus, 8, NULL, 0)).
+  kSmbusSlaveCount = 8,
+};
+
+// One device on the I2C bus: QEMU's SMBusDevice, whose class supplies these two
+// hooks and whose base class carries the protocol state (the mode and the write
+// buffer) a transfer leaves behind (hw/i2c/smbus_slave.c).
+typedef struct SmbusSlave {
+  uint8_t address;  // 7-bit I2C address
+  uint8_t (*ReceiveByte)(void* ctx);
+  void (*WriteData)(void* ctx, const uint8_t* buf, int len);
+  void* ctx;
+  int mode;                         // this device's protocol state (piix4pm.c)
+  uint8_t write_buf[kSmbusDataMax];  // bytes the write phase collected
+  int write_len;
+} SmbusSlave;
+
+typedef struct Piix4Smbus {
+  uint16_t base;  // where SMB_BASE decodes (0 = the window is off)
+  uint8_t sts;    // HST_STS: HOST_BUSY, INTR, DEV_ERR, BUS_ERR, FAILED, BYTE_DONE
+  uint8_t ctl;    // HST_CNT: INTREN, KILL, LAST_BYTE, START, protocol bits 4:2
+  uint8_t cmd;    // HST_CMD
+  uint8_t addr;   // HST_ADD: 7-bit address in bits 7:1, direction in bit 0
+  uint8_t data0;  // HST_DAT0
+  uint8_t data1;  // HST_DAT1
+  uint8_t data[kSmbusMaxMsgSize];  // the block buffer HST_BLKDAT walks
+  uint8_t blkdata;                 // HST_BLKDAT's single-byte window
+  uint8_t auxctl;                  // HST_AUXCTL: PEC_EN, BLK (32-byte block mode)
+  uint32_t index;                  // position inside the block buffer
+  int op_done;                     // the byte-by-byte transfer has finished
+  int in_i2c_block_read;
+  int start_on_status_read;
+  SmbusSlave* slaves[kSmbusSlaveCount];
+  int slave_count;
+  // The devices the current transfer selected, and whether its address was the
+  // broadcast one (hw/i2c/core.c's current_devs/broadcast).
+  SmbusSlave* current[kSmbusSlaveCount];
+  int current_count;
+  int broadcast;
+} Piix4Smbus;
+
+// Intel 82371AB (PIIX4) power management function: device 1 function 3 on bus 0,
 typedef struct Piix4PmDevice {
   PciDevice pci;
   Bus* io;            // the I/O address space the block gets decoded in
@@ -53,6 +122,7 @@ typedef struct Piix4PmDevice {
   void* sci_ctx;
   void (*request_shutdown)(void* ctx);
   void* shutdown_ctx;
+  Piix4Smbus smb;  // the SMBus host controller and the devices on its bus
 } Piix4PmDevice;
 
 void Piix4PmInit(Piix4PmDevice* d, uint8_t bus, uint8_t dev);
@@ -63,4 +133,7 @@ void Piix4PmSetShutdownSink(Piix4PmDevice* d, void (*request_shutdown)(void* ctx
 void Piix4PmPoll(Piix4PmDevice* d);
 void Piix4PmReset(Piix4PmDevice* d);
 
+// Puts a device on the SMBus. A reset leaves the bus populated: a device is
+// soldered onto the board, not programmed into a register.
+void Piix4SmbusAttach(Piix4PmDevice* d, SmbusSlave* slave);
 #endif

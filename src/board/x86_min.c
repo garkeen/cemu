@@ -20,6 +20,7 @@
 #include "device/misc/pci.h"
 #include "device/misc/piix3.h"
 #include "device/misc/piix4pm.h"
+#include "device/misc/smbus_eeprom.h"
 #include "device/misc/port92.h"
 #include "device/misc/testdev.h"
 #include "device/storage/fdc.h"
@@ -154,6 +155,9 @@ typedef struct X86Board {
   Piix3BridgeDevice piix;
   IdeDevice ide;
   Piix4PmDevice pm;
+  // The SMBus's SPD bank: eight serial EEPROMs at 0x50-0x57, the devices QEMU's
+  // pc machine attaches to this function's bus (device/misc/smbus_eeprom.h).
+  SmbusEeprom spd[kSmbusSpdCount];
   // The floppy subsystem: the 8272 controller and the 8237 whose channel 2
   // carries its sector data. They are separate devices on a real PC (the
   // controller only raises DRQ; the DMA engine walks memory), so they are
@@ -726,6 +730,9 @@ static void X86Reset(Board* m) {
   IdeReset(&xm->ide);
   Piix4PmReset(&xm->pm);
   DebugExitBind(&xm->dexit, &m->cpu);
+  // The SPD EEPROMs go back to what a power cycle would find (QEMU's
+  // smbus_eeprom_reset); the bus itself keeps its devices.
+  for (int i = 0; i < kSmbusSpdCount; i++) SmbusEepromReset(&xm->spd[i]);
   WireDevices(xm);
   m->cpu.pc = m->entry;
   m->cpu.halted = kCpuRunning;
@@ -816,6 +823,11 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   Piix3BridgeInit(&xm->piix, kPciBus0, kPiixDev);
   IdeInit(ide, kPciBus0, kPiixDev);
   Piix4PmInit(&xm->pm, kPciBus0, kPiixDev);
+  // The SMBus's devices are soldered on, so they are attached once, here; a
+  // reset clears their contents but not the bus (QEMU's pc machine does the
+  // same split: pc_piix.c attaches, smbus_eeprom_reset restores).
+  for (int i = 0; i < kSmbusSpdCount; i++)
+    SmbusEepromAttach(&xm->spd[i], &xm->pm, (uint8_t)(kSmbusSpdAddress + i));
   if (opts->hda && IdeAttach(ide, 0, 0, opts->hda, kIdeMediaDisk) != 0) {
     LogError("cannot attach -hda image '%s'", opts->hda);
     BoardDestroy(m);

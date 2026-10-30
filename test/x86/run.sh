@@ -626,6 +626,15 @@ fi
 # instead; the calibration file records the divergence.
 elf_cell pm_sci 0 lock
 
+# PIIX4 SMBus host controller (test/x86/probe/smbus.asm): the register file at
+# SMB_BASE (configuration 0x90/0xD2), every protocol the controller offers, and
+# the eight SPD EEPROMs the bus carries at 0x50-0x57. The probe names the base
+# itself -- SeaBIOS moves it to acpi_pm_base + 0x100 on a booted machine -- and
+# then walks a byte-data write and read, word data, block data in both the
+# 32-byte and the byte-by-byte mode, the I2C block read, a device error, and the
+# deferral that INTREN decides. ref cell: the transcript is byte-identical.
+elf_cell smbus 11 ref
+
 # I/O APIC NMI delivery (test/x86/probe/nmi_ioapic.asm), PIT IRQ0 -> I/O APIC
 # pin 0 -> NMI. Lock cell: QEMU 11 accepts the entry but does not raise the
 # CPU NMI flag in this configuration; cemu follows 82093AA §3.2.4.

@@ -1,5 +1,41 @@
 # cemu 当前状态（progress.md）
 
+## PIIX4 SMBus 主机控制器：D19 的最后一块在册缺口（2026-10-30）
+
+照 QEMU 参考实现把 00:01.3 的 SMBus 侧补齐（AGENTS §X D19 里"**SMBus 主机控制器
+未实现**"销账）：
+
+- 参考出处：`hw/i2c/pm_smbus.c`（寄存器组、协议分派、两处逐字节细节）、
+  `hw/i2c/core.c`（总线：起始条件、广播、重复起始不重扫、NACK）、
+  `hw/i2c/smbus_master.c`（六个协议在主机侧的电平序列）、
+  `hw/i2c/smbus_slave.c`（从设备的 mode/data_buf 状态机）、
+  `hw/i2c/smbus_eeprom.c`（SPD EEPROM 的偏移协议）、
+  `hw/acpi/piix4.c`（SMB_BASE 在配置 0x90、0xD2 bit 0 门控、force_aux_blk）。
+- 落点：`src/device/misc/piix4pm.c`（同一个 PCI 功能：寄存器文件 + I2C 主机 +
+  从设备协议层）、`src/device/misc/smbus_eeprom.{c,h}`（从设备）、
+  `src/board/x86_min.c`（挂 8 个 SPD EEPROM 到 0x50-0x57，复位清内容）。
+- **SMB_BASE 的两个值别弄混**：本机（以及 QEMU 的 pc_piix.c）把设备的复位配置
+  写成 0xb101；而一台**跑过固件**的机器读回 0x701 —— SeaBIOS 的
+  `piix4_pm_config_setup`（`src/fw/pciinit.c`）写 `acpi_pm_base + 0x100`，而
+  `acpi_pm_base` 是 0x600。探针因此自己写 SMB_BASE 再读回，既不受"固件跑没跑
+  过"影响，又顺带钉住了"写基址会移动解码"。
+- 验证：`test/x86/probe/smbus.asm`（自足 multiboot 探针，自己下 HST_* 命令）
+  双跑 cemu 与 `qemu-system-i386`（10.2.92 / v11.0.0-rc2），**一行 transcript
+  逐字节相同**：`cfg=0000b101 d2=09 st=00 ctl=00 aux=02 wq=01,02 rd=ab na=01,04
+  im=02 wd=12,34 bl=12 bw=81,81,02 wr=02,11 ib=81,02,02`。覆盖：配置空间基址与
+  门控、复位镜像、byte-data 写/读、无人应答地址的 DEV_ERR、INTREN 决定的立即
+  执行与延后执行（后者是 pm_smbus.c 给 AMIBIOS 的那处 workaround：写 START 后
+  状态先报 HOST_BUSY，事务在客人读 HST_STS 的那一刻才跑）、word-data（低字节
+  先行）、块模式读（设备第一个字节是长度）、逐字节块写（每个 BYTE_DONE 一位，
+  最后一字节才发块）、以及 I2C 块读（命令走 HST_DAT1、LAST_BYTE 收尾）。
+  块写在线上带长度字节，所以 EEPROM 存下来的第一个字节是长度（`wr=02,11`），
+  这与 QEMU 逐字节一致。
+- 套件：`test/x86/run.sh` 加 `elf_cell smbus 11 ref`，`check-x86` 43 → **44
+  passed, 0 failed**；依赖边 `target check` 仍 ok（零告警构建）。
+- 未做（仍在册）：XBCS（配置 0x4E）、PIRQ 0x60-0x63（没有拉 INTx 的 PCI 设备）、
+  SMBus 的中断在本机没有引脚可接（QEMU 的 `PMSMBus.set_irq` 同样是 NULL，所以
+  INTREN 只影响时机，不抬线）。
+
 ## Windows 3.1 红花屏：ROM 是"标准 VGA"构建，而卡是 Bochs/QEMU stdvga（2026-10-30）
 
 现象：`-hda windows31.img` 解压完、见到 logo 之后整屏红字/红斑，画面只有 2 种颜色。

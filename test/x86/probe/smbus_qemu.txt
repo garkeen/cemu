@@ -1,0 +1,58 @@
+Dual run of test/x86/probe/smbus.asm, 2026-10-30:
+
+  cemu --machine x86 --isa x86 smbus.elf                     -> status 11
+  qemu-system-i386 -machine pc -m 32 -cpu pentium -kernel smbus.elf \
+      -display none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x4 \
+      -serial file:smbus_qemu.txt                            -> status 11
+
+Both lines are identical, byte for byte. QEMU here is 10.2.92
+(v11.0.0-rc2-12119-gaa7f0eb8d8-dirty).
+
+  smbus cfg=0000b101 d2=09 st=00 ctl=00 aux=02 wq=01,02 rd=ab na=01,04 im=02 \
+        wd=12,34 bl=12 bw=81,81,02 wr=02,11 ib=81,02,02 ok
+
+What each field pins:
+
+  cfg       SMB_BASE (00:01.3 offset 0x90, dword) is 0xb101 after the probe
+            writes it: 0xb100 with bit 0 as the I/O-space indicator.
+  d2        the gate byte at 0xD2 is 0x09, bit 0 set.
+  st/ctl/aux  HST_STS 0, HST_CNT 0 (nothing reads back: START is an edge),
+            HST_AUXCTL 0x02 -- the 32-byte block mode pm_smbus_init presets with
+            force_aux_blk.
+  wq        a byte-data *write* (HST_ADD 0xA0) with INTREN clear: the first
+            status read reports HOST_BUSY (0x01) and runs the transaction on
+            that read, the second reports INTR (0x02). That deferred start is
+            pm_smbus.c's AMIBIOS workaround.
+  rd        the same byte read back with HST_ADD 0xA1 -> 0xAB.
+  na        a byte-data read of 0x30, no device there -> HOST_BUSY then DEV_ERR
+            (0x04).
+  im        the same write with INTREN set -> the status is already 0x02.
+  wd        word-data read of offsets 0/1 (0x12, 0x34 written first), low byte
+            first: HST_DAT0 0x12, HST_DAT1 0x34.
+  bl        block read in block mode: the device answers with a length byte,
+            0x12 (18), which lands in HST_DAT0.
+  bw        byte-by-byte block write (block mode cleared): 0x81 (HOST_BUSY |
+            BYTE_DONE) per step, 0x02 on the last one. HST_DAT0 says how many
+            bytes and the first data byte is the one HST_BLKDAT held before the
+            start.
+  wr        what that block write left: 0x02, 0x11 -- the length byte is part of
+            the block on the wire (smbus_write_block with send_len), so the
+            EEPROM stores it as the first byte past the command.
+  ib        I2C block read: 0x81, then HST_BLKDAT 0x02 (the byte the device
+            sends first from that offset), then 0x02 once LAST_BYTE ends the
+            transfer.
+
+SMB_BASE's reset value is 0xb100 here because that is what the device is
+configured with (hw/i386/pc_piix.c passes smb_io_base = 0xb100). A booted
+machine reads back 0x700 instead: SeaBIOS's piix4_pm_config_setup
+(src/fw/pciinit.c) programs acpi_pm_base + 0x100, and acpi_pm_base is 0x600. The
+probe writes the base itself so the transcript does not depend on whether
+firmware ran, and so that a written base moving the decode is covered.
+
+The eight SPD EEPROMs QEMU attaches at 0x50-0x57 (hw/i386/pc_piix.c
+smbus_eeprom_init(pcms->smbus, 8, NULL, 0)) carry no image, so they answer zeros
+until a byte is written; the probe's writes are what give the fields above
+non-zero bytes to show.
+
+cemu smbus cfg=0000b101 d2=09 st=00 ctl=00 aux=02 wq=01,02 rd=ab na=01,04 im=02 wd=12,34 bl=12 bw=81,81,02 wr=02,11 ib=81,02,02 ok
+qemu smbus cfg=0000b101 d2=09 st=00 ctl=00 aux=02 wq=01,02 rd=ab na=01,04 im=02 wd=12,34 bl=12 bw=81,81,02 wr=02,11 ib=81,02,02 ok
