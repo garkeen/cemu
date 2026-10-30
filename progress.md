@@ -1,5 +1,26 @@
 # cemu 当前状态（progress.md）
 
+## Windows 3.1 红花屏：ROM 是"标准 VGA"构建，而卡是 Bochs/QEMU stdvga（2026-10-30）
+
+现象：`-hda windows31.img` 解压完、见到 logo 之后整屏红字/红斑，画面只有 2 种颜色。
+
+- `fbdump` 只有 `ff3f3f` 与 `000000` 两种颜色，几何是 640x480；`dump=0xb8000` 是空的
+  （不是文本页，是图形模式）。QEMU 同镜像 150 秒的 `screendump` 是 **1024x768**
+  真桌面（`c0c0c0` 62 万像素 + 标题栏 `c00000`/白）。
+- 客人的 VBE 调用从 BIOS 日志里就能读到：`4F02 BX=0105`（1024x768x8）+ 大量
+  `4F05/4F06`（翻页、行长）。它以为自己在 8bpp VBE 模式里，而我们的 vgabios 是
+  `CONFIG_VGA_STANDARD_VGA=y` 且 `CONFIG_VGA_VBE`/`CONFIG_VGA_BOCHS` 全关，
+  于是模式没真正建立、数据通路与帧缓冲对不上。
+- 根因是 **ROM 与卡不匹配**：cemu 的显示卡是 `1234:1111`（QEMU/Bochs stdvga，
+  DISPI 与 16MB LFB 在 cemu 侧早已实现，见 D17），而 QEMU 用的
+  `vgabios-stdvga.bin` 正是 Bochs VBE 构建。
+- 修复：`.config` 改成 `CONFIG_VGA_BOCHS=y` + `CONFIG_VGA_VBE=y`
+  （`CONFIG_VGA_STANDARD_VGA` 关掉），`out/autoconf.h` 同步。vgabios 39424 → 48640 字节。
+- 验证：cemu 现在给出 **1024x768** 桌面（`c0c0c0` 622316 / `ffffff` 135631 /
+  `0000c0` 14621 / `000000` 11789），与 QEMU 的画面构成同形（QEMU 那帧是红标题栏，
+  属配色/时序差别）；10 个 trap 与 QEMU `-d int` 的 10 个异常同构（5×#GP、4×#NP、
+  1×#UD，都是客人自己的探测）；win2 的 framebuffer 与改前逐色相同；msdos622 仍到
+  `C:\>`；win101 仍是 640x350 桌面。
 ## Windows 2.0 卡在 logo：SeaVGABIOS 缺 extra stack，int10 用客人栈写穿客人代码（2026-10-30）
 
 现象：`-hda windows2.img` 停在微软 logo 不动（40 秒无进展）。
