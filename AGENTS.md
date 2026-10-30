@@ -119,7 +119,7 @@ ISA 头，`virt.c` 仅引 `platform.h`。
   `floppy` 与 `vga` 两格（`-bios ../seabios/out/bios.bin -vgabios ... -fda`）已从
   `test/x86/run.sh` 删除，覆盖改由两个自足探针承担（`vga_core` 直接写 0x3C4/0x3CE/
   0x3C0 与孔径；`fdc_dma` 自己下 8272A/8237 命令与 DMA 编程，都不借 SeaBIOS 的手），
-  x86 套件 47 格（39 个自足探针 + kvm-unit-tests 7 镜像 + realmode 1）。
+  x86 套件 50 格（42 个自足探针 + kvm-unit-tests 7 镜像 + realmode 1）。
 - 落盘体积：**任何**写入文件不得超过 5MB——测试对拍数据/捕获文件、
   CEMU_DEBUG 观测落盘（`2>file` 的 trace/state/mem/regs 等）一律算；
   超出即视为违规，须改用采样、截断或 CEMU_DEBUG `budget=` 抑制等

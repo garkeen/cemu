@@ -51,7 +51,7 @@ APIC 的 CPUID/leaf 0x0B 拓扑已广告，CR0.NE=0 的 FERR# 接到 8259 IRQ13�
 VME/PVI 重定向与 PMU 细节记在 D39，port 0xF0/IGNNE# 记在 D19。riscv 侧
 RV64IMAFDC + Sv39/Sv48 + PMP，RV32 是独立后端（RV32IMAFDC + Sv32）。
 
-回归：**riscv64 136 格、riscv32 104 格、x86 47 格，全绿**（x86 = 39 个自足探针 +
+回归：**riscv64 136 格、riscv32 104 格、x86 50 格，全绿**（x86 = 42 个自足探针 +
 7 个 kvm-unit-tests 镜像 + realmode 1 格，127 PASS/0 FAIL；realmode 偶见对 PIT
 IRQ0 到达时机的敏感，见 progress.log）。依赖边 `dep: ok`。逐轮记录见
 [progress.log](progress.log)。

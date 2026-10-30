@@ -133,6 +133,46 @@ elf_cell() {
   fi
 }
 
+# Multi-line transcript cell (v86_int / v86_irq): the probe prints a fixed set
+# of marker lines and the whole block is the judgement. The calibration file
+# carries it between "--- want ---" and "--- end ---", and the prose around it
+# records how the reference model was run and which fields are arrival-time
+# artifacts rather than semantics. The markers are lifted with sed instead of
+# matched by prefix because cemu's [info] loader lines carry no trailing
+# newline and glue themselves onto the first guest line. Trailing blanks are
+# trimmed on both sides (the probe's field helper leaves one after each field).
+transcript_cell() {
+  local stem=$1 status=$2
+  local elf="$dir/probe/$stem.elf" cal="$dir/probe/${stem}_qemu.txt"
+  if [ ! -f "$elf" ] && command -v nasm > /dev/null 2>&1 &&
+     command -v ld.lld > /dev/null 2>&1; then
+    local ld="$dir/probe/$stem.ld"
+    [ -f "$ld" ] || ld="$dir/probe/vbe_mode.ld"
+    nasm -f elf32 -o "$dir/probe/$stem.o" "$dir/probe/$stem.asm" &&
+      ld.lld -m elf_i386 -T "$ld" -o "$elf" "$dir/probe/$stem.o"
+  fi
+  if [ ! -f "$elf" ] || [ ! -f "$cal" ]; then
+    echo "SKIP ($stem: needs nasm/ld.lld and the calibration file $cal)"
+    return
+  fi
+  local out rc want got
+  out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$elf" 2>&1)
+  rc=$?
+  want=$(awk '/^--- want ---$/{f=1;next} /^--- end ---$/{f=0} f' "$cal" |
+         tr -d '\r' | sed 's/[[:space:]]*$//')
+  got=$(printf '%s\n' "$out" | tr -d '\r' |
+        sed -n 's/.*\(F2[012] \|GP  \|REP \|IRQ \|mark \|irqtab:\|v86-[a-z]* done\)/\1/p' |
+        sed 's/[[:space:]]*$//')
+  if [ "$rc" -eq "$status" ] && [ "$got" = "$want" ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "$stem: rc=$rc want rc=$status"
+    printf '%s\n' "$got" | sed 's/^/    got | /'
+    printf '%s\n' "$want" | sed 's/^/    want| /'
+  fi
+}
+
 # REP-prefixed string ops with (E)CX = 0 (test/x86/probe/rep_zero.asm): the
 # prefix's counter test stands in front of the loop body (SDM vol.2 REP
 # prefix), so a zero counter means no operation at all. libc-style memcpy
@@ -663,6 +703,27 @@ elf_cell uart_rx 11 ref
 # raise at the same point. ref cell: the transcript is byte-identical. Before
 # this existed the same probe answered `b=02 c=03` -- nothing was masked.
 elf_cell ignne 11 ref
+
+# MOV Sreg encoding (test/x86/probe/movsreg.asm): 0x8C stores exactly 16 bits
+# to memory whatever the operand size, a 32-bit register destination is
+# zero-extended, and reg=6/7 are #UD. One transcript line; the calibration file
+# records that cemu and QEMU answer it identically.
+elf_cell movsreg 11 ref
+
+# V86 interrupt delivery and reflection (test/x86/probe/v86_int.asm): a 32-bit
+# DPL3 gate entered from V86 pushes the V86 SS:ESP and clears ES/DS/FS/GS; the
+# handler reflects by rebuilding a 3-word frame on the V86 stack; INT 0x22 nests
+# while that outer frame is live; the I/O bitmap then denies OUT and REP OUTSW
+# with #GP(0), the state EMM386's reflector reads. Four marker lines plus
+# "done", byte-identical on both models (status 11).
+transcript_cell v86_int 11
+
+# V86 hardware-IRQ nesting (test/x86/probe/v86_irq.asm): three reflected IRQs
+# whose saved ESP walks 0x7000 -> 0x6ffa -> 0x6ff4, the shape of the DOS/EMM386
+# crash. Lock cell: IRQ0's interrupted flags and the tick counter depend on
+# where the PIT edge lands, so the golden is cemu's transcript and the file
+# records QEMU's two differing fields.
+transcript_cell v86_irq 11
 
 # I/O APIC NMI delivery (test/x86/probe/nmi_ioapic.asm), PIT IRQ0 -> I/O APIC
 # pin 0 -> NMI. Lock cell: QEMU 11 accepts the entry but does not raise the

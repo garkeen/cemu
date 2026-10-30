@@ -1,0 +1,21 @@
+V86 hardware-interrupt nesting (test/x86/probe/v86_irq.asm): three IRQs land
+while the previous reflected V86 handler is still live, so the saved ESP walks
+0x7000 -> 0x6ffa -> 0x6ff4 (the shape of the DOS/EMM386 crash).
+
+The block below is cemu's transcript, which the cell pins. QEMU prints the
+same F21/mark/irqtab lines and the same ESP/SS/CS nesting, but two fields are
+arrival-time artifacts rather than semantics, and differ by design:
+    IRQ0 fl: cemu 0x23216, QEMU 0x23293   (which instruction the IRQ hit)
+    cnt:     cemu 0x10000, QEMU 0x38f10   (the probe's instruction-axis tick)
+The levels 1/2 flags (0x23293/0x23297) agree between the models, and both exit
+with status 11 (captured 2026-10-30).
+
+--- want ---
+F21 eip=00008044 cs=00000000 fl=00023046 esp=00007000 ss=00001800 es=00000000 ds=00000000 fs=00003000 gs=00004000
+mark m0=0000aaaa m1=0000bbbb irqs=00000003
+irqtab:
+IRQ i=00000000 esp=00007000 ss=00001800 cs=00000000 fl=00023216 cnt=00010000
+IRQ i=00000001 esp=00006ffa ss=00001800 cs=00000000 fl=00023293 cnt=00010000
+IRQ i=00000002 esp=00006ff4 ss=00001800 cs=00000000 fl=00023297 cnt=00010000
+v86-irq done
+--- end ---

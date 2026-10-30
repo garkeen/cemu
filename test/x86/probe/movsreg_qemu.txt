@@ -1,0 +1,14 @@
+MOV r/m16,Sreg (0x8C) and MOV Sreg,r/m16 (0x8E): the probe pins the 16-bit
+store to memory whatever the operand size, the 32-bit register destination
+zero-extending, and reg=6/7 being #UD (reserved segment encodings).
+
+The same ELF answers the same single line and the same status under cemu and
+  qemu-system-i386 -machine pc -m 32 -kernel movsreg.elf -display none \
+      -no-reboot -serial file:movsreg_qemu.txt \
+      -device isa-debug-exit,iobase=0xf4,iosize=0x4
+(payload 5 -> status 11). The scratch slot was pre-filled with 0xa5, so a
+32-bit store into the 16-bit memory destination would show two zero bytes in
+"w16"; t6/t7/t8e are the reserved encodings and "rex" the 0x66 form.
+
+cemu w32=a5a50010,a5a5a5a5 w16=a5a50010,a5a5a5a5 rex=00000010,00000010 t6=00000001,00000010 t7=00000001,00000010 t8e=00000001,00000010
+qemu w32=a5a50010,a5a5a5a5 w16=a5a50010,a5a5a5a5 rex=00000010,00000010 t6=00000001,00000010 t7=00000001,00000010 t8e=00000001,00000010

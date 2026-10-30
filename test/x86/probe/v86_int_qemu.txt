@@ -1,0 +1,21 @@
+V86 interrupt delivery, reflection and nesting (test/x86/probe/v86_int.asm).
+
+The block below is assembled by the cell from the probe's marker lines and is
+byte-identical under cemu and
+  qemu-system-i386 -machine pc -m 32 -kernel v86_int.elf -display none \
+      -no-reboot -serial file:v86_int_qemu.txt \
+      -device isa-debug-exit,iobase=0xf4,iosize=0x4
+(both exit payload 5 -> status 11; captured 2026-10-30). F20 is a 32-bit DPL3
+interrupt gate entered from V86: the saved SS:ESP is the V86 stack and
+ES/DS/FS/GS are cleared in the handler. F22 is the nested INT 0x22 while the
+outer 3-word frame is live (saved ESP 0x6ffa). GP/REP are the I/O-bitmap #GP
+on OUT and on REP OUTSW -- the architectural state EMM386's reflector reads to
+resume the transfer.
+
+--- want ---
+F20 eip=00008024 cs=00000000 fl=00023202 esp=00007000 ss=00001800 es=00000000 ds=00000000 fs=00003000 gs=00004000
+F22 eip=00008108 cs=00000000 fl=00023202 esp=00006ffa ss=00001800 es=00000000 ds=00000000 fs=00003000 gs=00004000
+GP  ec=00000000 eip=00008033 cs=00000000 fl=00033202 esp=00007000 ss=00001800 es=00000000 ds=00000000 fs=00003000 gs=00004000
+REP ec=00000000 eip=0000804c ecx=00010003 esi=00019200 edi=0000830a edx=000303f8
+v86-int done
+--- end ---

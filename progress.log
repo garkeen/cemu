@@ -3,6 +3,31 @@
 按时间倒序，最新在最上。本文件只记过程、证据与裁决；当前状态摘要见
 README.md，架构与阶段见 arch.md，规格缺口台账见 AGENTS.md §X。
 
+## V86/VME 三个临时探针转正：MOV Sreg、V86 中断反射/嵌套、V86 IRQ 嵌套（2026-10-30）
+
+这三个探针是 10-28 定位 V86 交付时写的，一直未跟踪、也没接进套件。按"有价值
+就入库"逐个裁决，结论是都有，但形态各不相同：
+
+- `movsreg`：MOV r/m16,Sreg（0x8C）对内存目标恒写 16 位、32 位寄存器目标零扩展、
+  reg=6/7 为 #UD。cemu 与 QEMU 的单行 transcript 逐字节相同、同退 status 11，
+  直接进 `elf_cell movsreg 11 ref`（校准文件 `movsreg_qemu.txt`）。
+- `v86_int`：V86 下 32 位 DPL3 门压出的帧（保存 V86 SS:ESP、处理器清 ES/DS/FS/GS）、
+  反射重建 3 字帧、外层帧活着时的 INT 0x22 嵌套、I/O 位图对 OUT 与 REP OUTSW 的
+  #GP(0)。transcript 与 QEMU 逐字节相同，**但探针自己的 REP 尾（文件头里的第四个
+  标记）走的是 `fail_exit`**，与"两边都退 status 11"矛盾。两模型在该尾上既然一致，
+  就把它改成打完 `v86-int done` 后以 payload 5 退出；只有 ud/ss 路径保留 fail_exit。
+- `v86_irq`：三次反射 IRQ 的保存 ESP 必须走 0x7000→0x6ffa→0x6ff4（DOS/EMM386
+  崩溃的形状）。两模型的 nesting 字段一致，但 IRQ0 的 fl 与 cnt 是到达时刻的函数
+  （cemu 0x23216/0x10000，QEMU 0x23293/0x38f10），所以做成 lock 格：golden 是
+  cemu 的整段 transcript，QEMU 的两个差异字段写进校准文件。
+- 套件框架：单行 transcript 的 `probe_cell`/`elf_cell` 装不下多行，新增
+  `transcript_cell`——探针打固定标记行，校准文件用 `--- want ---`/`--- end ---`
+  携带整段 golden；标记用 sed 从粘连的 `[info]` 行里切出来，尾部空白两边裁掉。
+- 验证：删掉预构建 ELF 后 `bash test/x86/run.sh` 自行重建三格，
+  **50 passed, 0 failed**（47 + 3）。源码 / `.ld` / 校准文件与**预构建 ELF**
+  一并入库（与该目录其余 elf 探针一致，缺 nasm/ld.lld 的机器照跑），`.o` 不入库。
+  README/AGENTS/arch 的格数同步到 50（42+7+1）。
+
 ## docs: 五份文档按实际状态对齐；progress.md → progress.log（2026-10-30）
 
 - `progress.md` 更名为 `progress.log`：它记的一直是按轮追加的过程与证据，不是

@@ -276,7 +276,7 @@ realmode（kvm-unit-tests 官方实模式套件）127 PASS/0 FAIL。
   shamt 第 5 位四处修完；止于上游未实现的 S→U 交接，QEMU 同镜像同终点）、
   SPDOS/DOS7 软盘进 DOS（16 位 LGDT/LIDT 只带 24 位基址）。验收 3（xv6-riscv）仍未
   开始。Windows 95 卡在两个 logo（`cs=0x9000` 的页帧被客人自己清零后仍被 `jmp`
-  进去），见 progress.log 最新节。回归：riscv64 136/0、riscv32 104/0、x86 **47/0**、
+  进去），见 progress.log 最新节。回归：riscv64 136/0、riscv32 104/0、x86 **50/0**、
   依赖边 ok。
 - **验收 4（Windows 1.01）与显示实现形状**（2026-09-24 用户裁决；2026-09-29 落地）：验收件
   `build/windows/windows101.img`（1.44MB、MS-DOS 3.3 引导软盘，卷标 WIN101），QEMU
