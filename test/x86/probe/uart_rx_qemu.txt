@@ -1,0 +1,48 @@
+Dual run of test/x86/probe/uart_rx.asm, 2026-10-30:
+
+  cemu --machine x86 --isa x86 uart_rx.elf                     -> status 11
+  qemu-system-i386 -machine pc -m 32 -cpu pentium -kernel uart_rx.elf \
+      -display none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x4 \
+      -serial file:uart_rx_qemu.txt                           -> status 11
+
+Both lines are identical, byte for byte. QEMU here is 10.2.92
+(v11.0.0-rc2-12119-gaa7f0eb8d8-dirty).
+
+  uart hold=61 over=63 keep=42 clear=60 fifo=61 bytes=43444546 full=63 \
+       head=30 tail=3f off=60 ok
+
+What each field pins (the probe drives the chip through its own loopback, so no
+host input is involved and the order is fixed):
+
+  hold      one byte with FCR.FE=0: LSR = 0x61 = DR | THRE | TEMT
+  over      a second byte while that one is unread: OE joins it (the receiver is
+            one deep with the FIFO off)
+  keep      RBR then: 0x42, the newest byte -- what the displaced one was is
+            lost, which is what the OE reports
+  clear     LSR after reading RBR: 0x60, DR and OE both gone
+  fifo      four bytes with FCR.FE=1: 0x61, DR and no OE
+  bytes     the four in order: 0x43 0x44 0x45 0x46
+  full      sixteen more fill the FIFO and the seventeenth is dropped: the
+            overrun bit appears. The field is the OR of 64 LSR samples because
+            reading LSR is what clears a latched error bit
+  head      RBR: 0x30, the first byte of that block, so the queue kept its head
+  tail      RBR after draining 15 more: 0x3f, the last byte that fit
+  off       clearing FCR.FE with three bytes queued empties the receiver:
+            LSR = 0x60
+
+Why this cell exists: the model used to ignore FCR.FE on receive and buffer 16
+bytes either way, so it answered `over=61 keep=41 clear=61 ... off=61` -- no
+overrun, the older byte handed out first, and the FIFO-mode switch leaving the
+queue in place. The old registration (AGENTS.md §X D32) is what this closes:
+both depths now come from 16550D's FCR bit 0 and QEMU's serial_receive1 (`if
+(lsr & DR) lsr |= OE; rbr = buf[0];` for the FIFO-off case), and a change of FE
+empties the queue the way QEMU folds it into RFR | XFR.
+
+What is still not equal: QEMU's chardev asks the device whether it can receive
+(serial_can_receive) and holds the burst in the frontend when it cannot, so a
+mouse or keyboard burst survives on QEMU with the FIFO off; this machine's host
+sinks write straight into the device, so such a burst loses its front bytes to
+OE exactly as the wire would. That difference stays in D32.
+
+cemu uart hold=61 over=63 keep=42 clear=60 fifo=61 bytes=43444546 full=63 head=30 tail=3f off=60 ok
+qemu uart hold=61 over=63 keep=42 clear=60 fifo=61 bytes=43444546 full=63 head=30 tail=3f off=60 ok

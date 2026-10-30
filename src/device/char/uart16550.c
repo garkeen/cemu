@@ -128,8 +128,36 @@ static void UpdateMsr(Uart16550* u) {
   UpdateIrq(u);
 }
 
-// One byte into the receiver FIFO, from SIN or from the loopback path.
+// Empties the receiver: the queued bytes, the index pair and the character
+// timeout that was riding on them (QEMU serial_ioport_write's RFR branch).
+static void FlushRx(Uart16550* u) {
+  u->rx_count = 0;
+  u->rx_head = u->rx_tail = 0;
+  u->rx_timeout_armed = 0;
+  u->rx_timeout_ip = 0;
+}
+
+// One byte into the receiver, from SIN or from the loopback path. With the FIFO
+// off the receiver holds a single byte, so a byte that arrives while that one is
+// still unread replaces it and latches OE (16550D "FIFO Control Register" bit 0;
+// QEMU serial_receive1's else branch keeps the newest byte in RBR and sets
+// UART_LSR_OE). A driver that never enables the FIFO therefore loses the front
+// of a burst here exactly as it would on the wire: this port has no flow control
+// to hold the host back (简化登记 D32).
 static void PushRx(Uart16550* u, uint8_t ch) {
+  if (!(u->fcr & kFcrEnable)) {
+    if (u->rx_count > 0) {
+      u->lsr |= kLsrOe;  // the byte waiting there is lost, this one takes its place
+      u->rx_fifo[u->rx_tail] = ch;
+    } else {
+      u->rx_fifo[u->rx_head] = ch;
+      u->rx_head = (u->rx_head + 1) % kRxFifoSize;
+      u->rx_count = 1;
+    }
+    RefreshLsr(u);
+    UpdateIrq(u);
+    return;
+  }
   if (u->rx_count >= kRxFifoSize) {
     u->lsr |= kLsrOe;  // the FIFO is full: the byte is lost and OE latches
   } else {
@@ -138,12 +166,10 @@ static void PushRx(Uart16550* u, uint8_t ch) {
     u->rx_count++;
   }
   RefreshLsr(u);
-  if (u->fcr & kFcrEnable) {
-    // With the FIFO on, a burst that stops short of the trigger level is
-    // reported by the character timeout instead of by the level.
-    u->rx_timeout_armed = 1;
-    u->rx_timeout_at = HostTimerNow() + CharTimeUs(u) * kTimeoutChars;
-  }
+  // With the FIFO on, a burst that stops short of the trigger level is reported
+  // by the character timeout instead of by the level.
+  u->rx_timeout_armed = 1;
+  u->rx_timeout_at = HostTimerNow() + CharTimeUs(u) * kTimeoutChars;
   UpdateIrq(u);
 }
 
@@ -239,14 +265,18 @@ void Uart16550Write(Uart16550* u, uint64_t off, uint8_t val) {
         UpdateIrq(u);
       }
       break;
-    case 2:
+    case 2: {
+      // Turning the FIFO on or off empties it: a one-deep receiver cannot
+      // inherit a queue (QEMU folds a change of FCR.FE into the two FIFO
+      // resets). The write-1 clear of the receiver does the same, and also
+      // drops the latched error bits.
+      const int mode_changed = (val ^ u->fcr) & kFcrEnable;
       u->fcr = val;
       if (val & kFcrClearRx) {
-        u->rx_count = 0;
-        u->rx_head = u->rx_tail = 0;
-        u->rx_timeout_armed = 0;
-        u->rx_timeout_ip = 0;
+        FlushRx(u);
         u->lsr = (uint8_t)(u->lsr & ~kLsrErr);
+      } else if (mode_changed) {
+        FlushRx(u);
       }
       // Clearing the transmitter FIFO has nothing to clear: the transmitter is
       // never busy (a THR write leaves at once).
@@ -254,6 +284,7 @@ void Uart16550Write(Uart16550* u, uint64_t off, uint8_t val) {
       RefreshLsr(u);
       UpdateIrq(u);
       break;
+    }
     case 3:
       u->lcr = val;
       // Break control holds SOUT low, which the receiver reports as a break

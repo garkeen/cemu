@@ -1,5 +1,31 @@
 # cemu 当前状态（progress.md）
 
+## 16550 接收侧：FCR.FE 的两种深度与 OE（D32 销账，2026-10-30）
+
+旧模型无视 FCR.FE，接收侧一律当 16 字节 FIFO：不开 FIFO 的驱动在本机也能收全
+突发，实机/QEMU 会丢并置 OE。
+
+- 参考：16550D datasheet（FCR bit 0 的"FIFO 关闭 = 1 字节接收器"、LSR.DR/OE、
+  FIFO 16 字节）；QEMU `hw/char/serial.c` 的 `serial_receive1`（FE=0 分支就是
+  `if (lsr & DR) lsr |= OE; rbr = buf[0];`，**最新的字节留在 RBR**）、
+  `serial_ioport_write`（FCR.FE 变化被折成 RFR|XFR，即切换模式清空队列）、
+  `serial_can_receive`（FE=0 时 DR 置起就不再收）。
+- 落点 `src/device/char/uart16550.c`：`PushRx` 按 FE 分两种深度（FE=0 时后到的
+  字节取代待读的那个并置 OE；FE=1 时第 17 个丢弃并置 OE）；`FlushRx` 供 FCR 的
+  RFR 与"切换 FE"共用。
+- 验证：`test/x86/probe/uart_rx.asm` 走**芯片自己的 loopback**（MCR bit 4），
+  不需要宿主输入；双跑与 QEMU 逐字节相同：
+  `uart hold=61 over=63 keep=42 clear=60 fifo=61 bytes=43444546 full=63 head=30 tail=3f off=60`。
+  该探针在修复前跑出 `over=61 keep=41 ... off=61`，所以它是真判据（那四个字段
+  正是新旧行为的差）。
+- 细节两处值得记：`full` 取的是 64 次 LSR 采样的**或** —— 读 LSR 本身会清掉
+  锁存的错误位，单次读既当轮询又当报告会自己把 OE 擦掉；发送侧的 THRE 等待是
+  必需的，QEMU 的发送 FIFO 只有 16 深，一口气写 17 个字节会在发送侧就被覆盖。
+- 仍在册（已收窄）：宿主侧没有流控 —— QEMU 用 `serial_can_receive` 让 chardev
+  压住突发，本机的鼠标/键盘字节直接进设备，FIFO 关闭时突发会按 OE 丢字节（与
+  实机同）；以及 FE=0 且 DR=0 时读 RBR，QEMU 返回上一次的 rbr、本机返回 0。
+- 套件：`elf_cell uart_rx 11 ref`，`check-x86` 45 → **46 passed, 0 failed**。
+
 ## XBCS（ISA 桥配置 0x4E）：D19 里最后一个"寄存器未实现"（2026-10-30）
 
 - 参考：QEMU `hw/isa/piix.c` 的 `piix_reset` 只写 `pci_conf[0x4e] = 0x03`，之后这个

@@ -644,6 +644,16 @@ elf_cell smbus 11 ref
 # ref cell: the transcript is byte-identical.
 elf_cell xbcs 11 ref
 
+# 16550 receiver depth and overrun (test/x86/probe/uart_rx.asm): the two receive
+# depths FCR.FE selects (one byte with the FIFO off -- the next byte replaces it
+# and latches LSR.OE -- sixteen with it on, the seventeenth dropped and OE
+# latched), the ordering inside the queue, and a change of FE emptying it. The
+# probe drives all of it through the chip's own loopback, so no host input is
+# involved. ref cell: the transcript is byte-identical. Before this was modelled
+# the same probe answered `over=61 keep=41 ... off=61`; the remaining difference
+# from QEMU (its chardev holds a burst the device cannot take) is §X D32.
+elf_cell uart_rx 11 ref
+
 # I/O APIC NMI delivery (test/x86/probe/nmi_ioapic.asm), PIT IRQ0 -> I/O APIC
 # pin 0 -> NMI. Lock cell: QEMU 11 accepts the entry but does not raise the
 # CPU NMI flag in this configuration; cemu follows 82093AA §3.2.4.
