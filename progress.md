@@ -1,5 +1,28 @@
 # cemu 当前状态（progress.md）
 
+## Windows 2.0 卡在 logo：SeaVGABIOS 缺 extra stack，int10 用客人栈写穿客人代码（2026-10-30）
+
+现象：`-hda windows2.img` 停在微软 logo 不动（40 秒无进展）。
+
+- `trap`：`ud=6 tval=0000000000000f6d -> 000000000000e39d`，`sldt`（`0f 00 00`）在
+  实模式被拒——这条本身与 QEMU/v86 一致（两边探针同样 #UD），问题是客人反复从
+  F000:FF53 的 iret 桩返回同一条指令，成了无限 #UD 环（`gate a=6` 数千行）。
+- 那儿本该是 `retf`：`hist` 显示 `0e667 retf cb` 从栈上弹回 `0d43:0f6d`，正是
+  "LO"/"GO" 签名搜索例程的公共返回口。QEMU 同址（物理 `0xe380..0xe39f`）是完整代码
+  `81 3c 4c 4f`(cmp "LO") / `75 0f` / `81 7c 02 47 4f`(cmp "GO") / `0e b8 6d 0f 50`
+  / `cb`；cemu 同址被写成栈帧（`0x50 / 0xc000 / 0x1830 / 4..7 / 0xfc4`），写入者是
+  `0xc2160` 起的 32 位代码（`vgabios.bin` 偏移 0x2160），SS 仍是客人的 0d43。
+- 差别在固件构建：QEMU 的 vgabios 打 `VGA stack allocated at e9780`（走 PMM 另申请
+  512 字节栈），而我们的 `out/autoconf.h` 是 `CONFIG_VGA_ALLOCATE_EXTRA_STACK 0`，
+  `entry_10` 于是直接在调用者的 SS:SP 上压栈。Windows 2 的栈顶（`0d43:0xf84`）离
+  它自己的例程（`0x0f6d`）只有 0x17 字节余量，压穿即毁掉返回口。
+- 修复：SeaBIOS `.config` 加 `CONFIG_VGA_ALLOCATE_EXTRA_STACK=y`，`out/autoconf.h`
+  同步 `#define CONFIG_VGA_ALLOCATE_EXTRA_STACK 1`（本仓 ninja 构建直接读 autoconf.h，
+  没有 kconfig 规则）。重建后 vgabios 38912 → 39424 字节，启动日志出现
+  `VGA stack allocated at ed880`。
+- 验证：40 秒内 `ud=6` 计数 0；12M 指令（2 秒）处的 `fbdump` 与 QEMU `screendump`
+  逐色相同（ffffff 223912 / 57ffff 50877 / 000000 24507 / 5757ff 7904）；
+  msdos622 仍到 `C:\>`；`check-x86` 43 格全绿。
 ## 控制台"烫烫烫"的根因与修复：SeaBIOS 16 位段的字符串地址在 lld 合并后失效（2026-10-30）
 
 现象：`-display win32` 跑 msdos622 到 `Booting from 0000:7c00` 之后，宿主终端吐出几千个
