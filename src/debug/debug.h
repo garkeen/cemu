@@ -104,7 +104,7 @@ void DebugVirtio(const char* what, uint64_t a, uint64_t b, uint64_t c, uint64_t 
 // an x86 interpreter spells those as macros (cpu/isa/x86/exec.h: `ax`, `bx`,
 // `cx`, `dx`), and a member named `ax` could not be written from there.
 typedef struct DbgCallArgs {
-  uint32_t arg_ax, arg_bx, arg_cx, arg_dx, arg_ds, arg_es;
+  uint32_t arg_ax, arg_bx, arg_cx, arg_dx, arg_ds, arg_es, arg_si;
 } DbgCallArgs;
 
 // A guest's software INT n is a call with a request and an answer, and the two
@@ -181,6 +181,15 @@ int DebugUtf8(void);
 // the row prints even when the access itself faults).
 int DebugWatchHit(uint64_t addr, int size, int is_load);
 
+// Linear twin of the watch (watchl=): watch= matches the address the bus sees,
+// which is physical; a protected-mode structure (a VxD slot, a kernel object)
+// has no stable physical page across runs, so "who wrote this slot" has to be
+// asked at the linear address the guest names. The ISA's linear funnel calls
+// this after each access while `g_mem_slow` is on (a linear watch forces that
+// path, exactly as a physical one does).
+int DebugLinWatchHit(uint64_t addr, int size, int is_load);
+void DebugLinWatch(struct frame* f, uint64_t lin, int size, int is_load, uint64_t val);
+
 // ---- guest-memory dumps (dump=ADDR:SIZE:FILE) -------------------------------
 // A `watch` row says *that* an address was touched; it cannot say what the
 // guest left in a structure nobody reads again — a stopped guest's log buffer,
@@ -248,7 +257,8 @@ void DebugSessionEnd(const struct frame* f, const char* stop_reason);
 // CEMU_DEBUG grammar this hub implements (AGENTS.md §X):
 //   trace[:line|table][=N], state, mem[:ld|st], trap, bus[:ADDR|:NAME], regs=N,
 //   mark, hist[=N], screen, vga-io, pmp, virtio, utf8,
-//   watch=ADDR:SIZE[:r|w|rw] (repeatable), dump=ADDR:SIZE:FILE (repeatable),
+//   watch=ADDR:SIZE[:r|w|rw] (repeatable), watchl=ADDR:SIZE[:r|w|rw]
+//   (repeatable, linear address), dump=ADDR:SIZE:FILE (repeatable),
 //   fbdump=FILE (repeatable, binary PPM of the display card's picture),
 //   pcshot=ADDR[:COUNT], pcshot=LO-HI[:COUNT] (repeatable; state row when the
 //   next linear PC is ADDR or lands inside [LO,HI), plus the history ring when

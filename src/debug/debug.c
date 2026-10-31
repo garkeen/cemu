@@ -66,7 +66,9 @@ static uint64_t g_traps;
 static int g_trap_cause = -1;  // trap=CAUSE: only this vector prints
 static char g_mark_name[24];   // mark:NAME: only this mark name prints
 static int g_mark_vec = -1;    // mark:gatecall=N: only this INT vector
+static int g_mark_ah = -1;     // mark:gatecall=N:AH: only this INT function
 static int g_last_gate_vec = -1;  // vector of the call the pending return answers
+static int g_last_gate_ah = -1;   // AH of that call (the paired-function filter)
 static char g_screen_stop[24];  // screenstop=TEXT: end the session on that line
 
 // ---- the instruction in progress (DebugSetFrame) ---------------------------
@@ -116,6 +118,30 @@ int DebugWatchHit(uint64_t addr, int size, int is_load) {
   for (int i = 0; i < g_nwatch; i++)
     if (g_watch[i].rw & want && addr < g_watch[i].addr + (uint64_t)g_watch[i].size &&
         addr + (uint64_t)size > g_watch[i].addr)
+      return 1;
+  return 0;
+}
+
+// Linear watchpoints (watchl=): the same match, but on the address the guest
+// names instead of the one the bus sees. `watch=` is physical because the bus
+// funnels only know the translated address; a protected-mode structure (a VxD
+// data slot, a kernel object) has no stable physical address across runs --
+// paging decides it -- so "who wrote this slot" cannot be asked there. The
+// match is made in the ISA's linear funnel (cpu/isa/x86/exec.c lin_load/
+// lin_store) while `g_mem_slow` is on, which a linear watch forces exactly the
+// way a physical one does.
+static struct {
+  uint64_t addr;
+  int size;
+  int rw;  // 1 read, 2 write, 3 both
+} g_watchl[kMaxWatches];
+static int g_nwatchl;
+
+int DebugLinWatchHit(uint64_t addr, int size, int is_load) {
+  int want = is_load ? 1 : 2;
+  for (int i = 0; i < g_nwatchl; i++)
+    if (g_watchl[i].rw & want && addr < g_watchl[i].addr + (uint64_t)g_watchl[i].size &&
+        addr + (uint64_t)size > g_watchl[i].addr)
       return 1;
   return 0;
 }
@@ -476,6 +502,52 @@ static void AddWatch(const char* spec) {
   g_mask |= kDbgWatch;
 }
 
+static void AddWatchL(const char* spec) {
+  // watchl=ADDR:SIZE[:r|w|rw] -- the linear-address twin of watch=.
+  if (g_nwatchl >= kMaxWatches) {
+    LogError("debug: too many linear watches, dropping '%s'", spec);
+    return;
+  }
+  uint64_t addr, size;
+  const char* colon = strchr(spec, ':');
+  if (!colon) {
+    LogError("debug: watchl expects ADDR:SIZE[:r|w|rw] ('%s')", spec);
+    return;
+  }
+  char head[32];
+  size_t hl = (size_t)(colon - spec);
+  if (hl >= sizeof(head)) return;
+  memcpy(head, spec, hl);
+  head[hl] = 0;
+  if (!ParseUint(head, &addr)) {
+    LogError("debug: watchl address must be a number, 0x-prefixed for hex ('%s')", head);
+    return;
+  }
+  const char* rest = colon + 1;
+  const char* colon2 = strchr(rest, ':');
+  char szs[32];
+  size_t sl = colon2 ? (size_t)(colon2 - rest) : strlen(rest);
+  if (sl >= sizeof(szs)) return;
+  memcpy(szs, rest, sl);
+  szs[sl] = 0;
+  if (!ParseUint(szs, &size)) {
+    LogError("debug: watchl size must be a number ('%s')", szs);
+    return;
+  }
+  int rw = 3;
+  if (colon2) {
+    if (!strcmp(colon2 + 1, "r"))
+      rw = 1;
+    else if (!strcmp(colon2 + 1, "w"))
+      rw = 2;
+  }
+  g_watchl[g_nwatchl].addr = addr;
+  g_watchl[g_nwatchl].size = (int)size;
+  g_watchl[g_nwatchl].rw = rw;
+  g_nwatchl++;
+  g_mask |= kDbgWatch;
+}
+
 // exec=LO-HI (repeatable, up to kMaxExec); LO and HI are C literals.
 static void AddExec(const char* spec) {
   if (g_nexec >= kMaxExec) {
@@ -727,12 +799,28 @@ void DebugInit(void) {
         memcpy(g_mark_name, tok + 5, n);
         g_mark_name[n] = 0;
         g_mark_vec = -1;
+        g_mark_ah = -1;
         if (eq) {
+          // gatecall=N selects one vector; the optional :AH then selects one
+          // DOS/BIOS function inside it (INT 21h AH=3Fh is "read", and a file
+          // load's reads are what a failing VxD loader loses).
+          char spec[32];
+          snprintf(spec, sizeof(spec), "%s", eq + 1);
+          char* colon = strchr(spec, ':');
+          if (colon) *colon = 0;
           uint64_t v = 0;
-          if (!ParseUint(eq + 1, &v) || v > 0xff)
+          if (!ParseUint(spec, &v) || v > 0xff)
             LogError("debug: mark vector must be 0..255 ('%s')", tok);
-          else
+          else {
             g_mark_vec = (int)v;
+            if (colon) {
+              uint64_t ah = 0;
+              if (!ParseUint(colon + 1, &ah) || ah > 0xff)
+                LogError("debug: mark function must be 0..255 ('%s')", tok);
+              else
+                g_mark_ah = (int)ah;
+            }
+          }
         }
         g_mask |= kDbgMark;
       }
@@ -761,6 +849,8 @@ void DebugInit(void) {
       // category (or a watchpoint) is on, and this bit also arms the exit dump.
       g_mask |= kDbgRegs;
     }
+    else if (!strncmp(tok, "watchl=", 7))
+      AddWatchL(tok + 7);
     else if (!strncmp(tok, "watch=", 6))
       AddWatch(tok + 6);
     else if (!strncmp(tok, "exec=", 5))
@@ -789,7 +879,7 @@ void DebugInit(void) {
   if (g_mask &
           (kDbgTraceTable | kDbgMem | kDbgTrap | kDbgBus | kDbgGdb | kDbgMark |
            kDbgScreen | kDbgVgaIo | kDbgPmp | kDbgVirtio | kDbgExec) ||
-      g_nwatch || g_nexec) {
+      g_nwatch || g_nwatchl || g_nexec) {
     g_tbl = TableOpen(kEventCols, 6, g_ascii, g_header_every);
     TableHeader(g_tbl);
   }
@@ -797,9 +887,9 @@ void DebugInit(void) {
   // interpreters test these plain globals instead of calling DebugOn on every
   // byte of every instruction; a category that needs the event-emitting path
   // disables the fast memory path wholesale.
-  g_mem_slow = ((g_mask & (kDbgMem | kDbgBus)) != 0) || g_nwatch != 0;
+  g_mem_slow = ((g_mask & (kDbgMem | kDbgBus)) != 0) || g_nwatch != 0 || g_nwatchl != 0;
   g_record_raw = (g_mask & (kDbgTraceLine | kDbgTraceTable | kDbgHist)) != 0;
-  g_dbg_any = (g_mask != 0) || g_nwatch != 0;
+  g_dbg_any = (g_mask != 0) || g_nwatch != 0 || g_nwatchl != 0;
   // One line that says the range item armed: a range that parsed to nothing
   // used to be indistinguishable from one that never saw a crossing.
   if (g_nexec) LogInfo("debug: %d exec range(s) armed", g_nexec);
@@ -1198,6 +1288,20 @@ void DebugMem(frame* f, uint64_t addr, uint64_t watch_addr, int size, int acc,
   }
 }
 
+void DebugLinWatch(frame* f, uint64_t lin, int size, int is_load, uint64_t val) {
+  if (!f || !DebugLinWatchHit(lin, size, is_load) || !Allow(kDbgWatch)) return;
+  RowBegin(g_tbl, 'W', f);
+  char det[96];
+  snprintf(det, sizeof(det), "l%c %llx:%d %s %llx inst=%llu", is_load ? 'r' : 'w',
+           (unsigned long long)lin, size, is_load ? "->" : "<-",
+           (unsigned long long)(val & 0xffffffffULL),
+           (unsigned long long)f->cpu->inst_count);
+  TableRowCell(g_tbl, det);
+  CellFlags(g_tbl, f);
+  TableRowEnd(g_tbl);
+  HistDump();
+}
+
 void DebugBus(frame* f, const char* dev_name, uint64_t addr, int size, int is_load, uint64_t val) {
   // The filter runs before the budget: a row the caller narrowed away must not
   // spend the window that the rows it asked for need.
@@ -1302,15 +1406,21 @@ void DebugGateCall(uint32_t vec, const DbgCallArgs* a, uint32_t caller) {
   // own (the guest returns through IRET), so the last delivered one is what
   // lets mark:gateret=N filter a single service's answers.
   g_last_gate_vec = (int)vec;
+  // The function byte is what `mark:gatecall=VEC:AH` pairs the answer half
+  // against; record it for every call so the gateret side can filter on the
+  // request even when the request row itself was suppressed.
+  g_last_gate_ah = (int)((a->arg_ax >> 8) & 0xff);
   if (g_mark_name[0] && strcmp(g_mark_name, "gatecall") != 0) return;
   if (g_mark_vec >= 0 && (int)vec != g_mark_vec) return;
+  if (g_mark_ah >= 0 && (int)((a->arg_ax >> 8) & 0xff) != g_mark_ah) return;
   if (!DebugOn(kDbgMark) || !Allow(kDbgMark)) return;
   RowBeginBare(g_tbl, 'K');
-  char det[104];
+  char det[128];
   snprintf(det, sizeof(det),
-           "gatecall int=%02x ax=%04x bx=%04x cx=%04x dx=%04x ds=%04x es=%04x at=%04x:%04x",
+           "gatecall int=%02x ax=%04x bx=%04x cx=%04x dx=%04x si=%04x ds=%04x es=%04x at=%04x:%04x",
            vec, a->arg_ax & 0xffff, a->arg_bx & 0xffff, a->arg_cx & 0xffff, a->arg_dx & 0xffff,
-           a->arg_ds & 0xffff, a->arg_es & 0xffff, (caller >> 16) & 0xffff, caller & 0xffff);
+           a->arg_si & 0xffff, a->arg_ds & 0xffff, a->arg_es & 0xffff, (caller >> 16) & 0xffff,
+           caller & 0xffff);
   TableRowCell(g_tbl, det);
   TableRowEnd(g_tbl);
 }
@@ -1322,7 +1432,14 @@ void DebugGateCall(uint32_t vec, const DbgCallArgs* a, uint32_t caller) {
 // caller's context rather than answering anything.
 void DebugGateRet(const DbgCallArgs* a, int cf, uint32_t caller) {
   if (g_mark_vec >= 0 && g_last_gate_vec != g_mark_vec) return;
-  if (g_mark_name[0] && strcmp(g_mark_name, "gateret") != 0) return;
+  // Pair mode: `mark:gatecall=VEC:AH` prints both halves of that function, so the
+  // answer (a DOS read's byte count and CF) is visible next to the request.
+  int pair = g_mark_ah >= 0 && g_mark_name[0] && strcmp(g_mark_name, "gatecall") == 0;
+  if (pair) {
+    if (g_last_gate_ah != g_mark_ah) return;
+  } else if (g_mark_name[0] && strcmp(g_mark_name, "gateret") != 0) {
+    return;
+  }
   if (!DebugOn(kDbgMark) || !Allow(kDbgMark)) return;
   RowBeginBare(g_tbl, 'K');
   char det[96];

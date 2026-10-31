@@ -1107,11 +1107,20 @@ static uint64_t lin_load(uint64_t lin, int size, int user, int fetch) {
   AcCheckSlow(lin, size, user, fetch, 0);
   uint32_t off = (uint32_t)lin & 0xfff;
   if (g_mem_slow) {
-    if (off + (uint32_t)size <= 0x1000) return SlowLoadOne(lin, size, user, fetch);
-    int n1 = (int)(0x1000 - off);
-    uint64_t lo = SlowLoadOne(lin, n1, user, fetch);
-    uint64_t hi = SlowLoadOne(lin + (uint64_t)n1, size - n1, user, fetch);
-    return lo | (hi << (n1 * 8));
+    uint64_t v;
+    if (off + (uint32_t)size <= 0x1000) {
+      v = SlowLoadOne(lin, size, user, fetch);
+    } else {
+      int n1 = (int)(0x1000 - off);
+      uint64_t lo = SlowLoadOne(lin, n1, user, fetch);
+      uint64_t hi = SlowLoadOne(lin + (uint64_t)n1, size - n1, user, fetch);
+      v = lo | (hi << (n1 * 8));
+    }
+    // A linear watch names the address the guest computed; the physical watch
+    // cannot, because paging decides which page backs it. Fetches are not data
+    // watches (exec= answers the fetch side).
+    if (!fetch) DebugLinWatch(fr, lin, size, 1, v);
+    return v;
   }
   if (!(s->cr0 & kCr0Pg)) {
     if (off + (uint32_t)size <= 0x1000) return phys_load(lin, size, fetch);
@@ -1141,6 +1150,8 @@ static void lin_store(uint64_t lin, int size, int user, uint64_t v) {
       SlowStoreOne(lin, n1, user, lo);
       SlowStoreOne(lin + (uint64_t)n1, size - n1, user, hi);
     }
+    // Emitted after the store: a faulting store must not look like it landed.
+    DebugLinWatch(fr, lin, size, 0, v);
     return;
   }
   if (!(s->cr0 & kCr0Pg)) {
@@ -1673,6 +1684,38 @@ static void GateArgs(DbgCallArgs* o) {
   o->arg_dx = edx;
   o->arg_ds = s->sreg[ds_i];
   o->arg_es = s->sreg[es_i];
+  // SI carries the pointer for the services whose buffer is named DS:SI rather
+  // than ES:DX -- INT 13h AH=43h's disk address packet is the one the VMM's
+  // VxD loader uses for every file read, so a row without it cannot say which
+  // sector (or which buffer) a failing read was for.
+  o->arg_si = esi;
+}
+
+// SDM vol.2 IRET/RET, RETURN-TO-OUTER-PRIVILEGE-LEVEL: after an inter-privilege
+// return the processor clears every data segment register the new CPL cannot
+// use -- a data or non-conforming code descriptor with DPL < the new CPL
+// becomes a null selector (the hidden cache keeps base/limit but loses P;
+// QEMU target/i386/tcg/seg_helper.c validate_seg does exactly this). A null
+// selector stays null. Both pseudocodes state the loop (IRET: "FOR each SegReg
+// in (ES, FS, GS, and DS) ... IF (SegmentSelector == NULL) OR (tempDesc(DPL) <
+// CPL AND tempDesc(Type) is (data or non-conforming code)) THEN SegmentSelector
+// := 0"; RET: same condition, and its Description spells it out: "The DS, ES,
+// FS, and GS segment registers are cleared by the RET instruction during an
+// inter-privilege-level return if they refer to segments that are not allowed
+// to be accessed at the new privilege level").
+static void clear_outer_data_segs(int newpl) {
+  static const int kDataSegs[4] = {es_i, ds_i, fs_i, gs_i};
+  for (int i = 0; i < 4; i++) {
+    int seg = kDataSegs[i];
+    if ((s->sreg[seg] & 0xfffc) == 0) continue;  // already null
+    uint8_t ar = s->ar[seg];
+    // S=1 and (data, or code that is not conforming).
+    int data_or_nonconf = (ar & 0x10) && !((ar & 0x08) && (ar & 0x04));
+    if (data_or_nonconf && ((ar >> 5) & 3) < newpl) {
+      s->sreg[seg] = 0;
+      s->ar[seg] = (uint8_t)(ar & ~1u);  // selector null: cache loses P
+    }
+  }
 }
 
 // Protected-mode IRET (SDM vol.2 IRET Operation). Four shapes: a return
@@ -1696,6 +1739,8 @@ static void pm_iret(void) {
     // the monitor's IOPL must be 3.
     int vme = (s->cr4 & kCr4Vme) != 0;
     if (!vme && fl->iopl != 3) gp_fault(0);
+    // The handler's verdict, read before the flags image replaces CF below.
+    int cf = fl->cf;
     uint32_t new_eip = stack_peek(w, 0);
     uint16_t sel = (uint16_t)stack_peek(w, w);
     uint32_t flv = stack_peek(w, 2 * (uint32_t)w);
@@ -1716,6 +1761,15 @@ static void pm_iret(void) {
     esp = s->dbit[ss_i] ? esp + (uint32_t)w * 3
                         : (esp & 0xffff0000u) | (uint16_t)(esp + (uint32_t)w * 3);
     SetEip(new_eip);
+    // The V86 half of the request/answer pair: a DOS/BIOS service that runs as a
+    // VM86 client returns through the monitor's IRET, and its answer (AX/CF) is
+    // what the caller branches on. Without this row a V86 call has a request
+    // half and no answer (debug.h DebugGateCall).
+    if (DebugOn(kDbgMark)) {
+      DbgCallArgs a;
+      GateArgs(&a);
+      DebugGateRet(&a, cf, ((uint32_t)sel << 16) | (new_eip & 0xffff));
+    }
     return;
   }
 
@@ -1775,6 +1829,13 @@ static void pm_iret(void) {
     // V86 fetches with a 16-bit IP; the image's upper bits are not part of
     // the next address (SDM vol.2 IRET, vol.1 3.7.1).
     SetEip(new_eip & 0xffffu);
+    // A return into the high V86 segments is the monitor handing the client
+    // back to firmware/HMA code (the VMM's real-mode stubs live at CS=0xFFFF).
+    // The row's pc= is the IRET that made the transition, a=target IP (decimal),
+    // b=target CS (hex) -- the observation "who entered the real-mode stub"
+    // that the error path needed (AGENTS.md 十 mark). Filtered to the high
+    // segments: ordinary client returns would otherwise flood the ring.
+    if (sel >= 0xf000) DebugMark("v86in", (int)(new_eip & 0xffffu), (int)sel);
     return;
   }
 
@@ -1809,6 +1870,7 @@ static void pm_iret(void) {
   if (outer) {
     esp = new_esp;
     seg_commit(ss_i, new_ss, &sv);
+    clear_outer_data_segs(newpl);  // SDM vol.2 IRET outer return
   } else {
     esp = s->dbit[ss_i] ? esp + (uint32_t)w * 3
                         : (esp & 0xffff0000u) | (uint16_t)(esp + (uint32_t)w * 3);
@@ -1995,6 +2057,7 @@ static void pm_ret(uint32_t n) {
     esp = new_esp;
     seg_commit(ss_i, new_ss, &sv);
     esp += n;  // release the parameters from the caller's stack
+    clear_outer_data_segs(newpl);  // SDM vol.2 RET far outer return
   }
   SetEip(new_eip);
 }

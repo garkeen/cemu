@@ -3,6 +3,119 @@
 按时间倒序，最新在最上。本文件只记过程、证据与裁决；当前状态摘要见
 README.md，架构与阶段见 arch.md，规格缺口台账见 AGENTS.md §X。
 
+## 四类嫌疑逐个读实现：都没有缺陷；PIT BCD 登记 D41（2026-10-31）
+
+- **16 位远指针/远调用**（`LES/LDS/LSS`、调用门带参数、远返回）：`exec.c` 的
+  `case 0xc4/0xc5`、`case 0xb2/0xb4/0xb5` 按 `d.w32` 取 `m16:16` 或 `m32:16`，
+  先偏移后段、16 位只写低半；`call_gate` 换栈后压 `SS/ESP → params[n-1..0] → CS/IP`；
+  `pm_ret` 的 `saved = 2*w + n` 取调用者 `SS:ESP`、外层返回后 `esp = new_esp + n`。
+  对照 QEMU `target/i386/tcg/seg_helper.c` 的 `helper_ret_protected`：同样的
+  `sa.sp += addend` 两处推进、**同样不拷贝参数**，pop IP/CS → `+= addend` →
+  pop ESP/SS → `sp = new_esp` → `+= addend`，逐句等价。**无缺陷**。
+- **16 位算术/移位标志**：`grp2` 把计数 `cnt &= 31`（386+ 语义），`shl/shr/sar/
+  rol/ror/rcl` 的 CF/OF 规则逐条对 SDM（SHL 的 OF=MSB(结果)^CF、SHR 的
+  OF=原 MSB、SAR 的 OF=0、ROL/ROR/RCL 的对应式）；`cnt=0` 早退不改任何东西，
+  `cnt>=width` 的 0/符号填充也处理了。**无缺陷**。
+- **V86 搬运语义**：`seg_synth` 给 VM86/实模式段的 limit 固定 0xffff（SDM
+  vol.3 17.3.1）、base=sel<<4、DPL 3；`seg_use` 的限检查在 `lin_load/lin_store`
+  前；字符串指令的地址尺寸/方向位此前已审。**无缺陷**。
+- **PIT/CMOS**：`cmos.c` 的 RTC 是完整模型（BCD/BIN、24 小时、UIP 常清、闹钟、
+  内存尺寸寄存器）；`i8254.c` 的 **BCD 计数模式只存不建模**（`bcd` 字段保存但
+  计数/读回按二进制）——这是未登记的简化，已补进 AGENTS.md §X **D41**。
+- 顺带修的观测缺口：`DebugGateRet` 之前只在保护模式与实模式 IRET 发射，V86 的
+  返回（DOS 服务作为 VM86 client 的返回）没有答案行；已在 `pm_iret` 的 V86 分支
+  补发射（CF 在标志载入前取）。`mark:gatecall=VEC:AH` 的配对过滤也接上了
+  gateret 侧——但**已发现配对会被嵌套软中断打断**（处理程序内部再发 int 时
+  `g_last_gate_ah` 被覆盖，外层返回时配不上），这是设施的已知限制，记在这里。
+
+## PCI 设备视图对拍（临时探针，已删除）：核心设备一致（2026-10-31）
+
+- 方法：写了一个临时 multiboot 探针，枚举 bus 0 的每个 device/function 的
+  配置空间（00h/08h/0Ch/10h/14h/18h/1Ch/20h/3Ch 九个 dword），从 COM1 打出来，
+  debug-exit 收场；cemu 与 qemu-system-i386 各跑一次对 diff。
+- 相同的设备集合与 ID：`00.00 8086:1237`（i440FX）、`01.00 8086:7000`（PIIX3
+  ISA）、`01.01 8086:7010`（IDE）、`01.03 8086:7113`（PM）、`02.00 1234:1111`
+  （stdvga）。class/progif/header 全部一致。
+- 不同的部分都是**引导上下文**差异，不是模型差异：
+  - cemu 的 IDE 复位即带 BAR `1f1/3f7/171/377/c001` 与 `INTLINE=14`，QEMU 在
+    探针直启（不跑 BIOS POST）时这些还是 0/未设——真机上由 SeaBIOS 赋同样的值；
+  - VGA 的 BAR0 两边都是 **prefetchable memory**（低 3 位 0x8），只是 cemu 基址为 0、
+    QEMU 已赋 `fd000000`；BAR2 同理（cemu 0，QEMU `febf0000`）；
+  - QEMU 那次多出 `03.00 8086:100e`，是我调用时没加 `-nic none` 带出的默认网卡。
+- 结论：**PCI 配置空间这一层没有发现 cemu 的模型错误**。探针是临时诊断件，已删除；
+  没进套件（两模型"BIOS 之前"的配置状态本来就不同，用 QEMU 的转录当校准会编码错
+  的 oracle）。要看 POST 之后的状态得让 BIOS 跑过 PCI 初始化，探针直启做不到。
+
+## gatecall 行补 SI；VMM 磁盘读数据完整性核对通过（2026-10-31）
+
+- 背景：Win95 的 protection error 已确认是 VMM 软件层判定 VxD init 失败（全程无
+  ring-0 #GP/#PF/#UD；#UD 风暴全在失败之后）。剩下的嫌疑是"VxD 加载/注册表读盘
+  读回的数据不对"，而此前 gatecall 行没有 SI，说不出 int 13h AH=43h 的磁盘地址包
+  （DS:SI）指向哪里。
+- 设施：gatecall 行加 `si=`（DBgCallArgs 加 arg_si，格式从 104 扩到 128 字节），
+  登记在 AGENTS.md §十。热路径零成本（同一处 DebugOn 门控）。
+- 实测：VMM 的 AH=43 调用形如
+  `ax=4300 cx=0001 dx=0080 si=1788 ds=ffff es=03c0 at=ffff:1806`（DAP 在线性
+  0x101778，LBA 514，缓冲 0x044d:0x1f80=线性 0x6450）。会话结束 dump 回来：
+  DAP `size=16 flags=1 buf=0x44d:0x1f80 lba=514`，缓冲前 16 字节
+  `42 4f 4f 54 4c 4f 47 20 54 58 54 22` = `"BOOTLOG TXT\""`，与镜像 LBA 514
+  逐字节相同（`match True`）。**磁盘读路径的数据是对的**，这条假设排除。
+- 所以失败是"无异常、读盘正确"的软件层 VxD init 失败；下一步只能从 VMM 的
+  VxD 加载器判定点（它检查 IOS 的什么返回值）入手，或者对比两个模型的指令流找
+  静默语义偏差。
+
+## x86：IRET/RET 跨特权返回清空数据段（SDM/QEMU 取证）；Win95 未因此好转（2026-10-31）
+
+- SDM vol.2 IRET Operation 的 RETURN-TO-OUTER-PRIVILEGE-LEVEL 明文：
+  `FOR each SegReg in (ES, FS, GS, and DS) DO tempDesc := descriptor cache for
+  SegReg; IF (SegmentSelector == NULL) OR (tempDesc(DPL) < CPL AND tempDesc(Type)
+  is (data or non-conforming code))) THEN SegmentSelector := 0;`；
+  RET 的同一节有同样的循环，Description 还写："The DS, ES, FS, and GS segment
+  registers are cleared by the RET instruction during an inter-privilege-level
+  return if they refer to segments that are not allowed to be accessed at the new
+  privilege level."（抓取页 https://www.felixcloutier.com/x86/iret:iretd:iretq 、
+  https://www.felixcloutier.com/x86/ret）
+- QEMU 对应实现：target/i386/tcg/seg_helper.c 的 validate_seg() 在
+  helper_ret_protected 的外层返回路径里对 ES/DS/FS/GS 逐个检查，DPL < 新 CPL 的
+  data/非一致代码段被 `cpu_x86_load_seg_cache(..., 0, base, limit, flags &
+  ~DESC_P_MASK)` 置空（选择子 0、保留 base/limit、清 P）。
+- cemu 的 pm_iret / pm_ret 外层返回路径此前**完全没有这一步**（保留旧缓存）。
+  新增 clear_outer_data_segs(newpl)，两个外层返回各调用一次。x86 套件 59/59 通过。
+- Win95 实测**没有因此好转**：直启仍在 `Starting Windows 95...` 之后报
+  `Windows protection error` 并跑飞（400M 指令、1263 万次抑制异常）。所以这是一个
+  真实的 SDM 缺口修复，但不是本次 Win95 失败的根因。
+
+## CEMU_DEBUG：`mark:v86in`（V86 返回进高段）（2026-10-31）
+
+- 动机：Win95 的 `Windows protection error` 由 VMM 的**实模式**错误处理器
+  （HMA 里的 DOS 风格字符串 `0x10309e`，经 BIOS 控制台逐字符打印）报出，触发点
+  在保护模式侧。要问"谁把 client 送进实模式桩"，此前的设施都答不了：`mark:gate`
+  只给软件 INT，`pcshot` 要预知地址，`trace` 会被淹没。
+- 设施：`pm_iret` 的 V86 返回路径里，目标 CS ≥ 0xf000 时发一行
+  `v86in`（a=目标 IP 十进制、b=目标 CS 十六进制），行的 `pc=` 是那条 iret。
+  过滤高段是因为普通 client 返回（DOS 代码）量太大；HMA/固件桩正好在这个区间。
+- 登记在 AGENTS.md §十 mark 名单。热路径成本为零：发射点在 iret 的 V86 分支里，
+  由 `DebugOn(kDbgMark)` 位测试门控。
+
+## CEMU_DEBUG：`watchl=` 线性地址观测（2026-10-31）
+
+- 动机：`watch=` 只能按**物理地址**匹配。Win95 的 VxD 数据槽（如
+  `0xc001e1f7`）在分页打开后每次运行落在不同物理页，"谁写了这个槽"用物理
+  watch 问不出来（前几轮按物理地址猜、一次命中都没有，就是这条缺口）。
+- 设施：`watchl=ADDR:SIZE[:r|w|rw]`，与 `watch=` 同形的解析与预算，但匹配挂在
+  ISA 的**线性漏斗**（x86 的 `lin_load`/`lin_store`，已由 `g_mem_slow` 门控；
+  该条目自身也把 `g_mem_slow` 打开）。命中行 DETAIL 用 `lr`/`lw` 与物理的
+  `r`/`w` 区分，带 `inst=`，同样吃 `budget=`/`skip=`。取指不算（`exec=` 管那侧）。
+- 调试这个设施时踩到一个真 bug：表只在 `g_mask & (...)` 或 `g_nwatch`/`g_nexec`
+  时打开，没带上 `g_nwatchl`，于是**只用 `watchl=` 的会话里 `g_tbl` 为 NULL**，
+  第一次命中就 SIGSEGV（宿主退出码 2816、栈已坏、gdb 回不出栈）。修法是把
+  `g_nwatchl` 加进开表条件；日志-only 版本先证明了匹配与取值都对，再恢复表行。
+- 验收（同一条流，物理/线性两条设施对照）：`watchl=0x4c:4:rw,budget=6` 跑 Win95
+  引导，得到 BIOS 写 IVT[13] 的 `lw 4c:2 <- ff53 inst=91222`、
+  `lw 4c:2 <- e3fe inst=92262` 与 `int` 读回的 `lr 4c:2 -> e3fe inst=4555706`，
+  与早先 `watch=0x4c:4:rw` 的物理流逐行一致（同一批 PC，只是这次看到的是线性地址）。
+- 已登记到 AGENTS.md §十语法表。下一步用它看 `0xc001e1f7` 的写入者。
+
 ## Win95 保护错误的 VxD 定位：IOS.VXD（2026-10-31）
 
 - 手段：给 MSDOS.SYS 加 `BootLog=1`（把 `Network=1` 原地替换）后启动，再从镜像的
