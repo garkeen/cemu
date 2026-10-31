@@ -63,6 +63,11 @@ enum { kCatSlots = 18 };
 static uint64_t g_emitted[kCatSlots];
 static uint64_t g_suppressed[kCatSlots];
 static uint64_t g_traps;
+static int g_trap_cause = -1;  // trap=CAUSE: only this vector prints
+static char g_mark_name[24];   // mark:NAME: only this mark name prints
+static int g_mark_vec = -1;    // mark:gatecall=N: only this INT vector
+static int g_last_gate_vec = -1;  // vector of the call the pending return answers
+static char g_screen_stop[24];  // screenstop=TEXT: end the session on that line
 
 // ---- the instruction in progress (DebugSetFrame) ---------------------------
 // One pointer store per step, the same shape as QEMU's global current CPU: it
@@ -127,8 +132,10 @@ int DebugWatchHit(uint64_t addr, int size, int is_load) {
 // data the guest cleared, so no address in it can be guessed from the map.
 enum { kMaxExec = 4 };
 static struct {
-  uint64_t lo;  // inclusive
-  uint64_t hi;  // exclusive
+  uint64_t lo;   // inclusive
+  uint64_t hi;   // exclusive
+  uint32_t max;  // crossing rows this range reports (the optional :COUNT)
+  uint32_t hits;
 } g_exec[kMaxExec];
 static int g_nexec;
 static int g_fetch_inside;  // the previous fetch was inside one of the ranges
@@ -482,6 +489,20 @@ static void AddExec(const char* spec) {
     return;
   }
   memcpy(text, spec, n + 1);
+  // The optional :COUNT suffix belongs to the range, not to HI: leaving it on
+  // made ParseUint reject the whole spec, so `exec=LO-HI:N` — the documented
+  // form — armed nothing at all while the error line scrolled past.
+  uint32_t max = 1;
+  char* colon = strrchr(text, ':');
+  if (colon) {
+    uint64_t v = 0;
+    *colon = 0;
+    if (!ParseUint(colon + 1, &v) || v == 0 || v > 0xffff) {
+      LogError("debug: exec count must be 1..65535 ('%s')", spec);
+      return;
+    }
+    max = (uint32_t)v;
+  }
   char* dash = strchr(text, '-');
   if (!dash) {
     LogError("debug: exec expects LO-HI ('%s')", spec);
@@ -499,6 +520,8 @@ static void AddExec(const char* spec) {
   }
   g_exec[g_nexec].lo = lo;
   g_exec[g_nexec].hi = hi;
+  g_exec[g_nexec].max = max;
+  g_exec[g_nexec].hits = 0;
   g_nexec++;
   g_mask |= kDbgExec;
 }
@@ -656,6 +679,18 @@ void DebugInit(void) {
       g_mask |= kDbgMem;
     else if (!strcmp(tok, "trap"))
       g_mask |= kDbgTrap;
+    else if (!strncmp(tok, "trap=", 5)) {
+      // trap=CAUSE: one vector only. A guard-triggered storm (the #UD a
+      // mis-delivered V86/PM frame causes) buries the first hit under
+      // millions of repeats; with the vector the window opens on the first.
+      uint64_t v = 0;
+      if (!ParseUint(tok + 5, &v) || v > 0xff) {
+        LogError("debug: trap= wants a vector number ('%s')", tok);
+      } else {
+        g_trap_cause = (int)v;
+        g_mask |= kDbgTrap;
+      }
+    }
     else if (!strcmp(tok, "bus") || !strncmp(tok, "bus:", 4)) {
       g_mask |= kDbgBus;
       if (tok[3] == ':') {
@@ -679,12 +714,45 @@ void DebugInit(void) {
       g_mask |= kDbgGdb;
     else if (!strcmp(tok, "mark"))
       g_mask |= kDbgMark;
+    else if (!strncmp(tok, "mark:", 5)) {
+      // mark:NAME[=N] -- one mark name only (gatecall/gateret, intr/inta,
+      // fdc-* ...), and for the gate rows one vector. `mark` is a catch-all:
+      // an interrupt line storm, or a keyboard poll loop once the guest is
+      // waiting for a key, buries the one stream the caller is after.
+      char* eq = strchr(tok + 5, '=');
+      size_t n = eq ? (size_t)(eq - (tok + 5)) : strlen(tok + 5);
+      if (n == 0 || n >= sizeof(g_mark_name)) {
+        LogError("debug: mark name too long ('%s')", tok);
+      } else {
+        memcpy(g_mark_name, tok + 5, n);
+        g_mark_name[n] = 0;
+        g_mark_vec = -1;
+        if (eq) {
+          uint64_t v = 0;
+          if (!ParseUint(eq + 1, &v) || v > 0xff)
+            LogError("debug: mark vector must be 0..255 ('%s')", tok);
+          else
+            g_mark_vec = (int)v;
+        }
+        g_mask |= kDbgMark;
+      }
+    }
     else if (!strcmp(tok, "pmp"))
       g_mask |= kDbgPmp;
     else if (!strcmp(tok, "virtio"))
       g_mask |= kDbgVirtio;
     else if (!strcmp(tok, "screen"))
       g_mask |= kDbgScreen;
+    else if (!strncmp(tok, "screenstop=", 11)) {
+      // The transcript a failure leaves behind is text: stop on it and let
+      // dump=/regs write the post-mortem. Needs `screen` to see the line.
+      if (strlen(tok + 11) >= sizeof(g_screen_stop))
+        LogError("debug: screenstop text too long ('%s')", tok);
+      else {
+        snprintf(g_screen_stop, sizeof(g_screen_stop), "%s", tok + 11);
+        g_mask |= kDbgScreen;
+      }
+    }
     else if (!strcmp(tok, "vga-io"))
       g_mask |= kDbgVgaIo;
     else if (!strncmp(tok, "regs=", 5)) {
@@ -732,6 +800,10 @@ void DebugInit(void) {
   g_mem_slow = ((g_mask & (kDbgMem | kDbgBus)) != 0) || g_nwatch != 0;
   g_record_raw = (g_mask & (kDbgTraceLine | kDbgTraceTable | kDbgHist)) != 0;
   g_dbg_any = (g_mask != 0) || g_nwatch != 0;
+  // One line that says the range item armed: a range that parsed to nothing
+  // used to be indistinguishable from one that never saw a crossing.
+  if (g_nexec) LogInfo("debug: %d exec range(s) armed", g_nexec);
+  if (g_npcshot) LogInfo("debug: %d pc checkpoint(s) armed", g_npcshot);
 }
 
 int DebugOn(uint32_t cat) { return g_inited && ((g_mask & cat) || (g_nwatch && cat == kDbgMem)); }
@@ -1037,12 +1109,18 @@ void DebugInsn(frame* f) {
   if (g_nexec) {
     uint64_t next = FrameDnpc(f);
     int inside = 0;
+    int report = 0;
     for (int i = 0; i < g_nexec; i++)
       if (next >= g_exec[i].lo && next < g_exec[i].hi) {
         inside = 1;
+        // :COUNT caps the rows this range reports, not the crossings it sees.
+        if (g_exec[i].hits < g_exec[i].max) {
+          g_exec[i].hits++;
+          report = 1;
+        }
         break;
       }
-    if (inside && !g_fetch_inside && Allow(kDbgExec)) {
+    if (inside && report && !g_fetch_inside && Allow(kDbgExec)) {
       char det[72];
       snprintf(det, sizeof(det), "enter %016llx inst=%llu", (unsigned long long)next,
                (unsigned long long)f->cpu->inst_count);
@@ -1062,6 +1140,7 @@ void DebugInsn(frame* f) {
 
 void DebugTrap(frame* f) {
   g_traps++;
+  if (g_trap_cause >= 0 && (int)f->trap.cause != g_trap_cause) return;
   if (!DebugOn(kDbgTrap) || !Allow(kDbgTrap)) return;
   RowBegin(g_tbl, 'T', f);
   char det[128];
@@ -1161,6 +1240,7 @@ void DebugGdbNote(const char* note) {
 // addresses, controller state) — the two forms a mark's two numbers actually
 // need, since one cell cannot hold both.
 void DebugMark(const char* what, int a, int b) {
+  if (g_mark_name[0] && strcmp(g_mark_name, what) != 0) return;
   if (!DebugOn(kDbgMark) || !Allow(kDbgMark)) return;
   RowBeginBare(g_tbl, 'K');
   char det[112];
@@ -1218,6 +1298,12 @@ void DebugPmpDeny(uint64_t addr, int len, int acc, int mode, int idx, unsigned c
 // -- and a row carrying only AX can report "out of memory" without saying how
 // much was asked for, which is the question the guest came to answer.
 void DebugGateCall(uint32_t vec, const DbgCallArgs* a, uint32_t caller) {
+  // The vector the pairing return belongs to: gateret carries no vector of its
+  // own (the guest returns through IRET), so the last delivered one is what
+  // lets mark:gateret=N filter a single service's answers.
+  g_last_gate_vec = (int)vec;
+  if (g_mark_name[0] && strcmp(g_mark_name, "gatecall") != 0) return;
+  if (g_mark_vec >= 0 && (int)vec != g_mark_vec) return;
   if (!DebugOn(kDbgMark) || !Allow(kDbgMark)) return;
   RowBeginBare(g_tbl, 'K');
   char det[104];
@@ -1235,12 +1321,17 @@ void DebugGateCall(uint32_t vec, const DbgCallArgs* a, uint32_t caller) {
 // caller's segments are not, since a handler that changed them changed the
 // caller's context rather than answering anything.
 void DebugGateRet(const DbgCallArgs* a, int cf, uint32_t caller) {
+  if (g_mark_vec >= 0 && g_last_gate_vec != g_mark_vec) return;
+  if (g_mark_name[0] && strcmp(g_mark_name, "gateret") != 0) return;
   if (!DebugOn(kDbgMark) || !Allow(kDbgMark)) return;
   RowBeginBare(g_tbl, 'K');
-  char det[80];
-  snprintf(det, sizeof(det), "gateret ax=%04x bx=%04x cx=%04x dx=%04x cf=%d at=%04x:%04x",
-           a->arg_ax & 0xffff, a->arg_bx & 0xffff, a->arg_cx & 0xffff, a->arg_dx & 0xffff, cf,
-           (caller >> 16) & 0xffff, caller & 0xffff);
+  char det[96];
+  // The vector is the call's, carried over from the delivery: without it a
+  // return row cannot say which multiplexer answered (and `cf=1` alone cannot
+  // separate a DOS failure from a BIOS one).
+  snprintf(det, sizeof(det), "gateret int=%02x ax=%04x bx=%04x cx=%04x dx=%04x cf=%d at=%04x:%04x",
+           g_last_gate_vec, a->arg_ax & 0xffff, a->arg_bx & 0xffff, a->arg_cx & 0xffff,
+           a->arg_dx & 0xffff, cf, (caller >> 16) & 0xffff, caller & 0xffff);
   TableRowCell(g_tbl, det);
   TableRowEnd(g_tbl);
 }
@@ -1274,6 +1365,15 @@ void DebugVgaIo(uint32_t port, uint32_t val, int is_read) {
 // exactly the full-screen rows this facility exists to read.
 enum { kDebugTextMax = 512 };
 void DebugText(const char* kind, const char* text) {
+  // screenstop=TEXT: freeze the session on the console line that carries TEXT,
+  // so dump=/regs at session end describe the moment the guest printed it
+  // rather than whatever it wandered into afterwards (a fatal-error banner is
+  // followed by a halt loop, and the state that matters is the one before it).
+  // The hook rides the display's text publication — already a cold path.
+  if (g_screen_stop[0] && text && strstr(text, g_screen_stop)) {
+    if (g_frame) g_frame->cpu->halted = kCpuExited;
+    g_screen_stop[0] = 0;  // one shot
+  }
   if (!DebugOn(kDbgScreen) || !Allow(kDbgScreen)) return;
   char line[kDebugTextMax];
   int n = snprintf(line, sizeof(line), "%s %s\n", kind, text);

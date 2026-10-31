@@ -136,6 +136,10 @@ testimg taskswitch2
 testimg cmpxchg8b
 testimg memory
 testimg ioapic
+testimg tsc
+testimg sieve
+testimg port80
+testimg setjmp
 testimg_src debug "$OUT/kut_debug.c"
 testimg_src access "$OUT/kut_access.c"
-echo "built: taskswitch taskswitch2 cmpxchg8b memory ioapic debug access"
+echo "built: taskswitch taskswitch2 cmpxchg8b memory ioapic tsc sieve port80 setjmp debug access"

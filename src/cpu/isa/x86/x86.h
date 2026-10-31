@@ -191,7 +191,12 @@ typedef struct x86_state {
   uint64_t tsc_offset;
   uint32_t tsc_aux;   // IA32_TSC_AUX (0xc0000103), returned by RDTSCP
   // SYSENTER/SYSEXIT state (SDM vol.2 SYSENTER/SYSEXIT; MSRs 0x174-0x176).
-  uint32_t sysenter_cs, sysenter_esp, sysenter_eip;
+  // IA32_SYSENTER_CS/ESP/EIP are 64-bit MSRs: WRMSR stores EDX:EAX whole
+  // (SDM vol.2 WRMSR: "Writes the contents of registers EDX:EAX into the
+  // 64-bit model specific register (MSR) ... MSR[ECX] ← EDX:EAX"), and the
+  // #GP paragraph names IA32_SYSENTER_EIP/ESP among the MSRs that hold
+  // addresses. Only SYSENTER's load is 32-bit in legacy mode.
+  uint64_t sysenter_cs, sysenter_esp, sysenter_eip;
   uint64_t mtrr_physbase[8], mtrr_physmask[8];
   uint64_t mtrr_def_type;  // IA32_MTRR_DEF_TYPE (0x2ff)
   uint64_t pat;            // IA32_PAT (0x277); no cache model consumes it

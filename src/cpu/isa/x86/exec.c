@@ -1231,11 +1231,11 @@ static void MsrWrite(uint32_t idx, uint64_t v) {
   } else if (idx == 0x1b) {
     s->msr_apic_base = v;
   } else if (idx == 0x174) {
-    s->sysenter_cs = (uint32_t)v;
+    s->sysenter_cs = v;
   } else if (idx == 0x175) {
-    s->sysenter_esp = (uint32_t)v;
+    s->sysenter_esp = v;
   } else if (idx == 0x176) {
-    s->sysenter_eip = (uint32_t)v;
+    s->sysenter_eip = v;
   } else if (idx == 0x17a) {
     s->mcg_status = v & 7;  // RIPV/EIPV/MCIP
   } else if (idx == 0x17b) {
@@ -1627,11 +1627,35 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   } else {
     for (int i = 0; i < 8; i++) s->r[i].e = krd32(v.base + 0x28 + 4 * i);
   }
-  load_data(es_i, krd16(v.base + (tss16 ? 0x22 : 0x48)));
-  load_ss(krd16(v.base + (tss16 ? 0x26 : 0x50)));
-  load_data(ds_i, krd16(v.base + (tss16 ? 0x28 : 0x54)));
-  load_data(fs_i, tss16 ? 0 : krd16(v.base + 0x58));
-  load_data(gs_i, tss16 ? 0 : krd16(v.base + 0x5c));
+  // A virtual-8086 task's TSS holds real-mode segment values, not selectors, so
+  // all of its segment registers load with real-mode semantics. Reference: QEMU
+  // target/i386/tcg/seg_helper.c switch_tss_ra —
+  //   if (new_eflags & VM_MASK) {
+  //       for (i = 0; i < 6; i++) load_seg_vm(env, i, new_segs[i]);
+  //   } else {
+  //       ...descriptor loads...
+  //   }
+  // where load_seg_vm caches selector << 4 with limit 0xffff and DPL 3. Loading
+  // these fields as descriptors instead faults on the first real-mode value
+  // (0x13bd names GDT index 0x277, far past the table limit).
+  if (fl->vm) {
+    static const int kSegOrder[5] = {es_i, ss_i, ds_i, fs_i, gs_i};
+    static const int kOff32[5] = {0x48, 0x50, 0x54, 0x58, 0x5c};
+    static const int kOff16[5] = {0x22, 0x26, 0x28, 0, 0};
+    seg_view vv;
+    for (int i = 0; i < 5; i++) {
+      int off = tss16 ? kOff16[i] : kOff32[i];
+      uint16_t sel = off ? krd16(v.base + (uint32_t)off) : 0;
+      seg_synth(sel, &vv);
+      seg_commit(kSegOrder[i], sel, &vv);
+    }
+  } else {
+    load_data(es_i, krd16(v.base + (tss16 ? 0x22 : 0x48)));
+    load_ss(krd16(v.base + (tss16 ? 0x26 : 0x50)));
+    load_data(ds_i, krd16(v.base + (tss16 ? 0x28 : 0x54)));
+    load_data(fs_i, tss16 ? 0 : krd16(v.base + 0x58));
+    load_data(gs_i, tss16 ? 0 : krd16(v.base + 0x5c));
+  }
 
   s->cr0 |= 0x8;  // CR0.TS: the FPU state is per-task (SDM 7.2.1)
   if (has_ec) kpush32(ec);  // an exception's error code lands on the new stack
@@ -2577,10 +2601,25 @@ static void idiv_w(uint32_t src) {
   if (!d.w32) dividend = (int32_t)(uint32_t)dividend;
   int64_t divisor = d.w32 ? (int32_t)src : (int16_t)(uint16_t)src;
   if (divisor == 0) de();
-  int64_t q = dividend / divisor;
-  int64_t hi = 1LL << (qbits - 1);  // 2^31 / 2^15, exact in int64 (no shift UB)
-  if (q < -hi || q >= hi) de();
-  int64_t r = dividend % divisor;
+  // SDM IDIV Operation (r/m32): "temp ← EDX:EAX / SRC; IF (temp > 7FFFFFFFH)
+  // or (temp < 80000000H) THEN #DE", and "Overflow is indicated with the #DE
+  // (divide error) exception rather than with the CF flag" (table 3-50 gives
+  // the quotient range). The host's int64 division cannot compute that temp
+  // for the one pair whose quotient is 2^63 — EDX:EAX = 0x80000000:0 with
+  // SRC = -1: the C division is undefined behaviour and traps on an x86 host,
+  // so the #DE the SDM requires would never reach the guest. Divide magnitudes
+  // in uint64 (both are representable there) and range-check the magnitude
+  // before negating, which covers every divisor/dividend pair including that
+  // one. Remainder is the truncated one, by the relation dividend = q*src + r
+  // (the same definition the SDM's "SignedModulus" names).
+  uint64_t ua = (uint64_t)dividend;
+  uint64_t ub = (uint64_t)divisor;
+  int neg = (dividend < 0) != (divisor < 0);
+  uint64_t qmag = (dividend < 0 ? 0 - ua : ua) / (divisor < 0 ? 0 - ub : ub);
+  uint64_t limit = ((uint64_t)1 << (qbits - 1)) - (neg ? 0u : 1u);
+  if (qmag > limit) de();
+  int64_t q = neg ? -(int64_t)qmag : (int64_t)qmag;
+  int64_t r = dividend - q * divisor;
   if (d.w32) {
     eax = (uint32_t)q;
     edx = (uint32_t)r;
@@ -2665,10 +2704,16 @@ static void grp3(int size) {
 }
 
 // ---- string operations (SDM MOVS..SCAS, INS/OUTS, with REP/REPE/REPNE) -------
-// SI uses DS (overridable); DI always ES. SI/DI advance by the address size,
-// CX counts by the operand size. INS/OUTS swap the memory side for port DX and
-// share the whole loop. One iteration per step: a REP that wants another
-// re-executes the instruction (interruptible, like hardware).
+// SI uses DS (overridable); DI always ES. SI/DI advance by the address size, and
+// so does the repeat counter: SDM vol.2 REP Operation says AddressSize = 16
+// selects CX, AddressSize = 32 selects ECX (a REX.W in 64-bit mode does not
+// change it) -- the operand size only picks the element size, 1/2/4 bytes.
+// So `f3 66 a5` in 16-bit code is "rep movsd" with a CX count, not ECX; getting
+// this backwards lets a stale ECX upper half become a 4-gigabyte count (the
+// MS C memcpy's `shr cx,2` + `rep movsd` is exactly that shape). INS/OUTS swap
+// the memory side for port DX and share the whole loop. One iteration per step:
+// a REP that wants another re-executes the instruction (interruptible, like
+// hardware).
 static int str_uses_si(int op) {
   // SI uses DS (overridable). OUTS reads DS:[SI]; INS reads no memory at all.
   return (op >= 0xa4 && op <= 0xa7) || op == 0xac || op == 0xad || op == 0x6e || op == 0x6f;
@@ -2686,7 +2731,7 @@ static void string_op(uint8_t op) {
   // update. The guard has to stand before the single iteration below: entering
   // it with a zero counter and decrementing afterwards wraps (E)CX to
   // 0xffffffff and turns a no-op into a 2^32-iteration loop.
-  if (d.rep && (d.w32 ? ecx : cx) == 0) return;
+  if (d.rep && (d.a32 ? ecx : cx) == 0) return;
   // Odd opcodes are the word/dword forms for every member of the family
   // (A4/A5 MOVS, A6/A7 CMPS, AA/AB STOS, AC/AD LODS, AE/AF SCAS, 6C/6D INS,
   // 6E/6F OUTS): the operand size picks 4 or 2 bytes (SDM vol.2 per-opcode
@@ -2797,8 +2842,8 @@ static void string_op(uint8_t op) {
       di = (uint16_t)(dio + step);
   }
   if (!d.rep) return;
-  uint32_t cnt = (d.w32 ? ecx : cx) - 1;
-  if (d.w32)
+  uint32_t cnt = (d.a32 ? ecx : cx) - 1;
+  if (d.a32)
     ecx = cnt;
   else
     cx = (uint16_t)cnt;
@@ -3087,10 +3132,17 @@ static void SimdFp(uint8_t op2) {
 // 4 NEQ, 5 NLT, 6 NLE, 7 ORD. 1/2/5/6 are signaling (a NaN raises #IA).
 static uint32_t SimdPred32(int p, uint32_t a, uint32_t b) {
   if (SimdNan32(a) || SimdNan32(b)) {
+    // SDM CMPPS "SIMD Floating-Point Exceptions": "Invalid if SNaN operand and
+    // invalid if QNaN and predicate as listed in Table 3-1". The legacy
+    // predicates signal on a QNaN only for LT/LE/NLT/NLE; an SNaN signals for
+    // every predicate (quiet bit 22 clear with a non-zero fraction).
+    int snan = ((a & 0x00400000u) == 0 && (a & 0x007fffffu) != 0) ||
+               ((b & 0x00400000u) == 0 && (b & 0x007fffffu) != 0);
+    if (snan || p == 1 || p == 2 || p == 5 || p == 6)
+      softfloat_exceptionFlags |= softfloat_flag_invalid;
     if (p == 3 || p == 7) return p == 3 ? 0xffffffffu : 0;
     if (p == 4) return 0xffffffffu;
     if (p == 0) return 0;
-    softfloat_exceptionFlags |= softfloat_flag_invalid;
     return p == 1 || p == 2 ? 0 : 0xffffffffu;
   }
   float af, bf;
@@ -3110,10 +3162,15 @@ static uint32_t SimdPred32(int p, uint32_t a, uint32_t b) {
 }
 static uint64_t SimdPred64(int p, uint64_t a, uint64_t b) {
   if (SimdNan64(a) || SimdNan64(b)) {
+    // Same rule as SimdPred32 (SDM CMPPD "SIMD Floating-Point Exceptions");
+    // quiet bit 51 of a double.
+    int snan = ((a & 0x0008000000000000ULL) == 0 && (a & 0x000fffffffffffffULL) != 0) ||
+               ((b & 0x0008000000000000ULL) == 0 && (b & 0x000fffffffffffffULL) != 0);
+    if (snan || p == 1 || p == 2 || p == 5 || p == 6)
+      softfloat_exceptionFlags |= softfloat_flag_invalid;
     if (p == 3 || p == 7) return p == 3 ? ~0ULL : 0;
     if (p == 4) return ~0ULL;
     if (p == 0) return 0;
-    softfloat_exceptionFlags |= softfloat_flag_invalid;
     return p == 1 || p == 2 ? 0 : ~0ULL;
   }
   double ad, bd;
@@ -3263,13 +3320,21 @@ static void SimdMovHalf(uint8_t op2) {
   if (d.pf3 && op2 == 0x12) {  // MOVSLDUP
     uint8_t b[16];
     SimdSrc(b, 16, 1);
-    for (int i = 0; i < 4; i++) SimdSetElem(s->fpu.xmm[d.reg], 4, i, SimdElem(b, 4, i & 1));
+    // SDM vol.2 MOVSLDUP (128-bit legacy): DEST[31:0] := SRC[31:0],
+    // DEST[63:32] := SRC[31:0], DEST[95:64] := SRC[95:64],
+    // DEST[127:96] := SRC[95:64] — every element is replicated from the EVEN
+    // element of its pair, i.e. src[i & ~1]. Replicating from src[i & 1] put
+    // the odd element in the upper slot of each pair.
+    for (int i = 0; i < 4; i++) SimdSetElem(s->fpu.xmm[d.reg], 4, i, SimdElem(b, 4, i & ~1));
     return;
   }
   if (d.pf3 && op2 == 0x16) {  // MOVSHDUP
     uint8_t b[16];
     SimdSrc(b, 16, 1);
-    for (int i = 0; i < 4; i++) SimdSetElem(s->fpu.xmm[d.reg], 4, i, SimdElem(b, 4, 2 + (i & 1)));
+    // Mirror of MOVSLDUP: the ODD element of each pair is replicated
+    // (DEST[31:0] := SRC[63:32], DEST[95:64] := SRC[127:96], ...), i.e. src[i
+    // | 1].
+    for (int i = 0; i < 4; i++) SimdSetElem(s->fpu.xmm[d.reg], 4, i, SimdElem(b, 4, i | 1));
     return;
   }
   if (d.pf2 && op2 == 0x12) {  // MOVDDUP
@@ -4577,8 +4642,8 @@ static void run_op2(uint8_t op2) {
       s->limit[ss_i] = 0xffffffff;
       s->ar[ss_i] = 0x93;
       s->dbit[ss_i] = 1;
-      s->r[esp_i].e = s->sysenter_esp;
-      SetEip(s->sysenter_eip);
+      s->r[esp_i].e = (uint32_t)s->sysenter_esp;
+      SetEip((uint32_t)s->sysenter_eip);
       fl->word &= ~(0x100u | 0x10000u | 0x20000u);  // TF, RF, VM
       fl->if_ = 0;
       break;
@@ -4888,7 +4953,12 @@ static void run_op2(uint8_t op2) {
         uint32_t r = (uint32_t)(comb << cnt >> 32);
         if (cnt) {
           fl->cf = (comb >> (64 - cnt)) & 1;
-          fl->of = ((r & 0x80000000u) != 0) ^ ((dst & 0x40000000u) != 0);
+          // SDM vol.2 SHLD: "For a 1-bit shift, the OF flag is set if a sign
+          // change occurred; otherwise, it is cleared." The change is the
+          // result's MSB against the destination's original MSB. Testing bit 30
+          // of the destination instead compares the MSB with the bit that lands
+          // in it, which can never differ — OF was always cleared.
+          if (cnt == 1) fl->of = ((r & 0x80000000u) != 0) ^ ((dst & 0x80000000u) != 0);
           szp(r, 4);
         }
         SET_RM32(r);
@@ -4898,6 +4968,9 @@ static void run_op2(uint8_t op2) {
         uint16_t r = (uint16_t)(comb << cnt >> 16);
         if (cnt) {
           fl->cf = (comb >> (32 - cnt)) & 1;
+          // Same 1-bit sign-change rule as the 32-bit form (SDM SHLD); the
+          // 16-bit path never wrote OF at all, so it kept the previous flag.
+          if (cnt == 1) fl->of = ((r & 0x8000u) != 0) ^ ((dst & 0x8000u) != 0);
           szp(r, 2);
         }
         SET_RM16(r);
@@ -4915,6 +4988,11 @@ static void run_op2(uint8_t op2) {
         uint32_t r = (uint32_t)(comb >> cnt);
         if (cnt) {
           fl->cf = (comb >> (cnt - 1)) & 1;
+          // SDM vol.2 SHRD carries the same 1-bit OF rule as SHLD: "the OF
+          // flag is set if a sign change occurred; otherwise, it is cleared".
+          // A right shift leaves the destination's MSB in place, so no sign
+          // change can occur and the flag is cleared.
+          if (cnt == 1) fl->of = 0;
           szp(r, 4);
         }
         SET_RM32(r);
@@ -4924,6 +5002,7 @@ static void run_op2(uint8_t op2) {
         uint16_t r = (uint16_t)(comb >> cnt);
         if (cnt) {
           fl->cf = (comb >> (cnt - 1)) & 1;
+          if (cnt == 1) fl->of = 0;  // SDM SHRD 1-bit rule (see the 32-bit arm)
           szp(r, 2);
         }
         SET_RM16(r);
@@ -6472,22 +6551,36 @@ void run_op(uint8_t op) {
       int size = d.w32 ? 4 : 2;
       seg_use(d.mseg, d.moff, size, 0);
       WatchData(d.mlin, size, 0);
-      uint32_t lo = d.w32 ? rd32(d.mlin) : rd16(d.mlin);
+      uint32_t lo_word = d.w32 ? rd32(d.mlin) : rd16(d.mlin);
       uint64_t hi_lin = d.mlin + (uint64_t)size;
       seg_use(d.mseg, d.moff + (uint32_t)size, size, 0);
       WatchData(hi_lin, size, 0);
-      uint32_t hi = d.w32 ? rd32(hi_lin) : rd16(hi_lin);
-      uint32_t v = d.w32 ? reg32() : reg16();
-      // The hardware checks the bounds as unsigned values (80286/80386 real
-      // mode corpus; array-index semantics), not as signed integers.
+      uint32_t hi_word = d.w32 ? rd32(hi_lin) : rd16(hi_lin);
+      uint32_t v_word = d.w32 ? reg32() : reg16();
+      // Index and both bounds are signed integers: SDM vol.2 BOUND —
+      // "The array index is a signed integer ... The bounds operand is a memory
+      // location that contains a pair of signed doubleword-integers (when the
+      // operand-size attribute is 32) or a pair of signed word-integers", and
+      // its Operation reads
+      // "IF (ArrayIndex < LowerBound OR ArrayIndex > UpperBound) THEN #BR".
+      // Comparing the raw words as unsigned would accept a negative index whose
+      // bit pattern exceeds a positive upper bound (and reject the reverse).
+      int64_t v = d.w32 ? (int64_t)(int32_t)v_word : (int64_t)(int16_t)(uint16_t)v_word;
+      int64_t lo = d.w32 ? (int64_t)(int32_t)lo_word : (int64_t)(int16_t)(uint16_t)lo_word;
+      int64_t hi = d.w32 ? (int64_t)(int32_t)hi_word : (int64_t)(int16_t)(uint16_t)hi_word;
       if (v < lo || v > hi) raise_(fr, vec_br, 0);
       break;
     }
-    case 0x63: {  // arpl: raise r/m's RPL to the register's (SDM vol.2,
+    case 0x63: {  // arpl: raise r/m's RPL to the register's (SDM vol.2 ARPL)
       fr->rec.mnemonic = "arpl";
-                  // PM-only — v86 #UDs it outside protected mode)
-      if (!(s->cr0 & 1)) ud();
-      if (cpl() != 0) gp_fault(0);
+      // The instruction exists only in protected mode: both real-address mode
+      // and virtual-8086 mode do not recognize it and take #UD (SDM vol.2 ARPL
+      // "Real-Address Mode Exceptions" / "Virtual-8086 Mode Exceptions").
+      // It is NOT a privileged instruction: ring-3 code calls it to raise a
+      // caller-supplied selector's RPL to its own level, and the only
+      // protected-mode faults it has are the memory-operand ones (non-writable
+      // segment, limit, NULL selector) plus #SS/#PF/#AC — no CPL check.
+      if (!(s->cr0 & kCr0Pe) || fl->vm) ud();
       modrm();
       uint16_t dest = rm16();
       uint16_t src = reg16();
@@ -6517,7 +6610,12 @@ void run_op(uint8_t op) {
       // hook apply like every other memory operand.
       if (d.w32) {
         int32_t imm = (int32_t)imm32();
-        int64_t prod = (int64_t)RM32() * imm;
+        // The r/m operand is a signed doubleword: SDM vol.2 IMUL — "Performs a
+        // signed multiplication of two operands" and the three-operand
+        // Operation "TMP_XP := SRC1 * SRC2 (* Signed multiplication *)".
+        // Zero-extending the uint32 instead makes a negative multiplicand look
+        // positive, so CF/OF come out set for products that fit exactly.
+        int64_t prod = (int64_t)(int32_t)RM32() * imm;
         set_reg32((uint32_t)prod);
         flags_imul(prod, 4);
       } else {
@@ -6537,7 +6635,9 @@ void run_op(uint8_t op) {
       modrm();
       if (d.w32) {
         int8_t imm = (int8_t)imm8();
-        int64_t prod = (int64_t)RM32() * imm;
+        // Signed multiplicand, same rule as the imm32 form above (SDM IMUL
+        // three-operand Operation: TMP_XP := SRC1 * SRC2, signed).
+        int64_t prod = (int64_t)(int32_t)RM32() * imm;
         set_reg32((uint32_t)prod);
         flags_imul(prod, 4);
       } else {
@@ -6933,7 +7033,12 @@ void run_op(uint8_t op) {
       fr->rec.mnemonic = "ret";
       uint32_t n = imm16();
       SetEip(pop_w());
-      if (d.w32)
+      // The release after the return address follows the stack address size,
+      // not the operand size (SDM RET Operation: "IF StackAddressSize = 32 THEN
+      // ESP := ESP + SRC ELSE SP := SP + SRC"). A 16-bit ret on a 32-bit stack
+      // must move all of ESP; using the operand size leaves the high half of
+      // the stack pointer behind.
+      if (s->dbit[ss_i])
         esp += n;
       else
         sp = (uint16_t)(sp + n);
@@ -7026,7 +7131,10 @@ void run_op(uint8_t op) {
       }
       SetEip(pop_w());
       load_cs((uint16_t)pop_w());
-      if (d.w32)
+      // Same rule as the near return: the release is a stack-address-size
+      // adjustment (SDM RET Operation, RETURN-TO-SAME-PRIVILEGE-LEVEL and the
+      // real-address arm, which release through SP/ESP by StackAddressSize).
+      if (s->dbit[ss_i])
         esp += n;
       else
         sp = (uint16_t)(sp + n);
@@ -7161,8 +7269,15 @@ void run_op(uint8_t op) {
     case 0xe2: {  // loopne/loope/loop rel8
       fr->rec.mnemonic = op == 0xe0 ? "loopne" : op == 0xe1 ? "loope" : "loop";
       int8_t rel = (int8_t)imm8();
-      uint32_t cnt = (d.w32 ? ecx : cx) - 1;
-      if (d.w32)
+      // The counter register follows the ADDRESS size, not the operand size:
+      // SDM vol.2 LOOP/LOOPcc — "Performs a loop operation using the RCX, ECX
+      // or CX register as a counter (depending on whether address size is 64
+      // bits, 32 bits, or 16 bits)", and the Operation's first line is
+      // "IF (AddressSize = 32) THEN Count is ECX; ... ELSE Count is CX". A 66H
+      // prefix changes the operand size and must leave the counter alone; only
+      // 67H picks the other register.
+      uint32_t cnt = (d.a32 ? ecx : cx) - 1;
+      if (d.a32)
         ecx = cnt;
       else
         cx = (uint16_t)cnt;

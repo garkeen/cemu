@@ -173,6 +173,8 @@ typedef struct VgaPicture {
   int chain4;
   int shift_control;  // graphics controller GR5 bits 6-5
   int multi_scan;     // extra scan lines each VRAM row is displayed on
+  int pixel_dots;     // dots each source pixel covers (1 normally, 2 when the
+                      // dot clock is halved or the picture is 256-colour)
   int line_bytes;     // plane offsets per scan line
   int start;          // first displayed plane offset (CRTC R12/R13)
   int planes;         // which planes the picture reads (AR12)
@@ -1403,6 +1405,20 @@ static void VgaComputePicture(const VgaDevice* d, VgaPicture* p) {
     // an "XXX: is it correct?" of its own; AGENTS.md §五 settles a reference
     // disagreement with the manual, and the manual is on this side.)
     p->multi_scan = (d->cr[kCrtcMaxScanLine] & 0x80) ? 1 : 0;
+    // Dots per source pixel. SR1 bit 3 halves the dot clock, so the sequencer
+    // fetches the same pixels per character clock and every one of them covers
+    // two dots: the picture is twice as wide (QEMU vga.c shifts disp_width and
+    // picks VGA_DRAW_LINE4D2/LINE2D2 for shift_control 0/1). The 256-colour
+    // picture is two dots per byte by construction -- four bytes per character
+    // clock fill eight dots -- which is why QEMU's shift_control == 2 branch
+    // shifts nothing and instead counts its line in half the dots (bits = 4,
+    // VGA_DRAW_LINE8D2); SR1 bit 3 is not consulted there.
+    if (p->shift_control == 2) {
+      p->pixel_dots = 2;
+    } else if (d->sr[kSeqClockMode] & kSeqClockHalf) {
+      p->pixel_dots = 2;
+      p->width <<= 1;
+    }
   } else {
     p->cols = d->cr[kCrtcHorizontalDisplayEnd] + 1;
     p->rows = (display_end + 1) / p->cell_height;
@@ -1590,6 +1606,11 @@ static void VgaRenderGraphics(VgaDevice* d, const VgaPicture* p) {
   int y1 = 0;
   int multi_run = p->multi_scan;
   int hpel = p->hpel;
+  // A source pixel covers one or two dots (pixel_dots): the doubled shapes
+  // (256-colour, SR1 bit 3) walk the source at half the dot speed, so two
+  // neighbouring dots read the same byte (QEMU's Line4D2/Line2D2/Line8D2
+  // expanders do this as they fill disp_width dots from half as many bytes).
+  const int px_shift = p->pixel_dots == 2 ? 1 : 0;
   uint32_t line_base = (uint32_t)p->start;
   for (int y = 0; y < d->fb_height; y++) {
     uint32_t base = line_base;
@@ -1605,14 +1626,14 @@ static void VgaRenderGraphics(VgaDevice* d, const VgaPicture* p) {
         out[x] = 0;
         continue;
       }
+      const int px = (x + hpel) >> px_shift;
       if (p->shift_control == 2) {
         // Chain-4 256-colour: the byte's linear address is the plane offset
         // times four (the aperture's chain-4 mapping writes vram[addr]).
-        const uint32_t off = base * 4 + (uint32_t)(x + hpel);
+        const uint32_t off = base * 4 + (uint32_t)px;
         out[x] = DacColor(d, d->vram[off & (kVgaVramSize - 1)]);
         continue;
       }
-      const int px = x + hpel;
       int value;
       if (cga_colors) {
         uint8_t byte =

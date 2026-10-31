@@ -59,15 +59,6 @@ static int F80Sign(extFloat80_t v) { return (v.signExp >> 15) & 1; }
 
 static void UpdateEs(x86_fpu* f);
 
-int fpu_is_denormal(extFloat80_t v) { return F80IsDenormal(v); }
-
-void fpu_note_denormal(x86_fpu* f, extFloat80_t v) {
-  if (F80IsDenormal(v)) {
-    f->sw |= kFpuDe;
-    UpdateEs(f);
-  }
-}
-
 int fpu_top(const x86_fpu* f) { return (int)((f->sw >> kFpuTopShift) & 7); }
 
 void fpu_set_top(x86_fpu* f, int top) {
@@ -288,7 +279,10 @@ void fpu_examine(x86_fpu* f) {
   f->sw &= (uint16_t)~(kFpuC0 | kFpuC1 | kFpuC2 | kFpuC3);
   if (F80Sign(v)) f->sw |= kFpuC1;  // QEMU: FXAM puts the sign in C1
   if (fpu_tag(f, p) == kFpuTagEmpty) {
-    f->sw |= kFpuC3 | kFpuC2 | kFpuC0;
+    // SDM vol.2 FXAM table 3-42: Empty is C3,C2,C0 = 1,0,1. Setting C2 as well
+    // reported 1,1,1 (an encoding no class uses) and made an empty ST(0)
+    // indistinguishable from nothing in particular.
+    f->sw |= kFpuC3 | kFpuC0;
   } else if (F80IsNan(v)) {
     f->sw |= kFpuC0;
   } else if (F80IsZero(v)) {
@@ -701,8 +695,6 @@ void fpu_fcos(x86_fpu* f) {
   fpu_set(f, 0, r);
   f->sw &= (uint16_t)~kFpuC2;
 }
-
-void fpu_ftst(x86_fpu* f) { fpu_compare(f, kZero, 0); }
 
 // ---- conversions ------------------------------------------------------------
 

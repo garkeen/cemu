@@ -99,7 +99,6 @@ void fpu_frndint(x86_fpu* f);
 void fpu_fscale(x86_fpu* f);
 void fpu_fsin(x86_fpu* f);
 void fpu_fcos(x86_fpu* f);
-void fpu_ftst(x86_fpu* f);
 
 // Conversions. Loads flag a denormal operand (DE); stores round through
 // softfloat and set PE/UE/OE; integer stores set IE on out-of-range and write
@@ -116,8 +115,6 @@ int16_t fpu_store_i16(x86_fpu* f, extFloat80_t v);
 int32_t fpu_store_i32(x86_fpu* f, extFloat80_t v);
 int64_t fpu_store_i64(x86_fpu* f, extFloat80_t v);
 void fpu_store_bcd(x86_fpu* f, extFloat80_t v, uint8_t out[10]);
-int fpu_is_denormal(extFloat80_t v);
-void fpu_note_denormal(x86_fpu* f, extFloat80_t v);
 // FISTTP: truncate regardless of the control word's rounding mode (SSE3).
 int16_t fpu_store_i16_trunc(x86_fpu* f, extFloat80_t v);
 int32_t fpu_store_i32_trunc(x86_fpu* f, extFloat80_t v);

@@ -881,7 +881,19 @@ done
 # pages from 0xfffffa000 — a 64-bit address that truncates to 0xffffa000 here —
 # and loops over fw_cfg's RAM_SIZE, so on a 32-bit machine the pointer wraps
 # past 4GB and the loop overwrites the page tables it is building.
-for t in taskswitch taskswitch2 cmpxchg8b memory debug access ioapic; do
+# The v86 checkout's kvm-unit-tests tree carries more images than the seven
+# above; these four were added after checking them in this machine (2026-10-31)
+# because they are green and need no feature cemu lacks: tsc (RDTSC/RDTSCP and
+# the TSC MSR against the machine's own clock), sieve (a pure-C prime sieve
+# over the vm.c allocator — no CPU feature under test, it exercises paging and
+# the 4MB page path the same way memory does), port80 (writes port 0x80, which
+# the board forwards to the debug console), setjmp (libcflat's setjmp/longjmp
+# plus exception unwinding through the isr stubs). syscall is NOT built: its
+# source needs KERNEL_CS64/STAR and does not compile as a 32-bit image. msr is
+# not built either — it now passes the three IA32_SYSENTER_* cases but the
+# image dies on the first WRMSR to IA32_MISC_ENABLE (0x1A0), which this model
+# implements read-only; see AGENTS.md D40.
+for t in taskswitch taskswitch2 cmpxchg8b memory debug access ioapic tsc sieve port80 setjmp; do
   out=$(timeout 60 "$CEMU" --machine x86 --isa x86 "$dir/$t.elf" 2>&1)
   rc=$?
   # Exit status alone is not enough. A guest that exits cleanly reports payload
@@ -925,6 +937,57 @@ else
   fail=$((fail + 1))
   report_fail "realmode: $n_pass pass, $n_fail fail"
 fi
+
+# v86 tests/nasm: the 16-bit and 32-bit cases whose outcome the Intel SDM fixes
+# outright, so no reference model is needed to judge them — the guest asks for
+# an exception and the model must raise exactly that vector on exactly that
+# instruction:
+#
+#   idiv8/idiv16/idiv32-overflow  "Overflow is indicated with the #DE (divide
+#       error) exception rather than with the CF flag" (SDM IDIV Description;
+#       Operation for r/m32: "temp ← EDX:EAX / SRC; IF (temp > 7FFFFFFFH) or
+#       (temp < 80000000H) THEN #DE"). The three widths exercise idiv8, the
+#       16-bit path of idiv_w and the 32-bit path. idiv32-overflow is also the
+#       regression pin for the #DE the model used to lose: the 32-bit case is
+#       EDX:EAX = 0x80000000:0 over -1, whose quotient 2^63 made the host's own
+#       int64 division trap (a hung emulator, not a guest #DE).
+#   mov_sreg_ud1/ud2              MOV to a segment register with an illegal
+#       source encoding raises #UD (SDM MOV Sreg: "#UD if the source operand is
+#       not a valid segment register encoding").
+#
+# Images are built from the v86 checkout by nasm/build.sh and checked in, like
+# the kvm-unit-tests ones. The exception cannot be delivered: the multiboot
+# entry has no IDT, so the vector faults again and the run ends in the model's
+# own triple-fault stop (status 2) — the same end state for every case here.
+# The judgement is therefore "the T row says this cause, at an address inside
+# the test, and the run finished" — not the exit status alone.
+nasm_cell() { # nasm_cell <stem> <cause-token>
+  local stem=$1 cause=$2
+  local elf="$dir/nasm/$stem.elf"
+  if [ ! -f "$elf" ] && command -v nasm > /dev/null 2>&1 &&
+     command -v ld.lld > /dev/null 2>&1; then
+    bash "$dir/nasm/build.sh" > /dev/null 2>&1 || true
+  fi
+  if [ ! -f "$elf" ]; then
+    echo "SKIP ($stem: needs nasm/ld.lld and nasm/build.sh)"
+    return
+  fi
+  out=$(CEMU_DEBUG=trap timeout 30 "$CEMU" --machine x86 --isa x86 "$elf" 2>&1)
+  local rc=$?
+  if [ "$rc" -eq 2 ] && echo "$out" | grep -q " $cause " &&
+     echo "$out" | grep -q 'x86: triple fault'; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "$stem: rc=$rc cause=$cause"
+  fi
+}
+
+nasm_cell idiv8-overflow de=0
+nasm_cell idiv16-overflow de=0
+nasm_cell idiv32-overflow de=0
+nasm_cell mov_sreg_ud1 ud=6
+nasm_cell mov_sreg_ud2 ud=6
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

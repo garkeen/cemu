@@ -3,6 +3,94 @@
 按时间倒序，最新在最上。本文件只记过程、证据与裁决；当前状态摘要见
 README.md，架构与阶段见 arch.md，规格缺口台账见 AGENTS.md §X。
 
+## Win95 保护错误的 VxD 定位：IOS.VXD（2026-10-31）
+
+- 手段：给 MSDOS.SYS 加 `BootLog=1`（把 `Network=1` 原地替换）后启动，再从镜像的
+  FAT16 里读 `BOOTLOG.TXT`。日志在 `VMM`、`SMARTDRV.EXE` 之后停在
+  `Loading Vxd = C:\WINDOWS\system\VMM32\IOS.VXD`，**没有对应的 LoadSuccess**，
+  之后就是 `Windows protection error`。所以失败的是 I/O 监督器 IOS.VXD 的加载/初始化。
+- 磁盘通路是干净的：整场启动 544 条 ATA 命令（536 条 BIOS 的 READ SECTORS、
+  3 条 WRITE SECTORS、1 条 IDENTIFY DEVICE、4 条 IDENTIFY PACKET），唯一一次
+  ABRT 来自 BIOS 对 ATAPI 槽的探测；错误寄存器 0x1F1 只被写过 0、从未被读；
+  **保护模式侧一条 ATA 命令都没有**。即 ESDI_506 之类的端口驱动还没开始和控制器
+  说话，失败发生在 IOS 自己的初始化里，不是 IDE 模拟的错。
+- 新增设施（都挂在已门控的调用点上）：`trap=CAUSE` 只留一个向量；`mark:NAME[=N]`
+  只留一个标记名（N 对 gatecall 是 INT 向量）；IDE 的 `ata-cmd`（每条命令一行）与
+  `ata-abort`（被拒绝的命令一行）。用它们把 5MB 输出从"中断风暴/倒计时轮询"里解出来。
+- 顺带确认：`key=0x03@N` 这类注入能把启动菜单的选择从默认 3 改成 2（Logged），
+  但按键在 BIOS 键盘缓冲里能存活数百 M 指令，Enter 的时机会决定菜单是否立即确认。
+- 下一步：抓 IOS 初始化期间它向 IFS/注册表发的请求（`mark:gatecall=0x21`、
+  `mark:gatecall=0x2f`），与 QEMU 在同一点对比，找第一条不一致。
+
+## REP 计数器按地址尺寸（SDM 原文核实）；Win95 越过"执行零字节"进入 VMM（2026-10-31）
+
+- **手册依据先查网、不凭记忆**：SDM vol.2 的 REP 条目 Operation 伪代码写死
+  `IF AddressSize = 16 THEN Use CX for CountReg; ELSE IF AddressSize = 64 THEN RCX;
+  ELSE ECX`（[REP 条目](https://www.felixcloutier.com/x86/rep:repe:repz:repne:repnz)、
+  [MOVS 条目](https://www.felixcloutier.com/x86/movs:movsb:movsw:movsd:movsq)）。
+  计数寄存器跟**地址尺寸**走；操作数尺寸只决定元素是 1/2/4 字节。
+- 旧实现（`src/cpu/isa/x86/exec.c` 的 `string_op`）用 `d.w32 ? ecx : cx`：16 位代码里
+  `f3 66 a5`（rep movsd）被当成 ECX 计数。DOS 的 MS C memcpy 是 `shr cx,2` +
+  `rep movsd`，CX=0xE0FC 本应计 14,399 个 dword，而 ECX 高半留着 0x06A1（16 位写
+  不清高半是正确语义）→ 计数 0x06A1383F，从 `0x91F83` 起写约 445MB，把 DOS 内核段
+  整片写穿，随后客人在 `cs=0x8d92` 实模式里沿零字节执行（`traps=0`）。
+  现场由 gdb 条件断点直接取到：`dst=853d:cbb3 lin=91f83 src=523b:c4c1 len=6a1383f`。
+- 修复：`string_op` 的零计数早退与递减都改为 `d.a32 ? ecx : cx`，注释写明 SDM 依据。
+- 复跑：Win95 现在越过启动画面，控制台出现 `Starting Windows 95...`，随后 VMM 进入
+  保护模式；屏幕在 `screen` 里停在 `Windows protection e`（消息被截断），`trap` 显示
+  **`cause=6`（#UD）在同一线性地址 `0x100022` 上无限重复**（RAW/MNEMONIC 为空，说明
+  译码器把它判成非法指令）。这是"保护错误"的来源：VMM 的 #UD 处理返回后重执行同一条。
+- 另一次同二进制的跑法没有该 #UD（`traps=0`，300M 时停在 `cs=0x8d92 pc=0x5d35`）：
+  宿主时钟驱动的定时器中断让两条路径分叉，复现要用能固定时刻的观测（`pcshot`/gdb），
+  不能靠 `--max-inst` 逼近。
+- 下一步：取 `0x100022` 的指令字节（`dump=` 在会话结束时 1MB 处已是全零，需在命中时读），
+  判定是 cemu 把一条合法指令误判 #UD，还是客人真的取到坏字节。
+- **可复现路径**：`-icount shift=6`（64 ns/指令）下不再是"两个 logo 卡死"，而是
+  `screen` 依次给出 `Starting Windows 95...`、启动菜单（Normal/Logged/Safe mode），
+  过菜单后 `Windows protection e`；1.5e9 指令内 `traps=59,245,006`，收尾状态是
+  `cr0=0` 但 `cs=ffff ds=ffff ss=09ad esp=c13cxxxx`（32 位栈指针 + 垃圾选择子）。
+  300M 指令时它只是停在菜单（虚拟时间 19 s 未到超时）。
+- 前几个陷阱是**正常的 V86 虚拟化**：`sti`/`in`/`out` 在 V86 下按 IOPL 报 `cause=13`，
+  由 VMM 的 0xc000xxxx 处理；所以 V86 入口与 I/O 位图反射这条链是通的，崩溃发生在
+  更晚的位置，不是"缺某条系统指令"（`invd`/`wbinvd`/`clts`/`wrmsr`/`lar/lsl` 都在）。
+- 待查：`pcshot=0x100022` 在 icount 复跑里 0 次命中（该次跑法没走到 0x100022），
+  说明 #UD 风暴的落点随路径不同；要抓"状态从哪条指令开始变坏"，应在 icount 下对
+  陷阱流做窗口采样（`trap` 配 `skip=`/`budget=`）取风暴前沿，而不是继续猜地址。
+
+
+
+- **两个 logo 是 cemu 的 VGA 渲染错，不是 SeaBIOS、不是镜像**：Win95 启动画面是
+  320 字节/行、400 行的 256 色链式画面（`set VGA mode 13` 后客人自己改 CRTC）。
+  `fbdump` 给出 640×400，而每一行右半（x=320..639）逐字节等于下一行左半
+  （x=0..319，399/399 行命中），即渲染器按 640 个连续字节读一行，右半是下一扫描线。
+- 硬件规则（QEMU `hw/display/vga.c` 的 `vga_get_resolution` + `shift_control == 2`
+  分支）：宽度是 `(H_DISP+1)*8` 个 dot，256 色每字符时钟取 4 字节、占 8 dot，所以
+  每个字节两个 dot；QEMU 用 `bits = 4`（行字节 = width/2）配 `VGA_DRAW_LINE8D2`
+  画两遍。cemu 的 `VgaRenderGraphics` 把 dot 序号当字节索引（`base*4 + x + hpel`）。
+- 修复（`src/device/video/vga.c`）：`VgaPicture` 加 `pixel_dots`；256 色恒为 2；
+  `shift_control` 0/1 且 SR1 bit3（dot clock /2）时也为 2 并把宽度翻倍（QEMU 的
+  `disp_width <<= 1` + `LINE4D2`/`LINE2D2`，此路径同样缺，随这次一并补齐）；
+  渲染循环按 `(x + hpel) >> (pixel_dots - 1)` 取源像素。SR1 bit3 在标准模式下
+  为 0，所以 16 色/CGA 现有画面不受影响；该分支目前没有自足探针覆盖。
+- 验证：重建 88 目标、`warning:` 0；`-hda windows95.img --max-inst 300000000`
+  重跑后 fbdump 仍是 640×400，相邻像素对 0 差异、行剪切 0 行，画面是单幅
+  `Windows 95` 启动图（`build/win95-fb2.png`）。
+- **卡死（未修，证据链已建立）**：QEMU 10.2 用同一个 `../seabios/out/bios.bin`
+  与同一个 `../v86images/win/windows95.img` 启动到 Win95 桌面（只剩 NE2000 不在
+  的提示框），所以镜像与固件没问题，问题在 cemu 的 x86 侧。
+- cemu 侧现场（非 icount，300M 指令）：IVT 里 int 20/21/23/25/26/28/2a-2f 全指向
+  段 `0x8d92`（Win95 实模式 DOS 内核所在段），而 `0x91f8e..0x953d2`（约 18KB）
+  在 inst≈25.2M 被 `pc=0x37a0` 的 `rep movsd` 以 0 覆盖；写入是未对齐 dword
+  （`91f8b:4 <- 0`），调用链是 `0x6290 call 0x3756`（memcpy 包装，长度/源/目标
+  来自 `ES:DI` 描述符的 +8/+0xa 字段）。此后 CPU 在 `cs=0x8d92`、`cr0=0` 实模式下
+  沿零字节执行（`add [bx+si],al`），`traps=0`，`SS:SP`（`0x084a:0xaFxx`）也落在
+  清零区里；同一片内仍留着的 `jmp 0x1f8e` 让它绕回零区，成为永久循环。
+- `-icount shift=0` 会把客人时序改成 1GHz，启动路径与卡死点都变了（跑到 300M 时
+  停在 ROM），**不能**用它复现此问题；对拍仍用宿主时钟。
+- 下一步：取那次 memcpy 的 `ES:DI`/`DS:SI`/`CX`（`pcshot=0x37a0` 按 `inst` 过滤，
+  或 gdb 条件断点 `$es*16+$edi` 落在 0x91f8e 附近），判定是客人自己覆盖 DOS 区
+  （内存管理/loader 的正常释放）还是 cemu 的 `movs`/段语义把目标或长度写错。
+
 ## V86/VME 三个临时探针转正：MOV Sreg、V86 中断反射/嵌套、V86 IRQ 嵌套（2026-10-30）
 
 这三个探针是 10-28 定位 V86 交付时写的，一直未跟踪、也没接进套件。按"有价值

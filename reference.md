@@ -11,7 +11,7 @@
    已有答案（先例：DAS 的 SDM/实机 18 处分歧按 QEMU/v86 真值表修复）。
    定位不了时先读参考同位置代码，再回 CEMU_DEBUG 验证假设。
 
-## 一、参考代码树（D:/code/c/EMU/，cemu 的邻居）
+## 一、参考代码与素材树（D:/code/c/EMU/，cemu 的邻居）
 
 | 项目 | 位置 | 拿什么 | 许可 |
 |---|---|---|---|
@@ -22,7 +22,8 @@
 | byang1217-TQemu | byang1217-TQemu/ | 可移植哲学（OS 无关、单 mainloop、libc/libm only）；本 checkout 无 target 后端不可跑 | GPL-2 |
 | gem5 | gem5/ | 行为裁决第三票；ARM 阶段的行为规范 src/arch/arm/；riscv 侧 src/arch/riscv/ | BSD-3 |
 | v86 | v86/ | x86 设备/启动行为；tests/kvm-unit-tests（realmode 验收套件已入库 test/x86/realmode）、tests/nasm、tests/qemu 双跑方法论、tests/full（真实 OS 清单，阶段 4 用） | MIT |
-| v86images | v86images/ | 真实 OS 镜像素材（windows101/2/31/95、msdos622、spdos 等），阶段 4 手工验收与回归的取材地；引导不进套件（AGENTS.md §七） | 各方原许可 |
+| v86images | v86images/ | 真实 OS 镜像素材，按类分三目录：`dos/`（msdos4、msdos622、freedos722、pc86dos、PCMOS386-9-user-patched、xcom144、doof-1440、ibm-exploring、nanoshell.iso）、`win/`（windows101、windows2、windows30、windows31、windows95、windows98、windowsnt31、windowsnt351、windowsnt4）、`wps/`（spdos51.rar、wps3/4/5.zip）。阶段 4 x86 手工验收与回归的取材地；引导不进套件（AGENTS.md §七） | 各件原许可 |
+| jslinux | jslinux/ | riscv64 真实 OS 全镜像（Bellard JSLinux 的 buildroot-riscv64-xwin，从 vfsync 逐字节重建，目录/常规文件/符号链接/设备节点全保真）：`rootfs.ext2`（256 MiB 标准 ext2，系统本体）、`kernel-riscv64.bin`（Linux 4.15，含 virtio-blk/console/input 与 simplefb）、`fw_jump.bin`（OpenSBI v1.9，编译自 ../opensbi，FW_JUMP_ADDR=0x80200000）、`final.dtb`（QEMU virt 原树 + simple-framebuffer 1024x768x32 @ 0x8c000000、内存收窄到 192M）、`virt11.dtb`（QEMU 10.2 `-machine virt,dumpdtb` 原树）、`filelist.txt` + `files/`（vfsync 清单与内容库）、`tools/make_ext2.py`（纯 Python ext2 构建器 + 校验器，另 parse_filelist.py / make_fb_dtb.py）。用途：阶段 4 riscv 侧带图形的真实 OS 验收（cemu `--machine virt -display win32`，ramfb 直渲 0x8c000000、virtio 键鼠转窗口输入；`startx` 起 fluxbox），同一镜像在 QEMU 下作文本控制台对拍，树根另存对拍日志（`q_*.txt`、`qemu_tr.log`）。引导不进套件（AGENTS.md §七） | 各件原许可（Linux GPL-2、OpenSBI BSD-2、buildroot 各包原许可） |
 | abstract-machine | abstract-machine/ | 阶段 3 cesdk 蓝本：am/src/platform/nemu/ 的 trm.c、include/nemu.h 设备图、scripts/linker.ld | Mulan PSL v2 |
 | opensbi | opensbi/ | 阶段 2 验收固件源码（fw_dynamic.h 等结构定义） | BSD-2 |
 | riscv-tests / riscv-test-env | riscv-tests/ riscv-test-env/ | riscv 验收套件；env/p/riscv_test.h 是 tohost/fromhost 退出契约 | MIT/BSD 系 |

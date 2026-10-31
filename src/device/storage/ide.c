@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include "debug/debug.h"
+
 // Legacy port map. In compatibility mode — which is what the programming
 // interface byte 0x80 without bits 0/2 means — the channels answer at the ISA
 // addresses, and that is what the BARs mirror (seabios src/fw/pciinit.c
@@ -313,6 +315,10 @@ static void ClearIrq(IdeChannel* ch) {
 // (§6.3; the status register keeps DRDY set so the host can tell the drive is
 // still there).
 static void Abort(IdeChannel* ch, IdeDrive* dr) {
+  // A command the controller refused: the one row that separates "the guest's
+  // read went through" from "the drive answered ABRT and the guest's driver
+  // decided the device is unusable" (kDbgMark, once per refused command).
+  DebugMark("ata-abort", dr->error, (int)ch->lba);
   dr->error = kErrorAbrt;
   dr->status = kStatusAborted;
   ch->active = -1;
@@ -1398,6 +1404,11 @@ static void ExecPacket(IdeChannel* ch) {
 static void ExecCommand(IdeChannel* ch, uint8_t cmd) {
   IdeDrive* dr = Selected(ch);
   int drive = ch->selected;
+  // The ATA command stream is what a protected-mode port driver's probe looks
+  // like: BIOS int13h and Win95's ESDI_506 issue different sets, and a driver
+  // that gives up does so right after one specific command. One row per
+  // command, gated on kDbgMark (the dispatch already runs once per command).
+  DebugMark("ata-cmd", cmd, drive);
   ch->active = -1;
   ch->packet = 0;
   ch->left = 0;
@@ -1861,11 +1872,15 @@ void IdeInit(IdeDevice* d, uint8_t bus, uint8_t dev) {
   Put32(&d->pci.config[kCfgBar2], kBarSecondaryCmd);
   Put32(&d->pci.config[kCfgBar3], kBarSecondaryCtrl);
   Put32(&d->pci.config[kCfgBar4], kBarBusMaster);
-  // Compatibility mode: the channel interrupts are the fixed ISA IRQ 14/15, so
-  // the function has no PCI interrupt pin (the PIIX3 datasheet says the same
-  // for the IDE function while both channels stay compatible).
+  // The IDE function drives INTA#: the PIIX3 assigns it interrupt pin 1 and the
+  // firmware programs the line with the IRQ it hooked (14 here, the primary
+  // channel's fixed ISA IRQ). A pin byte of 0 means "this function has no
+  // interrupt pin", and that is what makes Win95's protected-mode port driver
+  // (ESDI_506.PDR) drop the controller during IOS init: IOS.VXD then fails its
+  // load and the guest stops with "Windows protection error". QEMU's
+  // hw/ide/pci.c publishes the same pin (pci_config_set_interrupt_pin(1)).
   d->pci.config[kCfgIntLine] = kIntLine;
-  d->pci.config[kCfgIntPin] = 0;
+  d->pci.config[kCfgIntPin] = 1;
   d->pci.written = ConfigWritten;
   d->pci.ctx = d;
 }
