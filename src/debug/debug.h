@@ -32,7 +32,8 @@ enum {
   kDbgVirtio = 1 << 14,     // virtio-mmio queue notify / chain parse / backend
   kDbgHist = 1 << 15,       // the last N instructions, dumped when an event row fires
   kDbgExec = 1 << 16,       // exec=: the fetch that crosses into a linear range
-  kDbgAny = 0x3ffff,
+  kDbgTfSet = 1 << 17,      // tfset: the instruction that turns EFLAGS.TF on
+  kDbgAny = 0x7ffff,
 };
 
 int DebugOn(uint32_t cat);

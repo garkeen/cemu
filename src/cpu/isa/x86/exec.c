@@ -7127,7 +7127,23 @@ void run_op(uint8_t op) {
                   // (SDM vol.2 POPF Operation, table 4-16). VM never loads and
                   // RF is 0 after POPF; a 16-bit pop touches only the low half.
       fr->rec.mnemonic = "popf";
-      uint32_t v = pop_w();
+      int pw = d.w32 ? 4 : 2;
+      // The image is read WITHOUT moving ESP first: a POPF that faults must
+      // leave the stack pointer where it was (fault atomicity). V86 with
+      // IOPL<3 is exactly such a fault (SDM vol.2 POPF, Virtual-8086
+      // Exceptions: "#GP(0) If IOPL < 3 and VME is not enabled"), and the V86
+      // monitor's emulation reads the image from the saved ESP -- advancing
+      // it here made it read the return address instead of the flags word.
+      // QEMU does the same: translate.c loads the image, calls helper_popf,
+      // and only then issues gen_stack_update.
+      uint32_t v = stack_peek(pw, 0);
+      {
+        // The read still counts as a data access for the debug registers
+        // (stack_pop reports it too); only the stack-pointer update waits for
+        // the fault checks above.
+        uint32_t soff = s->dbit[ss_i] ? esp : (uint16_t)esp;
+        WatchData(s->base[ss_i] + soff, pw, 0);
+      }
       int vme = fl->vm && fl->iopl != 3 && (s->cr4 & (kCr4Vme | kCr4Pvi));
       if (vme) {
         // Virtual-8086: IF and VIP bits update VIF/VIP; IF itself stays 1
@@ -7135,6 +7151,8 @@ void run_op(uint8_t op) {
         fl->vif = (v & 0x200u) != 0;
         fl->vip = (v & 0x100000u) != 0;
         fl->if_ = 1;
+        esp = s->dbit[ss_i] ? esp + (uint32_t)pw
+                            : (esp & 0xffff0000u) | (uint16_t)(esp + (uint32_t)pw);
         break;
       }
       // IOPL loads only at CPL 0 (real mode counts as CPL 0) and IF only at
@@ -7153,6 +7171,9 @@ void run_op(uint8_t op) {
         if (s->cr0 & kCr0Am) mask |= 0x40000u;
       }
       if (!d.w32) mask &= 0xffffu;
+      // Every faulting condition has been checked: the pop commits now.
+      esp = s->dbit[ss_i] ? esp + (uint32_t)pw
+                          : (esp & 0xffff0000u) | (uint16_t)(esp + (uint32_t)pw);
       fl->word = (fl->word & ~(mask | 0x10000u)) | (v & mask) | 2;
       break;
     }

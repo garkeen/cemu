@@ -66,6 +66,7 @@ static uint64_t g_emitted[kCatSlots];
 static uint64_t g_suppressed[kCatSlots];
 static uint64_t g_traps;
 static int g_trap_cause = -1;  // trap=CAUSE: only this vector prints
+static int g_tf_prev;          // tfset=: TF as of the previous committed step
 static char g_mark_name[24];   // mark:NAME: only this mark name prints
 static int g_mark_vec = -1;    // mark:gatecall=N: only this INT vector
 static int g_mark_ah = -1;     // mark:gatecall=N:AH: only this INT function
@@ -920,6 +921,8 @@ void DebugInit(void) {
     }
     else if (!strcmp(tok, "vga-io"))
       g_mask |= kDbgVgaIo;
+    else if (!strcmp(tok, "tfset"))
+      g_mask |= kDbgTfSet;
     else if (!strncmp(tok, "regs=", 5)) {
       g_regs_period = atoi(tok + 5);
       // The period alone would never be tested: DebugInsn only runs when a
@@ -1359,6 +1362,18 @@ void DebugInsn(frame* f) {
     // outside a requested window.
     g_regs_next += (uint64_t)g_regs_period;
     if (Allow(kDbgRegs)) f->isa->dump_regs(f->cpu);
+  }
+  // tfset=: who turns EFLAGS.TF on. The Windows 95 V86 monitor's single-step
+  // loop is entered through this one bit, and the frame the monitor builds
+  // carries the bit afterwards -- the instruction that first set it is the
+  // only place the origin is visible. A per-step compare inside the already
+  // gated hook costs nothing when the item is off (AGENTS.md §四 rule 10).
+  if (g_mask & kDbgTfSet) {
+    uint32_t w = f->isa->flag_word ? (uint32_t)f->isa->flag_word(f) : 0;
+    int tf = (w & 0x100u) != 0;
+    if (tf && !g_tf_prev)
+      DebugMark("tfset", (int)(uint32_t)f->cpu->inst_count, (int)w);
+    g_tf_prev = tf;
   }
 }
 

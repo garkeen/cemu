@@ -8,6 +8,119 @@ README.md，架构与阶段见 arch.md，规格缺口台账见 AGENTS.md §六�
 > 旧 §九 → §四，旧 §十/§X（调试设施）→ §五，旧 §十一 → §七；`§X Dnn`
 > 指现在的 §六 台账。
 
+## Win95：即时失败链落到 int 1Ch 服务 0x1C；VMCB 嵌套位 cemu 0x120 / QEMU 0（2026-11-01）
+
+> 本节只记本轮新钉死的证据。旧节“0xFFB17 是 VMM 的 V86 #UD 回调”仍然成立；
+> 本轮把失败点从“保护错误”推进到 **int 1Ch 的 VxD 服务 0x1C** 和
+> **VMCB 嵌套状态位**。
+
+### 复现与对照
+
+- 全部新实验都用 `-snapshot`：镜像当前状态固定，两次启动的屏幕文字、指令数、
+  `traps=` 一致（`Windows protection error.  You need to restart you`，
+  `inst=170000000 traps=13621`）。不用 `-snapshot` 时镜像会被客人写坏，
+  两次运行的指令流会漂移（同一 `--max-inst` 的 `traps` 7 → 48 → 106），
+  旧轮次之间数字不可直接比。
+- QEMU 10.2.92、同一 `windows95.img` / `bios.bin`、`-icount shift=8`、
+  `-snapshot`，在 42 秒时 `screendump` 是 **1024x768**（Windows 桌面）；
+  cemu 在同一镜像上停在保护错误。镜像/固件不是原因。
+
+### 即时失败链（cemu）
+
+- `pcshot=0xC0001032`（VxD 服务表分发 `jmp [eax*4+0xC000DF2C]`）命中
+  `inst=169239691`，`eax=0x1c`，`ebx=0xC15200E8`（当前 VMCB），
+  `edi=0xC159F068`（CB）。调用者是 V86 代码里的 `int 0x1c`
+  （线性 `0xFD055`，`hist` 里 `int cd 1c` 之后 `call 0xC00040F4`）。
+- 服务表项 0x1C = `0xC0FDA1A0`，桩代码：
+  `call 0xC0036109; mov eax,0x1c; mov ebx,[0xC001072C]; jc 0xC000253C; ret`。
+  `0xC0036109` 处是 `test dword [ebx],0x40; jz 0xC003613B; ...; 0xC003613B: stc; ret`
+  ——`[VMCB] & 0x40 == 0` 时直接返回失败（CF=1）。
+- 失败后走 `0xC000253C` 的 V86 帧反射，随后到 `0xC0001354 call 0xC000317F`
+  （VxD 故障处理器链）。链头 `0xC10D99A8` 的 next 指针为 0（或走完无匹配），
+  于是 `0xC000175D` 打印通用消息
+  `Windows protection error.  You need to restart your computer.`。
+  **空链是结果，不是根因**：故障发生在任何 VxD 注册故障处理器之前。
+
+### QEMU 同一点：服务桩与函数完全相同，差在 VMCB 状态
+
+- 在 QEMU gdb 上以 `hbreak *0xC0036109 if *(unsigned int*)($ebx+0x14)==0x293`
+  命中同一个服务函数（`0xC0036109` 的字节与 cemu 逐字节相同：
+  `00 f8 c3 cd 20 47 80 01 00 f7 03 40 ...`），说明服务表项、桩、实现
+  **不是**本次分歧。
+- 命中时 QEMU：`VMCB[0]=0x00000000`、`VMCB[0x14]=0x293`、
+  `VMCB[0x1C]=0x20200008`；cemu 同一 `VMCB[0x14]=0x293` 时：
+  `VMCB[0]=0x00000120`、`VMCB[0x1C]=0x00000008`。
+- QEMU 的 `testl $0x40,(%ebx)` 同样是 0 → 也返回 CF=1；不同之处是
+  **cemu 的 VMCB 已经带 0x20/0x100 两个嵌套状态位**，错误反射走成了
+  不可恢复的 V86 帧（最终到空链），QEMU 的 0 让它走可恢复路径。
+- 最后一次取证：QEMU `hbreak *0xC000371F if *(unsigned int*)($ebx+0x14) >= 0x293`
+  命中在 VMCB id **0x293**、flags 仍为 0 时；`bts [VMCB],5` 是在
+  int 1Ch 服务 0x1C **之后**执行。栈上返回地址 `0xC00034BE`，
+  对应 cemu 的 `0xC00034B8 call [0xC000E570]`——**同一个调用者**。
+- cemu 的同一条 `bts` 在 `inst=168,972,801`；服务 0x1C 在
+  `inst=169,239,691`；置位比服务早 **266,890 条指令 = 68.324 ms**。
+- 结论：V86 进入/退出代码（`0xC0003718`、`0xC00036C7`、`0xC00034F9`、
+  `0xC026D16E`）两边是同一段客户机代码，调用链也相同；**不是 V86
+  语义写错，而是定时中断落在 V86 嵌套周期的里面还是外面**。
+  这直接把根因从“V86 交付/IRET”移到了 **IRQ0 的交付相位**。
+- 据此又修了 `i8254.c` 的两处真实缺陷：时间基改纳秒；`PitNextEventNs`
+  的 mode 3 补上半周期下降沿（QEMU `pit_get_next_transition_time` 的
+  mode 3 分支）。两处都构建通过，但 Win95 仍是同一句保护错误、
+  `traps=13621`，说明 PIT 计数器本身已对齐，**剩余 3,369 条 / 862.464 µs
+  的相位在 PIT 之后的 PIC/CPU 交付链**（`i8259.c` 的 IRR 边沿、
+  `step_body.inc` 的 INTR 采样、`board/x86_min.c` 的接线）。下一步只需
+  对拍共同点后第一条 `inta` 的指令数，即可在 `i8259.c` 与
+  `step_body.inc` 之间二选一；V86 代码已排除。
+- 上面这条“PIC/CPU 交付链”也被 cemu 自己的 `mark` 否掉了：
+  `mark,inst=169000000-169250000` 里 IRQ0 的一次完整交付是
+  `isa a=0 b=0`、`intr a=1`、`isa a=0 b=1`、`inta a=0x80`，四行的
+  退休指令时钟全是 **169,022,464**。也就是说 PIT 抬线到 CPU 取 INTA
+  的延迟是 **0 条指令**，`i8259.c`/`step_body.inc` 没有把中断拖后。
+- 剩余 3,369 条 / 862.464 µs 只能在 **PIT 边沿时间戳**或更早的客户机
+  代码相位里。又按 QEMU `pit_get_next_transition_time` mode 2 修了
+  `last_irq_count` 的迟到重锚（原 `+= count` 会在一次迟到的 Poll 后
+  连续补发多个 IRQ0，QEMU 只发一个并把下一次排到下一个周期边界）；
+  Win95 仍是同一句错误、`traps=13621`。三处 PIT 修复都不改变失败，
+  说明 PIT 计数器本身也不是触发器，3,369 条是更早的客户机代码相位差
+  **累积出来的结果**，不是设备交付延迟。
+- cemu 这两个位的写入点（`watchl=0xC15200E8:0x20:w`）：
+  `0xC000371F bts dword [ebx],5`（inst 168,972,802）、
+  `0xC026D16E or byte [ebx+1],1`（inst 168,973,116）。
+  它们属于 VMM 的 **V86 嵌套执行/中断阴影** 路径；QEMU 在同一服务 id
+  0x293 上为 0，说明 QEMU 的 int 1Ch 不在嵌套执行里，cemu 的在。
+
+### 排除：VMCB +0x1E 不是 CPU 写错
+
+- `0xC002F104` 的 `66 81 0C 1E 20 20`（`or word [esi+ebx],0x2020`）在
+  `mem` 下明确写出 `st 4c4106:2 = 2020`，紧接着 `dumpl=0xC1520000` 读到
+  `VMCB[0x1C]=0x20200008`。这条指令的 32 位 SIB 寻址与 16 位存储都正确，
+  不是“32 位值被当 16:16 指针”的旧假设。
+- 之前看到 `VMCB[0x1C]=8` 的普通跑法，是因为 `-snapshot` 下 VMCB 是**另一个
+  实例**（id 0x26A），该实例的 `or` 还没执行；不能用它判定指令丢写。
+
+### PIT 纳秒时间基（真实修复，但不是本次触发器）
+
+- 旧 `i8254.c` 的 `count_load_time`/`PitElapsed` 用 `HostTimerNow()` 的**微秒**
+  作为锚点，每次重装最多丢 1 个 PIT 输入时钟（838 ns）；`time_win.c` 的注释
+  早已记下 Win95 的 862 µs 相位差。QEMU 的 i8254 用纳秒
+  （`hw/timer/i8254_common.c` 的 `qemu_clock_get_ns` 与
+  `muldiv64(..., NANOSECONDS_PER_SECOND)`）。
+- 已改：`host/host.h` + `host/time_win.c` 增加 `HostTimerNowNs()`（icount 下
+  直接返回 `g_icount_ns + g_warp_ns`，墙钟下 `HostWallUs()*1000 + warp`）；
+  `i8254.c` 的 `count_load_time`、`PitElapsed`、`PitLoadCount`、模式 2 的
+  安全重锚全部改 ns（旧的 `1<<31` µs 约 35 分钟，换成等价的 `1<<41` ns）。
+- 验证：`cmake --build build` 零告警，`target check` dep ok；Win95
+  `-snapshot ... --max-inst 170000000` 仍是同一句保护错误、`traps=13621`。
+  所以微秒截断不是本次触发器，但模型现在与 QEMU 的 ns 期限一致，保留。
+
+### 与旧 PIT 相位差的关系
+
+- 旧结论仍成立：同一共同点后下一次 PIT 到期 cemu +7,535 条、QEMU +4,166 条，
+  差 3,369 条（862 µs）。本轮的 VMCB 嵌套位差异正是“定时中断落在嵌套执行的
+  里面还是外面”的产物，因此 PIT/中断时序仍是根因候选；下一步应把
+  `0x20/0x100` 的置位/清零点与 int 1Ch 交付点按指令数对齐，再和 QEMU 的
+  `icount` 中断序列比。不要再从“空故障链”或“0xFFB17”下手，二者都已排除。
+
 ## E2：一个 exec、两个 step、debug bus 观测（2026-11-01）
 
 用户裁决：允许两个 step，exec 的巨型 switch 不能复制/重写，但可以删掉旧的
@@ -3447,3 +3560,56 @@ int21 读文件里的 int13 调用把 ES 留成了 BIOS 段、DOS 未恢复；QE
 真机 BIOS 提供。原盘未改，诊断副本在 `build/spdos_wps*.img`。
 调试设施补缺：`CEMU_DEBUG=regs=N` 原先只设周期不置类别位，`DebugInsn` 从不
 触发；现在同时置 `kDbgRegs`（周期表与退出表都能出）。
+
+## Win95 ��������TF ����·���� cemu ���еķ��磨2026-11-01��
+
+- ȫ�� trap ץȡ��build/cemu_trap_keys.txt��13621 �У�����ʵ�쳣ֻ��ǰ 200 ����
+  ����ȫ�� #DB ������ǰ 200 ���� QEMU -d int �������루���������Ե�ַȫͬ����
+  ˵���� inst=169.4M Ϊֹ����·��û�з��硣
+- ����㣺inst=169,454,108 ��V86 �ͻ��� CS=0x00C9 ִ�� ret������ 0x1D33����
+  ���� 0x2FF7 �������� CS=0x00C9 -> ���� 0x3C87��dumpl ʵ��Ϊ��ҳ����TF=1��
+  ÿ��ָ��һ�� #DB��ֱ�� 170M ������
+- QEMU ���գ�Ĭ�� CPU ȫ�� 70s -d int ��һ�� v=01��-cpu qemu32,-vme
+  ��VME ����棬�� cemu CPUID һ�£��Խ� 1024x768 ���棬40-44s ����ͬ���� #DB��
+  �� TF ������ cemu ����·�������ǿ��˱��ߵ�·��
+- �ֳ���VMM �� 0xC0002573��mov [esi],eax=0xFCB22FF7����0xC0002578
+  ��mov [esi+4],ax=0x0092/0x0096/0x0002��TF=0����0xC002F1BA
+  ��mov [esi+6],eax=0x00C910A3 -> CS=0x00C9,EIP=0x10A3���ȴ����� V86 iret ֡��
+  �� 0xB3C1 ���� iret ������ EFLAGS=0x23F97��TF=1������һ������ס���� iret
+  ʵ�ʵ�����֡���� exec.c pm_iret �� V86 ��֧��Լ 1816-1853 �У��� TF ��װ�ء�
+
+## Win95: tfset= sniffs the first TF=1 (2026-11-01)
+
+Observation gap (rule 9): the V86 single-step loop is driven by EFLAGS.TF and no
+facility named the instruction that turns it on. New CEMU_DEBUG item `tfset`
+(use together with `mark:tfset`): inside the already gated DebugInsn it compares
+flag_word bit 8 with the previous committed step and emits
+`tfset a=<inst> b=<eflags> pc=<lin>` on 0->1. Zero hot-path cost when off.
+
+First run (build/cemu_tfset.txt):
+  tfset a=169453923 b=0x23f97 pc=b3c1      first TF=1, the V86 iret
+  tfset a=169454107 b=0x33f97 pc=c0001350  the VMM iret (RF added)
+  tfset a=169454602 b=0x23f97 pc=b65       then every step is the iret at 0xB65
+No TF=1 anywhere in firmware or the early boot. The VMM already held TF=1 in its
+own copy of the client EFLAGS at inst=169453089 (0x20FB7, reserved bit 5 set),
+834 instructions before the CPU ever saw TF, so the bit is the VMM's decision;
+the iret at 0xB65 then reloads it into the CPU once per emulated instruction.
+
+## Win95 ��������ĸ���POPF ��Ȩ���ǰ�͵���ջ��2026-11-01��Ƭ 43��
+
+- ֢״����󶤵���V86 �ͻ��� EFLAGS ��д�� 0x20FB7��TF=1������λ 5����
+  �������ݴ˵������ͻ�����ҳ 0x3C87 ��һ��һ #DB����� protection error��
+- 0x20FB7 ����Դ���������� 0xC0002B6E �� `movzx eax,[eax+esi]` �ӿͻ�ջ
+  SS:SP �� flags��SP=0xFFF8����ȷ�� popf Ӧ�� 0xFFF6��thunk �� pushf �ۣ���
+  0xFFF8 �� `call 0x1087` ѹ��ȥ�ķ��ص�ַ 0x0FB7��TF=1��bit5=1����
+- SP Ϊʲô�� 2��`src/cpu/isa/x86/exec.c` �� case 0x9d �� `pop_w()` �ټ����Ȩ��
+  V86/IOPL<3 �� #GP �� fault��fault ���ı� ESP��SDM vol.2 POPF
+  ��Virtual-8086 Mode Exceptions����`#GP(0) If IOPL < 3 and VME is not enabled.`��
+  fault ����ָ��ִ��ǰ״̬��vol.3 6.5��table 6-1����QEMU ��˳����
+  load ���� -> helper_popf������ #GP��-> gen_stack_update�����Բ��ƽ� ESP��
+- �޸���popf �� `stack_peek(pw,0)` ��ȡ�������л� fault �ļ�����꣬
+  �����ύ ESP �� flags��VME ��֧ͬ���ύ�������ݶϵ�� WatchData ����ԭ����
+- ���գ�ͬ����ͬ BIOS��ͬ������-icount shift=8����
+  ��ǰ inst=170M traps=13621����Ļ `Windows protection error`��
+  �޺� traps=374��260M ʱ 1008�����ޱ�����fbdump �� Windows 95 ��������
+  ��640x400��build/win95_fb.ppm����

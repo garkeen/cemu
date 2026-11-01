@@ -2,11 +2,17 @@
 //
 // Adapted from the QEMU i8254 model (Fabrice Bellard, MIT; tiny386 port) to
 // the cemu device model. Three 16-bit down-counters clocked at PIT_FREQ
-// (1.193182 MHz) derived from the microseconds HostTimerNow() reports. Mode 2
+// (1.193182 MHz) derived from the nanoseconds HostTimerNowNs() reports. Mode 2
 // and 3 produce periodic edges; channel 0's edge raises PIC IRQ0 (the periodic
 // timer interrupt that wakes hlt and drives real-mode scheduler ticks).
 //
-// HostTimerNow() is the emulated clock (host/host.h): host wall time by
+// Nanoseconds, not microseconds: the PIT input clock is 838 ns, and QEMU's
+// i8254 keeps its deadlines in ns (hw/timer/i8254_common.c:
+// pit_get_next_transition_time returns muldiv64(..., NANOSECONDS_PER_SECOND)).
+// A microsecond anchor loses up to one input clock at every reload, which
+// accumulates into a timer phase error over a boot.
+//
+// HostTimerNowNs() is the emulated clock (host/host.h): host wall time by
 // default, a declared per-instruction rate under -icount. Either way the machine
 // poll loop calls PitPoll() once per step, so a period elapses even while the
 // CPU sleeps — and it lets exactly one edge per period boundary through since
@@ -39,7 +45,7 @@ typedef struct PitChannel {
   uint8_t mode;
   uint8_t bcd;  // not modeled
   uint8_t gate;
-  uint64_t count_load_time;  // HostTimerNow() us at last (re)load; 0 = unarmed
+  uint64_t count_load_time;  // HostTimerNowNs() ns at last (re)load; 0 = unarmed
   uint64_t last_irq_count;   // tick count at last edge
   int out_level;             // last driven OUT level; the PIC sees the rising edges
   int armed;                 // set after the first load; later loads anchor now
@@ -50,18 +56,18 @@ struct PitDevicePrivate {
   PitChannel channels[3];
 };
 
-// Ticks elapsed since (re)load, at PIT_FREQ from host microseconds. The
+// Ticks elapsed since (re)load, at PIT_FREQ from host nanoseconds. The
 // anchor is lazily armed on the first Poll after a (re)load: machine
 // creation and image loading take wall time, and the counter must not run
 // before the CPU does (QEMU runs the PIT on the virtual clock, which only
 // advances while the guest executes).
 static uint64_t PitElapsed(PitChannel* s) {
-  uint64_t now = HostTimerNow();
+  uint64_t now = HostTimerNowNs();
   if (s->count_load_time == 0) {
     s->count_load_time = now;
     return 0;
   }
-  return (now - s->count_load_time) * PIT_FREQ / 1000000;
+  return (now - s->count_load_time) * PIT_FREQ / 1000000000;
 }
 
 static int PitGetCount(PitChannel* s) {
@@ -124,7 +130,7 @@ static void PitLoadCount(PitDevice* pit, PitChannel* s, int val) {
   // 0 = unarmed: the anchor is armed on the first Poll after this load so
   // that machine construction / image loading wall time is not counted as
   // elapsed PIT ticks (the counter only runs while the guest does).
-  s->count_load_time = s->armed ? HostTimerNow() : 0;
+  s->count_load_time = s->armed ? (uint64_t)HostTimerNowNs() : 0;
   s->last_irq_count = 0;
   s->count = (uint32_t)val;
   s->armed = 1;
@@ -268,8 +274,20 @@ void PitPoll(PitDevice* pit) {
           pit->set_irq(pit->irq_ctx, s->irq, 0);
           pit->set_irq(pit->irq_ctx, s->irq, 1);
         }
-        s->last_irq_count += s->count;
-        if (HostTimerNow() - s->count_load_time > (1ULL << 31)) PitLoadCount(pit, s, s->count);
+        // Re-anchor to the period boundary that contains d, not to
+        // last_irq_count + count. A poll that lands several periods late (the
+        // CPU was halted and the run loop jumped, or one instruction covered
+        // them) must deliver one edge and skip the missed ones; adding a single
+        // count leaves the deadline still in the past, so the next instruction
+        // fires again and the guest sees a burst of IRQ0 where QEMU's
+        // pit_get_next_transition_time (mode 2: base = align_down(d, count),
+        // next = base + count + 1 when d is past the boundary) delivers one.
+        s->last_irq_count = d / s->count * s->count;
+        // Safety re-anchor for a counter left armed for a very long time; the
+        // old microsecond form used 1<<31 us (~35 min), so keep the same span
+        // in the nanosecond clock (1<<41 ns ~ 2200 s).
+        if ((uint64_t)HostTimerNowNs() - s->count_load_time > (1ULL << 41))
+          PitLoadCount(pit, s, s->count);
       } else if (s->out_level) {
         // A poll later OUT is low again: drop the line so the next terminal
         // count is a fresh rising edge (and a level-sensitive controller does
@@ -295,10 +313,24 @@ int64_t PitNextEventNs(PitDevice* pit) {
   if (s->irq == -1) return 0;
   if (s->mode != 2 && s->mode != 3) return 0;  // only these deliver edges
   if (s->count_load_time == 0) return 0;       // never loaded: nothing to wait for
-  // PitPoll fires when d reaches last_irq_count + count (same tick domain as
-  // PitElapsed, so the two agree on when the edge is).
+  // PitPoll fires when d reaches the next edge in the same tick domain as
+  // PitElapsed, so the two agree on when the edge is. Mode 3 is a square wave:
+  // the next edge is the half-period falling edge while the output is high,
+  // and the full-period rising edge after it. QEMU names exactly these two
+  // (hw/timer/i8254_common.c pit_get_next_transition_time, mode 3:
+  // base = align_down(d, count); next = base + ((d-base < period2) ? period2
+  // : count)). Scheduling only last_irq_count + count makes an idle skip jump
+  // over the falling edge, leaving the IRQ line high and hiding the next
+  // rising edge from an edge-triggered 8259.
   uint64_t d = PitElapsed(s);
-  uint64_t next = s->last_irq_count + s->count;
+  uint64_t next;
+  if (s->mode == 3) {
+    uint64_t base = d / s->count * s->count;
+    uint64_t half = (s->count + 1) >> 1;
+    next = (d - base < half) ? base + half : base + s->count;
+  } else {
+    next = s->last_irq_count + s->count;
+  }
   if (next <= d) return 0;  // already due: PitPoll has it
   return (int64_t)((next - d) * 1000000000 / PIT_FREQ);
 }

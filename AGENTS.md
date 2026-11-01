@@ -340,6 +340,11 @@ CEMU_DEBUG = item[,item...]
                             是哪条指令干的"：跑飞落点是被客人清零过的数据，地图上
                             查不到，不许猜地址。匹配点在 `DebugInsn`（与 pcshot 同一
                             个已门控的每步钩子），fetch 路径零成本（§四第 10 条）
+  tfset                     EFLAGS.TF 从 0 变为 1 的那一条指令（V86 单步循环的入口）。
+                            每步比较相邻两次提交的 flag_word 的 bit 8（TF），置位时打一行
+                            `tfset a=<退休指令数> b=<eflags> pc=<线性地址>`；走 mark 通道，
+                            必须与 `mark:tfset` 同开。Windows 95 的 V86 监视器单步风暴
+                            就是靠它钉到源头的（progress.log 片 43）。
   vga-io                   客人对 VGA 卡寄存器文件的一次端口访问一行（VGA/x86）：
                             `vga-io rd|wr port=0x3d5 val=0x28`。对应 QEMU 给自家测试用的
                             vga_std_read_io / vga_std_write_io trace 事件——**两个模型之间

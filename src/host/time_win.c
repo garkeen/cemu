@@ -58,6 +58,11 @@ int64_t HostTimerNow(void) {
   return (HostWallUs() * 1000 + g_warp_ns) / 1000;
 }
 
+int64_t HostTimerNowNs(void) {
+  if (g_icount_shift >= 0) return g_icount_ns + g_warp_ns;
+  return HostWallUs() * 1000 + g_warp_ns;
+}
+
 int64_t HostTimeRealtime(void) { return HostWallUs(); }
 
 void HostTimerIcountEnable(int shift) {

@@ -40,10 +40,14 @@ virtio-mmio（blk/console/keyboard/tablet），oberon 板按参考模拟器逐�
   （QEMU 执行同一镜像停在同一处 `j .`）。
 - **SPDOS/DOS7 软盘 ✅**：经 SeaBIOS 进 DOS；WPS 卡死经 QEMU 对拍判为 CHLIB
   依赖真机 BIOS 约定（0x80 的几何、段寄存器跨调用保持），不是 cemu 缺陷。
-- **Windows 95 进行中**：客人自己在控制台报 `Windows protection error`，打印到
-  第 20 个字符停住（"两个 logo"那条旧结论已被推翻）；两模型在 `0xC0360B8B` 的
-  CPU 与 20KB VMM 数据逐字节相同，分歧只在其后 13.9 万条指令内，根因未定。
-  见 progress.log 最新一节。
+- **Windows 95 进行中**：旧结论（VMCB `0x120` 对 `0`、根因未定）已推翻——那是
+  VMCB 位每几千条指令翻转一次的采样相位差。真根因是 **POPF 在特权检查前就推进了
+  ESP**：V86/IOPL<3 的 #GP 是 fault，不许改 ESP，cemu 却先弹后查，V86 监视器按
+  保存的 SP 读到的不是 flags 而是 `call` 压入的返回地址 `0x0FB7`（TF=1），于是
+  把客户置成单步模式，在零页 `0x3C87` 上一条指令一次 #DB，最后报
+  `Windows protection error`。已修（`exec.c` case 0x9d：先 peek，检查完再提交
+  ESP/flags）。同脚本实测 traps 13621 → 374，保护错误消失，安全模式可进桌面；
+  普通模式切到 1024×768 之后仍会蓝屏（显示驱动/VGA 侧，下一步）。见 progress.log 片 43。
 - **xv6-riscv 未开始**：镜像与 OpenSBI fw_jump 素材未取；riscv 侧的真实 OS 验收
   目前由 HelenOS 承担。
 

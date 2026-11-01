@@ -39,6 +39,12 @@ void HostWriteErr(const char* buf, size_t n);
 // Host wall time plus any --skip-idle warp, unless -icount replaced the wall
 // clock with a declared per-instruction rate (HostTimerIcountEnable).
 int64_t HostTimerNow(void);
+// The same clock in nanoseconds. Device periods that QEMU keeps in ns
+// (hw/timer/i8254_common.c's qemu_clock_get_ns / muldiv64) must not truncate
+// to microseconds on every read: a 1.193182 MHz PIT period is 838 ns, so a
+// microsecond-quantized anchor loses up to one input clock per reload and the
+// error accumulates across a boot (the Win95 timer phase measured 862 us).
+int64_t HostTimerNowNs(void);
 // The host's own wall clock, for the three things that measure host time rather
 // than emulated time: the MC146818 time-of-day, the window's repaint throttle,
 // the input poll throttle. Neither -icount nor --skip-idle may move it — the
