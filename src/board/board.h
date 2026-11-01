@@ -96,14 +96,14 @@ typedef struct Board {
   void (*poll)(struct Board* b);
   // Idle skip (--skip-idle). While the CPU is halted the run loop normally
   // lets the wait elapse in host time; with this set it instead jumps the
-  // emulated clock to the next device deadline (HostTimerWarp), so a guest
+  // emulated clock to the next device deadline (HostTimerWarpNs), so a guest
   // that sleeps for a tick gets it at once — QEMU's virtual-clock warp. The
-  // board names that deadline through next_event_us (microseconds, 0 = no
+  // board names that deadline through next_event_ns (nanoseconds, 0 = no
   // device will fire on its own, so the wait must be host time after all: only
   // the host can produce a key press). NULL = this board has no time-based
   // wakeup source and the flag does nothing.
   int skip_idle;
-  int64_t (*next_event_us)(struct Board* b);
+  int64_t (*next_event_ns)(struct Board* b);
   // Board-specific teardown of non-RAM devices; BoardDestroy calls it after
   // freeing the standard parts.
   void (*destroy)(struct Board* b);

@@ -52,7 +52,7 @@ if(WIN32)
   target_link_libraries(cemugui PRIVATE ws2_32 user32 gdi32 comctl32)
 endif()
 
-# --- check target (dependency-edge lint, AGENTS.md 第七节) ----------------
+# --- check target (dependency-edge lint, AGENTS.md §二) ----------------
 # The checks are bash scripts. On Windows a bare `bash` on PATH is WSL's, which
 # cannot run a D:/ path and fails under cmd/PowerShell (D23), so resolve the
 # shell once at configure time — Git's bash first — and run it as a *login*

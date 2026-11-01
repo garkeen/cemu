@@ -9,7 +9,7 @@
 #include "host/host.h"
 #include "x86.h"
 
-// ---- debug hooks (AGENTS.md §X) ----------------------------------------------
+// ---- debug hooks (AGENTS.md §五) ----------------------------------------------
 
 // Set-bit names indexed by EFLAGS bit position, NULL-terminated (the walker
 // in debug.c stops at the terminator; holes are "").
@@ -201,6 +201,7 @@ const isa_ops k_isa_x86 = {
     3,  // EM_386
     x86_init,
     x86_step,
+    x86_step_debug,
     x86_dump_regs,
     // debug hooks
     x86_cause_name,
@@ -217,4 +218,5 @@ const isa_ops k_isa_x86 = {
     x86_gdb_clear_watch,
     x86_gdb_watch_hits,
     1,  // ELFCLASS32 (EM_386)
+    x86_read_lin,
 };

@@ -31,7 +31,7 @@
 ## 三、目录结构
 
 目录按被模拟机器的部件划分；各目录之间允许/禁止的 include 边由
-`cmake --build build --target check` 机械检查，规则表见 AGENTS.md 第七节。
+`cmake --build build --target check` 机械检查，规则表见 AGENTS.md §二。
 
 ```
 cemu/
@@ -40,7 +40,7 @@ cemu/
   progress.log     开发日志（按时间倒序；过程与证据）
   reference.md     参考项目与用法
   tools/           depcheck.sh  依赖边检查
-                   clang.cmake  clang/mingw-w64 工具链文件（AGENTS.md 第七节）
+                   clang.cmake  clang/mingw-w64 工具链文件（AGENTS.md §二）
   tools/front/     cemugui：gdb RSP 图形调试前端（宿主侧工具，非机器部件）
                    front.c  rsp.h/.c
   src/
@@ -95,7 +95,7 @@ V2 曾尝试 μIR 方案（解码产出建筑级微操作、共享执行器、�
 后被用户否定：微操作把"一条指令"拆成多片，层间粘合累计 21 个失败，且可读性
 未达标。当前 V3 用**巨型 switch 直接解释器**取代 μIR（旧 `src/ir/` 已删除，旧各
 ISA 一份的 `execute.c` 大循环重写为 `exec.c`），遵循"代码简单清晰 + 小步操作
-语义"两条根本目的。架构铁律见 AGENTS.md 第八节。
+语义"两条根本目的。架构铁律见 AGENTS.md §三。
 
 - **无中间表示**：主板与解释器之间只有 `src/cpu/step.h` 一个接缝——
   `frame`（每步世界：cpu/priv/isa/raise 跳板/rec/trap）、`insn_rec`（观测面：
@@ -226,7 +226,7 @@ realmode（kvm-unit-tests 官方实模式套件）127 PASS/0 FAIL。
   与 SCI IRQ9 及 S5 关机、IOAPIC 的 NMI 交付；此后又补 SMBus 主机 + SPD EEPROM、
   XBCS、IGNNE#。D19 剩下的是 IOAPIC 的 SMI/INIT 交付、PIRQ 消费者与 PM 的 S3/S4
   唤醒路径；显示侧的 CRTC R17 bit5 地址回绕、过扫描边框、CGA 复合 NTSC 伪色仍按
-  AGENTS.md §X 台账在册。ACPI 表（DSDT/FADT）由 SeaBIOS 生成，不属于芯片组模型。
+  AGENTS.md §六 台账在册。ACPI 表（DSDT/FADT）由 SeaBIOS 生成，不属于芯片组模型。
 - bin 路线：multiboot 等价的入口契约，xv6 去掉 bootasm.S/bootmain.c
   编为 .bin；SeaBIOS 路线：官方 bios.bin 映射内存顶端，复位 F000:FFF0
   （bios.bin 已备料；跑通 SeaBIOS 本体属本阶段设备集成，不前置）。

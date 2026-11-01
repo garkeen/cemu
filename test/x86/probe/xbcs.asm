@@ -11,7 +11,7 @@
 ;   r0    the reset image, 0x03 (BIOSWE | BLE)
 ;   w2/w1/w0   a write of each bit pattern reads back unchanged, so the byte is
 ;         storage rather than write-one-to-set with a lock (the datasheet's
-;         reading, registered in AGENTS.md §X D19)
+;         reading, registered in AGENTS.md §六 D19)
 ;   wf    all eight bits store
 ;   pm    the same offset on 00:01.3 (the power-management function) is a
 ;         different register and reads 0 -- XBCS belongs to the ISA bridge

@@ -249,7 +249,7 @@ void Uart16550Write(Uart16550* u, uint64_t off, uint8_t val) {
       } else {
         // Both host-facing byte streams get a row of their own: a guest that
         // prints through the debug port or the UART is the one channel whose
-        // content the two models must reproduce byte for byte (AGENTS.md §十).
+        // content the two models must reproduce byte for byte (AGENTS.md §五).
         DebugMark("uart-tx", (int)(unsigned char)val, 0);
         char ch = (char)val;
         HostWriteOut(&ch, 1);  // transmit immediately: THRE/TEMT stay set

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dependency-edge check (AGENTS.md 第七节).
+# Dependency-edge check (AGENTS.md §二).
 #
 # The tree is organised by the machine part a module emulates (cpu/, bus/,
 # mem/, device/, board/, debug/). The include rules below keep the module

@@ -284,7 +284,13 @@ void PitPoll(PitDevice* pit) {
   }
 }
 
-int64_t PitNextEventUs(PitDevice* pit) {
+// Nanoseconds to the next output edge, for the run loop's idle skip. The unit
+// is ns because the run loop jumps the emulated clock straight to this
+// deadline: anything coarser drops the remainder at every halt and the clock
+// drifts behind by the discarded fraction (QEMU's equivalent,
+// pit_get_next_transition_time() in hw/timer/i8254_common.c, is ns — it
+// converts with muldiv64(next_time, NANOSECONDS_PER_SECOND, PIT_FREQ)).
+int64_t PitNextEventNs(PitDevice* pit) {
   PitChannel* s = &pit->channels[0];
   if (s->irq == -1) return 0;
   if (s->mode != 2 && s->mode != 3) return 0;  // only these deliver edges
@@ -294,7 +300,7 @@ int64_t PitNextEventUs(PitDevice* pit) {
   uint64_t d = PitElapsed(s);
   uint64_t next = s->last_irq_count + s->count;
   if (next <= d) return 0;  // already due: PitPoll has it
-  return (int64_t)((next - d) * 1000000 / PIT_FREQ);
+  return (int64_t)((next - d) * 1000000000 / PIT_FREQ);
 }
 
 static uint64_t PitRead(void* dev, uint64_t addr, int size) {

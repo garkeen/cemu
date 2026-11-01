@@ -52,7 +52,7 @@ void riscv_dump_regs(const CpuState* cpu) {
   HostWriteErr(buf, (size_t)n);
 }
 
-// ---- debug hooks (AGENTS.md §X) ----------------------------------------------
+// ---- debug hooks (AGENTS.md §五) ----------------------------------------------
 
 // Cause names for the trap table row (priv spec 1.3 table 1.2 plus the
 // interrupt bit forms).
@@ -149,6 +149,7 @@ const isa_ops k_isa_riscv64 = {
     243,  // EM_RISCV
     riscv_init,
     riscv_step,
+    riscv_step_debug,
     riscv_dump_regs,
     // debug hooks
     riscv_cause_name,
@@ -166,4 +167,7 @@ const isa_ops k_isa_riscv64 = {
     NULL,
     NULL,
     2,  // ELFCLASS64 (riscv32 shares e_machine 243; the loader matches class)
+    NULL,  // read_lin: dumpl= has no riscv reader yet (the x86 VxD diagnosis
+           // needed it first); the walk would take the same scratch-landing-pad
+           // shape as cpu/isa/x86/exec.c's x86_read_lin
 };

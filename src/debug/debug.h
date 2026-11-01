@@ -1,11 +1,13 @@
 #ifndef CEMU_DEBUG_DEBUG_H
 #define CEMU_DEBUG_DEBUG_H
 
-// The debug hub (AGENTS.md §X): one event table for every debug output the
+// The debug hub (AGENTS.md §五): one event table for every debug output the
 // emulator produces. Categories come from CEMU_DEBUG (parsed once at init
-// into a bitmask — no getenv on the hot path); emission points are bit
-// tests. Observation reads committed state only: interpreters never grow
-// debug branches.
+// into a bitmask — no getenv on the hot path); emission points are bit tests.
+// The board picks the observation step stream once per run from g_dbg_any
+// (cpu/step.h isa_ops.step_debug). The normal stream is a separately compiled
+// function with the debug blocks removed by the preprocessor (STEP_DBG=0), so
+// it has no per-step debug branch at all.
 
 #include <stdint.h>
 
@@ -40,13 +42,24 @@ int DebugOn(uint32_t cat);
 //   g_mem_slow   any category that observes every memory access is on, so the
 //                TLB/宿主指针 fast path must be bypassed to keep the event
 //                stream identical (mem, bus, and watch=).
-//   g_record_raw raw instruction bytes are needed by the trace formats; with
-//                none of them on, fetch8 skips the per-byte recording.
-//   g_dbg_any    any observation at all is on (mask or watch), so the step's
-//                DebugInsn call is worth making.
+//   g_record_raw raw instruction bytes are needed by the trace formats and the
+//                exec/trap rows; with none of them on, fetch8 skips the
+//                per-byte recording.
+//   g_dbg_any    any *step-scoped* observation is on: the debug step stream is
+//                selected (the one that fills the frame's rec fields). A plain
+//                screen-only, gdb-only or vga-io-only session stays on the fast
+//                stream; screenstop is the exception (it needs the live frame).
+//   g_dbg_insn   the per-instruction row stream is on (trace/state/pcshot/
+//                exec/hist/regs): DebugInsn is called after the commit.
+//   g_dbg_frame  a row with no instruction frame (mark/virtio/pmp) is on, or
+//                screenstop needs the live frame: DebugSetFrame publishes it
+//                each step. Memory/bus/trap rows carry their own frame.
+//                A plain `screen` session does not need this.
 extern int g_mem_slow;
 extern int g_record_raw;
 extern int g_dbg_any;
+extern int g_dbg_insn;
+extern int g_dbg_frame;
 
 // Parses CEMU_DEBUG into the bitmask, registers watchpoints, and opens the
 // tables. Call once before the first step. Inert when the env var is unset.
@@ -94,7 +107,7 @@ void DebugPmpDeny(uint64_t addr, int len, int acc, int mode, int idx, unsigned c
 void DebugVirtio(const char* what, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 
 // The argument registers of a BIOS/DOS service call, in the hub's plain-integer
-// form: the hub knows no ISA's register file (AGENTS.md §七's forbidden
+// form: the hub knows no ISA's register file (AGENTS.md §二's forbidden
 // dependency edges). Plain integers are also why the type exists at all -- the
 // parameters are not all in AX. AH=48h takes its size in BX, AH=3Dh its filename
 // in DS:DX, AH=0Ah its buffer in ES:DX, so a row carrying only AX could report
@@ -186,7 +199,8 @@ int DebugWatchHit(uint64_t addr, int size, int is_load);
 // has no stable physical page across runs, so "who wrote this slot" has to be
 // asked at the linear address the guest names. The ISA's linear funnel calls
 // this after each access while `g_mem_slow` is on (a linear watch forces that
-// path, exactly as a physical one does).
+// path, exactly as a physical one does). x86-only today: its caller is the
+// x86 lin_load/lin_store funnel; riscv has no linear watch wiring yet.
 int DebugLinWatchHit(uint64_t addr, int size, int is_load);
 void DebugLinWatch(struct frame* f, uint64_t lin, int size, int is_load, uint64_t val);
 
@@ -200,6 +214,21 @@ void DebugLinWatch(struct frame* f, uint64_t lin, int size, int is_load, uint64_
 // a host signal skips the session end and writes nothing.
 typedef int (*DebugMemReadFn)(void* ctx, uint64_t addr, uint8_t* buf, int len);
 void DebugSetMemReader(DebugMemReadFn read, void* ctx);
+
+// ---- linear-address dumps (dumpl=ADDR:SIZE:FILE) -----------------------------
+// dump= is physical for the same reason watch= is: the bus sees translated
+// addresses. A structure the guest names by LINEAR address -- a VxD heap
+// arena, a pageable segment, an IOS data slot -- is backed by whatever page
+// the live page tables picked, and that page moves between runs, so a physical
+// dump of it cannot be compared with another model's virtual dump (QEMU's gdb
+// `dump binary memory` reads through the guest's own mappings). The hub owns
+// no walk: the ISA does (cpu/step.h isa_ops.read_lin), and the board routes
+// the call here. A page that does not resolve fails the whole item -- the
+// guest's bytes are the point, and filling the gap with noise would make a
+// comparison look like a difference. x86-only today: riscv32/64 pass NULL for
+// read_lin (the VxD diagnosis was the first caller).
+typedef int (*DebugLinReadFn)(void* ctx, uint64_t lin, uint8_t* buf, int len);
+void DebugSetLinReader(DebugLinReadFn read, void* ctx);
 
 // ---- framebuffer dumps (fbdump=FILE) -----------------------------------------
 // dump= shows what the guest left in memory; a rendered picture is not in
@@ -228,7 +257,7 @@ void DebugSetClock(const uint64_t* inst_count);
 
 // ---- the guest instruction behind a frameless row ---------------------------
 // A device-side row has no instruction frame, and cannot get one: the device
-// vtable carries no CPU (device/ must not include cpu/isa/, AGENTS.md §七), so
+// vtable carries no CPU (device/ must not include cpu/isa/, AGENTS.md §二), so
 // a console byte, an interrupt edge or a host-input packet used to be
 // unplaceable in the guest's own code — the row could say *that* it happened
 // and at which retired-instruction count, but not which instruction caused it.
@@ -254,15 +283,21 @@ void DebugSetFrame(struct frame* f);
 // active at all).
 void DebugSessionEnd(const struct frame* f, const char* stop_reason);
 
-// CEMU_DEBUG grammar this hub implements (AGENTS.md §X):
+// CEMU_DEBUG grammar this hub implements (AGENTS.md §五):
 //   trace[:line|table][=N], state, mem[:ld|st], trap, bus[:ADDR|:NAME], regs=N,
 //   mark, hist[=N], screen, vga-io, pmp, virtio, utf8,
 //   watch=ADDR:SIZE[:r|w|rw] (repeatable), watchl=ADDR:SIZE[:r|w|rw]
 //   (repeatable, linear address), dump=ADDR:SIZE:FILE (repeatable),
+//   dumpl=ADDR:SIZE:FILE (repeatable, linear address),
 //   fbdump=FILE (repeatable, binary PPM of the display card's picture),
 //   pcshot=ADDR[:COUNT], pcshot=LO-HI[:COUNT] (repeatable; state row when the
 //   next linear PC is ADDR or lands inside [LO,HI), plus the history ring when
-//   `hist` is on), budget=N (per-category cap), skip=N (per-category silent window
+//   `hist` is on), budget=N (per-category cap), skip=N (per-category silent window),
+//   inst=LO-HI (instruction window for every category: rows whose guest clock
+//   falls outside [LO,HI) are dropped before the budget is consulted, so the
+//   filter narrows the stream instead of the 5MB session cap being raised —
+//   an interrupt sequence inside a 54M-instruction boot is a few hundred rows
+//   once the window is armed, and nothing is buffered to get there),
 //   the linear PC the ISA's gdb_pc reports; that is the address a QEMU gdb
 //   breakpoint names, so a checkpoint can be compared across the two models
 //   without an instruction-count window (which REP loops and timer drift make

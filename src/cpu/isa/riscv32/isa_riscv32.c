@@ -54,7 +54,7 @@ void riscv32_dump_regs(const CpuState* cpu) {
   HostWriteErr(buf, (size_t)n);
 }
 
-// ---- debug hooks (AGENTS.md §X) ----------------------------------------------
+// ---- debug hooks (AGENTS.md §五) ----------------------------------------------
 
 // Cause names for the trap table row (priv spec 1.3 table 1.2 plus the
 // interrupt bit forms).
@@ -151,6 +151,7 @@ const isa_ops k_isa_riscv32 = {
     243,  // EM_RISCV (shared with riscv64; elf_class below disambiguates)
     riscv32_init,
     riscv32_step,
+    riscv32_step_debug,
     riscv32_dump_regs,
     // debug hooks
     riscv32_cause_name,
@@ -168,4 +169,5 @@ const isa_ops k_isa_riscv32 = {
     NULL,
     NULL,
     1,  // ELFCLASS32
+    NULL,  // read_lin: dumpl= has no riscv reader yet (see isa_riscv64.c)
 };

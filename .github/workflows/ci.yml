@@ -16,7 +16,7 @@
 # test/x86/*.elf 7 份、realmode.elf、pm_smoke.elf、smoke/cga 的 .bin），
 # CI 只构建 cemu 本体。nasm 不装的话，三个探针格是 SKIP 而不是 FAIL。
 #
-# 构建与测试全部走 AGENTS.md 第七节的入口，不另造流程：
+# 构建与测试全部走 AGENTS.md §二的入口，不另造流程：
 #   cmake --build build                         （编译，-Wall -Wextra 须零告警）
 #   cmake --build build --target check          （依赖边，tools/depcheck.sh）
 #   cmake --build build --target check-riscv64  （test/riscv64/run.sh）
@@ -93,7 +93,7 @@ jobs:
         run: cmake --build build
 
       # 依赖边检查与编译是否通过无关（纯 grep 头文件），编译红了也让这格出结论。
-      - name: Dependency edges (AGENTS.md 第七节)
+      - name: Dependency edges (AGENTS.md §二)
         if: ${{ !cancelled() && steps.configure.outcome == 'success' }}
         run: cmake --build build --target check
 

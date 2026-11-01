@@ -64,7 +64,7 @@ enum {
 // modules announce every call as 0xAA tag words carrying three filename
 // bytes each, one 0xCC word naming the module and position, and a 0 word on
 // return; 0xBB dumps the stack. The reference stamps each entry with the
-// guest pc; a device here cannot see the CPU (AGENTS.md §七), so the dump's
+// guest pc; a device here cannot see the CPU (AGENTS.md §二), so the dump's
 // frameless mark row carries retired-instruction stamps instead — a dump
 // reproduces as `--max-inst` on that row.
 enum { kOberonTraceDepth = 500, kOberonTraceFileLen = 20 };

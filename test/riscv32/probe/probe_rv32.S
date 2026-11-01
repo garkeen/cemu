@@ -7,7 +7,7 @@
 #   * satp mode 1 (Sv32) round-trips and Bare clears it;
 #   * the RV32 high counter halves (mcycleh/minstreth) and mstatush.
 #
-# This is a smoke probe (AGENTS.md 六), not an acceptance test: the rv32
+# This is a smoke probe (AGENTS.md §一·6), not an acceptance test: the rv32
 # riscv-tests suite is the acceptance artifact. Exit code 0 = all checks
 # passed; exit code n = check n failed (the HTIF payload is (n<<1)|1).
 #

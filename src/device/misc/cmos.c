@@ -137,7 +137,18 @@ static int FromBcd(int v) { return ((v >> 4) & 0xf) * 10 + (v & 0xf); }
 // counting while the processor is stopped, and no emulator time base
 // (-icount, --skip-idle) has any business moving it (QEMU gives these
 // registers QEMU_CLOCK_REALTIME, hw/rtc/mc146818.c).
+//
+// The one exception is -icount, where the whole point is a run that replays
+// bit for bit: a date/time read from the host would differ between two runs
+// seconds apart, and the guest reads it during boot (SeaBIOS latches it into
+// the BDA, DOS and Windows read it again). So under -icount the clock starts
+// at a fixed epoch and advances with the emulated clock instead. The epoch is
+// 1995-08-24T00:00:00Z, the retail Windows 95 date — a guest that logs
+// timestamps then produces identical bytes across runs.
+static const int64_t kIcountCmosEpoch = 809222400;  // 1995-08-24T00:00:00Z
+
 static int64_t CmosEpoch(const struct CmosState* st) {
+  if (HostTimerIcountOn()) return kIcountCmosEpoch + HostTimerNow() / 1000000 + st->bias_sec;
   return HostTimeRealtime() / 1000000 + st->bias_sec;
 }
 

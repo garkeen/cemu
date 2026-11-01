@@ -122,6 +122,12 @@ void HostInputOpen(void (*serial)(void* ctx, int ch), void* serial_ctx,
 }
 
 void HostInputPoll(void) {
+  // -icount exists to make a run replay bit for bit, and host input is the one
+  // guest-visible source no clock can pin down: a stray console byte or a
+  // window mouse move would land at a different instruction in every run.
+  // Synthetic events (CEMU_DEBUG key=/mouse=) still enter through the same
+  // sinks from the run loop, so an automated test keeps that channel.
+  if (HostTimerIcountOn()) return;
   static int announced;
   if (!announced) {
     announced = 1;

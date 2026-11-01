@@ -84,7 +84,7 @@ static void TraceWrite(OberonIoDevice* d, uint32_t value) {
     case 0xBB: {
       // Dump: one frameless mark stamps the moment (its inst=N column), one
       // whole-line screen row per frame — the event table's columns would
-      // mangle them (AGENTS.md §X on screen rows).
+      // mangle them (AGENTS.md §五 on screen rows).
       if (DebugOn(kDbgMark)) DebugMark("oberon-trace", (int)d->trace_index, 0);
       if (DebugOn(kDbgScreen)) {
         char line[64];

@@ -1,7 +1,7 @@
 #ifndef CEMU_UTIL_TABLE_H
 #define CEMU_UTIL_TABLE_H
 
-// Streaming table renderer for the debug facility (AGENTS.md §X). Columns
+// Streaming table renderer for the debug facility (AGENTS.md §五). Columns
 // are declared with fixed widths; rows are formatted cell by cell and written
 // immediately — no full-table buffering, so million-line traces stay ordered
 // (fprintf buffering scrambled event order once; everything goes through

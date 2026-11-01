@@ -36,7 +36,7 @@ Notes on the reference, both followed rather than invented:
     status word (QEMU cpu_clear_ignne, called from cpu_set_fpus -- which only
     FLDENV/FRSTOR reach). FNCLEX and FINIT do not drop it on either model,
     which is why phase c uses FLDENV. Both gaps stay registered in AGENTS.md
-    §X D19.
+    §六 D19.
   * With NE=0 QEMU raises the interrupt from WAIT/FWAIT (fpu_raise_exception is
     called only there), while this machine raises it at the arithmetic
     instruction. The probe executes FWAIT after every divide, so both models

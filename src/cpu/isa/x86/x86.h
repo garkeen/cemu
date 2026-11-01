@@ -267,6 +267,9 @@ typedef struct x86_state {
 
 void x86_init(CpuState* cpu);
 void x86_step(CpuState* cpu);
+// The observation stream: same body, rec/frame/hub blocks enabled. Selected by
+// the board when g_dbg_any is set (cpu/step.h isa_ops.step_debug).
+void x86_step_debug(CpuState* cpu);
 void x86_dump_regs(const CpuState* cpu);
 void x86_set_intr(CpuState* cpu, int level);
 void x86_set_nmi(CpuState* cpu);
@@ -276,5 +279,10 @@ void x86_set_nmi(CpuState* cpu);
 // the caller removes exactly what it put in; -1 means the encoding cannot say it.
 int x86_gdb_set_watch(CpuState* cpu, uint64_t addr, uint32_t len, int kind);
 int x86_gdb_clear_watch(CpuState* cpu, int slot);
+// Linear-address byte reader for the debug hub's dumpl= (cpu/step.h isa_ops):
+// the walk runs through the live page tables under a scratch landing pad, so a
+// page that does not resolve is a failed read, not a fault of a step that does
+// not exist. Physical reads are the board's (board/run.c's BusRead path).
+int x86_read_lin(CpuState* cpu, uint64_t lin, uint8_t* buf, int len);
 
 #endif

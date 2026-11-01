@@ -157,8 +157,8 @@ static int ReadCounter(const CpuState* cpu, RiscvState* s, uint64_t addr, uint64
       return 0;
     case 0xC01:
       // time: the machine timer when the platform provides one (virt CLINT
-      // mtime); otherwise the registered mcycle alias (spike simplification
-      // D4 in AGENTS.md 简化登记).
+      // mtime); otherwise the registered mcycle alias (the spike board has no
+      // mtime, so mcycle stands in).
       *out = cpu->timer_read ? cpu->timer_read(cpu->timer_dev) : s->mcycle;
       return 0;
     default:

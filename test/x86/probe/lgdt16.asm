@@ -6,7 +6,7 @@
 ; protected-mode far jump cannot read its CS descriptor (DOS7's IO.SYS calls
 ; that service while booting). v86 lgdt/lidt/sgdt/sidt apply the 0xffffff mask.
 ;
-; Output is the isa-debugcon port 0x402 (AGENTS.md section 10).
+; Output is the isa-debugcon port 0x402 (AGENTS.md §五).
 ; Run (self-contained; no firmware):
 ;   cemu --machine x86 --isa x86 lgdt16.bin
 ;   qemu-system-i386 -machine pc -m 32 -drive file=lgdt16.bin,format=raw,if=floppy \

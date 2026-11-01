@@ -180,13 +180,15 @@ void LapicPoll(LapicDevice* d) {
   TimerExpire(d);
 }
 
-int64_t LapicNextEventUs(LapicDevice* d) {
+// Nanoseconds until the timer's next edge, for the run loop's idle skip; cf.
+// PitNextEventNs for why the unit is ns rather than us.
+int64_t LapicNextEventNs(LapicDevice* d) {
   if (d->timer_count == 0) return 0;
   uint64_t burned = CountsElapsed(d, HostTimerNow());
   if (burned >= d->timer_count) return 0;  // already due: LapicPoll has it
   uint64_t per_sec = kLapicTimerFreq / TimerDivisor(d->reg[kLapicTimerDivide / 16]);
   uint64_t left = d->timer_count - burned;
-  return (int64_t)((left * 1000000 + per_sec - 1) / per_sec);  // round up: never 0 while pending
+  return (int64_t)((left * 1000000000 + per_sec - 1) / per_sec);  // round up: never 0 while pending
 }
 
 static uint64_t LapicRead(void* dev, uint64_t addr, int size) {

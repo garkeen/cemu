@@ -1,89 +1,305 @@
 # cemu 开发日志（progress.log）
 
 按时间倒序，最新在最上。本文件只记过程、证据与裁决；当前状态摘要见
-README.md，架构与阶段见 arch.md，规格缺口台账见 AGENTS.md §X。
+README.md，架构与阶段见 arch.md，规格缺口台账见 AGENTS.md §六。
 
-## 四类嫌疑逐个读实现：都没有缺陷；PIT BCD 登记 D41（2026-10-31）
+> 本文件里的章节号是写作当时的编号，按原文保留、不逐条改写。2026-11-01 的
+> AGENTS.md 重写后：旧 §五/§六 → §一·5/§一·6，旧 §七/§八 → §二/§三，
+> 旧 §九 → §四，旧 §十/§X（调试设施）→ §五，旧 §十一 → §七；`§X Dnn`
+> 指现在的 §六 台账。
 
-- **16 位远指针/远调用**（`LES/LDS/LSS`、调用门带参数、远返回）：`exec.c` 的
-  `case 0xc4/0xc5`、`case 0xb2/0xb4/0xb5` 按 `d.w32` 取 `m16:16` 或 `m32:16`，
-  先偏移后段、16 位只写低半；`call_gate` 换栈后压 `SS/ESP → params[n-1..0] → CS/IP`；
-  `pm_ret` 的 `saved = 2*w + n` 取调用者 `SS:ESP`、外层返回后 `esp = new_esp + n`。
-  对照 QEMU `target/i386/tcg/seg_helper.c` 的 `helper_ret_protected`：同样的
-  `sa.sp += addend` 两处推进、**同样不拷贝参数**，pop IP/CS → `+= addend` →
-  pop ESP/SS → `sp = new_esp` → `+= addend`，逐句等价。**无缺陷**。
-- **16 位算术/移位标志**：`grp2` 把计数 `cnt &= 31`（386+ 语义），`shl/shr/sar/
-  rol/ror/rcl` 的 CF/OF 规则逐条对 SDM（SHL 的 OF=MSB(结果)^CF、SHR 的
-  OF=原 MSB、SAR 的 OF=0、ROL/ROR/RCL 的对应式）；`cnt=0` 早退不改任何东西，
-  `cnt>=width` 的 0/符号填充也处理了。**无缺陷**。
-- **V86 搬运语义**：`seg_synth` 给 VM86/实模式段的 limit 固定 0xffff（SDM
-  vol.3 17.3.1）、base=sel<<4、DPL 3；`seg_use` 的限检查在 `lin_load/lin_store`
-  前；字符串指令的地址尺寸/方向位此前已审。**无缺陷**。
-- **PIT/CMOS**：`cmos.c` 的 RTC 是完整模型（BCD/BIN、24 小时、UIP 常清、闹钟、
-  内存尺寸寄存器）；`i8254.c` 的 **BCD 计数模式只存不建模**（`bcd` 字段保存但
-  计数/读回按二进制）——这是未登记的简化，已补进 AGENTS.md §X **D41**。
-- 顺带修的观测缺口：`DebugGateRet` 之前只在保护模式与实模式 IRET 发射，V86 的
-  返回（DOS 服务作为 VM86 client 的返回）没有答案行；已在 `pm_iret` 的 V86 分支
-  补发射（CF 在标志载入前取）。`mark:gatecall=VEC:AH` 的配对过滤也接上了
-  gateret 侧——但**已发现配对会被嵌套软中断打断**（处理程序内部再发 int 时
-  `g_last_gate_ah` 被覆盖，外层返回时配不上），这是设施的已知限制，记在这里。
+## 文档重编号清理与 x86 transcript 解析器回归（2026-11-01）
 
-## PCI 设备视图对拍（临时探针，已删除）：核心设备一致（2026-10-31）
+- **死引用**：`bd57816` 把 AGENTS.md 重写成 §一~§七，但源码/脚本里 38 处仍写
+  旧编号（`§X`/`§九`/`§IX.1`/`第七节`/`section 10`），README/arch/reference 里
+  12 处同样过期。按"旧 §五/§六 → §一·5/§一·6，§七/§八 → §二/§三，§九 → §四，
+  §十/§X → §五，§十一 → §七"逐条改正；progress.log 的历史条目保留原文，在文件头
+  加映射说明（日志是过程记录，不逐条改写）。
+- **套件回归**：`util/log.c` 补换行后，`test/x86/run.sh` 的 `probe_cell`/
+  `elf_cell`/`transcript_cell` 仍按"`[info] loaded ...` 与客人输出粘在一行"的旧
+  行为取 transcript，`grep -m1` 先命中日志行，6 格（lgdt16/vga_census/smbus/
+  xbcs/uart_rx/ignne）报 got=镜像名。解析器改为先滤掉 `^\[[a-z]*\] ` 的 hub 行，
+  再按 token 取客人行；golden 不动。
+- **结果**：clean build 0 warning；`test/riscv64/run.sh` 136/0、
+  `test/riscv32/run.sh` 104/0、`test/x86/run.sh` **59/0**（51 个自足探针 +
+  7 个 kvm-unit-tests + realmode）、`target check` dep ok。README 的 x86 50 格
+  同步为 59（10-31 日志的 59/59 是对的），Win95 状态改为最新结论。
 
-- 方法：写了一个临时 multiboot 探针，枚举 bus 0 的每个 device/function 的
-  配置空间（00h/08h/0Ch/10h/14h/18h/1Ch/20h/3Ch 九个 dword），从 COM1 打出来，
-  debug-exit 收场；cemu 与 qemu-system-i386 各跑一次对 diff。
-- 相同的设备集合与 ID：`00.00 8086:1237`（i440FX）、`01.00 8086:7000`（PIIX3
-  ISA）、`01.01 8086:7010`（IDE）、`01.03 8086:7113`（PM）、`02.00 1234:1111`
-  （stdvga）。class/progif/header 全部一致。
-- 不同的部分都是**引导上下文**差异，不是模型差异：
-  - cemu 的 IDE 复位即带 BAR `1f1/3f7/171/377/c001` 与 `INTLINE=14`，QEMU 在
-    探针直启（不跑 BIOS POST）时这些还是 0/未设——真机上由 SeaBIOS 赋同样的值；
-  - VGA 的 BAR0 两边都是 **prefetchable memory**（低 3 位 0x8），只是 cemu 基址为 0、
-    QEMU 已赋 `fd000000`；BAR2 同理（cemu 0，QEMU `febf0000`）；
-  - QEMU 那次多出 `03.00 8086:100e`，是我调用时没加 `-nic none` 带出的默认网卡。
-- 结论：**PCI 配置空间这一层没有发现 cemu 的模型错误**。探针是临时诊断件，已删除；
-  没进套件（两模型"BIOS 之前"的配置状态本来就不同，用 QEMU 的转录当校准会编码错
-  的 oracle）。要看 POST 之后的状态得让 BIOS 跑过 PCI 初始化，探针直启做不到。
+## Win95 启动失败：证据链、已排除项与下一步（2026-11-01 重写）
 
-## gatecall 行补 SI；VMM 磁盘读数据完整性核对通过（2026-10-31）
+> 本节合并 2026-10-30 至 11-01 的 Win95 记录，只保留能复现的证据与已裁决的
+> 结论。旧的逐轮假设（微秒截断、RTC 纪元、VGA 光栅冻结、无 icount 的 QEMU
+> 对拍等）统一列在“已排除”，不再作为线索。
 
-- 背景：Win95 的 protection error 已确认是 VMM 软件层判定 VxD init 失败（全程无
-  ring-0 #GP/#PF/#UD；#UD 风暴全在失败之后）。剩下的嫌疑是"VxD 加载/注册表读盘
-  读回的数据不对"，而此前 gatecall 行没有 SI，说不出 int 13h AH=43h 的磁盘地址包
-  （DS:SI）指向哪里。
-- 设施：gatecall 行加 `si=`（DBgCallArgs 加 arg_si，格式从 104 扩到 128 字节），
-  登记在 AGENTS.md §十。热路径零成本（同一处 DebugOn 门控）。
-- 实测：VMM 的 AH=43 调用形如
-  `ax=4300 cx=0001 dx=0080 si=1788 ds=ffff es=03c0 at=ffff:1806`（DAP 在线性
-  0x101778，LBA 514，缓冲 0x044d:0x1f80=线性 0x6450）。会话结束 dump 回来：
-  DAP `size=16 flags=1 buf=0x44d:0x1f80 lba=514`，缓冲前 16 字节
-  `42 4f 4f 54 4c 4f 47 20 54 58 54 22` = `"BOOTLOG TXT\""`，与镜像 LBA 514
-  逐字节相同（`match True`）。**磁盘读路径的数据是对的**，这条假设排除。
-- 所以失败是"无异常、读盘正确"的软件层 VxD init 失败；下一步只能从 VMM 的
-  VxD 加载器判定点（它检查 IOS 的什么返回值）入手，或者对比两个模型的指令流找
-  静默语义偏差。
+### 复现
 
-## x86：IRET/RET 跨特权返回清空数据段（SDM/QEMU 取证）；Win95 未因此好转（2026-10-31）
+- 镜像 `../v86images/win/windows95.img`，固件 `../seabios/out/bios.bin` +
+  `../seabios/out/vgabios.bin`（Bochs VBE 构建）。
+- 镜像当前带 “Windows did not finish loading on the previous attempt” 警告
+  （前次中断启动留下的），菜单默认 3（Safe mode）。按 Normal 走：
+  `-icount shift=8`，注入 `key=0x02@130000000`（'1'）、
+  `key=0x02:0:1@130100000`、`key=0x1c@131000000`（Enter）、
+  `key=0x1c:0:1@131100000`。
+- 客人加载 `smartdrv` / `VBMouse` 后打印
+  `Windows protection error.  You need to restart you`；会话统计
+  `traps=8,871,248`。QEMU 10.2 用同一份 BIOS 与镜像能到桌面（只剩 NE2000
+  提示），所以镜像与固件不是原因。
+- 打印停在哪里不是稳定判据：`screen` 跑法停在 `Windows protection e`（20 字符），
+  `watchl` 跑法一直写到 `b803e`（`...You n`）。**打印路径本身是结果，不是根因。**
 
-- SDM vol.2 IRET Operation 的 RETURN-TO-OUTER-PRIVILEGE-LEVEL 明文：
-  `FOR each SegReg in (ES, FS, GS, and DS) DO tempDesc := descriptor cache for
-  SegReg; IF (SegmentSelector == NULL) OR (tempDesc(DPL) < CPL AND tempDesc(Type)
-  is (data or non-conforming code))) THEN SegmentSelector := 0;`；
-  RET 的同一节有同样的循环，Description 还写："The DS, ES, FS, and GS segment
-  registers are cleared by the RET instruction during an inter-privilege-level
-  return if they refer to segments that are not allowed to be accessed at the new
-  privilege level."（抓取页 https://www.felixcloutier.com/x86/iret:iretd:iretq 、
-  https://www.felixcloutier.com/x86/ret）
-- QEMU 对应实现：target/i386/tcg/seg_helper.c 的 validate_seg() 在
-  helper_ret_protected 的外层返回路径里对 ES/DS/FS/GS 逐个检查，DPL < 新 CPL 的
-  data/非一致代码段被 `cpu_x86_load_seg_cache(..., 0, base, limit, flags &
-  ~DESC_P_MASK)` 置空（选择子 0、保留 base/limit、清 P）。
-- cemu 的 pm_iret / pm_ret 外层返回路径此前**完全没有这一步**（保留旧缓存）。
-  新增 clear_outer_data_segs(newpl)，两个外层返回各调用一次。x86 套件 59/59 通过。
-- Win95 实测**没有因此好转**：直启仍在 `Starting Windows 95...` 之后报
-  `Windows protection error` 并跑飞（400M 指令、1263 万次抑制异常）。所以这是一个
-  真实的 SDM 缺口修复，但不是本次 Win95 失败的根因。
+### 当前钉死的故障链
+
+1. 错误消息由 VGA BIOS 的 teletype 直接写 `0xB8000`（`C000:3039` 的
+   `mov [es:edi],al`）；这是结果。
+2. 运行里有 8,871,248 次 trap。`trap,inst=399000000-400000000` 全是
+   `ud=6` at PC `0x100022`（tval=0x32）。在 160M-170M 窗口里，第一条 #UD
+   落在 `0xFFB17`（`arpl`）；该地址是 BIOS ROM 里的 VGA 字体数据
+   （`bios.bin` 0x3FB17 = `63 38 6c 6c 38 cc 78...`）。IVT 的 int 6 仍是
+   未初始化的 `FFFF:FFFF`，没有处理程序，于是 #UD 风暴跑飞。
+3. `exec=0xffb17-0xffb18,hist` 抓到首次进入来自 `iret` at `0x1036DC`
+   （CS=0xFF33、IP=0x43AC）；`state` 显示这是 16 位 IRET
+   （SS=0x8F00、ESP 0xFFA→0x1000，弹 3 字），弹出的 **IP=0x2FF7、
+   CS=0xFCB2**，合起来线性 `0xFFB17`。
+4. `watchl=0x8fffa:6:w` 显示帧槽 `SS:SP=0x8F00:0x0FFA` 由 VMM 的
+   `0xC0002573: mov [esi],eax` 写入 **0xFCB22FF7**（EAX）。这是一个
+   32 位值（平坦地址形状，不是 16:16 far pointer）；16 位 IRET 把它拆成
+   `0x2FF7:0xFCB2`，正好落到字体。
+5. 结论：**VMM 的客户 CS:IP 槽里存了一个 32 位值**，而 V86 返回需要的是
+   16:16 far pointer。字体地址只是拆分后的落点；真正要查的是这个值在哪一步
+   进入客户状态。
+
+### 已排除 / 作废（不要再当线索）
+
+- **微秒截断**：halt 跳时钟改成 ns 后，下一次 PIT 到期的指令差仍是 7,535
+  （与改前逐条相同），不是微秒余数。
+- **RTC 纪元**：把 `kIcountCmosEpoch` 挪到 03:45:00 重跑，保护错误照旧；
+  常量已改回 `809222400`。
+- **VGA 光栅冻结**：无光栅时的 dumb retrace 回退已按 QEMU 实现；错误行之前
+  的字符都能正常写。
+- **无 `-icount` 的 QEMU 对拍**：QEMU 的虚拟时钟来自宿主，同一锚点两次读到
+  不同值；之前“第 928 步分歧”是噪声。跨模型结论必须两边同用
+  `-icount shift=8`。
+- **磁盘数据**：VMM 的 int 13h AH=43h DAP 在 LBA 514、缓冲
+  `0x044d:0x1f80`，读回 `BOOTLOG TXT\` 与镜像逐字节相同；整场 544 条 ATA
+  命令，保护模式侧一条都没有；不是 IDE/读盘。
+- **PCI 配置空间**：核心设备集合与 ID 与 QEMU 一致（i440FX/PIIX3/IDE/PM/
+  stdvga）；差异是 BIOS POST 前后的 BAR/INTLINE 上下文。
+- **16 位远指针/远调用/远返回**：`LES/LDS/LSS`、调用门参数、`pm_ret` 与
+  QEMU `helper_ret_protected` 逐句对照，无缺陷。
+- **16 位算术/移位标志**：`grp2` 与 SDM 的 CF/OF 规则逐条对照，无缺陷。
+- **V86 段合成**：limit=0xffff、base=sel<<4、DPL3；不是这次的分歧。
+- **PIT/CMOS**：RTC 模型完整；PIT 的 BCD 只存不建模已登记 D41，与本路径无关。
+- **`0xC0011590` 写 0**：是 VMM 收到退出/系统关闭广播后的复位路径，不是原因。
+- **`gatecall` 配对**：单槽，处理程序内部再发 int 会覆盖外层；这是设施的已知
+  限制，不是本次帧损坏的原因。
+
+### 已修但不是根因（都保留）
+
+- **REP 计数器按地址尺寸**（`string_op`）：16 位代码里的 `f3 66 a5` 原来按
+  ECX 计数（SDM vol.2 [REP](https://www.felixcloutier.com/x86/rep:repe:repz:repne:repnz)、
+  [MOVS](https://www.felixcloutier.com/x86/movs:movsb:movsw:movsd:movsq) 条目：
+  计数寄存器跟 AddressSize 走），把 DOS 内核
+  从 `0x91F83` 起写了约 445MB 的 0，客人在 `cs=0x8d92` 的零字节里跑飞。
+  修复后 Win95 越过启动画面进入 VMM。真实 bug，但只把现场推进到 VMM。
+- **IRET/RET 外层返回清空 ES/DS/FS/GS**（SDM vol.2
+  [IRET](https://www.felixcloutier.com/x86/iret:iretd:iretq)、
+  [RET](https://www.felixcloutier.com/x86/ret) Operation；QEMU `validate_seg`）：
+  补了 `clear_outer_data_segs`；Win95 没有因此好转。
+- **VGA 链式 256 色渲染**（`VgaPicture.pixel_dots`、SR1 bit3）：修掉了
+  640×400 启动图右半等于下一行左半的“两个 logo”渲染错；不是当前的保护错误。
+- **`util/log.c` 补换行**：info 行不再与 CEMU_DEBUG 行粘连；随后发现
+  `test/x86/run.sh` 的 transcript 解析器依赖粘连，已单独修复。
+- **halt 跳时钟改 ns**：只把单位对齐到 QEMU 的纳秒期限，没有改变本场景行为。
+
+### 仍然成立的关键对照
+
+- `0xC0360B8B` 处，cemu 与 QEMU（都 `-icount shift=8`）的 CPU 与 20KB VMM
+  数据逐字节相同；分歧只在其后约 13.9 万条指令内。
+- 下一次 PIT 到期：cemu +7,535 条、QEMU +4,166 条，差 **3,369 条
+  （862 µs）**；改 ns 后差值不变。这个相位差仍是“输入时刻”级别的未决项，
+  尚未证明它是本次跑飞的触发器。
+- VxD 表（同地址 dump 对拍）：IOS DDB + 18 项服务表 `0xC0012DE0`（192B）
+  0 字节不同；VMM 分发槽 `0xC000F400-0xC000F520`（288B）0 字节不同；
+  服务跳转表 `0xC000DF20-0xC000DFA0`（128B）0 字节不同，服务 0x13 的桩
+  `0xC0FDA174: call 0xC0011254` 两边一致；VxD 堆 `0xC0FDA000-0xC0FDC000`
+  有 199 字节分配顺序差异。
+- QEMU 在 `0xC000DF78` 读到服务 0x13（EAX=0x13、EDI=0xC0FDA174），cemu
+  没有这次分发；但 BOOTLOG 在 `Loading Vxd = ...IOS.VXD` 后没有 LoadSuccess，
+  失败发生在 IOS 初始化里，可能早于/独立于服务 0x13 分发。两条线都还开着。
+
+### 未决与下一步
+
+1. **0xFCB22FF7 从哪来**：在 VMM 写 `0x8FFFA` 的那一步，取完整的 9-dword
+   V86 帧（EIP,CS,EFLAGS,ESP,SS,ES,DS,FS,GS）和 VMM 的客户状态；候选是
+   EFLAGS.VM 保存位错误（32 位保护模式地址被当成 V86 返回），或 VMM 读错
+   帧槽。用 `watchl` 盯客户状态槽，`pcshot`/`state`（不开 `g_mem_slow`）
+   在 VMM 组帧处取现场，再与 QEMU gdb 同点对比。
+2. **IOS.VXD 的初始化判定**：BOOTLOG 停在 IOS.VXD，磁盘数据已排除；下一步抓
+   IOS 初始化期间对 IFS/注册表的请求（`mark:gatecall=0x21`/`0x2f`），与 QEMU
+   同点对比第一条不一致。
+3. **PIT 相位差**：用同一段 halt 序列逐次比较跳后的虚拟时钟，判断 3,369 条
+   是纯记账误差还是输入时刻差；不要在没有固定 `-icount` 的跑法上做结论。
+
+## 观测设施优化：快/慢 step 流、拆分门控、COUNT 按行（2026-11-01）
+
+- **快/慢 step 流**：`isa_ops` 增加 `step_debug`；step 体在 `step_body.inc`
+  模板里只写一份，按 `STEP_DBG=0/1` 各实例化一次（`x86_step`/`x86_step_debug`
+  等）。正常跑的函数里预处理已删掉所有 debug 块——反汇编确认没有
+  `g_dbg_*`/`DebugInsn`/`DebugSetFrame` 引用；观测跑才有。板级在
+  `BoardRunSteps` 开头按 `g_dbg_any` 选一次。
+- **门控拆分**：`g_dbg_insn`（`DebugInsn`）、`g_dbg_frame`（`DebugSetFrame`）、
+  `g_dbg_any`（step 选择）。只开 `watch`/`watchl`/`mem` 时不再调用
+  `DebugInsn`/`DebugSetFrame`；`regs=0` 不 arm 指令流；只有 `screen`（无
+  `screenstop`）/`gdb`/`dump`/`fbdump`/`vga-io`/`regs=0` 的会话走 fast 流。
+- **`g_record_raw` 补 `exec`/`trap`**：`exec=` 单独跑、`trap` 单独跑的 RAW 列
+  不再为空（此前只有 trace/hist 会记录）。
+- **`regs=N` 改倒计数 + `Allow`**：去掉每指令一次 64 位取模；`budget=`/`skip=`/
+  `inst=` 现在对周期表生效；halt/exit 仍必打。
+- **`:COUNT` 改为“打印行数”**：`pcshot`/`exec` 被 `inst=`/`skip=`/`budget=`
+  抑制的命中/跨越不占 COUNT；`pcshot` 行里的 `hit=` 仍是命中号（含被抑制的）。
+  验证：`pcshot=0x7c00-0x7d00:1,inst=10-11` 在 x86 smoke 上打印
+  `hit=11 inst=10`（旧实现的前 10 次命中会把 COUNT 吃光，一行不打印）。
+- **x86-only 标注**：`watchl=`/`dumpl=`/`v86in`/`gatecall`/`vga-io`/`screen`
+  在 AGENTS §五 标出归属；`pmp` 标 riscv、`virtio` 标 virt。
+- **验证（单探针，不跑整包）**：riscv `rv64ui-p-add` 正常 exit=0；x86 smoke
+  exit=11；`regs=100` 出 6 次表；`regs=100,inst=250-260` 只留 exit 表；
+  `trace:line,budget=5` 五行；`exec=0x7c00-0x7d00` 单独出 RAW=`fa`/`cli`；
+  `watch=0xb8000:4:w` 与 `watchl=0xb8000:4:w` 在 cga probe 上命中；`mark`
+  行带 `pc=`；`trap` 单独的 riscv `ecall` 行带 RAW。
+- **未做**：取指/访存路径没有复制成两套解释器（每取指字节仍有一次
+  `g_mem_slow` 测试）。复制 `exec.c` 的巨型 switch 与“代码简单清晰”冲突，
+  留给以后真的需要极限性能时再做；当前收益来自 step 钩子与门控拆分。
+
+## 观测设施审计：热路径成本、通用性与已知语义（2026-11-01）
+
+> 下面是**优化前**的审计快照；`regs` 取模、watch-only 的
+> `DebugInsn`/`DebugSetFrame`、`pcshot`/`exec` 的 COUNT 语义已在上一节修掉。
+
+### 关闭时（正常跑）的成本
+
+- 每条指令一次 `g_dbg_any` 读取与分支（`x86/step.c:126`、riscv `step.c:52`）；
+  `DebugInsn`/`DebugSetFrame` 只在 `dbg` 为真时调用。
+- 每次取指字节一次 `g_mem_slow` 测试（`exec.c:424` 的 `fetch8`），每次数据访问
+  一次（`phys_load/store`、`lin_load/store`）；两者都是单个全局读，不是每字节
+  匹配或格式化。
+- 每 1024 条指令（`kPollStrideLog2=10`）才进一次 `DebugNextInjection`，不是每步。
+- 因此“热路径零成本”按字面不成立：关闭时仍有每步 1 次、每取指字节 1 次、
+  每访存 1 次的可预测全局测试。没有的是格式化、watch 匹配、慢走查、状态行，
+  这些都在门控之后。AGENTS 的“零成本”应读作“只多一条门控测试”，不是“零指令”。
+  这与 §四第 10 条的字面（“if (g_xxx) 放在 fetch8/phys_load/每步取指里一律
+  驳回”）有张力：现有实现正是这样做的，只是 `g_mem_slow` 是单全局、分支可预测。
+
+### 打开时的成本
+
+- `trace:line`/`state`：每条退休指令格式化并写 stderr，I/O 主导，慢几个数量级。
+- `regs=N`：`DebugInsn` 里每指令做一次 64 位 `inst_count % N`；N 很大时也是一次
+  除法。它是常驻观测里最不该按指令做的检查，建议改成倒计数或在 N 为 2 的幂时
+  用掩码。
+- `hist`：每指令写环形缓冲并做 REP 去重比较；只在 `hist` 开时发生。
+- `pcshot`/`exec`：每指令扫最多 8/4 个区间；区间少时可接受。
+- `mem`/`bus`/`watch`/`watchl`：打开 `g_mem_slow`，绕过 TLB、逐次走查；不仅慢，
+  还可能改变客人的 A/D/时序。Win95 实测里 `watch` 跑法与不开慢路径的
+  `pcshot`/`state` 跑法落在不同的指令数（608M vs 5M）；两次跑之间还夹着镜像
+  状态的变化，不能把差值全归给 `g_mem_slow`，但慢路径会改 A/D/时序这一点是
+  设计事实。**内存观测的时间线不能当作正常跑的时间线**；定时敏感的场景用
+  `trace`/`state`/`pcshot`（不改访存路径），内存观测只用来回答“谁碰了这个地址”。
+- 只开 `watch`/`watchl` 时 `g_dbg_any` 仍为真，于是每条指令仍调用
+  `DebugInsn`/`DebugSetFrame`，尽管指令类目全关；这是一个可省的每步开销。
+  建议把门控拆成“指令类目”和“内存类目”两个全局。
+
+### 通用性
+
+- 机制层是通用的：`trace/state/mem/bus/trap/watch/watchl/dump/dumpl/fbdump/
+  pcshot/exec/inst/budget/skip/hist/regs` 都不认具体设备或客户程序。
+- 事件层有一部分是设备/ISA 专用，这是合理的：`pmp`（riscv）、`virtio`（virt）、
+  `vga-io`/`screen`（VGA 文本）、`mark` 的 `isa/intr/inta/pic/ioapic/lapic/
+  fdc/dma/ata/...`。
+- 真正“为某个情况设计”的：
+  - `v86in`：只在 V86 返回目标 CS≥0xF000 时发射，是为 Win95 的 HMA/固件桩
+    加的启发式；低于 0xF000 的桩看不到，别的 ISA 也没有对应物。
+  - `gatecall`/`gateret`：单槽配对，嵌套软中断会覆盖外层；`mark:gatecall=VEC:AH`
+    只能跟一层。够用于浅层 BIOS/DOS 调用，不是通用的调用栈追踪。
+  - `screen`：只覆盖 VGA 文本平面（CP437、行稳定发射），图形模式/其他主板没有。
+  - `watchl`/`dumpl`：实现只在 x86 的 `lin_load/lin_store` 与 `x86_read_lin`；
+    riscv32/riscv64 的 `read_lin` 是 NULL。名字是通用的，能力是 x86-only。
+  - `mark` 的 `a`/`b` 没有类型/字段名，每个 name 自己的语义；新增事件要同时
+    改发射点、文档与使用者的解析。
+- 输出格式是事实上的 API：`util/log.c` 补换行就让 `test/x86/run.sh` 的
+  transcript 解析器坏了 6 格。设施的输出格式没有版本/稳定性契约，改格式要
+  同步所有消费者。
+
+### 已知语义坑
+
+- `pcshot`/`exec` 的命中计数在 `Allow` 之前：`inst=`/`budget`/`skip` 抑制的行
+  仍消耗 `:COUNT`。`exec` 的注释说“COUNT caps the rows this range reports”，
+  与实现不完全一致；要用窗口取第 N 次命中时，COUNT 要放大或别用窗口。
+- `watch=` 是物理地址，`watchl=` 是线性地址；分页打开后按线性地址写 `watch=`
+  会一行不出（这不是设施坏了，是语义）。
+- `inst=` 在 `Allow` 层过滤；`g_traps` 汇总仍统计窗口外的陷阱（汇总是有意的，
+  但容易被误读为窗口内计数）。
+- `hist` 没有自己的 skip（否则环永远攒不满），它只跟着已放行的行打印。
+- `dumpl` 在会话收尾读，要求会话自行结束；宿主信号会跳过收尾。
+
+## 补设施 inst=LO-HI（全类别指令窗口），并据它取到 54M 指令窗口内的中断序列（2026-11-01）
+
+- **问题**：Win95 在 cemu 里于 inst 54,125,138 把 0 写回 IVT int 13（槽 0xC00130A7
+  全程零写入），而 QEMU 不会；两模型在最后一个共有代码点 0xC0360B8B 上状态逐字节
+  相同（0xC000C000-0xC0010000 与 0xC000D000-0xC000E000 两段 dump 比对零差异，
+  其后 1 万条指令流也一致），分歧只能在之后 13.9 万条指令内、由中断/设备到达时刻
+  分开。`mark` 全量输出在跑到该窗口前就撞上 5MB 硬顶（实测写出 5,243,379 字节后
+  被截断），`trap` 对中断不产生事件（全程 0 行），窗口取不到。
+- **设施**：`CEMU_DEBUG` 增加 `inst=LO-HI`（语法进 AGENTS.md §五）。它不是新的事件
+  发射点，而是把已有的门控收窄：`debug.c` 的 `Allow()` / `AllowTrace()` 在**已经
+  为调试打开**的路径上先比一次客人时钟，窗口外的行直接丢弃，**不占 budget、不占
+  5MB 硬顶**（与 `bus:ADDR` 的地址过滤同一语义）。不缓存、不新增内存（门外丢弃），
+  设施关闭时热路径不新增判定。文档与 `debug.h` 的语法注释同步更新。
+- **验证（体积与可用性）**：`mark,inst=53976000-54130000` 在同一次启动里给出
+  **2383 行 / 387,381 字节**（此前全量 `mark` 在同一启动上是 5,243,379 字节且被
+  截断）；`state,inst=54124960-54124990` 给出该区间的逐指令规范状态行。
+- **该窗口里读到的中断序列**（`mark` 的 `isa`/`intr`/`inta`）：IRQ0 在
+  inst 54,026,240、54,079,488 各交付一次（`inta a=80`），此后 54,124,963 再次
+  抬线（`intr a=1`、`isa a=0 b=1`）但**没有 ack**。查 IF：`state,inst=54124960-
+  54124990` 显示该处 eflags=0x3046，**IF=0**，所以挂起是正常的（中断被关着），
+  这不是丢中断——一条看起来很像 bug 的线索就此排除。
+- 现状：设施已进树并可用；**根因仍未落到 cemu 源码**，下一步是用同一个窗口把
+  QEMU 侧的同段中断/设备事件序列（`-d int`，保护模式下有记录）对齐比较。
+
+## 补设施 dumpl=；两个模型的 VxD 登记表逐字节相同，缺的是服务 0x13 的分发（2026-11-01）
+
+- **新设施 `dumpl=ADDR:SIZE:FILE`**（语法进 AGENTS.md §五）：与 `dump=` 同形，
+  地址是线性地址。实现分三层：`cpu/step.h` 的 `isa_ops.read_lin`（可选钩子，
+  说明为什么 hub 不能自己翻译）、`debug/debug.c` 的解析与收尾落盘（复用
+  `dump=` 的 4 段/5MB 账本，用 `linear` 标志区分地址空间与报错文案）、
+  `board/run.c` 的路由（`DebugReadLin` → `m->isa->read_lin`）。x86 的实现
+  `exec.c: x86_read_lin` 用一块 scratch `frame` 的 `setjmp(scratch.raise)` 兜住
+  走查里的 `#PF`/`#GP`——会话收尾时没有指令在飞，页不存在必须是"读不到"而不是
+  跳到 step 的落地垫；同时临时清 `g_mem_slow`，否则每个字节都会以无帧行的形式
+  往观测流里写 bus/mem 行。riscv32/riscv64 的表项显式写 NULL（还没有读者）。
+  验证：`dumpl=0xc0fda000:0x3000` 取回 12288 字节、`dumpl=0xc0012de0:0xc0`
+  取回 192 字节，与 QEMU 侧 gdb `dump binary memory`（走客人映射）同地址文件
+  直接 `diff`。
+- **顺带修的观测缺陷**：`util/log.c` 的 `VLog` 不补换行，所有 info 行连成一条，
+  紧跟其后的 `CEMU_DEBUG` 行粘在日志行尾。本轮据此误判过"cemu 从未执行
+  `0xC00012C0`"——实际 `P @lin=...c00012c0 hit=1 inst=49580483` 就在文件里，
+  只是行首被粘住、`^P @lin` 匹配不到。已在 `VLog` 末尾补 `'\n'`（调用点都不
+  自带换行），重建后 info 行逐行独立。
+- **对拍结论（QEMU 侧同地址 gdb dump，逐字节）**：
+  - IOS 的 DDB + 18 项服务表 `0xC0012DE0`（192 字节）：**0 字节不同**；
+  - VMM 分发槽 `0xC000F400-0xC000F520`（288 字节）：**0 字节不同**（两边
+    `0xC000F454` 都已被 `0xC03615C6` 的 `xchg` 改成 `0xC0001A00`）；
+  - VMM 服务跳转表 `0xC000DF20-0xC000DFA0`（128 字节）：**0 字节不同**，
+    其中 `0xC000DF78`（服务号 0x13）两边都是 `0xC0FDA174`；
+  - VxD 堆 `0xC0FDA000-0xC0FDC000`（8192 字节）：199 字节不同（分配顺序造成的
+    记录字段/桩位置差异），但服务 0x13 的桩代码本身两边一致：
+    `0xC0FDA174: e8 db 70 03 ff  call 0xC0011254`。
+- **定位推进**：`0xC0FDA174` 是服务 0x13 的入口，其实现指针是 IOS 的
+  `0xC0011254`，由 `0xC0228EE2` 的 `xchg %edx,[0xC000DF2C+%eax*4]` 注册。
+  cemu 执行了这条注册（inst=51608254），但因为表项相同，说明**注册没问题**；
+  缺的是**分发**：QEMU 在 `0xC000DF78` 上被 `awatch` 抓到一次读，EAX=0x13、
+  EDI=0xC0FDA174、CS=0x28，随后跳到桩、调用 IOS 的保存例程；cemu 全程没有
+  这次分发（`pcshot=0xC0011254` 0 命中）。下一步是找请求服务 0x13 的客人代码
+  （QEMU 侧在分发点经线程块 `[0xC00106B8]+0x4C` 取回被换下的调用者栈），
+  再在 cemu 对照同一条路径。
 
 ## CEMU_DEBUG：`mark:v86in`（V86 返回进高段）（2026-10-31）
 
@@ -115,94 +331,6 @@ README.md，架构与阶段见 arch.md，规格缺口台账见 AGENTS.md §X。
   `lw 4c:2 <- e3fe inst=92262` 与 `int` 读回的 `lr 4c:2 -> e3fe inst=4555706`，
   与早先 `watch=0x4c:4:rw` 的物理流逐行一致（同一批 PC，只是这次看到的是线性地址）。
 - 已登记到 AGENTS.md §十语法表。下一步用它看 `0xc001e1f7` 的写入者。
-
-## Win95 保护错误的 VxD 定位：IOS.VXD（2026-10-31）
-
-- 手段：给 MSDOS.SYS 加 `BootLog=1`（把 `Network=1` 原地替换）后启动，再从镜像的
-  FAT16 里读 `BOOTLOG.TXT`。日志在 `VMM`、`SMARTDRV.EXE` 之后停在
-  `Loading Vxd = C:\WINDOWS\system\VMM32\IOS.VXD`，**没有对应的 LoadSuccess**，
-  之后就是 `Windows protection error`。所以失败的是 I/O 监督器 IOS.VXD 的加载/初始化。
-- 磁盘通路是干净的：整场启动 544 条 ATA 命令（536 条 BIOS 的 READ SECTORS、
-  3 条 WRITE SECTORS、1 条 IDENTIFY DEVICE、4 条 IDENTIFY PACKET），唯一一次
-  ABRT 来自 BIOS 对 ATAPI 槽的探测；错误寄存器 0x1F1 只被写过 0、从未被读；
-  **保护模式侧一条 ATA 命令都没有**。即 ESDI_506 之类的端口驱动还没开始和控制器
-  说话，失败发生在 IOS 自己的初始化里，不是 IDE 模拟的错。
-- 新增设施（都挂在已门控的调用点上）：`trap=CAUSE` 只留一个向量；`mark:NAME[=N]`
-  只留一个标记名（N 对 gatecall 是 INT 向量）；IDE 的 `ata-cmd`（每条命令一行）与
-  `ata-abort`（被拒绝的命令一行）。用它们把 5MB 输出从"中断风暴/倒计时轮询"里解出来。
-- 顺带确认：`key=0x03@N` 这类注入能把启动菜单的选择从默认 3 改成 2（Logged），
-  但按键在 BIOS 键盘缓冲里能存活数百 M 指令，Enter 的时机会决定菜单是否立即确认。
-- 下一步：抓 IOS 初始化期间它向 IFS/注册表发的请求（`mark:gatecall=0x21`、
-  `mark:gatecall=0x2f`），与 QEMU 在同一点对比，找第一条不一致。
-
-## REP 计数器按地址尺寸（SDM 原文核实）；Win95 越过"执行零字节"进入 VMM（2026-10-31）
-
-- **手册依据先查网、不凭记忆**：SDM vol.2 的 REP 条目 Operation 伪代码写死
-  `IF AddressSize = 16 THEN Use CX for CountReg; ELSE IF AddressSize = 64 THEN RCX;
-  ELSE ECX`（[REP 条目](https://www.felixcloutier.com/x86/rep:repe:repz:repne:repnz)、
-  [MOVS 条目](https://www.felixcloutier.com/x86/movs:movsb:movsw:movsd:movsq)）。
-  计数寄存器跟**地址尺寸**走；操作数尺寸只决定元素是 1/2/4 字节。
-- 旧实现（`src/cpu/isa/x86/exec.c` 的 `string_op`）用 `d.w32 ? ecx : cx`：16 位代码里
-  `f3 66 a5`（rep movsd）被当成 ECX 计数。DOS 的 MS C memcpy 是 `shr cx,2` +
-  `rep movsd`，CX=0xE0FC 本应计 14,399 个 dword，而 ECX 高半留着 0x06A1（16 位写
-  不清高半是正确语义）→ 计数 0x06A1383F，从 `0x91F83` 起写约 445MB，把 DOS 内核段
-  整片写穿，随后客人在 `cs=0x8d92` 实模式里沿零字节执行（`traps=0`）。
-  现场由 gdb 条件断点直接取到：`dst=853d:cbb3 lin=91f83 src=523b:c4c1 len=6a1383f`。
-- 修复：`string_op` 的零计数早退与递减都改为 `d.a32 ? ecx : cx`，注释写明 SDM 依据。
-- 复跑：Win95 现在越过启动画面，控制台出现 `Starting Windows 95...`，随后 VMM 进入
-  保护模式；屏幕在 `screen` 里停在 `Windows protection e`（消息被截断），`trap` 显示
-  **`cause=6`（#UD）在同一线性地址 `0x100022` 上无限重复**（RAW/MNEMONIC 为空，说明
-  译码器把它判成非法指令）。这是"保护错误"的来源：VMM 的 #UD 处理返回后重执行同一条。
-- 另一次同二进制的跑法没有该 #UD（`traps=0`，300M 时停在 `cs=0x8d92 pc=0x5d35`）：
-  宿主时钟驱动的定时器中断让两条路径分叉，复现要用能固定时刻的观测（`pcshot`/gdb），
-  不能靠 `--max-inst` 逼近。
-- 下一步：取 `0x100022` 的指令字节（`dump=` 在会话结束时 1MB 处已是全零，需在命中时读），
-  判定是 cemu 把一条合法指令误判 #UD，还是客人真的取到坏字节。
-- **可复现路径**：`-icount shift=6`（64 ns/指令）下不再是"两个 logo 卡死"，而是
-  `screen` 依次给出 `Starting Windows 95...`、启动菜单（Normal/Logged/Safe mode），
-  过菜单后 `Windows protection e`；1.5e9 指令内 `traps=59,245,006`，收尾状态是
-  `cr0=0` 但 `cs=ffff ds=ffff ss=09ad esp=c13cxxxx`（32 位栈指针 + 垃圾选择子）。
-  300M 指令时它只是停在菜单（虚拟时间 19 s 未到超时）。
-- 前几个陷阱是**正常的 V86 虚拟化**：`sti`/`in`/`out` 在 V86 下按 IOPL 报 `cause=13`，
-  由 VMM 的 0xc000xxxx 处理；所以 V86 入口与 I/O 位图反射这条链是通的，崩溃发生在
-  更晚的位置，不是"缺某条系统指令"（`invd`/`wbinvd`/`clts`/`wrmsr`/`lar/lsl` 都在）。
-- 待查：`pcshot=0x100022` 在 icount 复跑里 0 次命中（该次跑法没走到 0x100022），
-  说明 #UD 风暴的落点随路径不同；要抓"状态从哪条指令开始变坏"，应在 icount 下对
-  陷阱流做窗口采样（`trap` 配 `skip=`/`budget=`）取风暴前沿，而不是继续猜地址。
-
-
-
-- **两个 logo 是 cemu 的 VGA 渲染错，不是 SeaBIOS、不是镜像**：Win95 启动画面是
-  320 字节/行、400 行的 256 色链式画面（`set VGA mode 13` 后客人自己改 CRTC）。
-  `fbdump` 给出 640×400，而每一行右半（x=320..639）逐字节等于下一行左半
-  （x=0..319，399/399 行命中），即渲染器按 640 个连续字节读一行，右半是下一扫描线。
-- 硬件规则（QEMU `hw/display/vga.c` 的 `vga_get_resolution` + `shift_control == 2`
-  分支）：宽度是 `(H_DISP+1)*8` 个 dot，256 色每字符时钟取 4 字节、占 8 dot，所以
-  每个字节两个 dot；QEMU 用 `bits = 4`（行字节 = width/2）配 `VGA_DRAW_LINE8D2`
-  画两遍。cemu 的 `VgaRenderGraphics` 把 dot 序号当字节索引（`base*4 + x + hpel`）。
-- 修复（`src/device/video/vga.c`）：`VgaPicture` 加 `pixel_dots`；256 色恒为 2；
-  `shift_control` 0/1 且 SR1 bit3（dot clock /2）时也为 2 并把宽度翻倍（QEMU 的
-  `disp_width <<= 1` + `LINE4D2`/`LINE2D2`，此路径同样缺，随这次一并补齐）；
-  渲染循环按 `(x + hpel) >> (pixel_dots - 1)` 取源像素。SR1 bit3 在标准模式下
-  为 0，所以 16 色/CGA 现有画面不受影响；该分支目前没有自足探针覆盖。
-- 验证：重建 88 目标、`warning:` 0；`-hda windows95.img --max-inst 300000000`
-  重跑后 fbdump 仍是 640×400，相邻像素对 0 差异、行剪切 0 行，画面是单幅
-  `Windows 95` 启动图（`build/win95-fb2.png`）。
-- **卡死（未修，证据链已建立）**：QEMU 10.2 用同一个 `../seabios/out/bios.bin`
-  与同一个 `../v86images/win/windows95.img` 启动到 Win95 桌面（只剩 NE2000 不在
-  的提示框），所以镜像与固件没问题，问题在 cemu 的 x86 侧。
-- cemu 侧现场（非 icount，300M 指令）：IVT 里 int 20/21/23/25/26/28/2a-2f 全指向
-  段 `0x8d92`（Win95 实模式 DOS 内核所在段），而 `0x91f8e..0x953d2`（约 18KB）
-  在 inst≈25.2M 被 `pc=0x37a0` 的 `rep movsd` 以 0 覆盖；写入是未对齐 dword
-  （`91f8b:4 <- 0`），调用链是 `0x6290 call 0x3756`（memcpy 包装，长度/源/目标
-  来自 `ES:DI` 描述符的 +8/+0xa 字段）。此后 CPU 在 `cs=0x8d92`、`cr0=0` 实模式下
-  沿零字节执行（`add [bx+si],al`），`traps=0`，`SS:SP`（`0x084a:0xaFxx`）也落在
-  清零区里；同一片内仍留着的 `jmp 0x1f8e` 让它绕回零区，成为永久循环。
-- `-icount shift=0` 会把客人时序改成 1GHz，启动路径与卡死点都变了（跑到 300M 时
-  停在 ROM），**不能**用它复现此问题；对拍仍用宿主时钟。
-- 下一步：取那次 memcpy 的 `ES:DI`/`DS:SI`/`CX`（`pcshot=0x37a0` 按 `inst` 过滤，
-  或 gdb 条件断点 `$es*16+$edi` 落在 0x91f8e 附近），判定是客人自己覆盖 DOS 区
-  （内存管理/loader 的正常释放）还是 cemu 的 `movs`/段语义把目标或长度写错。
 
 ## V86/VME 三个临时探针转正：MOV Sreg、V86 中断反射/嵌套、V86 IRQ 嵌套（2026-10-30）
 
@@ -259,30 +387,6 @@ README.md，架构与阶段见 arch.md，规格缺口台账见 AGENTS.md §X。
   的敏感性（该格前后就是自带 millicycles 的计时段落），非语义回归；若复现率
   升高，按 §九用 `watch=`/`pcshot=` 开观测窗口再定。
 - 本轮只改文档与注释里的日志路径，无行为改动；构建与三套回归在收尾重跑。
-
-## Windows 95 卡在两个 logo：cs=0x9000 的页帧被清零后仍被 jmp 进去（2026-10-30）
-
-现象：`-hda windows95.img` 在控制台 `pnp call arg1=5` 之后不再动（宿主看是两个 logo）。
-
-- 现状（**未修**）：300M 指令处 `cs=0x9000`（基址 0x90000）、`cr0=0`（实模式），
-  PC 逐字节跑在 0x91f8e..0x953d2 的 `00 00`（`add [bx+si],al`）上，`traps=0`。
-  `dump=0x8d920:0x10000` 取回该段：段内偏移 0x0d57-0x53d2（18KB）全零。
-- 跨界归因（新设施 `exec=`）：19979 次跨越里 **17927 次是同一条 `jmp e9 3c 9e`**
-  （线性 0x9814f → 段内偏移 0x1f8e），每轮约 6709 条指令 —— 跑飞是结构性循环，
-  不是随机乱跳；循环体把零字节当指令执行，所以不产生任何异常。
-- 谁清的：`watch=0x91840:3:w` 给出 `f3 66 a5`（rep movsd，pc=0x37a0）把该处写 0；
-  在此之前是 `f3 a5`（movsw，pc=0x86acd）把代码拷进去。客人自己在反复清零这段。
-- 本轮补的设施（都按 §九第 10 条落在已门控的钩子上，fetch/译码路径零改动，
-  `git diff` 里没有任何 `cpu/isa/` 文件）：
-  - `pcshot=` 支持 `LO-HI[:COUNT]` 区间，命中打 canonical state 行 + `hist`，
-    并纳入 `budget=`/`skip=`（同一区间可能被命中上万次）；
-  - `watch=` 命中行自成类别（`kDbgWatch`），吃 `budget=`/`skip=`。此前它们绕过
-    预算，一片频繁写入的区域直接撞 5MB 硬顶（实测写出 5.2MB，违反 §七）；
-  - `exec=LO-HI`：区间跨越行，PC/MNEMONIC 是产生跨越的指令，命中带 `hist`。
-    匹配点在 `DebugInsn`（每步一次、已由 `g_dbg_any` 门控），不在 `fetch8`。
-- 下一步（未做）：判断 0x9000 段的清空是客人的正常释放，还是我们某条语义
-  （rep movsd 的 ES:EDI/ECX、段限、EMM386 页帧）越界写坏。证据面：`pcshot=0x37a0`
-  直接给写者的寄存器现场。
 
 ## port 0xF0 IGNNE#：D19 里最后一个 CPU 侧缺口（2026-10-30）
 

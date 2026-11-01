@@ -81,9 +81,14 @@ typedef struct isa_ops {
   void (*init)(CpuState* cpu);
   // Fetch, decode, execute one instruction; commits cpu->pc exactly once.
   void (*step)(CpuState* cpu);
+  // The observation stream: the same instruction semantics with the per-step
+  // rec/frame/debug-hub work enabled. The board selects it once per run when
+  // g_dbg_any is set; NULL = this model has no split and step() must handle
+  // observations itself (no current model does that).
+  void (*step_debug)(CpuState* cpu);
   void (*dump_regs)(const CpuState* cpu);
 
-  // ---- debug hooks (AGENTS.md §X): optional, NULL = feature absent ----
+  // ---- debug hooks (AGENTS.md §五): optional, NULL = feature absent ----
   const char* (*cause_name)(uint64_t cause);  // cause id -> printable name
   const char* const* flag_names;              // set-bit names by flag-word bit, or NULL
   uint64_t (*flag_word)(frame* f);            // the flag word; 0 when flag_names is NULL
@@ -136,6 +141,19 @@ typedef struct isa_ops {
   // 0 = any. riscv32 and riscv64 share e_machine 243, so the loader must
   // match EI_CLASS too; x86's EM_386 is unambiguously 32-bit.
   int elf_class;
+
+  // Read `len` bytes from linear address `lin` into `buf`, for the debug hub's
+  // dumpl= items (debug/debug.h): the hub owns no address space and cannot
+  // page-translate, and a VxD heap page or a pageable segment has no stable
+  // physical address across runs — so a structure the guest names by linear
+  // address can only be taken back by the model that owns the walk.
+  //
+  // Returns 1, or 0 when a page on the way does not resolve. It runs at
+  // session end with no instruction in flight, so it must not fault into the
+  // step's landing pad: the implementation is its own fault boundary. NULL =
+  // this model has no linear-address reader (x86 is the only one today;
+  // riscv32/64 have the address space but pass NULL).
+  int (*read_lin)(CpuState* cpu, uint64_t lin, uint8_t* buf, int len);
 } isa_ops;
 
 extern const isa_ops k_isa_x86;

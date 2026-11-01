@@ -1,4 +1,5 @@
-; Reset-facility probe for the x86_min machine (AGENTS.md D18). The three ways
+; Reset-facility probe for the x86_min machine (D18, closed; see progress.log).
+; The three ways
 ; a PC guest reboots the machine are pulled in turn, one per life:
 ;
 ;   life 1  port 0xCF9, the PIIX3 reset control register (SeaBIOS pci_reboot:

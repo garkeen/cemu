@@ -257,8 +257,11 @@ QEMU/参考实现的行为、"我记得是这样"都不算证据，写进注释�
      匹配挂在**已被门控的调用点**上（`DebugInsn` / `DebugMem` / `DebugTrap`）；
    - 若确实需要落在取指/译码内部，先把该路径改成已门控（像 `g_record_raw` 那样
      一次解析、热路径只读一个全局），并说明为什么既有门控不够用。
-   性能是验收项：加设施后要能说出"关闭该设施时热路径多了几条指令"，答案必须是
-   **零**。芝麻开关（`if (g_xxx)` 放在 `fetch8`/`phys_load`/每步取指里）一律驳回。
+   性能是验收项：加设施后要能说出"关闭该设施时热路径多了几条指令"，只允许
+   **一次已解析全局的门控读取**（`fetch8`/`phys_load` 的 `g_mem_slow`、
+   step 的 `g_dbg_any` 这类）；不允许每字节/每访存做匹配、格式化或函数调用。
+   要连这次读取也去掉，只能把快/慢做成两条流（step 已有 `isa_ops.step_debug`；
+   取指/访存路径没有复制，代价是每字节一次可预测分支）。
 
 ## 五、CEMU_DEBUG 语法（常驻调试设施，唯一调试入口）
 
@@ -277,16 +280,17 @@ CEMU_DEBUG = item[,item...]
                             对应 QEMU `-trace` 的事件模式匹配。不带过滤时一次引导的前
                             几万行全是 ROM 影子拷贝，5MB 输出硬顶会把要看的窗口吃掉；
                             被滤掉的行不占 budget，也不占 skip 窗口
-  pmp                       PMP 拒绝事件（每次拒绝一行）：
+  pmp                       PMP 拒绝事件（每次拒绝一行；riscv-only）：
                             `pmp-deny addr=<物理地址> len=4 w S entry=0 cfg=18 base=... size=...`
                             —— 被拒绝的访问不会到达总线，`bus` 一行都不出；这一行给出
                             最低号命中条目的 cfg 与解码区间（`entry=none` = 无规则命中）。
                             riscv 的负载/存储/取指与页表走查都过 PMP，32/64 两个后端同款
-  virtio                    virtio-mmio 传输事件：notify 时的队列状态、解析失败的
+  virtio                    virtio-mmio 传输事件（virt 板专用）：notify 时的队列状态、解析失败的
                             描述符链、后端调用。客人卡在 used-ring 等待时，`mem`
                             看不出"宿主没收到 notify"与"收到但丢了链"，这几行能
                             对应 QEMU 的 virtio_mmio trace 事件
-  regs=N                    每 N 条指令打一次全寄存器表；halt/exit 必打
+  regs=N                    每 N 条指令打一次全寄存器表（倒计数，不取模）；吃
+                            budget=/skip=/inst=；halt/exit 必打
   gdb                       gdb stub 的协议包（tx/rx）与状态机行（attach/detach、
                             stop 原因）。排查"客人该停没停/停错地方"用
   watch=ADDR:SIZE[:r|w|rw]  地址观测（可重复逗号分隔；数字按 C 字面量解析，
@@ -296,21 +300,28 @@ CEMU_DEBUG = item[,item...]
                             0x2c0180），写线性地址会一行都不出
                             watch 的命中行同样吃 `budget=`/`skip=`（自成一类）：不设预算
                             时，一片客人频繁拷贝的区域能在 5MB 硬顶之前写满磁盘
-  watchl=ADDR:SIZE[:r|w|rw] 线性地址观测：与 watch= 同形，但**按线性地址匹配**。
+  watchl=ADDR:SIZE[:r|w|rw] 线性地址观测（**x86-only**：匹配点在 x86 的
+                            lin_load/lin_store；riscv 尚未接线）：与 watch= 同形，
+                            但**按线性地址匹配**。
                             分页打开后内核结构（VxD 数据槽、内核对象）的物理页
                             每次运行都可能不同，watch= 报不出"谁写了这个槽"；
                             这条在 ISA 的线性漏斗（x86 的 lin_load/lin_store）
                             里匹配，因此也把 g_mem_slow 打开。命中行 DETAIL 用
                             `lr`/`lw` 与物理的 `r`/`w` 区分，同样吃 budget=/skip=。
                             例：`watchl=0xc001e1f7:4:rw`（读/写该线性地址的指令）
-  exec=LO-HI[:COUNT]       区间跨越行（可重复，上限 4 条）：下一条指令的**线性 PC
+                            **注意：mem/bus/watch/watchl 会打开 g_mem_slow，绕过
+                            TLB 逐次走查；A/D 位与到达时序可能与正常跑不同。
+                            定时敏感的问题用 trace/state/pcshot（不改访存路径），
+                            内存观测只用来回答"谁碰了这个地址"。**
+  exec=LO-HI[:COUNT]       区间跨越行（可重复，上限 4 条；COUNT 数**打印的行**，
+                            被 inst=/skip=/budget= 抑制的跨越不占 COUNT）：下一条指令的**线性 PC
                             落入 [LO,HI) 且上一步不在该区间**时打一行——PC/MNEMONIC
                             给的是产生这次转移的指令，DETAIL 给落点与退休指令数，
                             命中时连带打 `hist`。回答的是"执行流第一次跑进这片内存
                             是哪条指令干的"：跑飞落点是被客人清零过的数据，地图上
                             查不到，不许猜地址。匹配点在 `DebugInsn`（与 pcshot 同一
                             个已门控的每步钩子），fetch 路径零成本（§四第 10 条）
-  vga-io                   客人对 VGA 卡寄存器文件的一次端口访问一行，读写各一行：
+  vga-io                   客人对 VGA 卡寄存器文件的一次端口访问一行（VGA/x86）：
                             `vga-io rd|wr port=0x3d5 val=0x28`。对应 QEMU 给自家测试用的
                             vga_std_read_io / vga_std_write_io trace 事件——**两个模型之间
                             唯一能把"客人的整段对话"逐访问对齐的通道**。寄存器的写流说明
@@ -323,6 +334,19 @@ CEMU_DEBUG = item[,item...]
                             要求会话自行结束（--max-inst 或客机停机）：宿主信号
                             会跳过会话收尾，什么也不写。例：取 Linux 的 __log_buf
                             `dump=0x30a000:0x18000:build/logbuf.bin`
+  dumpl=ADDR:SIZE:FILE      与 dump= 同形，但地址是**线性地址**（**x86-only**：
+                            riscv32/64 的 isa_ops.read_lin 为 NULL）：走 ISA 自己的
+                            页表走查（cpu/step.h isa_ops.read_lin；x86 的实现是
+                            exec.c 的 x86_read_lin，用一块 scratch frame 的
+                            setjmp 兜住走查中的 #PF/#GP），所以分页打开后的 VxD
+                            堆、服务表、IO 槽都能按客人给出的地址取回。物理页
+                            每次运行都可能不同，dump= 取不回这些结构，也没法跟
+                            另一个模型的虚拟地址 dump 逐字节对比（QEMU 侧的对照
+                            物是 gdb 的 `dump binary memory`，它走客人的映射）。
+                            路径上任何一页不可解析即**整段落空**并报该线性地址，
+                            不填噪声（填了会让"没有这一页"看起来像"内容不同"）；
+                            与 dump= 合计上限 4 段、单段 5MB，同样要求会话自行结束。
+                            例：`dumpl=0xc0fda000:0x3000:build/vxdheap.bin`
   fbdump=FILE                会话结束时把**显示卡的渲染缓冲**落成二进制 PPM
                             （P6，与 QEMU `screendump` 同格式，两张图可逐字节
                             diff；可重复，上限 2 段，超 5MB 拒写不截断）。
@@ -331,7 +355,9 @@ CEMU_DEBUG = item[,item...]
                             交给中枢（D17 里缺的就是这个：无头核对渲染的唯一手段）。
                             同样要求会话自行结束。例：`fbdump=build/fb.ppm`
   pcshot=ADDR[:COUNT]       在**线性 PC** 触发的规范 state 行（可重复，上限 8 条；
-  pcshot=LO-HI[:COUNT]      COUNT 默认 1）。命中点是"下一条指令的线性 PC 等于 ADDR
+  pcshot=LO-HI[:COUNT]      COUNT 默认 1，数的是**打印的行**，被 inst=/skip=/
+                            budget= 抑制的命中不占 COUNT；行里的 hit= 是命中号
+                            （含被抑制的命中））。命中点是"下一条指令的线性 PC 等于 ADDR
                             或落在 [LO,HI) 内"，也就是 CPU 即将执行那里的状态。
                             区间形式回答"执行流第一次跑进这片内存是哪条指令干的"
                             （跑飞取证：入口地址未知时不猜，见 §四第 9 条），命中时
@@ -353,6 +379,15 @@ CEMU_DEBUG = item[,item...]
   skip=N                    类别静默窗口：该类别的前 N 个单位不打印。**trace 类目按
                             指令计**，其余类目按自己的事件计（trace 不为每条退休指令
                             都发射事件，按事件计会在没人要的指令号上开窗）
+  inst=LO-HI                全类别指令窗口（会话汇总的 traps= 仍统计窗口外的陷阱，
+                            汇总是全程计数）：客人时钟落在 [LO,HI) 之外的行走不到
+                            `Allow`/`AllowTrace` 之外就被丢掉，**既不占 budget 也
+                            不占 5MB 硬顶**（与 `bus:ADDR` 的地址过滤同一语义）。
+                            用途是把一次诊断收窄到一段指令区间：5 千万条指令的引导
+                            里一次中断序列在窗口内只有几百行，总输出反而比全量少两
+                            个数量级。实现不缓存任何东西（门外丢弃），内存 O(1)，
+                            设施关闭时热路径不新增判定。LO 含、HI 不含；`inst=LO-`
+                            表示"从 LO 起"，`inst=-HI` 表示"到 HI 止"
   hist[=N]                  环形缓冲里最后 N 条已退休指令（默认 32，上限 64）：
                             `<线性 PC> <助记符> <机器码>`。**任何无帧事件行触发时**
                             从旧到新整段打印（mark/watch/bus/trap/pmp/virtio）：
@@ -369,7 +404,7 @@ CEMU_DEBUG = item[,item...]
                             lidt/lgdt gate(门描述符) hostkey kbd-byte kbd-irq
                             aux-byte aux-irq(IRQ12) hostmouse mouse-inj key-inj
                             gatecall int=<向量> ax= bx= cx= dx= si= ds= es= at=<cs:ip>
-                            gateret ax= bx= cx= dx= cf= at=<cs:ip> —— 软件 INT n
+                            gateret ax= bx= cx= dx= cf= at=<cs:ip> —— x86 软件 INT n
                             的两半。参数不止在 AX 里：AH=48h 的容量在 BX、AH=3Dh
                             的文件名在 DS:DX、AH=0Ah 的缓冲在 ES:DX，只报 AX 的
                             一行能说出"内存不够"却说不出客人要了多少；返回值也不
@@ -389,7 +424,7 @@ CEMU_DEBUG = item[,item...]
                             `if (cr0 & PE)` 里且只在入口触发，实模式一条不出、
                             也没有返回值（见 progress.log 片 33）
                             reset-req(设备请求机器复位)
-                            v86in(V86 返回进入高段 CS>=0xf000 的一句：a=目标 IP 十进制、
+                            v86in(x86 V86 返回进入高段 CS>=0xf000 的一句：a=目标 IP 十进制、
                             b=目标 CS 十六进制；行的 pc= 是那条 iret。用于追"谁把
                             client 送回 HMA/固件实模式桩"，正常 client 返回不过滤会淹没
                             环形缓冲)
@@ -417,16 +452,22 @@ CEMU_DEBUG = item[,item...]
                             扫描码 + EXT（0xe0 前缀）+ UP（释放），也就是窗口
                             键盘交给 sink 的那个三元组。@N 必填：缺省的节奏
                             等于替调用方做决定
-  screen                    无帧文本行：客机控制台镜像，**整行输出**（控制台一行
+  screen                    无帧文本行（VGA 文本平面）：客机控制台镜像，**整行输出**（控制台一行
                             80 列，套进事件表只剩列框，call trace 就读不出来了）。
                             一行与上一次渲染相同（已稳定）才发；向上滚动只发进入
                             视口的新行。字形按 CP437 解码，`utf8` 下转成 UTF-8，
                             否则降为空格
+  screenstop=TEXT           screen 的行包含 TEXT 时停会话（隐含 screen）。行在
+                            稳定渲染后才检查；打印后立刻退出的探针可能赶不上这一拍
   utf8                      UTF-8 边框与字形（默认 ASCII，Windows 代码页安全）
 ```
 
-- 输出走 stderr，`2>file` 留档；热路径零成本（发射点一个位测试，
-  类别掩码 init 时解析一次）。
+- 输出走 stderr，`2>file` 留档。step 有两条流：正常跑走 `isa_ops.step`
+  （`STEP_DBG=0`，预处理已把 debug 块删掉，连 `dbg` 参数都没有），观测跑走
+  `isa_ops.step_debug`；`g_dbg_insn`/`g_dbg_frame`
+  分别决定 `DebugInsn`/`DebugSetFrame`，`g_mem_slow`/`g_record_raw` 决定访存
+  慢路径与原始字节。关闭时的代价是每取指字节/每访存一次已解析全局测试，不做
+  匹配或格式化。
 - 事件表统一列 `KIND │ PC │ RAW │ MNEMONIC │ DETAIL │ FLAGS`（DETAIL 宽 88：
   一行 BIOS 调用要装下 `int/ax/bx/cx/dx/ds/es/at`，宽度不够就等于为它加宽了列
   还是把它截了），KIND：

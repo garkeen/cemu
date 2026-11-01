@@ -32,6 +32,7 @@ typedef struct Args {
   uint32_t switches;  // --switches N: a machine's front-panel switches
   int dump_regs;
   int skip_idle;  // --skip-idle: a halted CPU's idle time runs at full speed
+  int snapshot;   // -snapshot: disk images are copy-on-write, writes discarded
   int icount;         // -icount: the emulated clock is declared, not wall time
   int icount_shift;   // log2 of the nanoseconds one retired instruction costs
   int gdb_port;  // -s / -gdb tcp::PORT; 0 = no stub
@@ -63,6 +64,9 @@ static void Usage(void) {
       "                    0x80200000, what OpenSBI fw_jump jumps to)\n"
       "  -append STR       kernel command line -> device tree /chosen/bootargs\n"
       "  -hda FILE         x86: primary IDE master disk image\n"
+      "  -snapshot         every disk image is opened copy-on-write: the guest\n"
+      "                    sees its writes but the image file never changes, so\n"
+      "                    two runs start from the same bytes (QEMU -snapshot)\n"
       "  -hdb FILE         x86: primary IDE slave disk image\n"
       "  -cdrom FILE       x86: secondary IDE master CD-ROM image\n"
       "  -fda FILE         x86: floppy image for drive A:\n"
@@ -160,6 +164,8 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       a->append = argv[++i];
     else if (strcmp(arg, "-hda") == 0)
       a->hda = argv[++i];
+    else if (strcmp(arg, "-snapshot") == 0)
+      a->snapshot = 1;
     else if (strcmp(arg, "-hdb") == 0)
       a->hdb = argv[++i];
     else if (strcmp(arg, "-cdrom") == 0)
@@ -209,6 +215,9 @@ int main(int argc, char** argv) {
     LogInfo("-icount shift=%d: one retired instruction = %llu ns of emulated time",
             a.icount_shift, (unsigned long long)1 << a.icount_shift);
   }
+  // -snapshot also goes in before any image is opened: the copy-on-write view
+  // is a property of the file handle, not of the disk model.
+  if (a.snapshot) HostFileSetSnapshot(1);
 
   // -mouse: which pointing device the host's pointer drives (the PC board is
   // the only one with a choice). An unknown name is an error, not a silent

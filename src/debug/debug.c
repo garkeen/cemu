@@ -1,7 +1,7 @@
 // The debug hub: CEMU_DEBUG parsing, the event table, watchpoints, budget,
 // and the session summary. Everything renders through util/table.c and
 // HostWriteErr (streaming, ordered). Register naming goes through the ISA's
-// DebugLayout so the core stays ISA-blind (AGENTS.md §X).
+// DebugLayout so the core stays ISA-blind (AGENTS.md §五).
 #include "debug/debug.h"
 
 #include <stdarg.h>
@@ -17,19 +17,21 @@
 
 static uint32_t g_mask;
 static int g_inited;
-// Hot-path gates the interpreters read directly (see debug.h): whether any
-// per-access/per-instruction observation is on, whether raw instruction bytes
-// are needed, and whether memory accesses must take the event-emitting slow
-// path instead of the TLB/宿主指针 fast path.
+// Hot-path gates (see debug.h): the board reads g_dbg_any once to pick the
+// step stream; the debug stream reads g_dbg_insn/g_dbg_frame, and the memory
+// funnels read g_mem_slow/g_record_raw. None is a getenv or a per-byte match.
 int g_mem_slow;
 int g_record_raw;
 int g_dbg_any;
+int g_dbg_insn;
+int g_dbg_frame;
 static int g_ascii = 1;  // plain borders by default (console codepages
                          // mangle UTF-8); `utf8` switches on
 static int g_header_every = 40;
-static int g_regs_period;      // 0 = off
+static int g_regs_period;       // 0 = off
+static uint64_t g_regs_next;    // next inst_count that reaches the period
 // Per-category event cap, and the silent window each category counts through
-// before it starts printing (AGENTS.md §X). One value, applied to every
+// before it starts printing (AGENTS.md §五). One value, applied to every
 // category's own counter: "per-category" is about the accounting, not about
 // spelling the number once per category.
 static int g_budget = 100000;
@@ -43,7 +45,7 @@ static const uint64_t kOutLimit = 5ULL * 1024 * 1024;
 static uint64_t g_out_bytes;
 static int g_limit_hit;
 
-// The one event table every category shares (AGENTS.md §X). DETAIL carries a
+// The one event table every category shares (AGENTS.md §五). DETAIL carries a
 // whole BIOS-call row ("gatecall int=21 ax=4800 bx=0400 cx=... at=9dbd:09de"),
 // so it is wide enough for the longest of them: a column that truncates the
 // field it was widened for is worse than a narrow one.
@@ -154,14 +156,14 @@ int DebugLinWatchHit(uint64_t addr, int size, int is_load) {
 // previous fetch inside a range -- and reports the first fetch of each entry.
 // That is the crossing: the caller gets the history ring (the jump that did
 // it) and the landing point, which is what "who sent the control flow into
-// this memory" asks (AGENTS.md §九 rule 9). The region a runaway lands in is
+// this memory" asks (AGENTS.md §四 rule 9). The region a runaway lands in is
 // data the guest cleared, so no address in it can be guessed from the map.
 enum { kMaxExec = 4 };
 static struct {
   uint64_t lo;   // inclusive
   uint64_t hi;   // exclusive
-  uint32_t max;  // crossing rows this range reports (the optional :COUNT)
-  uint32_t hits;
+  uint32_t max;  // printed rows this range reports (the optional :COUNT)
+  uint32_t hits; // rows printed so far (not crossings seen)
 } g_exec[kMaxExec];
 static int g_nexec;
 static int g_fetch_inside;  // the previous fetch was inside one of the ranges
@@ -179,11 +181,17 @@ static struct {
   uint64_t addr;
   uint64_t size;
   char file[128];
+  int linear;  // dumpl=: addr is a linear address, read through the ISA's walk
 } g_dump[kMaxDumps];
 static int g_ndump;
 static DebugMemReadFn g_mem_read;
 static void* g_mem_ctx;
-// AGENTS.md §七 caps every file this repo writes at 5MB; a dump is a file this
+// The linear reader (dumpl=): installed by the board, implemented by the ISA
+// (cpu/step.h isa_ops.read_lin) — this hub owns no address space and cannot
+// page-translate.
+static DebugLinReadFn g_lin_read;
+static void* g_lin_ctx;
+// AGENTS.md §二 caps every file this repo writes at 5MB; a dump is a file this
 // repo writes, so an oversized region is refused rather than truncated.
 static const uint64_t kDumpLimit = 5ULL * 1024 * 1024;
 
@@ -196,17 +204,18 @@ static const uint64_t kDumpLimit = 5ULL * 1024 * 1024;
 // commit, the frame's next linear PC is compared against the checkpoint, and
 // the canonical state row is printed when the guest is about to execute that
 // address. That is the boundary a QEMU gdb breakpoint stops on, so the two
-// states compare field for field (AGENTS.md §十). LO-HI names a range instead
+// states compare field for field (AGENTS.md §五). LO-HI names a range instead
 // of one address: "the first fetch inside this region" is what a runaway
-// control flow asks, and a guessed address cannot answer it (AGENTS.md §九
+// control flow asks, and a guessed address cannot answer it (AGENTS.md §四
 // rule 9). A hit also dumps the history ring when `hist` is on, because the
 // jump that lands in the region is the row before the landing.
 enum { kMaxPcShots = 8 };
 static struct {
-  uint64_t lo;  // inclusive
-  uint64_t hi;  // exclusive
-  uint64_t max;
-  uint64_t hits;
+  uint64_t lo;    // inclusive
+  uint64_t hi;    // exclusive
+  uint64_t max;   // printed rows (the optional :COUNT)
+  uint64_t hits;  // matches seen; this is the hit= number in the row
+  uint64_t rows;  // rows actually admitted by Allow (window/skip/budget)
 } g_pcshot[kMaxPcShots];
 static int g_npcshot;
 
@@ -258,6 +267,7 @@ static void AddPcShot(const char* spec) {
   g_pcshot[g_npcshot].hi = hi;
   g_pcshot[g_npcshot].max = max;
   g_pcshot[g_npcshot].hits = 0;
+  g_pcshot[g_npcshot].rows = 0;
   g_npcshot++;
 }
 
@@ -266,26 +276,34 @@ void DebugSetMemReader(DebugMemReadFn read, void* ctx) {
   g_mem_ctx = ctx;
 }
 
-// dump=ADDR:SIZE:FILE — the address is physical, exactly as in watch=.
-static void AddDump(const char* spec) {
+void DebugSetLinReader(DebugLinReadFn read, void* ctx) {
+  g_lin_read = read;
+  g_lin_ctx = ctx;
+}
+
+// dump=ADDR:SIZE:FILE / dumpl=ADDR:SIZE:FILE — the same grammar; `linear` says
+// which address space the range lives in (dump= matches watch='s physical
+// convention, dumpl= matches watchl='s linear one).
+static void AddDump(const char* spec, int linear) {
+  const char* name = linear ? "dumpl" : "dump";
   if (g_ndump >= kMaxDumps) {
-    LogError("debug: too many dumps, dropping '%s'", spec);
+    LogError("debug: too many dump/dumpl items, dropping '%s'", spec);
     return;
   }
   const char* c1 = strchr(spec, ':');
   if (!c1) {
-    LogError("debug: dump expects ADDR:SIZE:FILE ('%s')", spec);
+    LogError("debug: %s expects ADDR:SIZE:FILE ('%s')", name, spec);
     return;
   }
   const char* c2 = strchr(c1 + 1, ':');
   if (!c2) {
-    LogError("debug: dump expects ADDR:SIZE:FILE, and the file is not optional ('%s')", spec);
+    LogError("debug: %s expects ADDR:SIZE:FILE, and the file is not optional ('%s')", name, spec);
     return;
   }
   char head[32], szs[32];
   size_t hl = (size_t)(c1 - spec), sl = (size_t)(c2 - c1 - 1);
   if (hl >= sizeof(head) || sl >= sizeof(szs) || strlen(c2 + 1) >= sizeof(g_dump[0].file)) {
-    LogError("debug: dump field too long ('%s')", spec);
+    LogError("debug: %s field too long ('%s')", name, spec);
     return;
   }
   memcpy(head, spec, hl);
@@ -294,11 +312,12 @@ static void AddDump(const char* spec) {
   szs[sl] = 0;
   uint64_t addr, size;
   if (!ParseUint(head, &addr) || !ParseUint(szs, &size) || size == 0) {
-    LogError("debug: dump address/size must be numbers, 0x-prefixed for hex ('%s')", spec);
+    LogError("debug: %s address/size must be numbers, 0x-prefixed for hex ('%s')", name, spec);
     return;
   }
   g_dump[g_ndump].addr = addr;
   g_dump[g_ndump].size = size;
+  g_dump[g_ndump].linear = linear;
   snprintf(g_dump[g_ndump].file, sizeof(g_dump[0].file), "%s", c2 + 1);
   g_ndump++;
 }
@@ -309,37 +328,47 @@ static void AddDump(const char* spec) {
 static void WriteDump(const int idx) {
   const uint64_t addr = g_dump[idx].addr, size = g_dump[idx].size;
   const char* path = g_dump[idx].file;
+  const int linear = g_dump[idx].linear;
+  const char* name = linear ? "dumpl" : "dump";
   char line[192];
-  if (!g_mem_read) {
-    LogError("debug: dump %s: no memory reader (the board installed none)", path);
+  if (size > kDumpLimit) {
+    LogError("debug: %s %s: %llu bytes exceeds the 5MB session file cap", name, path,
+             (unsigned long long)size);
     return;
   }
-  if (size > kDumpLimit) {
-    LogError("debug: dump %s: %llu bytes exceeds the 5MB session file cap", path,
-             (unsigned long long)size);
+  int (*read)(void* ctx, uint64_t addr, uint8_t* buf, int len) = g_mem_read;
+  void* ctx = g_mem_ctx;
+  if (linear) {
+    read = g_lin_read;
+    ctx = g_lin_ctx;
+  }
+  if (!read) {
+    LogError("debug: %s %s: no reader (the %s installed none)", name, path,
+             linear ? "ISA" : "board");
     return;
   }
   uint8_t* buf = (uint8_t*)malloc((size_t)size);
   if (!buf) {
-    LogError("debug: dump %s: out of memory", path);
+    LogError("debug: %s %s: out of memory", name, path);
     return;
   }
-  if (!g_mem_read(g_mem_ctx, addr, buf, (int)size)) {
-    LogError("debug: dump %s: no memory at %llx for %llu bytes", path, (unsigned long long)addr,
+  if (!read(ctx, addr, buf, (int)size)) {
+    LogError("debug: %s %s: no %s at %llx for %llu bytes", name, path,
+             linear ? "mapping" : "memory", (unsigned long long)addr,
              (unsigned long long)size);
     free(buf);
     return;
   }
   HostFile* f = HostFileCreate(path);
   if (!f) {
-    LogError("debug: dump %s: cannot create the file", path);
+    LogError("debug: %s %s: cannot create the file", name, path);
     free(buf);
     return;
   }
   size_t wrote = HostFileWriteAt(f, 0, buf, (size_t)size);
   HostFileClose(f);
   free(buf);
-  int n = snprintf(line, sizeof(line), "== dump: %llx:%llu -> %s (%llu bytes)\n",
+  int n = snprintf(line, sizeof(line), "== %s: %llx:%llu -> %s (%llu bytes)\n", name,
                    (unsigned long long)addr, (unsigned long long)size, path,
                    (unsigned long long)wrote);
   if (n > 0 && DebugAccountOut((size_t)n)) HostWriteErr(line, (size_t)n);
@@ -350,7 +379,7 @@ static void WriteDump(const int idx) {
 // XRGB buffer (device/video/display.h), which this hub does not own. The
 // board installs the two accessors and the item is written at session end,
 // beside dump=, in the same binary PPM (P6) QEMU's `screendump` writes, so
-// the two pictures compare byte for byte. AGENTS.md §七 caps every file this
+// the two pictures compare byte for byte. AGENTS.md §二 caps every file this
 // repo writes at 5MB, so a picture over the cap is refused, not truncated.
 enum { kMaxFbDumps = 2 };
 static struct {
@@ -374,6 +403,53 @@ void DebugSetFbReader(DebugFbInfoFn info, DebugFbPixelsFn pixels, void* ctx) {
 static const uint64_t* g_inst;
 
 void DebugSetClock(const uint64_t* inst_count) { g_inst = inst_count; }
+
+// Instruction window (`inst=LO-HI`). Rows whose guest clock falls outside it are
+// dropped before any budget is consulted, so a filtered window costs neither a
+// budget slot nor a byte of the 5MB session cap — the point is to *shrink* what
+// a diagnostic run writes, not to widen the sink. The hub is the only layer
+// that holds both the clock and every category's emission point, which is why
+// the window lives here and not in each device: one filter covers marks, bus,
+// watch, trap and the rest without a new event source. Nothing is buffered: an
+// event outside the window is turned away at the door, so memory stays O(1).
+static uint64_t g_win_lo;
+static uint64_t g_win_hi = UINT64_MAX;
+static int g_win_on;
+
+// True while the guest clock is inside the armed window (always true when the
+// item is absent). Only called from the already-gated emit path.
+static int InWindow(uint64_t now) {
+  return !g_win_on || (now >= g_win_lo && now < g_win_hi);
+}
+
+// `inst=LO-HI`, numbers parsed as C literals like the rest of the spec. A bare
+// `inst=LO-` means "from LO on"; `inst=-HI` means "up to HI". LO is inclusive,
+// HI exclusive (the convention exec= and pcshot= use for ranges).
+static void ParseWindow(const char* s) {
+  char lo[32];
+  const char* dash = strchr(s, '-');
+  if (!dash) {
+    LogError("debug: inst= expects LO-HI ('%s')", s);
+    return;
+  }
+  size_t n = (size_t)(dash - s);
+  if (n >= sizeof(lo)) {
+    LogError("debug: inst= range too long ('%s')", s);
+    return;
+  }
+  memcpy(lo, s, n);
+  lo[n] = 0;
+  g_win_lo = n ? strtoull(lo, NULL, 0) : 0;
+  g_win_hi = dash[1] ? strtoull(dash + 1, NULL, 0) : UINT64_MAX;
+  if (g_win_lo >= g_win_hi) {
+    LogError("debug: inst= window is empty (lo=%llu hi=%llu)",
+             (unsigned long long)g_win_lo, (unsigned long long)g_win_hi);
+    g_win_lo = 0;
+    g_win_hi = UINT64_MAX;
+    return;
+  }
+  g_win_on = 1;
+}
 
 static void AddFbDump(const char* spec) {
   if (g_nfbdump >= kMaxFbDumps) {
@@ -856,7 +932,9 @@ void DebugInit(void) {
     else if (!strncmp(tok, "exec=", 5))
       AddExec(tok + 5);
     else if (!strncmp(tok, "dump=", 5))
-      AddDump(tok + 5);
+      AddDump(tok + 5, 0);
+    else if (!strncmp(tok, "dumpl=", 6))
+      AddDump(tok + 6, 1);
     else if (!strncmp(tok, "fbdump=", 7))
       AddFbDump(tok + 7);
     else if (!strncmp(tok, "pcshot=", 7)) {
@@ -871,6 +949,8 @@ void DebugInit(void) {
       g_budget = atoi(tok + 7);
     else if (!strncmp(tok, "skip=", 5))
       g_skip = strtoull(tok + 5, NULL, 0);
+    else if (!strncmp(tok, "inst=", 5))
+      ParseWindow(tok + 5);
     else if (!strcmp(tok, "utf8"))
       g_ascii = 0;
     else
@@ -888,12 +968,33 @@ void DebugInit(void) {
   // byte of every instruction; a category that needs the event-emitting path
   // disables the fast memory path wholesale.
   g_mem_slow = ((g_mask & (kDbgMem | kDbgBus)) != 0) || g_nwatch != 0 || g_nwatchl != 0;
-  g_record_raw = (g_mask & (kDbgTraceLine | kDbgTraceTable | kDbgHist)) != 0;
-  g_dbg_any = (g_mask != 0) || g_nwatch != 0 || g_nwatchl != 0;
+  // Raw bytes feed the line/table formats and the rows that quote the
+  // instruction that caused an event (exec=, trap). Recording them only for the
+  // trace formats left exec=/trap-only runs with a blank RAW column.
+  g_record_raw =
+      (g_mask & (kDbgTraceLine | kDbgTraceTable | kDbgHist | kDbgExec | kDbgTrap)) != 0;
+  // Three step gates, resolved once:
+  //   insn  -> DebugInsn after the commit (trace/state/pcshot/exec/hist/regs)
+  //   frame -> DebugSetFrame for rows that have no instruction frame
+  //   any   -> the debug step stream itself (rec fields, frame, memory rows)
+  // A watch-only or screen-only session must not pay the per-step call chain of
+  // the other stream, and a regs=0 session must not arm the instruction stream.
+  g_dbg_insn = (g_mask & (kDbgTraceLine | kDbgTraceTable | kDbgState | kDbgPcShot |
+                          kDbgHist | kDbgExec)) != 0 ||
+               g_regs_period > 0;
+  // screen rows are frameless; only screenstop needs the live frame (it stops
+  // the CPU on a matching line), so a plain `screen` session stays on the fast
+  // stream.
+  g_dbg_frame = (g_mask & (kDbgMark | kDbgVirtio | kDbgPmp)) != 0 || g_screen_stop[0] != 0;
+  g_dbg_any = g_dbg_insn || g_dbg_frame || g_mem_slow || (g_mask & kDbgTrap) != 0;
+  g_regs_next = g_regs_period > 0 ? (uint64_t)g_regs_period : 0;
   // One line that says the range item armed: a range that parsed to nothing
   // used to be indistinguishable from one that never saw a crossing.
   if (g_nexec) LogInfo("debug: %d exec range(s) armed", g_nexec);
   if (g_npcshot) LogInfo("debug: %d pc checkpoint(s) armed", g_npcshot);
+  if (g_win_on)
+    LogInfo("debug: instruction window [%llu,%llu) armed",
+            (unsigned long long)g_win_lo, (unsigned long long)g_win_hi);
 }
 
 int DebugOn(uint32_t cat) { return g_inited && ((g_mask & cat) || (g_nwatch && cat == kDbgMem)); }
@@ -921,6 +1022,10 @@ static int AllowAfterWindow(uint32_t cat) {
 // Budget gate: 1 = emit, 0 = suppress (counted for the summary). The skip
 // window here is counted in this category's own events.
 static int Allow(uint32_t cat) {
+  // inst= window: an event outside it is not printed and, like bus:'s address
+  // filter, does not consume a budget slot either — otherwise the window would
+  // still be paid for in suppressed-count bookkeeping.
+  if (g_inst && !InWindow(*g_inst)) return 0;
   int i = CatIdx(cat);
   if (g_emitted[i] < g_skip) {  // skip window: count, don't print
     g_emitted[i]++;
@@ -937,6 +1042,7 @@ static int Allow(uint32_t cat) {
 // like a silent trace (D29). The retired-instruction counter is the unit the
 // caller means.
 static int AllowTrace(uint32_t cat, uint64_t inst) {
+  if (!InWindow(inst)) return 0;  // inst= window, same unit as the trace's own skip
   if (inst < g_skip) return 0;
   int i = CatIdx(cat);
   if (g_emitted[i] < g_skip) g_emitted[i] = g_skip;  // the budget starts at the window's edge
@@ -1107,7 +1213,7 @@ static void RowBegin(Table* t, char kind, frame* f) {
 
 // One canonical line per committed instruction: register banks in cell
 // order (never mnemonic order) so the format survives refactors and is the
-// diff baseline for golden runs (AGENTS.md §X).
+// diff baseline for golden runs (AGENTS.md §五).
 static void StateRow(frame* f) {
   char line[1024];
   size_t cap = sizeof(line);
@@ -1175,11 +1281,15 @@ void DebugInsn(frame* f) {
   if (g_mask & kDbgPcShot) {
     uint64_t next = FrameDnpc(f);
     for (int i = 0; i < g_npcshot; i++) {
-      if (g_pcshot[i].hits < g_pcshot[i].max && next >= g_pcshot[i].lo &&
-          next < g_pcshot[i].hi) {
+      if (next >= g_pcshot[i].lo && next < g_pcshot[i].hi) {
         char mark[96];
-        g_pcshot[i].hits++;
+        g_pcshot[i].hits++;  // every match, including ones a window drops
+        // :COUNT caps printed rows, not matches: a row suppressed by inst=,
+        // skip= or budget= does not spend the count. hit= still reports the
+        // match number, so a windowed run says how many matches preceded it.
+        if (g_pcshot[i].rows >= g_pcshot[i].max) continue;
         if (!Allow(kDbgPcShot)) continue;
+        g_pcshot[i].rows++;
         int n = snprintf(mark, sizeof(mark), "P @lin=%016llx hit=%llu inst=%llu\n",
                          (unsigned long long)next,
                          (unsigned long long)g_pcshot[i].hits,
@@ -1193,38 +1303,44 @@ void DebugInsn(frame* f) {
   // exec= : the crossing into a range, judged on the same boundary as the
   // checkpoints (the next linear PC). The whole item lives inside this
   // already-gated per-step hook, so a run without it pays nothing in the fetch
-  // path (AGENTS.md §九 rule 10). One row per crossing: a runaway that walks
+  // path (AGENTS.md §四 rule 10). One row per crossing: a runaway that walks
   // cleared memory stays inside the range and reports nothing more, and the row
   // carries the instruction that produced the crossing.
   if (g_nexec) {
     uint64_t next = FrameDnpc(f);
-    int inside = 0;
-    int report = 0;
+    int idx = -1;
     for (int i = 0; i < g_nexec; i++)
       if (next >= g_exec[i].lo && next < g_exec[i].hi) {
-        inside = 1;
-        // :COUNT caps the rows this range reports, not the crossings it sees.
-        if (g_exec[i].hits < g_exec[i].max) {
-          g_exec[i].hits++;
-          report = 1;
-        }
+        idx = i;
         break;
       }
-    if (inside && report && !g_fetch_inside && Allow(kDbgExec)) {
-      char det[72];
-      snprintf(det, sizeof(det), "enter %016llx inst=%llu", (unsigned long long)next,
-               (unsigned long long)f->cpu->inst_count);
-      RowBegin(g_tbl, 'X', f);
-      TableRowCell(g_tbl, det);
-      CellFlags(g_tbl, f);
-      TableRowEnd(g_tbl);
-      HistDump();
+    int inside = idx >= 0;
+    if (inside && !g_fetch_inside && g_exec[idx].hits < g_exec[idx].max) {
+      // :COUNT caps printed rows, not crossings: a row suppressed by inst=,
+      // skip= or budget= does not spend the count, so a later crossing can
+      // still print. hits is the number of rows this range has reported.
+      if (Allow(kDbgExec)) {
+        g_exec[idx].hits++;
+        char det[72];
+        snprintf(det, sizeof(det), "enter %016llx inst=%llu", (unsigned long long)next,
+                 (unsigned long long)f->cpu->inst_count);
+        RowBegin(g_tbl, 'X', f);
+        TableRowCell(g_tbl, det);
+        CellFlags(g_tbl, f);
+        TableRowEnd(g_tbl);
+        HistDump();
+      }
     }
     g_fetch_inside = inside;
   }
-  if (g_regs_period && (f->cpu->inst_count % (uint64_t)g_regs_period) == 0) {
-    // Periodic register table reuses DumpRegs through a Frame-less path.
-    f->isa->dump_regs(f->cpu);
+  if (g_regs_period > 0 && f->cpu->inst_count >= g_regs_next) {
+    // Periodic register table. A countdown, not `inst_count % period`: the
+    // modulo was a 64-bit divide on every instruction whenever regs= was armed
+    // (even with a period of millions). The table is a category like any other,
+    // so inst=, skip= and budget= apply; it used to bypass all three and print
+    // outside a requested window.
+    g_regs_next += (uint64_t)g_regs_period;
+    if (Allow(kDbgRegs)) f->isa->dump_regs(f->cpu);
   }
 }
 
@@ -1339,7 +1455,7 @@ void DebugGdbNote(const char* note) {
 
 // Frameless note rows: the board's interrupt lines and the host input path live
 // outside the guest's step stream, and that gap is what made the keyboard path
-// invisible (AGENTS.md §IX.1: fix the facility instead of guessing).
+// invisible (AGENTS.md §四第 1 条: fix the facility instead of guessing).
 // `a` prints decimal (vectors, line numbers, IRQ ids) and `b` hex (bitmasks,
 // addresses, controller state) — the two forms a mark's two numbers actually
 // need, since one cell cannot hold both.

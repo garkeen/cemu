@@ -17,6 +17,18 @@ static int DebugReadPhys(void* ctx, uint64_t addr, uint8_t* buf, int len) {
   return 1;
 }
 
+// Linear reader for the hub's dumpl= items (debug/debug.h): a VxD heap page or
+// a pageable segment has no stable physical address across runs, so the range
+// is named in the address space the guest uses. The walk belongs to the ISA
+// (cpu/step.h isa_ops.read_lin) — the hub cannot translate, and the board owns
+// no page tables either — so the board only routes the call, the same way the
+// physical reader routes to the bus.
+static int DebugReadLin(void* ctx, uint64_t lin, uint8_t* buf, int len) {
+  Board* m = (Board*)ctx;
+  if (len <= 0 || !m->isa || !m->isa->read_lin) return 0;
+  return m->isa->read_lin(&m->cpu, lin, buf, len);
+}
+
 // The display card's picture, for fbdump= (debug/debug.h). The hub owns no
 // device, so the board hands it the card's own vtable calls: the size it
 // reports now, and the XRGB buffer behind them (device/video/display.h).
@@ -43,6 +55,12 @@ enum { kPollStrideLog2 = 10 };
 
 int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuState* cpu),
                   void* cb_ctx) {
+  // Two step entry points built from one template: the normal run is compiled
+  // with STEP_DBG=0 (no debug blocks at all), and an observing run takes the
+  // STEP_DBG=1 function that fills the frame's rec fields and calls the hub.
+  // Resolved once: DebugInit fixes g_dbg_any before the first step.
+  void (*step)(CpuState*) = m->isa->step;
+  if (g_dbg_any && m->isa->step_debug) step = m->isa->step_debug;
   while (!m->cpu.halted) {
     if ((m->cpu.inst_count & ((1u << kPollStrideLog2) - 1)) == 0 || m->cpu.wait) {
       if (m->poll) m->poll(m);
@@ -85,13 +103,13 @@ int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuStat
       // arrive (QEMU advances the icount deadline across a halt for the same
       // reason).
       int warp_idle = m->skip_idle || HostTimerIcountOn();
-      int64_t wake_us = (warp_idle && m->next_event_us) ? m->next_event_us(m) : 0;
-      if (wake_us > 0)
-        HostTimerWarp(wake_us);
+      int64_t wake_ns = (warp_idle && m->next_event_ns) ? m->next_event_ns(m) : 0;
+      if (wake_ns > 0)
+        HostTimerWarpNs(wake_ns);
       else
         HostSleepMs(1);
     }
-    m->isa->step(&m->cpu);
+    step(&m->cpu);
     if (asleep && m->cpu.wait) {
       // Still asleep (no interrupt yet): no instruction retired. The per-step
       // observers still get their look — the gdb stub polls for connecting
@@ -126,6 +144,7 @@ void BoardRun(Board* m, uint64_t max_inst) {
   // the bus, so a region no device claims fails the dump instead of returning
   // open-bus noise.
   DebugSetMemReader(DebugReadPhys, &m->bus);
+  DebugSetLinReader(DebugReadLin, m);
   DebugSetFbReader(DebugFbInfo, DebugFbPixels, m);
   DebugSetClock(&m->cpu.inst_count);
   DebugInit();

@@ -296,6 +296,8 @@ enum {
 
 void riscv32_init(CpuState* cpu);
 void riscv32_step(CpuState* cpu);
+// The observation stream (rec/frame/hub blocks); selected when g_dbg_any is set.
+void riscv32_step_debug(CpuState* cpu);
 void riscv32_dump_regs(const CpuState* cpu);
 // The memory pipeline lives with the instruction set (exec.c): translation ->
 // PMP -> bus, raising the matching trap on failure. The step protocol (step.c)

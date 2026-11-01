@@ -407,9 +407,17 @@ static void VgaUpdateStatus(VgaDevice* d, uint64_t now_us) {
     }
   } else {
     // The CRTC's reset registers always describe a frame; this is reachable only
-    // if a guest programs registers that name none. Leave the latched flags
-    // alone rather than inventing a phase for a raster that does not exist.
-    val = d->st01;
+    // if a guest programs registers that name none (vstart outside the vertical
+    // total, or a horizontal start past the total). QEMU does not leave the
+    // status frozen in that case: its precise model is unavailable
+    // (total_chars == 0), so vga_precise_retrace() falls back to
+    // vga_dumb_retrace(), which flips both raster bits on every read —
+    // hw/display/vga.c:
+    //     static uint8_t vga_dumb_retrace(VGACommonState *s)
+    //     { return s->st01 ^ (ST01_V_RETRACE | ST01_DISP_ENABLE); }
+    // Freezing them instead made a guest that polls for a retrace edge spin
+    // until its timeout: win95's mode set does exactly that at 0x0a22.
+    val = (uint8_t)(d->st01 ^ (kStatusVsync | kStatusDisplayEnable));
   }
   d->st01 = val;
 }
@@ -1402,7 +1410,7 @@ static void VgaComputePicture(const VgaDevice* d, VgaPicture* p) {
     // TR 3.1a gives the maximum scan line meaning only for character rows -- so
     // a graphics picture must not repeat rows on it. (QEMU's vga_draw_graphic
     // does repeat on it, `multi_scan = ((R9 & 0x1f) + 1 << double) - 1`, with
-    // an "XXX: is it correct?" of its own; AGENTS.md §五 settles a reference
+    // an "XXX: is it correct?" of its own; AGENTS.md §一·5 settles a reference
     // disagreement with the manual, and the manual is on this side.)
     p->multi_scan = (d->cr[kCrtcMaxScanLine] & 0x80) ? 1 : 0;
     // Dots per source pixel. SR1 bit 3 halves the dot clock, so the sequencer
@@ -1680,7 +1688,7 @@ static void VgaRenderGraphics(VgaDevice* d, const VgaPicture* p) {
 // --- observation and refresh ------------------------------------------------------
 // The guest prints by writing the text plane, so a guest whose console never
 // touches the serial port can only be read back through the screen mirror
-// (CEMU_DEBUG=screen, AGENTS.md §X). A cell of that plane holds an IBM glyph
+// (CEMU_DEBUG=screen, AGENTS.md §五). A cell of that plane holds an IBM glyph
 // code, not ASCII: 0x7f-0xff are CP437's accented letters, box drawing and
 // blocks (IBM PC code page 437). They reach the log as UTF-8 only under `utf8`,
 // because the default ASCII output is what keeps a Windows console in its own
@@ -1858,7 +1866,7 @@ static void ScreenMirror(VgaDevice* d, const VgaPicture* p) {
 // not.
 enum { kRenderIntervalUs = 4000, kFallbackFieldNs = 1000000000 / 60 };
 
-// --- the mode report (CEMU_DEBUG=mark, AGENTS.md §十) -------------------------
+// --- the mode report (CEMU_DEBUG=mark, AGENTS.md §五) -------------------------
 // A guest that goes wrong on a display shows it in the register file, not in an
 // instruction: which mode it asked for, and what the card ended up describing.
 // This emits three frameless rows per *change* of picture, so a boot's whole

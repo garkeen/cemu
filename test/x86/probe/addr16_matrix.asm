@@ -13,7 +13,7 @@
 ; r/m 2,3 and 6(mod=1/2); the read segment is the table's DS or SS.
 ;
 ; Output is the isa-debugcon port (0x402), the two-model byte stream from
-; AGENTS.md section 10, so the 512-byte sector fits without a UART driver.
+; AGENTS.md §五, so the 512-byte sector fits without a UART driver.
 ;
 ; Run (self-contained; no firmware):
 ;   cemu --machine x86 --isa x86 addr16_matrix.bin

@@ -19,13 +19,20 @@
 //                      the emulator's (QEMU QEMU_CLOCK_REALTIME: "should be
 //                      used only for stuff which does not change the virtual
 //                      machine state").
-//   g_warp_us          the offset on the emulated clock: --skip-idle jumps a
+//   g_warp_ns          the offset on the emulated clock: --skip-idle jumps a
 //                      halted CPU to the next device deadline instead of
 //                      letting the wait elapse in wall time (QEMU's virtual
 //                      clock warp). HostTimerNow() reports its time base plus
 //                      this, so a warp moves every device's deadline at once
-//                      without touching the devices themselves.
-static int64_t g_warp_us;
+//                      without touching the devices themselves. The unit is
+//                      nanoseconds because each halt jumps to a deadline and
+//                      the remainder below the unit is dropped: in
+//                      microseconds that remainder is up to 1 us per halt,
+//                      which accumulates into a visible phase error (win95
+//                      measured 862 us after ~1e3 halts), while QEMU keeps its
+//                      deadlines in ns (hw/timer/i8254_common.c:
+//                      qemu_clock_get_ns / muldiv64(..., NANOSECONDS_PER_SECOND)).
+static int64_t g_warp_ns;
 
 // -icount shift=N: log2 of the nanoseconds one retired instruction accounts for,
 // or negative for the wall-clock time base. QEMU spells it the same way.
@@ -47,8 +54,8 @@ static int64_t HostWallUs(void) {
 }
 
 int64_t HostTimerNow(void) {
-  if (g_icount_shift >= 0) return g_icount_ns / 1000 + g_warp_us;
-  return HostWallUs() + g_warp_us;
+  if (g_icount_shift >= 0) return (g_icount_ns + g_warp_ns) / 1000;
+  return (HostWallUs() * 1000 + g_warp_ns) / 1000;
 }
 
 int64_t HostTimeRealtime(void) { return HostWallUs(); }
@@ -64,8 +71,8 @@ void HostTimerIcountAdvance(void) {
   if (g_icount_shift >= 0) g_icount_ns += (int64_t)1 << g_icount_shift;
 }
 
-void HostTimerWarp(int64_t us) {
-  if (us > 0) g_warp_us += us;
+void HostTimerWarpNs(int64_t ns) {
+  if (ns > 0) g_warp_ns += ns;
 }
 
 // The run loop's last resort while the guest sleeps: it has reached no device

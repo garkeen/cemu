@@ -6,7 +6,7 @@
 
 // The system clipboard, UTF-8 text only — the same contract SDL's
 // SDL_GetClipboardText / SDL_SetClipboardText give the reference emulator's
-// clipboard channel. windows.h lives only in this directory (AGENTS.md §七).
+// clipboard channel. windows.h lives only in this directory (AGENTS.md §二).
 //
 // OpenClipboard can fail while another window is still draining its paste
 // menu; the customary remedy is a short retry, which is what SDL's win32

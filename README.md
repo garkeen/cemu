@@ -24,7 +24,7 @@ riscv 侧尚未接 trigger 模块，两处记在 D6）。
 8237 DMA、IDE/ATAPI（LBA-48、multi-sector）、LAPIC/IOAPIC（含 NMI 交付）、
 PIIX4 PM（SCI、S5）、SMBus 主机 + SPD EEPROM、XBCS、IGNNE#；riscv 侧 virt 板带
 virtio-mmio（blk/console/keyboard/tablet），oberon 板按参考模拟器逐契约复刻。
-余下规格缺口按 AGENTS.md §X 的 D17/D19 在册。
+余下规格缺口按 AGENTS.md §六 的 D17/D19 在册。
 
 验收阶梯（全部是真实软件，无 cemu 定制成分）：
 
@@ -40,8 +40,10 @@ virtio-mmio（blk/console/keyboard/tablet），oberon 板按参考模拟器逐�
   （QEMU 执行同一镜像停在同一处 `j .`）。
 - **SPDOS/DOS7 软盘 ✅**：经 SeaBIOS 进 DOS；WPS 卡死经 QEMU 对拍判为 CHLIB
   依赖真机 BIOS 约定（0x80 的几何、段寄存器跨调用保持），不是 cemu 缺陷。
-- **Windows 95 进行中**：卡在两个 logo（`cs=0x9000` 的页帧被客人自己清零后仍被
-  `jmp` 进去），见 progress.log 最新一节。
+- **Windows 95 进行中**：客人自己在控制台报 `Windows protection error`，打印到
+  第 20 个字符停住（"两个 logo"那条旧结论已被推翻）；两模型在 `0xC0360B8B` 的
+  CPU 与 20KB VMM 数据逐字节相同，分歧只在其后 13.9 万条指令内，根因未定。
+  见 progress.log 最新一节。
 - **xv6-riscv 未开始**：镜像与 OpenSBI fw_jump 素材未取；riscv 侧的真实 OS 验收
   目前由 HelenOS 承担。
 
@@ -51,7 +53,7 @@ APIC 的 CPUID/leaf 0x0B 拓扑已广告，CR0.NE=0 的 FERR# 接到 8259 IRQ13�
 VME/PVI 重定向与 PMU 细节记在 D39，port 0xF0/IGNNE# 记在 D19。riscv 侧
 RV64IMAFDC + Sv39/Sv48 + PMP，RV32 是独立后端（RV32IMAFDC + Sv32）。
 
-回归：**riscv64 136 格、riscv32 104 格、x86 50 格，全绿**（x86 = 42 个自足探针 +
+回归：**riscv64 136 格、riscv32 104 格、x86 59 格，全绿**（x86 = 51 个自足探针 +
 7 个 kvm-unit-tests 镜像 + realmode 1 格，127 PASS/0 FAIL；realmode 偶见对 PIT
 IRQ0 到达时机的敏感，见 progress.log）。依赖边 `dep: ok`。逐轮记录见
 [progress.log](progress.log)。
@@ -108,7 +110,7 @@ build/cemu.exe --machine oberon -dsk disk.img -display win32
 `-dsk`、`--switches N`（oberon）、`-vgabios`、`-mouse ps2|serial`、
 `-gdb tcp::PORT` / `-s` / `-S`（gdb RSP stub，配套图形前端 `cemugui`）。
 
-窗口指针按**设备原生语义**投递（契约见 AGENTS.md §十一）：virt 的 virtio-tablet
+窗口指针按**设备原生语义**投递（契约见 AGENTS.md §七）：virt 的 virtio-tablet
 与 Oberon 鼠标寄存器是原生绝对设备，客户区坐标直接映射到源画面像素；x86 的
 PS/2 与 `-mouse serial` 只有相对协议，投的是宿主指针的位移（漂移边界见 D38）。
 
@@ -127,7 +129,7 @@ cmake --build build --target check-x86      # x86 套件
 
 ## 调试
 
-观测统一走常驻设施 `CEMU_DEBUG`（唯一调试入口，语法见 AGENTS.md 第十节）：
+观测统一走常驻设施 `CEMU_DEBUG`（唯一调试入口，语法见 AGENTS.md §五）：
 
 ```sh
 CEMU_DEBUG="trace:table,state,mem,budget=200" \

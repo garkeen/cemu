@@ -33,7 +33,7 @@ host input is involved and the order is fixed):
 Why this cell exists: the model used to ignore FCR.FE on receive and buffer 16
 bytes either way, so it answered `over=61 keep=41 clear=61 ... off=61` -- no
 overrun, the older byte handed out first, and the FIFO-mode switch leaving the
-queue in place. The old registration (AGENTS.md §X D32) is what this closes:
+queue in place. The old registration (AGENTS.md §六 D32) is what this closes:
 both depths now come from 16550D's FCR bit 0 and QEMU's serial_receive1 (`if
 (lsr & DR) lsr |= OE; rbr = buf[0];` for the FIFO-off case), and a change of FE
 empties the queue the way QEMU folds it into RFR | XFR.

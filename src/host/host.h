@@ -9,6 +9,13 @@ typedef struct HostFile HostFile;
 HostFile* HostFileOpenRead(const char* path);
 // Read-write image file: a disk image has sectors the guest writes back.
 HostFile* HostFileOpenReadWrite(const char* path);
+// -snapshot: a read-write image becomes a copy-on-write view. The base file is
+// opened read-only and each 4KiB block is copied to a throwaway overlay the
+// first time it is written (the overlay is deleted when the handle closes), so
+// the image on disk never changes. Two runs then start from the same bytes
+// whatever the guest wrote into the previous one — the reproducibility a
+// run-to-run comparison needs (QEMU's -snapshot has the same job).
+void HostFileSetSnapshot(int on);
 // Truncating create for files this process produces rather than consumes
 // (debug dumps): the old contents are never wanted and a partial rewrite
 // would leave a stale tail.
@@ -57,12 +64,17 @@ void HostTimerIcountAdvance(void);
 // Under -icount the wait is also charged to the emulated clock, since a halt
 // that advances nothing would leave the guest with a clock that never moves.
 void HostSleepMs(int ms);
-// Advances the clock HostTimerNow() reports by us microseconds, i.e. makes
+// Advances the clock HostTimerNow() reports by ns nanoseconds, i.e. makes
 // emulated time jump forward without host time passing. The run loop uses it
 // while the CPU is halted to reach the next device deadline at once instead of
 // waiting for it in wall time (--skip-idle; the same idea as QEMU's virtual
 // clock warp). Monotonic: a non-positive argument is ignored.
-void HostTimerWarp(int64_t us);
+// Nanoseconds, not microseconds: every halt truncates the remaining time down
+// to the deadline, so a coarser unit leaks the remainder at each halt and the
+// emulated clock falls behind by however many halts the guest performs (QEMU
+// keeps its deadlines in ns: hw/timer/i8254_common.c,
+// pit_get_next_transition_time() returns muldiv64(..., NANOSECONDS_PER_SECOND)).
+void HostTimerWarpNs(int64_t ns);
 
 // ---- TCP sockets (gdb stub transport; winsock lives only in host/) ----------
 typedef struct HostSock HostSock;

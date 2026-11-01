@@ -5,7 +5,7 @@
 ; device hands back on COM1. Run the same image on cemu and on
 ; qemu-system-i386 with the same CD-ROM: the transcripts must match byte for
 ; byte. That dual run is the reference this device model is judged against
-; (AGENTS.md §五 参考优先; §六 手写探针只作冒烟探针).
+; (AGENTS.md §一·5 参考优先; §一·6 手写探针只作冒烟探针).
 ;
 ; Build: nasm -f bin -o cd_atapi.bin cd_atapi.asm
 ; Run:   cemu --machine x86 --isa x86 -cdrom linux.iso cd_atapi.bin

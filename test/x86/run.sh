@@ -54,7 +54,7 @@ fi
 #   mode=ref   the two lines are equal and cemu's live output must equal them:
 #              the reference model pins the answer.
 #   mode=lock  the two lines differ at fields this card takes from the spec
-#              instead of from the reference (AGENTS.md §X's D17); cemu's live
+#              instead of from the reference (AGENTS.md §六's D17); cemu's live
 #              output must equal *its* line, so any change in the card's answers
 #              is caught, and the divergence stays on the record instead of in a
 #              silent exception list.
@@ -77,7 +77,13 @@ probe_cell() {
   want_c=$(awk '/^cemu /{sub(/^cemu /,""); print; exit}' "$cal" | sed 's/[[:space:]]*$//')
   want_q=$(awk '/^qemu /{sub(/^qemu /,""); print; exit}' "$cal" | sed 's/[[:space:]]*$//')
   tok=${want_c%% *}
-  got=$(printf '%s\n' "$out" | grep -m1 -- "$tok" | sed "s/.*$tok/$tok/" | sed 's/[[:space:]]*$//')
+  # cemu's own [info] lines start at column 0 too, and one of them names the
+  # image (`[info] loaded .../uart_rx.elf`), so matching the transcript token by
+  # substring would return the loader line. util/log.c now terminates every log
+  # line, so drop the hub's rows first and match the guest's row after that
+  # (the transcript line begins with its first token).
+  got=$(printf '%s\n' "$out" | grep -v '^\[[a-z]*\] ' | grep -m1 -- "$tok" |
+        sed "s/.*$tok/$tok/" | sed 's/[[:space:]]*$//')
   local want="$want_c"
   [ "$mode" = ref ] && want="$want_q"
   if [ "$rc" -eq "$status" ] && [ -n "$got" ] && [ "$got" = "$want" ]; then
@@ -117,7 +123,13 @@ elf_cell() {
   want_c=$(awk '/^cemu /{sub(/^cemu /,""); print; exit}' "$cal" | sed 's/[[:space:]]*$//')
   want_q=$(awk '/^qemu /{sub(/^qemu /,""); print; exit}' "$cal" | sed 's/[[:space:]]*$//')
   tok=${want_c%% *}
-  got=$(printf '%s\n' "$out" | grep -m1 -- "$tok" | sed "s/.*$tok/$tok/" | sed 's/[[:space:]]*$//')
+  # cemu's own [info] lines start at column 0 too, and one of them names the
+  # image (`[info] loaded .../uart_rx.elf`), so matching the transcript token by
+  # substring would return the loader line. util/log.c now terminates every log
+  # line, so drop the hub's rows first and match the guest's row after that
+  # (the transcript line begins with its first token).
+  got=$(printf '%s\n' "$out" | grep -v '^\[[a-z]*\] ' | grep -m1 -- "$tok" |
+        sed "s/.*$tok/$tok/" | sed 's/[[:space:]]*$//')
   local want="$want_c"
   [ "$mode" = ref ] && want="$want_q"
   if [ "$rc" -eq "$status" ] && [ -n "$got" ] && [ "$got" = "$want" ]; then
@@ -137,10 +149,11 @@ elf_cell() {
 # of marker lines and the whole block is the judgement. The calibration file
 # carries it between "--- want ---" and "--- end ---", and the prose around it
 # records how the reference model was run and which fields are arrival-time
-# artifacts rather than semantics. The markers are lifted with sed instead of
-# matched by prefix because cemu's [info] loader lines carry no trailing
-# newline and glue themselves onto the first guest line. Trailing blanks are
-# trimmed on both sides (the probe's field helper leaves one after each field).
+# artifacts rather than semantics. The markers are lifted with sed because the
+# probe's field helper leaves a blank after each field and the block must keep
+# its line order; the hub's own [info] rows are dropped first (they used to
+# glue onto the first guest line, so a prefix match would not have been enough).
+# Trailing blanks are trimmed on both sides.
 transcript_cell() {
   local stem=$1 status=$2
   local elf="$dir/probe/$stem.elf" cal="$dir/probe/${stem}_qemu.txt"
@@ -160,7 +173,7 @@ transcript_cell() {
   rc=$?
   want=$(awk '/^--- want ---$/{f=1;next} /^--- end ---$/{f=0} f' "$cal" |
          tr -d '\r' | sed 's/[[:space:]]*$//')
-  got=$(printf '%s\n' "$out" | tr -d '\r' |
+  got=$(printf '%s\n' "$out" | tr -d '\r' | grep -v '^\[[a-z]*\] ' |
         sed -n 's/.*\(F2[012] \|GP  \|REP \|IRQ \|mark \|irqtab:\|v86-[a-z]* done\)/\1/p' |
         sed 's/[[:space:]]*$//')
   if [ "$rc" -eq "$status" ] && [ "$got" = "$want" ]; then
@@ -277,7 +290,7 @@ else
   echo "SKIP (pit-irq: no nasm and no prebuilt probe bin)"
 fi
 
-# Machine reset (test/x86/probe/reset.asm, AGENTS.md D18): a boot sector that
+# Machine reset (test/x86/probe/reset.asm, D18 closed): a boot sector that
 # pulls the three ways a PC guest reboots the machine — port 0xCF9's reset
 # control register (SeaBIOS pci_reboot), port 0x92 bit 0 (INIT_NOW) and the
 # keyboard controller's 0xFE command (SeaBIOS i8042_reboot) — one per life,
@@ -332,7 +345,7 @@ else
   echo "SKIP (bt-bits: no nasm and no prebuilt probe bin)"
 fi
 
-# CMOS RTC interrupts (test/x86/probe/rtc_irq.asm, AGENTS.md D18): status A
+# CMOS RTC interrupts (test/x86/probe/rtc_irq.asm, D18 closed): status A
 # RS=6 (1024 Hz) plus status B's PIE|AIE and an all-don't-care alarm, then the
 # guest HALTS and counts which of status C's flags its IRQ8 handler sees. It
 # reports pf/af/uf, never a tick count (that depends on host timing). The
@@ -680,7 +693,7 @@ elf_cell smbus 11 ref
 # stores what is written, plus 00:01.3's same offset being a different register.
 # The datasheet's write-one-to-set BIOSWE and the BLE lock are not modelled
 # because the reference keeps the byte as plain storage (QEMU hw/isa/piix.c) and
-# nothing on this machine consumes it; §X D19 carries that gap.
+# nothing on this machine consumes it; §六 D19 carries that gap.
 # ref cell: the transcript is byte-identical.
 elf_cell xbcs 11 ref
 
@@ -691,7 +704,7 @@ elf_cell xbcs 11 ref
 # probe drives all of it through the chip's own loopback, so no host input is
 # involved. ref cell: the transcript is byte-identical. Before this was modelled
 # the same probe answered `over=61 keep=41 ... off=61`; the remaining difference
-# from QEMU (its chardev holds a burst the device cannot take) is §X D32.
+# from QEMU (its chardev holds a burst the device cannot take) is §六 D32.
 elf_cell uart_rx 11 ref
 
 # IGNNE#, port 0xF0 (test/x86/probe/ignne.asm): with CR0.NE=0 an unmasked x87

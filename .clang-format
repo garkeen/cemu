@@ -8,7 +8,7 @@ BasedOnStyle: Google
 ColumnLimit: 100
 
 # 关闭 include 排序：exec.h 定义单/双字母宏 x/f/eax，必须位于每个 .c 的
-# include 列表末尾（AGENTS.md 第八节坑点），否则会替换后续头文件里的形参名
+# include 列表末尾（AGENTS.md §三坑点），否则会替换后续头文件里的形参名
 # frame *f。Google 风格默认 SortIncludes 会把它排到主头位从而违反该约束，
 # 故关闭；include 顺序由手工人肉维护。
 SortIncludes: false

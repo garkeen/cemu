@@ -1171,6 +1171,61 @@ static void lin_store(uint64_t lin, int size, int user, uint64_t v) {
   }
 }
 
+// ---- linear reader for the debug hub (dumpl=) --------------------------------
+//
+// The hub can read PHYSICAL memory (board/run.c's BusRead path) but cannot
+// translate, and the structures a Win95 diagnosis needs to compare live at
+// linear addresses: a VxD heap arena, a pageable segment, an IOS data slot.
+// Their backing pages differ between runs, so a physical dump cannot be lined
+// up against another model's virtual dump -- the guest names the address, and
+// only the model that owns the walk can answer it.
+//
+// This runs at session end, when no instruction is in flight. A page that does
+// not resolve must therefore NOT reach the step's landing pad (there is no
+// step): the walk is wrapped in a scratch frame, the same setjmp channel every
+// fault already uses (cpu/step.h raise_), and a fault there means "cannot
+// read", reported as such. The dump is also not an observation stream, so the
+// slow memory path is switched off for its duration -- otherwise phys_load
+// would emit bus/mem rows for every byte, under a frame with no instruction to
+// name.
+int x86_read_lin(CpuState* c, uint64_t lin, uint8_t* buf, int len) {
+  CpuState* saved_cpu = cpu;
+  x86_state* saved_s = s;
+  eflags* saved_fl = fl;
+  frame* saved_fr = fr;
+  int saved_slow = g_mem_slow;
+  frame scratch;
+  memset(&scratch, 0, sizeof(scratch));
+  scratch.cpu = c;
+  scratch.priv = c->priv;
+  scratch.isa = &k_isa_x86;
+  cpu = c;
+  s = (x86_state*)c->priv;
+  fl = &s->fl;
+  fr = &scratch;
+  g_mem_slow = 0;
+  volatile int ok = 1;
+  if (setjmp(scratch.raise)) {
+    ok = 0;  // pf_fault/gp_fault landed here: a page on the way is not there
+  } else {
+    for (int at = 0; at < len;) {
+      uint64_t cur = lin + (uint64_t)at;
+      int n = (int)(0x1000 - (cur & 0xfff));
+      if (n > len - at) n = len - at;
+      uint64_t pa = page_translate_as(cur, 0, 0, 0);
+      for (int i = 0; i < n; i++)
+        buf[at + i] = (uint8_t)phys_load(pa + (uint64_t)i, 1, 0);
+      at += n;
+    }
+  }
+  g_mem_slow = saved_slow;
+  fr = saved_fr;
+  fl = saved_fl;
+  s = saved_s;
+  cpu = saved_cpu;
+  return ok;
+}
+
 // ---- time stamp counter (SDM vol.3 17.17) ------------------------------------
 
 // The TSC is emulated time in nanoseconds plus the retired-instruction count:
@@ -1833,7 +1888,7 @@ static void pm_iret(void) {
     // back to firmware/HMA code (the VMM's real-mode stubs live at CS=0xFFFF).
     // The row's pc= is the IRET that made the transition, a=target IP (decimal),
     // b=target CS (hex) -- the observation "who entered the real-mode stub"
-    // that the error path needed (AGENTS.md 十 mark). Filtered to the high
+    // that the error path needed (AGENTS.md §五 mark). Filtered to the high
     // segments: ordinary client returns would otherwise flood the ring.
     if (sel >= 0xf000) DebugMark("v86in", (int)(new_eip & 0xffffu), (int)sel);
     return;

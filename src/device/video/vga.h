@@ -39,7 +39,7 @@
 // resolve into the planes through the graphics controller's memory mode; in
 // text modes the odd/even scheme keeps each cell's character in plane 0 and
 // its attribute in plane 1 — which is also what CEMU_DEBUG's `screen` mirror
-// reads back (AGENTS.md §X).
+// reads back (AGENTS.md §五).
 enum {
   // Planes are stored dword-interleaved: vram[offset * 4 + plane] is plane
   // `plane` at offset, and chain-4 addressing (which selects the plane with

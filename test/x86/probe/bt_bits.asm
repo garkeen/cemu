@@ -27,7 +27,7 @@
 ; bitmap test read the same dword for all 224 vectors (stage 4 片 12, whose
 ; fix this guards). An emulator that advances in the *immediate* form is the
 ; mirror-image error (tiny386's BTEvIb does this; the manual arbitrates, per
-; AGENTS.md §五).
+; AGENTS.md §一·5).
 ;
 ; Buffers: B32 = two dwords [0] = 0, [1] = 0xffffffff; B16 = two words
 ; [0] = 0, [1] = 0x0010. Every case picks a bit whose value differs between

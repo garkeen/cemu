@@ -21,7 +21,14 @@ static void VLog(const char* tag, const char* fmt, va_list ap) {
   char buf[1024];
   int n = snprintf(buf, sizeof(buf), "[%s] ", tag);
   n += vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
-  if (n > 0 && (size_t)n < sizeof(buf)) Emit(buf, (size_t)n);
+  // One line per message. Without the newline every info line ran into the
+  // next one ("[info] ...time[info] bios ..."), and a CEMU_DEBUG row that
+  // starts right after a log line is glued to it — that concatenation is how
+  // an observation was misread once. No call site carries its own newline.
+  if (n > 0 && (size_t)n < sizeof(buf) - 1) {
+    buf[n++] = '\n';
+    Emit(buf, (size_t)n);
+  }
 }
 
 void LogInfo(const char* fmt, ...) {

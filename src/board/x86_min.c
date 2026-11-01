@@ -613,10 +613,10 @@ static void X86Poll(Board* m) {
 // The next moment a device wakes the processor on its own: the PC's two
 // time-driven sources are the PIT (IRQ0) and the APIC timer. The run loop's
 // --skip-idle jumps a halted CPU to whichever comes first.
-static int64_t X86NextEventUs(Board* m) {
+static int64_t X86NextEventNs(Board* m) {
   X86Board* xm = (X86Board*)m;
-  int64_t pit = PitNextEventUs(&xm->pit);
-  int64_t apic = LapicNextEventUs(&xm->lapic);
+  int64_t pit = PitNextEventNs(&xm->pit);
+  int64_t apic = LapicNextEventNs(&xm->lapic);
   if (pit <= 0) return apic;
   if (apic <= 0) return pit;
   return pit < apic ? pit : apic;
@@ -949,7 +949,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   m->bin_base = kBootSectorLoad;
   m->default_isa = "x86";  // a BIOS reset has no image to name its ISA
   m->poll = X86Poll;
-  m->next_event_us = X86NextEventUs;
+  m->next_event_ns = X86NextEventNs;
   m->skip_idle = opts->skip_idle;
   m->reset = X86Reset;  // port 0x92 bit 0 / RCR 0xCF9 / i8042 0xFE (D18)
   m->destroy = X86Destroy;

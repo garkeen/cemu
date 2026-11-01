@@ -19,7 +19,7 @@ What each field pins:
             makes bit 0 (BIOSWE) write-one-to-set and bit 1 (BLE) a lock that
             freezes it until reset, which would answer 0x03/0x02/0x02 here; the
             reference model keeps the byte as plain storage, so this model does
-            too and the lock semantics stay registered (AGENTS.md §X D19).
+            too and the lock semantics stay registered (AGENTS.md §六 D19).
   wf        all eight bits store (a write of 0xFF reads back 0xFF).
   pm        the same offset on 00:01.3 reads 0: that function's 0x40 is PMBASE
             and it has no XBCS, so the register belongs to function 0 alone.

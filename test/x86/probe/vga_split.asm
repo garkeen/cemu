@@ -495,7 +495,7 @@ gfx_get:                         ; al = index -> al = value
   ret
 
 ; ---- give the host time to render the picture -------------------------------
-; The card re-renders on a timer (VgaPoll's interval, AGENTS.md §十's fbdump
+; The card re-renders on a timer (VgaPoll's interval, AGENTS.md §五's fbdump
 ; needs the frame that is on screen when the session ends), so this is a plain
 ; delay: a few million instructions is far longer than one render interval.
 settle:

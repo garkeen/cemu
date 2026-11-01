@@ -27,10 +27,11 @@ void PitSetIrqSink(PitDevice* pit, void (*set_irq)(void*, int, int), void* ctx);
 // Advances the counter state by the elapsed host time and emits any pending
 // IRQ edges. Called from the machine poll loop.
 void PitPoll(PitDevice* pit);
-// Microseconds until channel 0's next IRQ edge, or 0 when channel 0 will not
+// Nanoseconds until channel 0's next IRQ edge, or 0 when channel 0 will not
 // fire on its own (no IRQ wired, a mode that delivers no edges, or the edge is
 // already due). The run loop asks this to jump a halted guest's idle time to
-// the next deadline instead of letting it elapse in host time.
-int64_t PitNextEventUs(PitDevice* pit);
+// the next deadline instead of letting it elapse in host time; the unit is ns
+// so that jump drops no remainder (see the definition).
+int64_t PitNextEventNs(PitDevice* pit);
 
 #endif

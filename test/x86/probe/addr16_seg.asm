@@ -12,7 +12,7 @@
 ;   10-12 the Windows 1.01 encoding [bp+si-0x9c]: a negative disp16 is a
 ;         plain 16-bit displacement, and BP+SI wraps before the SS base
 ;
-; Output is the isa-debugcon port 0x402 (AGENTS.md section 10).
+; Output is the isa-debugcon port 0x402 (AGENTS.md §五).
 ; Run (self-contained; no firmware):
 ;   cemu --machine x86 --isa x86 addr16_seg.bin
 ;   qemu-system-i386 -machine pc -m 32 -drive file=addr16_seg.bin,format=raw,if=floppy \

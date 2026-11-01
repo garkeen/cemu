@@ -4,7 +4,7 @@
 覆盖面、POSIX 依赖、许可证、参考建议）。本文是**工作索引**：修 bug、
 写设备、加指令时按此表直达文件，并守住两条纪律——
 
-1. **参考优先，防止造轮子**（AGENTS.md 第五节）：动手前先查下表对应
+1. **参考优先，防止造轮子**（AGENTS.md §一·5）：动手前先查下表对应
    实现；cemu 现有设备（uart16550/clint/plic/i8259/i8254/htif）当初都
    是照参考逐条校准的，先看 cemu 已有什么。
 2. **参考优先，防止无意义调试**：模拟器 bug 的真相往往在参考实现里
@@ -22,8 +22,8 @@
 | byang1217-TQemu | byang1217-TQemu/ | 可移植哲学（OS 无关、单 mainloop、libc/libm only）；本 checkout 无 target 后端不可跑 | GPL-2 |
 | gem5 | gem5/ | 行为裁决第三票；ARM 阶段的行为规范 src/arch/arm/；riscv 侧 src/arch/riscv/ | BSD-3 |
 | v86 | v86/ | x86 设备/启动行为；tests/kvm-unit-tests（realmode 验收套件已入库 test/x86/realmode）、tests/nasm、tests/qemu 双跑方法论、tests/full（真实 OS 清单，阶段 4 用） | MIT |
-| v86images | v86images/ | 真实 OS 镜像素材，按类分三目录：`dos/`（msdos4、msdos622、freedos722、pc86dos、PCMOS386-9-user-patched、xcom144、doof-1440、ibm-exploring、nanoshell.iso）、`win/`（windows101、windows2、windows30、windows31、windows95、windows98、windowsnt31、windowsnt351、windowsnt4）、`wps/`（spdos51.rar、wps3/4/5.zip）。阶段 4 x86 手工验收与回归的取材地；引导不进套件（AGENTS.md §七） | 各件原许可 |
-| jslinux | jslinux/ | riscv64 真实 OS 全镜像（Bellard JSLinux 的 buildroot-riscv64-xwin，从 vfsync 逐字节重建，目录/常规文件/符号链接/设备节点全保真）：`rootfs.ext2`（256 MiB 标准 ext2，系统本体）、`kernel-riscv64.bin`（Linux 4.15，含 virtio-blk/console/input 与 simplefb）、`fw_jump.bin`（OpenSBI v1.9，编译自 ../opensbi，FW_JUMP_ADDR=0x80200000）、`final.dtb`（QEMU virt 原树 + simple-framebuffer 1024x768x32 @ 0x8c000000、内存收窄到 192M）、`virt11.dtb`（QEMU 10.2 `-machine virt,dumpdtb` 原树）、`filelist.txt` + `files/`（vfsync 清单与内容库）、`tools/make_ext2.py`（纯 Python ext2 构建器 + 校验器，另 parse_filelist.py / make_fb_dtb.py）。用途：阶段 4 riscv 侧带图形的真实 OS 验收（cemu `--machine virt -display win32`，ramfb 直渲 0x8c000000、virtio 键鼠转窗口输入；`startx` 起 fluxbox），同一镜像在 QEMU 下作文本控制台对拍，树根另存对拍日志（`q_*.txt`、`qemu_tr.log`）。引导不进套件（AGENTS.md §七） | 各件原许可（Linux GPL-2、OpenSBI BSD-2、buildroot 各包原许可） |
+| v86images | v86images/ | 真实 OS 镜像素材，按类分三目录：`dos/`（msdos4、msdos622、freedos722、pc86dos、PCMOS386-9-user-patched、xcom144、doof-1440、ibm-exploring、nanoshell.iso）、`win/`（windows101、windows2、windows30、windows31、windows95、windows98、windowsnt31、windowsnt351、windowsnt4）、`wps/`（spdos51.rar、wps3/4/5.zip）。阶段 4 x86 手工验收与回归的取材地；引导不进套件（AGENTS.md §二） | 各件原许可 |
+| jslinux | jslinux/ | riscv64 真实 OS 全镜像（Bellard JSLinux 的 buildroot-riscv64-xwin，从 vfsync 逐字节重建，目录/常规文件/符号链接/设备节点全保真）：`rootfs.ext2`（256 MiB 标准 ext2，系统本体）、`kernel-riscv64.bin`（Linux 4.15，含 virtio-blk/console/input 与 simplefb）、`fw_jump.bin`（OpenSBI v1.9，编译自 ../opensbi，FW_JUMP_ADDR=0x80200000）、`final.dtb`（QEMU virt 原树 + simple-framebuffer 1024x768x32 @ 0x8c000000、内存收窄到 192M）、`virt11.dtb`（QEMU 10.2 `-machine virt,dumpdtb` 原树）、`filelist.txt` + `files/`（vfsync 清单与内容库）、`tools/make_ext2.py`（纯 Python ext2 构建器 + 校验器，另 parse_filelist.py / make_fb_dtb.py）。用途：阶段 4 riscv 侧带图形的真实 OS 验收（cemu `--machine virt -display win32`，ramfb 直渲 0x8c000000、virtio 键鼠转窗口输入；`startx` 起 fluxbox），同一镜像在 QEMU 下作文本控制台对拍，树根另存对拍日志（`q_*.txt`、`qemu_tr.log`）。引导不进套件（AGENTS.md §二） | 各件原许可（Linux GPL-2、OpenSBI BSD-2、buildroot 各包原许可） |
 | abstract-machine | abstract-machine/ | 阶段 3 cesdk 蓝本：am/src/platform/nemu/ 的 trm.c、include/nemu.h 设备图、scripts/linker.ld | Mulan PSL v2 |
 | opensbi | opensbi/ | 阶段 2 验收固件源码（fw_dynamic.h 等结构定义） | BSD-2 |
 | riscv-tests / riscv-test-env | riscv-tests/ riscv-test-env/ | riscv 验收套件；env/p/riscv_test.h 是 tohost/fromhost 退出契约 | MIT/BSD 系 |
@@ -61,7 +61,7 @@ QEMU 源码不在树中：QEMU 行为经 D:/qemu 的二进制实测校准
 - 裁决仪器还有两支（2026-09-19 片 10 补记）：QEMU 侧 `-gdb tcp::N -S`（与 cemu 的 RSP
   stub 同协议，可在同一地址下断点、把两边的寄存器与栈逐项对齐）、`-d cpu`（逐指令
   状态流）与 `-trace 'ide_*'`（设备事件真值）；cemu 侧自身的 `-gdb` stub 是唯一能
-  "让客人停下来看状态"的入口（AGENTS.md 第九、十节）。
+  "让客人停下来看状态"的入口（AGENTS.md §四、§五）。
 
 ## 四、cemu 内已有资产的对照表（别重造）
 
@@ -81,7 +81,7 @@ QEMU 源码不在树中：QEMU 行为经 D:/qemu 的二进制实测校准
 | VGA 家族核显示卡 | device/video/vga.c（CGA/EGA 是其兼容模式） | IBM VGA Technical Reference（四组寄存器、寻址、写/读模式、DAC）；IBM CGA Technical Reference（0x3D8/0x3D9 兼容闩锁与 CGA 调色板）；FreeVGA；行为交叉核对 QEMU hw/display/vga.c。**设备内没有字库**：文本字形运行时从 plane 2 读 SeaVGABIOS 在模式设置时加载的字库（`vgasrc/stdvgamodes.c` 的 `stdvga_load_font`） |
 | spike 主板 | board/spike_min.c | spike 契约（tohost 从 ELF 符号表） |
 | 引导扇区契约 | board/x86_min.c（0x7C00、DL=0x80） | QEMU seabios 交接契约实测 |
-| 目录依赖检查 | tools/depcheck.sh（`cmake --build build --target check`） | 自订；规则见 AGENTS.md 第七节 |
+| 目录依赖检查 | tools/depcheck.sh（`cmake --build build --target check`） | 自订；规则见 AGENTS.md §二 |
 | PC 芯片组与固件接口 | device/misc/{i440fx,piix3,pci,cmos,port92,fwcfg,debugcon}.c | QEMU hw/i386/*、seabios src/fw/pciinit.c（progress.log 片 1 逐项记录） |
 | PIIX IDE 与 ATAPI | device/storage/ide.c | ATA/ATAPI-7 §6.3/§7.10/§9.6（PIO 与 PACKET）；QEMU hw/ide/core.c（经 tiny386/ide.c 转述）+ SeaBIOS src/hw/ata.c 的实际用法（片 9） |
 | PS/2 键盘（i8042） | device/input/i8042.c | PC/AT Technical Reference；QEMU ps2.c/pckbd.c（片 5-7） |
