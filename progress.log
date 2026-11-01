@@ -8,6 +8,160 @@ README.md，架构与阶段见 arch.md，规格缺口台账见 AGENTS.md §六�
 > 旧 §九 → §四，旧 §十/§X（调试设施）→ §五，旧 §十一 → §七；`§X Dnn`
 > 指现在的 §六 台账。
 
+## E2：一个 exec、两个 step、debug bus 观测（2026-11-01）
+
+用户裁决：允许两个 step，exec 的巨型 switch 不能复制/重写，但可以删掉旧的
+`g_mem_slow`/`g_record_raw` 判定。按此实现：正常函数保持原名，debug 侧只有
+`x86_step_debug` 与 `debug_bus`。
+
+### 结构
+
+- **一个 exec**：`run_op`/`run_op2` 与全部指令 case 只有一份，未复制。
+- **两个 step**：`x86_step` 用真实 `cpu->bus`；`x86_step_debug` 用
+  `debug_bus`（`debug/busdebug.c`）。
+- **debug bus** 是真实 bus 的转发副本：region 的 `ops` 换成包装器，`host` 置
+  NULL，`BusRamPage`/`BusRamRange` 永远失败，所以 TLB 不会缓存宿主指针，
+  每一次取指/数据访问都经过包装器；包装器转发到真实设备并在此发
+  `DebugMem`/`DebugBus`。data/fetch 两个 `Bus` 分开，fetch 侧不发 `DebugBus`
+  （`bus=` 不含取指），但发 `DebugMem`。
+- `Bus` 增加 `version`（Add/Relocate/Remove 时自增）；debug bus 在 debug step
+  入口 `BusDebugSync`，版本未变则只做一次比较，BAR/设备窗口移动后重建。
+- **正常路径零观测判定**：`fetch8`、`phys_load`/`phys_store`、`lin_load`/
+  `lin_store` 里的 `g_mem_slow`/`g_record_raw` 全部删除；正常 `x86_step` 直接
+  用真实 bus 与 TLB host 指针。端口 I/O 的 `bus` 行与段加载的 `mark` 行不在
+  取指/数据访存热路径上，仍是调用点位测试。
+- **raw 字节**：debug fetch bus 在取指时把字节追加到 `fr->rec.raw`（与旧
+  `fetch8` 的记录点一致），因此远跳转、CR3 切换、故障指令的 RAW 都保留；
+  正常 step 不做任何记录。
+- **watchl**：debug bus 包装器在数据访问后调用 `CpuState.phys_to_lin`，x86 用
+  当前 TLB 反查线性地址（无分页时线性=物理），再交给 `DebugLinWatch`。这样
+  `lin_load`/`lin_store` 不需要保留线性 watch 判定。
+- `x86_read_lin`（dumpl=）改用 `CpuState.real_bus` 读，避免在 debug run 的
+  收尾 dump 里发 mem/bus 行。
+
+### 验证
+
+- 正常：`bt_bits.bin` → `bt-bits ok`；`pm_smoke.elf` → `pm-smoke done`。
+- `CEMU_DEBUG=trace:line`：RAW 列逐指令正确；`mem`：L 行地址/值正确；
+  `watch=0x7bfe:4:rw` 与 `watchl=0x7bfe:4:rw` 都命中（实模式与 pm_smoke 的
+  分页模式都试过）；`bus` 的 uart/vga 端口行仍正常。
+- Win95 有界调试（`timeout 110`、`--max-inst 170000000`、`screen`）仍停在同一处
+  `Windows protection error`，说明 E2 没有改变已知失败链。
+- 未跑套件，未提交。
+
+## x86 副作用补齐：MOV SS/POP SS 阴影、FXSAVE/WAIT/SYSENTER/APIC_BASE/RDPMC/LOCK（2026-11-01）
+
+本轮把上一节审计出的“非 E2”缺口逐条落盘，全部以 SDM/QEMU 实现为依据；
+E2（取指/访存快慢流）按用户要求暂缓。
+
+### MOV SS/POP SS 的宽阴影（CVE-2018-8897）
+
+- 旧实现只有 `intr_inhibit`，只挡 INTR；SDM vol.3 6.8.3 与 CVE-2018-8897
+  明确：MOV SS/POP SS 在**下一条指令之后**的边界前抑制 INTR、NMI、数据断点
+  和单步陷阱。LSS **不**抑制（Intel 80386 Programmer's Reference Manual
+  §3.10：LSS 同时装载 SS:ESP，无需阴影；QEMU 的 gen_movl_seg 注释同样写
+  “MOV or POP to SS (but not LSS)”）。
+- 实现：`x86_state.ss_inhibit` + `db_pending`；MOV SS/POP SS 置位，
+  `step_body.inc` 在下一步读 `ss_shadow`，用它挡 NMI，并把该步的 DR6 原因
+  合并到下一步边界再投递；STI 仍只置 `intr_inhibit`。故障路径清空
+  `db_pending`，避免泄漏到无关边界。
+- 证据：SDM vol.3 6.8.3；CVE-2018-8897 的描述逐字列出“including NMIs,
+  data breakpoints, and single step trap exceptions”；QEMU
+  `target/i386/tcg/seg_helper.c` 的 `switch_tss_ra`/`gen_movl_seg` 同款。
+
+### 其余逐条
+
+- **FXSAVE/FXRSTOR**：补 `CR0.TS|CR0.EM → #NM`（SDM FXSAVE/FXRSTOR
+  “Protected Mode Exceptions”；QEMU `gen_FXSAVE`/`gen_FXRSTOR` 的
+  `HF_EM|HF_TS`）。同时拆开旧的一刀切 `OSFXSR → #UD`：FXSAVE/FXRSTOR 不
+  受 OSFXSR 门控（SDM 只说 MXCSR 字段可省略，implementation-dependent；
+  QEMU 不查），LDMXCSR/STMXCSR 才是 Type 5 的 `TS→#NM / EM→#UD /
+  OSFXSR=0→#UD`。
+- **WAIT/FWAIT**：`#NM` 条件改为 `CR0.MP=1 && CR0.TS=1`（SDM WAIT；
+  QEMU `gen_WAIT` 的 `(HF_MP|HF_TS)`）。Win95 的 `CR0.MP=0`，旧实现会在
+  `TS=1` 时错误 #NM。
+- **SYSENTER**：只清 VM（IF 另清）；TF 保留，RF 由 step 提交统一清
+  （SDM Flags Affected 只有 VM/IF；QEMU `HELPER(sysenter)` 清
+  `VM|IF|RF`，从不清 TF）。
+- **WRMSR IA32_APIC_BASE**：保留 BSP、按写入切换 enable 位、拒绝保留位，
+  并通过 `CpuState.set_apic_enabled` 板级钩子接到 LAPIC；LAPIC 在
+  enable=0 时读回全 1、丢弃写、清 SVR 软件使能（QEMU
+  `target/i386/tcg/system/misc_helper.c` 的 `case MSR_IA32_APICBASE` →
+  `cpu_set_apic_base`；`hw/intc/apic.c` 的 `apic_set_base`/`apic_mem_read`）。
+- **RDPMC（0F 33）**：实现 type 0 的 2 个通用计数器与 type 4000H 的 3 个
+  固定计数器，40 位零扩展，非法编码 #GP(0)，CPL>0 受 CR4.PCE 门控
+  （SDM vol.2 RDPMC；QEMU `gen_RDPMC`）。CPUID 0x0A 同步改成
+  `EAX=0x02280202`（v2、EBX 事件向量长 2、2 个 40 位通用）、
+  `EDX=0x503`（3 个 40 位固定），与数组/`PerfUpdateActive` 一致；补
+  IA32_FIXED_CTR0..2 的 WRMSR。版本必须是 2：SDM vol.2A CPUID 初值 0AH
+  的 EDX[4:0] 写明固定计数器“if Version ID > 1”才有效；宽度字段
+  EAX[23:16]/EDX[12:5] 是宽度本身（不是 value+1），40 位即 0x28。
+  首轮写的 `0x280201/0x2803` 把 v1 与固定计数器混在一起，且把宽度塞进了
+  EDX[12:8]，`sys686` 探针按旧值校验时暴露出来。
+- **LOCK**：新增 `d.lock` 与 `lockable_first`/`lockable_0f` 白名单，
+  `run_op`/`run_op2` 在执行前拒绝非白名单，`modrm()` 拒绝寄存器目的；
+  组内再按子操作码收窄（CMP/TEST/BT/CALL 等不可 LOCK）。依据 SDM vol.2
+  LOCK 的指令清单；QEMU 对每条指令检查 `PREFIX_LOCK`。
+- **IA32_MISC_ENABLE（D40）**：改为可写存储，复位值 1（QEMU
+  `MSR_IA32_MISC_ENABLE_DEFAULT`）；AGENTS.md §六 的 D40 行按“销账=整行
+  删除”移除。
+
+### 验证
+
+- `cmake --build build` 通过（clang -Wall -Wextra 零告警）。
+- 单探针：`test/x86/probe/bt_bits.bin` 输出 `bt-bits ok`；
+  `test/x86/pm/pm_smoke.elf` 输出 `pm-smoke done`。
+- Win95 有界调试（`timeout 110`、`--max-inst 170000000`、`screen`）仍停在
+  同一处 `Windows protection error`，说明本轮副作用修复没有改变已知失败链；
+  根因仍在 VMM 保护错误路径，E2 未动。
+- 未跑任何套件（`test/run.sh` / `test/*/run.sh` 均未执行），未提交。
+
+## Win95 复盘：0xFFB17 是 VMM 的 V86 #UD 回调；失败链落在 IVT 13 清零后的 int 13（2026-11-01）
+
+> 本节推翻上一节“VMM 把 32 位平坦地址当 16:16 far pointer”的结论。0xFFB17
+> 不是被写坏的代码，而是 Win95 VMM 故意留下的 V86 #UD 陷阱地址。
+
+### 0xFFB17：QEMU 同款，不是 bug
+
+- QEMU 10.2.92、同一 `bios.bin`/`vgabios.bin`/`windows95.img`、`-icount shift=8`，
+  gdb 在 `0xFFB17` 停下：`cs=fcbf eip=2f27 eflags=23246（VM=1）cr0=80000011
+  cr3=6b2000`；内存是 `63 38 6c 6c 38 cc 78...`（VGA 字体），与 cemu 逐字节相同。
+- QEMU 的 `#UD` 投递帧（ring0 `ESP=0xC13ADF94`）与 cemu 的
+  `0xC13ADF70+0x24` **逐字节相同**：EIP/CS/EFLAGS/ESP/SS/ES/DS/FS/GS =
+  `2F27/FCBF/33246/0FF6/8F00/0/0/0/0`。两模型都在 V86 下把字体字节当
+  `arpl` 执行、都 `#UD` 到 `0xC0001250`。这是 VMM 的正常回调机制，不是
+  CS:IP 槽损坏。
+
+### CR0.ET：cemu 0，QEMU 1（真 bug，但不是本次根因）
+
+- cemu 的 `state` 在 `0xC0002573` 为 `cr0=80000001`；QEMU gdb 同点为
+  `0x80000011`（ET 位 4）。QEMU `target/i386/helper.c` 的
+  `cpu_x86_update_cr0` 写 `env->cr[0] = new_cr0 | CR0_ET_MASK;`，SDM vol.3
+  2.5 规定 486+ 的 ET 恒为 1。
+- 已修：`x86.h` 增 `kCr0Et`；`MOV CR0` 强制置位；复位态
+  `st->cr0 = kCr0Et`；multiboot 入口 `kCr0Pe | kCr0Et`。Win95 仍报
+  `Windows protection error`（trap 数 8.87M → 18.47M），说明 ET 是独立
+  缺陷，不是本次启动失败的根因。
+
+### 真正的故障链：IVT int 13 被清零后才执行 int 13
+
+- `watchl=0x4C:4:w` 抓到：inst **169,545,852**，VMM 代码
+  `0xC0011590: mov [eax],edi`，`eax=0x4C`、`edi=0`，把 **IVT int 13 写成 0**。
+  `hist` 是 VMM 的退出/资源回收路径（`0xC0011582 pushf; cli; mov eax,0x4c;
+  mov edi,[0xC00130A7]`）。QEMU 同一启动在 60 秒内**从未执行**
+  `0xC0011590`（硬件断点 0 命中）。
+- 随后 inst **169,674,138**，VMM 的实模式代码在 `0x1017F4` 执行
+  `int 13`；`gate a=19 b=0`（IVT 13 = 0:0），CPU 从 0:0 开始执行垃圾，
+  穿过 `0xFFFF0`/HMA，最后在 `0x100022`（VDISK 头，`4D 53 FF FF...`）
+  连续 `#UD`。progress.log 旧节里的“0x100022 / tval=0x32 风暴”就是这条链的
+  后半段，不是独立缺陷。
+- `0xC0011590` 属于 VMM 的**保护错误/关机清理**，清零本身是结果。下一处该
+  取证的是：`0xC000323F` 的 VxD 故障处理链表（cemu 在
+  `0xC0FDA31C` 处 `[edx-4]=0` 提前终止）与 QEMU 的同表；以及 `#UD`
+  回调返回后第一处 cemu/QEMU 状态分叉。`mark:seg` 已加（见 §五），本次用它
+  确认 IRET 的 CS 基址确实是 `0xFCBF0`，排除了“陈旧段基址”假设。
+- 本轮没有跑套件（用户要求）；clean build 通过。
+
 ## 文档重编号清理与 x86 transcript 解析器回归（2026-11-01）
 
 - **死引用**：`bd57816` 把 AGENTS.md 重写成 §一~§七，但源码/脚本里 38 处仍写

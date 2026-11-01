@@ -194,6 +194,9 @@ int64_t LapicNextEventNs(LapicDevice* d) {
 static uint64_t LapicRead(void* dev, uint64_t addr, int size) {
   (void)size;
   LapicDevice* d = (LapicDevice*)dev;
+  // QEMU's xAPIC answers all ones while IA32_APIC_BASE.ENABLE is clear
+  // (hw/intc/apic.c apic_mem_read); the window itself stays mapped.
+  if (!d->enabled) return ~0ULL;
   uint64_t off = addr - kLapicBase;
   if (off & 0xf) return 0;  // reserved bytes inside a register
   // The vector sets (SDM vol.3 figure 11-18): eight registers of one bit per
@@ -231,6 +234,7 @@ static uint64_t LapicRead(void* dev, uint64_t addr, int size) {
 static void LapicWrite(void* dev, uint64_t addr, int size, uint64_t val) {
   (void)size;
   LapicDevice* d = (LapicDevice*)dev;
+  if (!d->enabled) return;  // QEMU's apic_mem_write drops writes while disabled
   uint64_t off = addr - kLapicBase;
   if (off & 0xf) return;
   uint32_t v = (uint32_t)val;
@@ -294,6 +298,7 @@ void LapicInit(LapicDevice* d) {
   }
   d->timer_count = 0;
   d->timer_base_us = 0;
+  d->enabled = 1;  // IA32_APIC_BASE.ENABLE resets to 1 (SDM vol.3 11.4.3)
   d->irq_level = 0;
   // Reset state (SDM vol.3 11.4.1): the APIC starts disabled with the
   // spurious vector at 0xFF, and TPR at 0 — the machine's firmware therefore
@@ -305,6 +310,17 @@ void LapicInit(LapicDevice* d) {
 }
 
 void LapicRegister(Bus* bus, LapicDevice* d) { BusAddRegion(bus, kLapicBase, kLapicSize, &kLapicOps, d); }
+
+void LapicSetEnabled(LapicDevice* d, int enabled) {
+  if (d->enabled == enabled) return;
+  d->enabled = enabled;
+  if (!enabled) {
+    // QEMU's apic_set_base clears the SVR software enable on a global
+    // disable; the software has to program SVR again after re-enabling.
+    d->reg[kLapicSvr / 16] &= ~kSvrEnable;
+    UpdateIrq(d);
+  }
+}
 
 void LapicSetIrqSink(LapicDevice* d, void (*set_irq)(void* ctx, int line, int level), void* ctx) {
   d->set_irq = set_irq;

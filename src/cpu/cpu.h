@@ -22,6 +22,16 @@ typedef struct CpuState {
                         // riscv = linear vaddr; x86 = offset within CS)
   uint64_t image_base;  // where the loaded image starts (multiboot scans here)
   Bus* bus;             // where the ISA reads and writes memory
+  Bus* fetch_bus;       // instruction-stream bus (debug runs install a fetch
+                        // wrapper here; normal runs point at `bus`)
+  Bus* real_bus;        // the machine's bus before any debug wrapper (dumps)
+  Bus* debug_bus;       // data debug wrapper, NULL when no run needs one
+  Bus* debug_fetch_bus; // fetch debug wrapper, NULL when no run needs one
+  void (*debug_bus_sync)(void* ctx);  // rebuild wrappers after BAR moves
+  void* debug_bus_ctx;
+  // Physical-to-linear recovery for the debug bus's watchl= matcher. x86
+  // implements it by searching the live TLB; NULL for ISAs without one.
+  uint64_t (*phys_to_lin)(void* priv, uint64_t paddr, int* ok);
   Bus* io;              // port I/O space for ISAs that have one (x86 IN/OUT); NULL = none
   void* priv;
   int halted;
@@ -55,6 +65,11 @@ typedef struct CpuState {
   // turns into IRQ13 (SDM vol.1 8.7.2). Same hook shape as set_a20; NULL for
   // ISAs without one.
   void (*set_ignne)(struct CpuState* cpu, int on);
+  // Local-APIC global enable (x86 IA32_APIC_BASE bit 11): the CPU model calls
+  // this when WRMSR changes the enable bit; the board wires it to the LAPIC's
+  // register file. NULL for ISAs without an APIC.
+  void (*set_apic_enabled)(void* dev, int enabled);
+  void* apic_dev;
   // Non-maskable interrupt input (x86 NMI pin; the I/O APIC's NMI delivery
   // mode is its only source on this machine). Same hook shape as set_irq;
   // NULL for ISAs without one.

@@ -21,6 +21,11 @@
 #include "host/host.h"
 #include "util/log.h"
 
+// The stub is outside the guest: its memory packets must not appear as guest
+// mem/bus rows (and must not go through the observing wrapper). Use the
+// machine's real bus, falling back for ISAs that do not install one.
+static Bus* GdbRealBus(Board* m) { return m->cpu.real_bus ? m->cpu.real_bus : m->cpu.bus; }
+
 enum {
   kPacketMax = 4096,       // matches the qSupported PacketSize we advertise
   kMaxBreakpoints = 64,
@@ -452,8 +457,8 @@ static int Session(GdbStub* g) {
           break;
         }
         uint8_t buf[kPacketMax / 2];
-        if (BusProbe(m->cpu.bus, addr, (int)len, NULL) == 0) {
-          for (uint64_t i = 0; i < len; i++) buf[i] = (uint8_t)BusRead(m->cpu.bus, addr + i, 1);
+        if (BusProbe(GdbRealBus(m), addr, (int)len, NULL) == 0) {
+          for (uint64_t i = 0; i < len; i++) buf[i] = (uint8_t)BusRead(GdbRealBus(m), addr + i, 1);
           char hex[2 * kPacketMax / 2 + 1];
           HexEncode(buf, (int)len, hex);
           PktSend(g, hex);
@@ -477,8 +482,8 @@ static int Session(GdbStub* g) {
           PktSend(g, "E14");
           break;
         }
-        if (BusProbe(m->cpu.bus, addr, (int)len, NULL) == 0) {
-          for (uint64_t i = 0; i < len; i++) BusWrite(m->cpu.bus, addr + i, 1, buf[i]);
+        if (BusProbe(GdbRealBus(m), addr, (int)len, NULL) == 0) {
+          for (uint64_t i = 0; i < len; i++) BusWrite(GdbRealBus(m), addr + i, 1, buf[i]);
           PktSend(g, "OK");
         } else {
           PktSend(g, "E14");

@@ -42,6 +42,7 @@ static void do_step(void) {
     else if (b == 0x65)
       d.seg = gs_i;
     else if (b == 0xf0) {
+      d.lock = 1;
     } else if (b == 0xf2) {
       d.rep = 2;
       d.pf2 = 1;

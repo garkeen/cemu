@@ -53,11 +53,14 @@ static uint64_t a20_gate(uint64_t addr) {
 // accesses (MMIO and port hits), and a fetch is not one. Firmware executes from
 // its ROM window for most of a boot, and those fetch rows would otherwise fill
 // the session's output cap before any real device access happens.
-static uint64_t phys_load(uint64_t addr, int size, int is_fetch) {
+// The normal memory path has no debug test: the debug run swaps cpu->bus (and
+// cpu->fetch_bus) to the observing bus, whose regions forward and emit rows.
+// Page-table walks are data accesses and use the data bus.
+static uint64_t phys_load_on(Bus* bus, uint64_t addr, int size) {
   BusRegion* r;
   addr = a20_gate(addr);
-  if (BusProbe(cpu->bus, addr, size, &r) != 0) return size == 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
-  uint64_t v;
+  if (BusProbe(bus, addr, size, &r) != 0) return size == 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
+  uint64_t v = 0;  // narrow reads leave the upper bytes zero, not stack garbage
   if (r->host && !r->overlaps) {
     // RAM: one region lookup, no device call. The bytes are the same ones
     // kRamOps would copy; page-table walks and the non-host fallback both use
@@ -66,24 +69,19 @@ static uint64_t phys_load(uint64_t addr, int size, int is_fetch) {
   } else {
     v = r->ops->Read(r->dev, addr, size);
   }
-  if (g_mem_slow) {
-    if (DebugOn(kDbgBus) && !r->host && !is_fetch) DebugBus(fr, r->ops->name, addr, size, 1, v);
-    if (DebugOn(kDbgMem)) DebugMem(fr, addr, addr, size, acc_read, v, 1);
-  }
   return v;
+}
+
+static uint64_t phys_load(uint64_t addr, int size) { return phys_load_on(cpu->bus, addr, size); }
+
+static uint64_t phys_load_fetch(uint64_t addr, int size) {
+  return phys_load_on(cpu->fetch_bus, addr, size);
 }
 
 static void phys_store(uint64_t addr, int size, uint64_t v) {
   BusRegion* r;
   addr = a20_gate(addr);
   if (BusProbe(cpu->bus, addr, size, &r) != 0) return;
-  if (g_mem_slow) {
-    if (DebugOn(kDbgBus) && !r->host) {
-      DebugBus(fr, r->ops->name, addr, size, 0, v);
-    } else if (DebugOn(kDbgMem)) {
-      DebugMem(fr, addr, addr, size, acc_write, v, 0);
-    }
-  }
   if (r->host && !r->overlaps) {
     memcpy(r->host + (addr - r->base), &v, (size_t)size);
   } else {
@@ -91,10 +89,12 @@ static void phys_store(uint64_t addr, int size, uint64_t v) {
   }
 }
 
-// Linear accesses go through the TLB/fetch fast path unless an observation
-// category needs every walk (debug.h g_mem_slow). The page walk itself lives
-// with the segment machinery below; these are the only entry points.
-static uint64_t lin_load(uint64_t lin, int size, int user, int fetch);
+// Linear accesses go through the TLB/fetch path. A run that observes every
+// access installs the debug bus (debug/busdebug.h), whose regions have no host
+// pointer, so the same path falls through to the forwarding wrapper. The page
+// walk itself lives with the segment machinery below; these are the only entry
+// points.
+static uint64_t lin_load(uint64_t lin, int size, int user);
 static void lin_store(uint64_t lin, int size, int user, uint64_t v);
 static uint64_t page_translate_as(uint64_t lin, int write, int user, int fetch);
 static int cpl(void);
@@ -104,9 +104,10 @@ static void TlbCheck(x86_tlb_entry* e, uint64_t lin, int write, int fetch, int u
 static void AcCheckSlow(uint64_t lin, int size, int user, int fetch, int write);
 static void X87UpdateFerr(void);
 static void PerfUpdateActive(void);
+_Noreturn static void ud(void);
 
 static uint64_t bus_load(uint64_t lin, int size) {
-  return lin_load(lin, size, cpl() == 3, 0);
+  return lin_load(lin, size, cpl() == 3);
 }
 static void bus_store(uint64_t lin, int size, uint64_t v) {
   lin_store(lin, size, cpl() == 3, v);
@@ -121,7 +122,7 @@ static void bus_store(uint64_t lin, int size, uint64_t v) {
 // are the processor's own state), and every OS depends on it — its GDT/IDT/TSS
 // live in supervisor pages.
 static uint64_t kbus_load(uint64_t lin, int size) {
-  return lin_load(lin, size, 0, 0);
+  return lin_load(lin, size, 0);
 }
 static void kbus_store(uint64_t lin, int size, uint64_t v) {
   lin_store(lin, size, 0, v);
@@ -421,42 +422,36 @@ uint8_t fetch8(void) {
   uint64_t lin = s->base[cs_i] + off;
   int user = cpl() == 3;
   uint8_t v;
-  if (g_mem_slow) {
-    v = (uint8_t)lin_load(lin, 1, user, 1);
+  uint32_t page = (uint32_t)(lin >> 12);
+  if (s->fetch_valid && s->fetch_page == page) {
+    v = s->fetch_host[(uint32_t)lin & 0xfff];
   } else {
-    uint32_t page = (uint32_t)(lin >> 12);
-    if (s->fetch_valid && s->fetch_page == page) {
-      v = s->fetch_host[(uint32_t)lin & 0xfff];
+    uint8_t* host = NULL;
+    uint64_t paddr;
+    if (!(s->cr0 & kCr0Pg)) {
+      paddr = a20_gate(lin);
+      BusRamPage(cpu->bus, paddr & ~(uint64_t)0xfff, &host);
     } else {
-      uint8_t* host = NULL;
-      uint64_t paddr;
-      if (!(s->cr0 & kCr0Pg)) {
-        paddr = a20_gate(lin);
-        BusRamPage(cpu->bus, paddr & ~(uint64_t)0xfff, &host);
+      x86_tlb_entry* e = TlbLookup(lin, 0);
+      if (!e) {
+        e = TlbFill(lin, 0, 1, user);
       } else {
-        x86_tlb_entry* e = TlbLookup(lin, 0);
-        if (!e) {
-          e = TlbFill(lin, 0, 1, user);
-        } else {
-          TlbCheck(e, lin, 0, 1, user);
-        }
-        paddr = e->pbase + ((uint32_t)lin & 0xfff);
-        if (e->flags & kTlbHost) host = e->host;
+        TlbCheck(e, lin, 0, 1, user);
       }
-      if (host) {
-        s->fetch_page = page;
-        s->fetch_host = host;
-        s->fetch_valid = 1;
-        v = host[(uint32_t)lin & 0xfff];
-      } else {
-        // ROM/MMIO has no host backing; every byte goes through the bus.
-        s->fetch_valid = 0;
-        v = (uint8_t)phys_load(paddr, 1, 1);
-      }
+      paddr = e->pbase + ((uint32_t)lin & 0xfff);
+      if (e->flags & kTlbHost) host = e->host;
+    }
+    if (host) {
+      s->fetch_page = page;
+      s->fetch_host = host;
+      s->fetch_valid = 1;
+      v = host[(uint32_t)lin & 0xfff];
+    } else {
+      // ROM/MMIO has no host backing; every byte goes through the fetch bus.
+      s->fetch_valid = 0;
+      v = (uint8_t)phys_load_fetch(paddr, 1);
     }
   }
-  if (g_record_raw && fr->rec.raw_len < sizeof(fr->rec.raw))
-    fr->rec.raw[fr->rec.raw_len++] = v;
   d.nxt++;
   return v;
 }
@@ -483,6 +478,10 @@ static void modrm(void) {
   d.mseg = d.seg;
   if (d.mod == 3) {
     d.is_mem = 0;
+    // Every LOCK-able instruction needs a memory destination; the register
+    // form is #UD (SDM vol.2 LOCK). The opcode/sub-opcode checks have already
+    // admitted only the lockable family.
+    if (d.lock) ud();
     return;
   }
   d.is_mem = 1;
@@ -770,6 +769,12 @@ static void seg_commit(int seg, uint16_t sel, const seg_view* v) {
   s->limit[seg] = v->limit;
   s->ar[seg] = v->ar;
   s->dbit[seg] = v->dbit;
+  // A segment load is the only place the hidden base changes; a guest that
+  // switches between real/V86 and protected mode and keeps the visible
+  // selector can therefore fetch through a stale base. `mark` names the
+  // selector and the base it committed: a = (segment index << 16) | selector,
+  // b = base (AGENTS.md §五).
+  if (DebugOn(kDbgMark)) DebugMark("seg", (seg << 16) | sel, (int)v->base);
   if ((s->cr0 & 1) && !fl->vm && (sel & 0xfffc) && !(v->ar & 1))
     kbus_store((sel & 4 ? s->ldtr_base : s->gdtr) + (uint64_t)(sel >> 3) * 8 + 5, 1,
                (uint8_t)(v->ar | 1));
@@ -872,7 +877,7 @@ static void CheckPerm(uint64_t lin, int write, int user, int writable, int user_
 static void WalkNonPae(uint64_t lin, int write, int user, walk_res* w) {
   uint32_t code = (write ? kPfWrite : 0) | (user ? kPfUser : 0);
   uint32_t pde_addr = (uint32_t)(s->cr3 & ~0xfffu) | ((uint32_t)(lin >> 20) & 0xffc);
-  uint32_t pde = (uint32_t)phys_load(pde_addr, 4, 0);
+  uint32_t pde = (uint32_t)phys_load(pde_addr, 4);
   if (!(pde & kPdeP)) pf_fault(lin, code);
   if ((pde & kPdePs) && (s->cr4 & kCr4Pse)) {
     if (pde & kPde4mReserved) pf_fault(lin, code | kPfPresent);
@@ -889,7 +894,7 @@ static void WalkNonPae(uint64_t lin, int write, int user, walk_res* w) {
     return;
   }
   uint32_t pte_addr = (pde & ~0xfffu) | ((uint32_t)(lin >> 10) & 0xffc);
-  uint32_t pte = (uint32_t)phys_load(pte_addr, 4, 0);
+  uint32_t pte = (uint32_t)phys_load(pte_addr, 4);
   if (!(pte & kPteP)) pf_fault(lin, code);
   int writable = (pde & kPdeRw) && (pte & kPteRw);
   int user_ok = (pde & kPdeUs) && (pte & kPteUs);
@@ -910,7 +915,7 @@ static void WalkNonPae(uint64_t lin, int write, int user, walk_res* w) {
 static void WalkPae(uint64_t lin, int write, int user, int fetch, walk_res* w) {
   uint32_t code = (write ? kPfWrite : 0) | (user ? kPfUser : 0);
   uint64_t pdpte_addr = (s->cr3 & 0xffffffe0u) + (((lin >> 30) & 3) * 8);
-  uint64_t pdpte = phys_load(pdpte_addr, 8, 0);
+  uint64_t pdpte = phys_load(pdpte_addr, 8);
   if (!(pdpte & kPdeP)) pf_fault(lin, code);
   uint64_t nx = pdpte & kNxBit;
   if (pdpte & kPdePs) PfRsvd(lin, code);  // 1GB pages do not exist in 32-bit PAE
@@ -918,7 +923,7 @@ static void WalkPae(uint64_t lin, int write, int user, int fetch, walk_res* w) {
   if (nx && !(s->efer & kEferNxe)) PfRsvd(lin, code);
 
   uint64_t pde_addr = (pdpte & kPaeAddrMask) | (((lin >> 21) & 0x1ff) * 8);
-  uint64_t pde = phys_load(pde_addr, 8, 0);
+  uint64_t pde = phys_load(pde_addr, 8);
   if (!(pde & kPdeP)) pf_fault(lin, code);
   nx |= pde & kNxBit;
   if (pde & kPaeRsvdHi) PfRsvd(lin, code);
@@ -942,7 +947,7 @@ static void WalkPae(uint64_t lin, int write, int user, int fetch, walk_res* w) {
   }
 
   uint64_t pte_addr = (pde & kPaeAddrMask) | (((lin >> 12) & 0x1ff) * 8);
-  uint64_t pte = phys_load(pte_addr, 8, 0);
+  uint64_t pte = phys_load(pte_addr, 8);
   if (!(pte & kPteP)) pf_fault(lin, code);
   nx |= pte & kNxBit;
   if (pte & kPaeRsvdHi) PfRsvd(lin, code);
@@ -969,8 +974,8 @@ static void WalkPage(uint64_t lin, int write, int user, int fetch, walk_res* w) 
     WalkNonPae(lin, write, user, w);
 }
 
-// The slow translation entry: one walk, no cache. Used whenever g_mem_slow is
-// set (mem/bus/watch observation) and by processor-internal accessors.
+// The uncached translation entry: one walk, no TLB fill. Used by the debug
+// hub's linear dump reader and by processor-internal accessors.
 static uint64_t page_translate_as(uint64_t lin, int write, int user, int fetch) {
   if (!(s->cr0 & kCr0Pg)) return lin;
   walk_res w;
@@ -1018,7 +1023,7 @@ static x86_tlb_entry* TlbFill(uint64_t lin, int write, int fetch, int user) {
   e->pbase = w.paddr & ~(uint64_t)0xfff;
   e->host = NULL;
   uint8_t* host;
-  if (!g_mem_slow && BusRamPage(cpu->bus, e->pbase, &host) == 0) {
+  if (BusRamPage(cpu->bus, e->pbase, &host) == 0) {
     e->host = host;
     e->flags |= kTlbHost;
   }
@@ -1049,6 +1054,31 @@ static void TlbFlushNonGlobal(x86_state* st) {
   st->fetch_valid = 0;
 }
 
+// Reverse lookup for the debug bus's watchl=: the bus sees a physical address,
+// the watch names a linear one. The TLB is the only structure that still knows
+// both, so scan it for the page that contains `paddr`. Aliases are inherently
+// ambiguous (two linear pages can map one physical page); the first live match
+// wins, which is the common single-mapping case.
+static uint64_t x86_phys_to_lin(void* priv, uint64_t paddr, int* ok) {
+  x86_state* st = (x86_state*)priv;
+  if (!(st->cr0 & kCr0Pg)) {  // real mode: linear == physical (A20 already applied)
+    *ok = 1;
+    return paddr;
+  }
+  for (int i = 0; i < (int)(kTlbSets * kTlbWays); i++) {
+    x86_tlb_entry* e = &st->tlb[i];
+    if (!(e->tag & kTlbValid)) continue;
+    if (((e->tag >> kTlbGenShift) & kTlbGenMask) != st->tlb_gen) continue;
+    uint64_t size = 1ull << e->page_shift;
+    if (paddr >= e->pbase && paddr < e->pbase + size) {
+      *ok = 1;
+      return (uint64_t)e->lin_base + (paddr - e->pbase);
+    }
+  }
+  *ok = 0;
+  return 0;
+}
+
 // INVLPG invalidates the page regardless of G. A huge leaf was cached as
 // several 4KB slots, so the match is against the entry's linear range: every
 // slot derived from the same 2MB/4MB leaf goes. The fetch shortcut is dropped
@@ -1064,12 +1094,12 @@ static void TlbFlushPage(x86_state* st, uint32_t lin) {
 
 // ---- linear access ------------------------------------------------------------
 
-static uint64_t FastLoadOne(uint64_t lin, int size, int user, int fetch) {
+static uint64_t TlbLoadOne(uint64_t lin, int size, int user) {
   x86_tlb_entry* e = TlbLookup(lin, 0);
   if (!e) {
-    e = TlbFill(lin, 0, fetch, user);
+    e = TlbFill(lin, 0, 0, user);
   } else {
-    TlbCheck(e, lin, 0, fetch, user);
+    TlbCheck(e, lin, 0, 0, user);
   }
   uint32_t off = (uint32_t)lin & 0xfff;
   if (e->flags & kTlbHost) {
@@ -1077,10 +1107,10 @@ static uint64_t FastLoadOne(uint64_t lin, int size, int user, int fetch) {
     memcpy(&v, e->host + off, (size_t)size);
     return v;
   }
-  return phys_load(e->pbase + off, size, fetch);
+  return phys_load(e->pbase + off, size);
 }
 
-static void FastStoreOne(uint64_t lin, int size, int user, uint64_t v) {
+static void TlbStoreOne(uint64_t lin, int size, int user, uint64_t v) {
   x86_tlb_entry* e = TlbLookup(lin, 1);
   if (!e) {
     e = TlbFill(lin, 1, 0, user);
@@ -1095,44 +1125,20 @@ static void FastStoreOne(uint64_t lin, int size, int user, uint64_t v) {
   }
 }
 
-static uint64_t SlowLoadOne(uint64_t lin, int size, int user, int fetch) {
-  return phys_load(page_translate_as(lin, 0, user, fetch), size, fetch);
-}
-
-static void SlowStoreOne(uint64_t lin, int size, int user, uint64_t v) {
-  phys_store(page_translate_as(lin, 1, user, 0), size, v);
-}
-
-static uint64_t lin_load(uint64_t lin, int size, int user, int fetch) {
-  AcCheckSlow(lin, size, user, fetch, 0);
+static uint64_t lin_load(uint64_t lin, int size, int user) {
+  AcCheckSlow(lin, size, user, 0, 0);
   uint32_t off = (uint32_t)lin & 0xfff;
-  if (g_mem_slow) {
-    uint64_t v;
-    if (off + (uint32_t)size <= 0x1000) {
-      v = SlowLoadOne(lin, size, user, fetch);
-    } else {
-      int n1 = (int)(0x1000 - off);
-      uint64_t lo = SlowLoadOne(lin, n1, user, fetch);
-      uint64_t hi = SlowLoadOne(lin + (uint64_t)n1, size - n1, user, fetch);
-      v = lo | (hi << (n1 * 8));
-    }
-    // A linear watch names the address the guest computed; the physical watch
-    // cannot, because paging decides which page backs it. Fetches are not data
-    // watches (exec= answers the fetch side).
-    if (!fetch) DebugLinWatch(fr, lin, size, 1, v);
-    return v;
-  }
   if (!(s->cr0 & kCr0Pg)) {
-    if (off + (uint32_t)size <= 0x1000) return phys_load(lin, size, fetch);
+    if (off + (uint32_t)size <= 0x1000) return phys_load(lin, size);
     int n1 = (int)(0x1000 - off);
-    uint64_t lo = phys_load(lin, n1, fetch);
-    uint64_t hi = phys_load(lin + (uint64_t)n1, size - n1, fetch);
+    uint64_t lo = phys_load(lin, n1);
+    uint64_t hi = phys_load(lin + (uint64_t)n1, size - n1);
     return lo | (hi << (n1 * 8));
   }
-  if (off + (uint32_t)size <= 0x1000) return FastLoadOne(lin, size, user, fetch);
+  if (off + (uint32_t)size <= 0x1000) return TlbLoadOne(lin, size, user);
   int n1 = (int)(0x1000 - off);
-  uint64_t lo = FastLoadOne(lin, n1, user, fetch);
-  uint64_t hi = FastLoadOne(lin + (uint64_t)n1, size - n1, user, fetch);
+  uint64_t lo = TlbLoadOne(lin, n1, user);
+  uint64_t hi = TlbLoadOne(lin + (uint64_t)n1, size - n1, user);
   return lo | (hi << (n1 * 8));
 }
 
@@ -1143,17 +1149,6 @@ static void lin_store(uint64_t lin, int size, int user, uint64_t v) {
   int n1 = crossing ? (int)(0x1000 - off) : 0;
   uint64_t lo = crossing ? (v & ((1ull << (n1 * 8)) - 1)) : v;
   uint64_t hi = crossing ? (v >> (n1 * 8)) : 0;
-  if (g_mem_slow) {
-    if (!crossing) {
-      SlowStoreOne(lin, size, user, v);
-    } else {
-      SlowStoreOne(lin, n1, user, lo);
-      SlowStoreOne(lin + (uint64_t)n1, size - n1, user, hi);
-    }
-    // Emitted after the store: a faulting store must not look like it landed.
-    DebugLinWatch(fr, lin, size, 0, v);
-    return;
-  }
   if (!(s->cr0 & kCr0Pg)) {
     if (!crossing) {
       phys_store(lin, size, v);
@@ -1164,10 +1159,10 @@ static void lin_store(uint64_t lin, int size, int user, uint64_t v) {
     return;
   }
   if (!crossing) {
-    FastStoreOne(lin, size, user, v);
+    TlbStoreOne(lin, size, user, v);
   } else {
-    FastStoreOne(lin, n1, user, lo);
-    FastStoreOne(lin + (uint64_t)n1, size - n1, user, hi);
+    TlbStoreOne(lin, n1, user, lo);
+    TlbStoreOne(lin + (uint64_t)n1, size - n1, user, hi);
   }
 }
 
@@ -1184,16 +1179,15 @@ static void lin_store(uint64_t lin, int size, int user, uint64_t v) {
 // not resolve must therefore NOT reach the step's landing pad (there is no
 // step): the walk is wrapped in a scratch frame, the same setjmp channel every
 // fault already uses (cpu/step.h raise_), and a fault there means "cannot
-// read", reported as such. The dump is also not an observation stream, so the
-// slow memory path is switched off for its duration -- otherwise phys_load
-// would emit bus/mem rows for every byte, under a frame with no instruction to
-// name.
+// read", reported as such. The dump is also not an observation stream, so it
+// reads through the real bus for its duration -- otherwise the debug bus would
+// emit mem/bus rows for every byte, under a frame with no instruction to name.
 int x86_read_lin(CpuState* c, uint64_t lin, uint8_t* buf, int len) {
   CpuState* saved_cpu = cpu;
   x86_state* saved_s = s;
   eflags* saved_fl = fl;
   frame* saved_fr = fr;
-  int saved_slow = g_mem_slow;
+  Bus* saved_bus = c->bus;
   frame scratch;
   memset(&scratch, 0, sizeof(scratch));
   scratch.cpu = c;
@@ -1203,7 +1197,9 @@ int x86_read_lin(CpuState* c, uint64_t lin, uint8_t* buf, int len) {
   s = (x86_state*)c->priv;
   fl = &s->fl;
   fr = &scratch;
-  g_mem_slow = 0;
+  // The dump is not an observation stream: read through the machine's real
+  // bus, not the debug wrapper, so no mem/bus row is emitted for its bytes.
+  if (c->real_bus) c->bus = c->real_bus;
   volatile int ok = 1;
   if (setjmp(scratch.raise)) {
     ok = 0;  // pf_fault/gp_fault landed here: a page on the way is not there
@@ -1214,11 +1210,11 @@ int x86_read_lin(CpuState* c, uint64_t lin, uint8_t* buf, int len) {
       if (n > len - at) n = len - at;
       uint64_t pa = page_translate_as(cur, 0, 0, 0);
       for (int i = 0; i < n; i++)
-        buf[at + i] = (uint8_t)phys_load(pa + (uint64_t)i, 1, 0);
+        buf[at + i] = (uint8_t)phys_load(pa + (uint64_t)i, 1);
       at += n;
     }
   }
-  g_mem_slow = saved_slow;
+  c->bus = saved_bus;
   fr = saved_fr;
   fl = saved_fl;
   s = saved_s;
@@ -1256,6 +1252,11 @@ static void AcCheckSlow(uint64_t lin, int size, int user, int fetch, int write) 
 
 // ---- MSRs -------------------------------------------------------------------
 
+// The architectural PMU counters are 40 bits wide (CPUID.0AH EAX[23:16] for
+// general-purpose, EDX[12:5] for fixed-function); RDPMC zero-extends the
+// unimplemented high bits.
+static const uint64_t kPerfMask = (1ull << 40) - 1;
+
 // The bank this machine implements. Unknown indices #GP (SDM WRMSR/RDMSR
 // "#GP(0) if the MSR is not implemented").
 static uint64_t MsrRead(uint32_t idx) {
@@ -1269,13 +1270,13 @@ static uint64_t MsrRead(uint32_t idx) {
   if (idx == 0x175) return s->sysenter_esp;
   if (idx == 0x176) return s->sysenter_eip;
   if (idx == 0x186 || idx == 0x187) return s->perf_evtsel[idx - 0x186];
-  if (idx == 0xc1 || idx == 0xc2) return s->perf_pmc[idx - 0xc1];
+  if (idx == 0xc1 || idx == 0xc2) return s->perf_pmc[idx - 0xc1] & kPerfMask;
   if (idx >= 0x200 && idx <= 0x20f)
     return (idx & 1) ? s->mtrr_physmask[(idx - 0x200) >> 1]
                      : s->mtrr_physbase[(idx - 0x200) >> 1];
   if (idx == 0x277) return s->pat;
   if (idx == 0x2ff) return s->mtrr_def_type;
-  if (idx >= 0x309 && idx <= 0x30b) return s->perf_fixed_ctr[idx - 0x309];
+  if (idx >= 0x309 && idx <= 0x30b) return s->perf_fixed_ctr[idx - 0x309] & kPerfMask;
   if (idx == 0x345) return 0;  // IA32_PERF_CAPABILITIES: no LBR/PEBS
   if (idx == 0x38d) return s->perf_fixed_ctrl;
   if (idx == 0x38e) return s->perf_global_status;
@@ -1287,7 +1288,7 @@ static uint64_t MsrRead(uint32_t idx) {
   if (idx == 0xc0000080) return s->efer;
   if (idx == 0xc0000100 || idx == 0xc0000101) return s->msr_fs_gs_base[idx - 0xc0000100];
   if (idx == 0xc0000103) return s->tsc_aux;
-  if (idx == 0x1a0) return 0x1801;  // IA32_MISC_ENABLE: fast strings on
+  if (idx == 0x1a0) return s->misc_enable;  // IA32_MISC_ENABLE
   gp_fault(0);
 }
 
@@ -1295,7 +1296,21 @@ static void MsrWrite(uint32_t idx, uint64_t v) {
   if (idx == 0x10) {
     s->tsc_offset = v - ((uint64_t)HostTimerNow() * 1000u + cpu->inst_count);
   } else if (idx == 0x1b) {
-    s->msr_apic_base = v;
+    // IA32_APIC_BASE (SDM vol.3 11.4.3): base[31:12], BSP bit 8, enable bit
+    // 11; every other bit is reserved. QEMU rejects the reserved bits and
+    // calls cpu_set_apic_base, which preserves BSP and toggles the global
+    // enable (target/i386/tcg/system/misc_helper.c; hw/intc/apic.c
+    // apic_set_base). The xAPIC MMIO window itself stays at 0xFEE00000 in
+    // QEMU's model, so the enable bit is the observable side effect here.
+    if (v & ~(uint64_t)(kApicBaseMask | kApicBaseBsp | kApicBaseEnable)) gp_fault(0);
+    uint64_t old = s->msr_apic_base;
+    s->msr_apic_base = (v & kApicBaseMask) | (old & (kApicBaseBsp | kApicBaseEnable));
+    if (!(v & kApicBaseEnable))
+      s->msr_apic_base &= ~(uint64_t)kApicBaseEnable;
+    else if (!(old & kApicBaseEnable))
+      s->msr_apic_base |= kApicBaseEnable;
+    if (cpu->set_apic_enabled)
+      cpu->set_apic_enabled(cpu->apic_dev, (s->msr_apic_base & kApicBaseEnable) != 0);
   } else if (idx == 0x174) {
     s->sysenter_cs = v;
   } else if (idx == 0x175) {
@@ -1310,7 +1325,7 @@ static void MsrWrite(uint32_t idx, uint64_t v) {
     s->perf_evtsel[idx - 0x186] = (uint32_t)v;
     PerfUpdateActive();
   } else if (idx == 0xc1 || idx == 0xc2) {
-    s->perf_pmc[idx - 0xc1] = v;
+    s->perf_pmc[idx - 0xc1] = v & kPerfMask;
   } else if (idx >= 0x200 && idx <= 0x20f) {
     int i = (int)((idx - 0x200) >> 1);
     if (idx & 1)
@@ -1321,6 +1336,9 @@ static void MsrWrite(uint32_t idx, uint64_t v) {
     s->pat = v;
   } else if (idx == 0x2ff) {
     s->mtrr_def_type = v & 0xc07u;
+  } else if (idx >= 0x309 && idx <= 0x30b) {
+    // IA32_FIXED_CTR0..2: the RDPMC fixed-function bank (SDM vol.3 19.2).
+    s->perf_fixed_ctr[idx - 0x309] = v & kPerfMask;
   } else if (idx == 0x38d) {
     s->perf_fixed_ctrl = v & 0x7ffu;
     PerfUpdateActive();
@@ -1338,6 +1356,11 @@ static void MsrWrite(uint32_t idx, uint64_t v) {
     else if (idx == 0x401) s->mc0_status &= ~v;
     else if (idx == 0x402) s->mc0_addr = v;
     else s->mc0_misc = v;
+  } else if (idx == 0x1a0) {
+    // IA32_MISC_ENABLE is writable; QEMU stores the written value and reads
+    // it back (target/i386/tcg/system/misc_helper.c). The bits this machine
+    // does not model (fast-string microcode, bus-lock, ...) are storage only.
+    s->misc_enable = v;
   } else if (idx == 0xc0000080) {
     s->efer = v;
     TlbFlushAll(s);
@@ -1380,7 +1403,8 @@ void x86_count_perf(void) {
       continue;
     uint32_t ev = (uint32_t)sel & 0xff;
     if (ev == 0xc0 || ev == 0x3c) {
-      if (++s->perf_pmc[i] == 0) s->perf_global_status |= 1ull << i;
+      s->perf_pmc[i] = (s->perf_pmc[i] + 1) & kPerfMask;
+      if (s->perf_pmc[i] == 0) s->perf_global_status |= 1ull << i;
     }
   }
   for (int i = 0; i < 3; i++) {
@@ -1388,7 +1412,8 @@ void x86_count_perf(void) {
     int mode = (int)((s->perf_fixed_ctrl >> (2 * i)) & 7);
     int on = (mode & 1 && ring == 0) || (mode & 2 && ring != 0) || (mode & 4);
     if (on) {
-      if (++s->perf_fixed_ctr[i] == 0) s->perf_global_status |= 1ull << (32 + i);
+      s->perf_fixed_ctr[i] = (s->perf_fixed_ctr[i] + 1) & kPerfMask;
+      if (s->perf_fixed_ctr[i] == 0) s->perf_global_status |= 1ull << (32 + i);
     }
   }
 }
@@ -2514,6 +2539,7 @@ static void grp1(int size, int imm_form) {
   static const int kind[8] = {0, 1, 2, 3, 4, 5, 6, 7};
   static const char* const kGrp1Names[8] = {"add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"};
   modrm();
+  if (d.lock && d.reg == 7) ud();  // CMP is not lockable
   fr->rec.mnemonic = kGrp1Names[d.reg];
   uint32_t src;
   if (imm_form == 1)
@@ -2753,6 +2779,7 @@ static void grp3(int size) {
   static const char* const kGrp3Names[8] = {"test", "test", "not", "neg",
                                             "mul",  "imul", "div", "idiv"};
   modrm();
+  if (d.lock && d.reg != 2 && d.reg != 3) ud();  // only NOT/NEG are lockable
   fr->rec.mnemonic = kGrp3Names[d.reg];
   if (d.reg <= 1) {  // test rm, imm
     uint32_t imm = size == 1 ? imm8() : d.w32 ? imm32() : imm16();
@@ -4406,7 +4433,42 @@ static void SimdOp(uint8_t op2) {
   }
 }
 
+// LOCK is legal only on the read-modify-write family (SDM vol.2 LOCK: "The
+// LOCK prefix can be used with ... ADD, ADC, AND, BTC, BTR, BTS, CMPXCHG,
+// CMPXCHG8B, DEC, INC, NEG, NOT, OR, SBB, SUB, XADD, XCHG, XOR"), and only
+// when the destination is memory. Everything else is #UD before any state
+// changes. The group opcodes are admitted here and their sub-opcode is
+// checked after modrm() (BT/TEST/CMP/CALL/... share an opcode with a
+// lockable form but are not themselves lockable).
+static int lockable_first(uint8_t op) {
+  switch (op) {
+    case 0x00: case 0x01: case 0x08: case 0x09:
+    case 0x10: case 0x11: case 0x18: case 0x19:
+    case 0x20: case 0x21: case 0x28: case 0x29:
+    case 0x30: case 0x31:
+    case 0x80: case 0x81: case 0x82: case 0x83:
+    case 0x86: case 0x87:
+    case 0xf6: case 0xf7:
+    case 0xfe: case 0xff:
+    case 0x0f:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+static int lockable_0f(uint8_t op2) {
+  switch (op2) {
+    case 0xab: case 0xb0: case 0xb1: case 0xb3:
+    case 0xba: case 0xbb: case 0xc0: case 0xc1: case 0xc7:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 static void run_op2(uint8_t op2) {
+  if (d.lock && !lockable_0f(op2)) ud();
   // The MMX/SSE/SSE2 map: 0F 10-17, 28-2F, 50-77, 7E/7F, C2-C6, D1-DF,
   // E0-EF and F0-FE. Their mandatory prefixes are consumed by SimdOp.
   if ((op2 >= 0x10 && op2 <= 0x17) || (op2 >= 0x28 && op2 <= 0x2f) ||
@@ -4673,7 +4735,12 @@ static void run_op2(uint8_t op2) {
         // PG can rise only out of protected mode (SDM vol.2 MOV to CR0:
         // PG=1 with PE=0 is #GP(0); vol.3 9.9 sets PE first).
         if ((v & kCr0Pg) && !(v & kCr0Pe)) gp_fault(0);
-        s->cr0 = v;
+        // ET is hardwired to 1 on 486+ (SDM vol.3 2.5); QEMU's
+        // cpu_x86_update_cr0 ORs CR0_ET_MASK into every write
+        // (target/i386/helper.c,
+        // https://gitlab.com/qemu-project/qemu/-/raw/master/target/i386/helper.c),
+        // so the guest reads back the same bit.
+        s->cr0 = v | kCr0Et;
         // PG/PE/WP changes all alter translation or its permission check;
         // dropping the cache is cheap and always safe.
         TlbFlushAll(s);
@@ -4745,6 +4812,28 @@ static void run_op2(uint8_t op2) {
       edx = (uint32_t)(v >> 32);
       break;
     }
+    case 0x33: {  // rdpmc: EDX:EAX = PMC[ECX] (SDM vol.2 RDPMC)
+      fr->rec.mnemonic = "rdpmc";
+      // CR4.PCE lets CPL>0 read the counters; without it only CPL0 (real
+      // mode counts as CPL0, V86 does not).
+      if ((s->cr0 & kCr0Pe) && cpl() != 0 && !(s->cr4 & kCr4Pce)) gp_fault(0);
+      // CPUID.0AH advertises two general-purpose counters (type 0) and three
+      // fixed-function counters (type 4000H); any other encoding is #GP(0)
+      // (SDM RDPMC "Protected Mode Exceptions").
+      uint32_t type = ecx >> 16;
+      uint32_t idx = ecx & 0xffff;
+      uint64_t v;
+      if (type == 0 && idx < 2)
+        v = s->perf_pmc[idx];
+      else if (type == 0x4000 && idx < 3)
+        v = s->perf_fixed_ctr[idx];
+      else
+        gp_fault(0);
+      v &= kPerfMask;
+      eax = (uint32_t)v;
+      edx = (uint32_t)(v >> 32);
+      break;
+    }
     case 0x34: {  // sysenter (SDM vol.2; flat ring-0 CS, no frame)
       fr->rec.mnemonic = "sysenter";
       if (!(s->cr0 & kCr0Pe) || (s->sysenter_cs & 0xfffc) == 0) gp_fault(0);
@@ -4762,7 +4851,12 @@ static void run_op2(uint8_t op2) {
       s->dbit[ss_i] = 1;
       s->r[esp_i].e = (uint32_t)s->sysenter_esp;
       SetEip((uint32_t)s->sysenter_eip);
-      fl->word &= ~(0x100u | 0x10000u | 0x20000u);  // TF, RF, VM
+      // SDM SYSENTER flags affected: VM and IF only. RF is cleared by the
+      // step commit (this instruction does not load an EFLAGS image), and TF
+      // must survive so single-step still traps at the new EIP — QEMU's
+      // helper_sysenter clears VM|IF|RF and never TF
+      // (target/i386/tcg/seg_helper.c).
+      fl->word &= ~0x20000u;  // VM
       fl->if_ = 0;
       break;
     }
@@ -4872,9 +4966,21 @@ static void run_op2(uint8_t op2) {
       break;      // pop gs
     case 0xae: {  // 0f ae group: FXSAVE/FXRSTOR/LDMXCSR/STMXCSR/CLFLUSH
       modrm();
-      // The state-image and MXCSR forms are #UD unless the OS enabled the
-      // FXSAVE context (CR4.OSFXSR, SDM vol.3 13.5).
-      if (d.reg <= 3 && !(s->cr4 & kCr4Osfxsr)) ud();
+      // FXSAVE/FXRSTOR are x87/SSE state images: CR0.TS and CR0.EM both raise
+      // #NM (SDM FXSAVE/FXRSTOR "Protected Mode Exceptions"; QEMU's
+      // gen_FXSAVE/gen_FXRSTOR check HF_EM|HF_TS). They are not gated by
+      // CR4.OSFXSR: the SDM only says the MXCSR field may be omitted when
+      // OSFXSR=0 (implementation-dependent), and QEMU raises no #UD there.
+      // LDMXCSR/STMXCSR are Type 5 SSE instructions: TS raises #NM, EM and
+      // OSFXSR=0 raise #UD (SDM table 2-22). QEMU TCG's gen_LDMXCSR does not
+      // add the TS/EM check; the manual wins here.
+      if (d.reg == 0 || d.reg == 1) {
+        if (s->cr0 & (kCr0Ts | kCr0Em)) nm();
+      } else if (d.reg == 2 || d.reg == 3) {
+        if (s->cr0 & kCr0Ts) nm();
+        if (s->cr0 & kCr0Em) ud();
+        if (!(s->cr4 & kCr4Osfxsr)) ud();
+      }
       switch (d.reg) {
         case 0: {  // fxsave m512 (16-byte aligned, SDM FXSAVE)
           fr->rec.mnemonic = "fxsave";
@@ -4996,12 +5102,20 @@ static void run_op2(uint8_t op2) {
           eax = ebx = ecx = edx = 0;
         }
       } else if (leaf == 0x0a) {
-        // Architectural performance monitoring, version 1: two general
-        // counters and three fixed counters (SDM vol.3 19.2).
-        eax = 0x0101;
+        // Architectural performance monitoring (SDM vol.2A CPUID, initial
+        // EAX=0AH): EAX[7:0]=version, EAX[15:8]=general counter count,
+        // EAX[23:16]=general counter width, EAX[31:24]=length of the EBX
+        // architectural-event vector; EDX[4:0]=fixed counter count,
+        // EDX[12:5]=fixed counter width. The fixed-counter fields are valid
+        // only when the version is greater than 1, so this machine -- which
+        // implements IA32_FIXED_CTR0..2 -- reports version 2. Widths are 40
+        // bits, the value RDPMC masks to; EBX=0 marks events 0 (core cycles,
+        // 3CH) and 1 (instructions retired, C0H) available, the two this
+        // interpreter counts.
+        eax = 0x02280202;
         ebx = 0;
         ecx = 0;
-        edx = 2;
+        edx = 0x503;
       } else if (leaf == 0x80000000) {
         eax = 0x80000001;
         ebx = ecx = edx = 0;
@@ -5182,6 +5296,7 @@ static void run_op2(uint8_t op2) {
     case 0xba: {  // grp8: bt/bts/btr/btc rm, imm8 (reg field 4-7)
       modrm();
       if (d.reg < 4) ud();
+      if (d.lock && d.reg == 4) ud();  // BT is not lockable; BTS/BTR/BTC are
       // The reg field is the sub-opcode, so the name is only known once modrm()
       // has decoded it; picking it earlier reads the previous instruction's reg
       // and labels all four "btc".
@@ -5943,6 +6058,7 @@ static void x87_exec(uint8_t op) {
 // The one-byte opcodes, manual order. The comment names the encoding; body
 // is the manual's Operation section.
 void run_op(uint8_t op) {
+  if (d.lock && !lockable_first(op)) ud();
   if (op == 0x0f) {
     run_op2(fetch8());
     return;
@@ -6183,7 +6299,12 @@ void run_op(uint8_t op) {
     case 0x17:
       fr->rec.mnemonic = "pop ss";
       load_ss((uint16_t)pop_w());
-      s->intr_inhibit = 1;  // POP SS: one-instruction interrupt shadow (SDM)
+      // POP SS/MOV SS inhibit INTR, NMI, data breakpoints and single-step at
+      // the boundary after the NEXT instruction (SDM vol.3 6.8.3;
+      // CVE-2018-8897). The step body consumes both flags one instruction
+      // later; STI sets only intr_inhibit (its shadow covers INTR alone).
+      s->intr_inhibit = 1;
+      s->ss_inhibit = 1;
       break;  // pop ss
     case 0x18: {
       fr->rec.mnemonic = "sbb";
@@ -6900,7 +7021,11 @@ void run_op(uint8_t op) {
       uint16_t sel = rm16();
       if (d.reg == ss_i) {
         load_ss(sel);
-        s->intr_inhibit = 1;  // MOV SS: one-instruction interrupt shadow (SDM)
+        // MOV SS/POP SS shadow: INTR, NMI, data breakpoints and single-step
+        // are all inhibited at the boundary after the next instruction (SDM
+        // vol.3 6.8.3). STI's shadow is INTR-only.
+        s->intr_inhibit = 1;
+        s->ss_inhibit = 1;
       } else if (d.reg == cs_i) {
         ud();  // MOV to CS does not exist (SDM vol.2 MOV)
       } else {
@@ -6974,10 +7099,11 @@ void run_op(uint8_t op) {
       break;
     }
     case 0x9b: {
-      // WAIT/FWAIT: #NM if CR0.TS (the lazy-switch check; EM is not part of
-      // WAIT's check, SDM WAIT), then report a standing unmasked x87 exception.
+      // WAIT/FWAIT: #NM only when CR0.MP=1 AND CR0.TS=1 (SDM WAIT "Protected
+      // Mode Exceptions"; QEMU's gen_WAIT tests both flags). EM is not part
+      // of WAIT's check, and with MP=0 the lazy-switch signal is ignored.
       fr->rec.mnemonic = "wait";
-      if (s->cr0 & kCr0Ts) nm();
+      if ((s->cr0 & (kCr0Mp | kCr0Ts)) == (kCr0Mp | kCr0Ts)) nm();
       if (s->fpu.pending_mf && (s->cr0 & kCr0Ne)) raise_(fr, vec_mf, 0);
       break;
     }
@@ -7548,7 +7674,7 @@ void run_op(uint8_t op) {
       break;
     case 0xfe: {  // grp4: inc/dec rm8 (reg field)
       modrm();
-      if (d.reg > 1) ud();
+      if (d.reg > 1) ud();  // only INC/DEC are lockable
       fr->rec.mnemonic = d.reg ? "dec" : "inc";
       uint8_t v = RM8();
       uint8_t r = d.reg ? (uint8_t)(v - 1) : (uint8_t)(v + 1);
@@ -7561,6 +7687,7 @@ void run_op(uint8_t op) {
     }
     case 0xff: {  // grp5: inc/dec/call/jmp/push (reg field)
       modrm();
+      if (d.lock && d.reg > 1) ud();  // only INC/DEC are lockable
       switch (d.reg) {
         case 0:
         case 1: {
@@ -7702,9 +7829,14 @@ void x86_init(CpuState* c) {
     st = (x86_state*)c->priv;
     memset(st, 0, sizeof(*st));
   }
+  if (!c->real_bus) c->real_bus = c->bus;
+  if (!c->fetch_bus) c->fetch_bus = c->bus;  // normal run: same bus for fetch
   fpu_init(&st->fpu);
   st->r = (cell*)c->gpr;
   st->fl.word = 0x202;  // IF set, reserved bit 1 on (SDM reset state)
+  // CR0.ET is 1 in the reset state and stays 1 on every write on 486+
+  // (SDM vol.3 2.5; QEMU target/i386/helper.c cpu_x86_update_cr0).
+  st->cr0 = kCr0Et;
   // Debug-register reset state (SDM vol.3 17.2.2/17.2.4): DR6's reserved
   // bits read 1; DR7's bit 10 reads 1 and every breakpoint is disabled.
   st->dr[6] = kDr6Rsvd1;
@@ -7717,9 +7849,13 @@ void x86_init(CpuState* c) {
   // IA32_APIC_BASE reset state (SDM vol.3 11.4.3): default base, APIC
   // enabled, BSP.
   st->msr_apic_base = 0xFEE00000ULL | 0x800ULL | 0x100ULL;
+  // IA32_MISC_ENABLE reset: QEMU's MSR_IA32_MISC_ENABLE_DEFAULT is bit 0
+  // (fast strings); cemu stores writes, so this is the read-back image.
+  st->misc_enable = 1;
   c->set_irq = x86_set_irq_line;
   c->set_a20 = x86_set_a20_line;
   c->set_ignne = x86_set_ignne_line;
+  c->phys_to_lin = x86_phys_to_lin;
   c->set_nmi = x86_set_nmi;
   // The gate starts open (the reasoning lives in port92.h): every image cemu
   // accepts is handed flat memory above 1 MiB and never expects the alias.
@@ -7735,7 +7871,7 @@ void x86_init(CpuState* c) {
       break;
     }
   if (multiboot) {
-    st->cr0 = 1;  // PE
+    st->cr0 = kCr0Pe | kCr0Et;  // flat protected mode, ET hardwired
     // Boot stack (multiboot leaves ESP undefined; QEMU's loader hands the
     // image a stack just below the multiboot info struct — measured
     // 0x6f07 post-push on qemu-system-i386 -kernel). Our info scratch sits

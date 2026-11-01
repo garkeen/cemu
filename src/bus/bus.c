@@ -31,6 +31,7 @@ void BusAddRegion(Bus* bus, uint64_t base, uint64_t size, const DeviceOps* ops, 
   r->dev = dev;
   r->host = NULL;
   r->overlaps = 0;
+  bus->version++;
   RefreshBus(bus);
 }
 
@@ -45,6 +46,7 @@ void BusRelocateRegion(Bus* bus, const DeviceOps* ops, void* dev, uint64_t base,
     if (bus->regions[i].ops == ops && bus->regions[i].dev == dev) {
       bus->regions[i].base = base;
       bus->regions[i].size = size;
+      bus->version++;
       RefreshBus(bus);
       return;
     }
@@ -57,6 +59,7 @@ int BusRemoveRegion(Bus* bus, const DeviceOps* ops, void* dev) {
     if (bus->regions[i].ops == ops && bus->regions[i].dev == dev) {
       for (int j = i + 1; j < bus->count; j++) bus->regions[j - 1] = bus->regions[j];
       bus->count--;
+      bus->version++;
       RefreshBus(bus);
       return 1;
     }

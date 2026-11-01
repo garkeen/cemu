@@ -39,27 +39,39 @@ int DebugOn(uint32_t cat);
 
 // Resolved once by DebugInit. The interpreters read these directly on their
 // hot paths:
-//   g_mem_slow   any category that observes every memory access is on, so the
-//                TLB/宿主指针 fast path must be bypassed to keep the event
-//                stream identical (mem, bus, and watch=).
 //   g_record_raw raw instruction bytes are needed by the trace formats and the
-//                exec/trap rows; with none of them on, fetch8 skips the
-//                per-byte recording.
+//                exec/trap rows; the debug fetch bus appends them as the
+//                instruction is fetched.
 //   g_dbg_any    any *step-scoped* observation is on: the debug step stream is
 //                selected (the one that fills the frame's rec fields). A plain
-//                screen-only, gdb-only or vga-io-only session stays on the fast
-//                stream; screenstop is the exception (it needs the live frame).
+//                screen-only, gdb-only or vga-io-only session stays on the
+//                normal stream; screenstop is the exception (it needs the live
+//                frame).
 //   g_dbg_insn   the per-instruction row stream is on (trace/state/pcshot/
 //                exec/hist/regs): DebugInsn is called after the commit.
 //   g_dbg_frame  a row with no instruction frame (mark/virtio/pmp) is on, or
-//                screenstop needs the live frame: DebugSetFrame publishes it
-//                each step. Memory/bus/trap rows carry their own frame.
+//                screenstop needs the live frame. The debug step always
+//                publishes the frame; this flag only keeps such a session on
+//                the debug step when no insn/mem/trap stream is active.
 //                A plain `screen` session does not need this.
-extern int g_mem_slow;
 extern int g_record_raw;
 extern int g_dbg_any;
 extern int g_dbg_insn;
 extern int g_dbg_frame;
+
+// The frame published by DebugSetFrame; the debug bus wrapper uses it to name
+// the instruction that caused an access.
+struct frame* DebugFrame(void);
+// True when at least one watchl= is armed; the debug bus wrapper uses this to
+// skip the physical-to-linear reverse lookup on runs without linear watches.
+int DebugLinWatchActive(void);
+
+// The fetch bus appends each fetched byte here. The debug step calls
+// DebugFetchBegin before every instruction, so raw bytes survive a far jump, a
+// CR3 change, or a fault without the interpreter carrying a per-byte recording
+// branch.
+void DebugFetchBegin(void);
+void DebugFetchByte(uint8_t b);
 
 // Parses CEMU_DEBUG into the bitmask, registers watchpoints, and opens the
 // tables. Call once before the first step. Inert when the env var is unset.
@@ -197,10 +209,9 @@ int DebugWatchHit(uint64_t addr, int size, int is_load);
 // Linear twin of the watch (watchl=): watch= matches the address the bus sees,
 // which is physical; a protected-mode structure (a VxD slot, a kernel object)
 // has no stable physical page across runs, so "who wrote this slot" has to be
-// asked at the linear address the guest names. The ISA's linear funnel calls
-// this after each access while `g_mem_slow` is on (a linear watch forces that
-// path, exactly as a physical one does). x86-only today: its caller is the
-// x86 lin_load/lin_store funnel; riscv has no linear watch wiring yet.
+// asked at the linear address the guest names. The debug bus wrapper recovers
+// the linear address from the CPU's TLB (phys_to_lin) and calls this after the
+// access. x86-only today; riscv has no linear watch wiring yet.
 int DebugLinWatchHit(uint64_t addr, int size, int is_load);
 void DebugLinWatch(struct frame* f, uint64_t lin, int size, int is_load, uint64_t val);
 

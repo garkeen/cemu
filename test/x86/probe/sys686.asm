@@ -70,11 +70,16 @@ _start:
   jz fail1
   test edx, 1 << 17
   jz fail1
+  ; SDM vol.2A CPUID initial EAX=0AH: EAX[7:0]=version, [15:8]=general
+  ; count, [23:16]=general width, [31:24]=EBX event-vector length;
+  ; EDX[4:0]=fixed count, [12:5]=fixed width. Fixed counters need
+  ; version > 1, so the leaf reports v2 with two 40-bit general and
+  ; three 40-bit fixed counters; events 0 (3CH) and 1 (C0H) are available.
   mov eax, 0x0a
   cpuid
-  cmp eax, 0x0101
+  cmp eax, 0x02280202
   jne fail1
-  cmp edx, 2
+  cmp edx, 0x503
   jne fail1
 
   ; APIC advertisement and topology: leaf 1 names one logical processor with

@@ -61,6 +61,16 @@ int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuStat
   // Resolved once: DebugInit fixes g_dbg_any before the first step.
   void (*step)(CpuState*) = m->isa->step;
   if (g_dbg_any && m->isa->step_debug) step = m->isa->step_debug;
+  // One choice for the whole run, never per access. Every debug step uses the
+  // observing bus for both data and fetch: the fetch side is what records RAW
+  // bytes, and keeping both sides on wrappers with no host pointer stops a
+  // data TLB fill from handing the fetch path a cached host pointer that would
+  // bypass that recording. Normal runs use the real bus on both sides.
+  if (m->cpu.real_bus) {
+    int debug_run = g_dbg_any && m->cpu.debug_bus && m->cpu.debug_fetch_bus;
+    m->cpu.bus = debug_run ? m->cpu.debug_bus : m->cpu.real_bus;
+    m->cpu.fetch_bus = debug_run ? m->cpu.debug_fetch_bus : m->cpu.real_bus;
+  }
   while (!m->cpu.halted) {
     if ((m->cpu.inst_count & ((1u << kPollStrideLog2) - 1)) == 0 || m->cpu.wait) {
       if (m->poll) m->poll(m);

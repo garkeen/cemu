@@ -21,9 +21,13 @@ void STEP_FN(CpuState* c) {
   static int delivering_vec = -1;
 
   // The one-instruction INTR inhibit shadow expires here (read once, then
-  // cleared below with the sample point after the landing pad).
+  // cleared below with the sample point after the landing pad). MOV SS/POP SS
+  // also inhibit NMI and debug traps across the next instruction (SDM vol.3
+  // 6.8.3), so they carry a second, wider shadow.
   int intr_shadow = s->intr_inhibit;
   s->intr_inhibit = 0;
+  int ss_shadow = s->ss_inhibit;
+  s->ss_inhibit = 0;
 
   // Only the fields that can survive from the previous instruction are
   // cleared; every modrm-derived field is written by modrm() before use, and
@@ -33,6 +37,7 @@ void STEP_FN(CpuState* c) {
   g.delivered = 0;
   g.op2 = 0;
   g.rep = 0;
+  g.lock = 0;
   g.nxt = 0;
   g.eip_set = 0;
   g.p66 = g.pf2 = g.pf3 = 0;
@@ -63,7 +68,18 @@ void STEP_FN(CpuState* c) {
   // this instruction (a console byte, an interrupt edge) has no frame of its
   // own, and this is what lets it name the guest code that caused it (debug.h).
 #if STEP_DBG
-  if (g_dbg_frame) DebugSetFrame(fr);
+  // Memory/bus rows are emitted from the observing bus, which has no access
+  // to this step's `fr`; publish it for every debug step. `g_dbg_frame` still
+  // decides whether *frameless* rows carry the pc= context.
+  DebugSetFrame(fr);
+  // The observing bus is a copy of the machine bus; a BAR programmed by
+  // firmware moves regions, so refresh the copy before this instruction.
+  if (cpu->debug_bus_sync) cpu->debug_bus_sync(cpu->debug_bus_ctx);
+  // The fetch bus appends every byte it hands out to the instruction's RAW
+  // column; this bracket clears the column for the new instruction. It
+  // survives a far jump, a CR3 change and a fault because the bytes are
+  // captured before execution.
+  DebugFetchBegin();
 #endif
 
   if (setjmp(fr->raise)) {
@@ -93,6 +109,9 @@ void STEP_FN(CpuState* c) {
     // interrupted context held (an instruction-breakpoint #DB forces RF=1 in
     // its image so the resumed instruction reports nothing, SDM vol.3 17.3.1).
     fl->rf = 0;
+    // A fault in the instruction after MOV SS/POP SS preempts the deferred
+    // debug trap; do not let it leak into an unrelated later boundary.
+    s->db_pending = 0;
     // gdb stub: an exception landed during the step that just ran (step.h
     // hook). Hardware INTR delivery above intentionally does not count.
     s->trap_seq++;
@@ -120,7 +139,7 @@ void STEP_FN(CpuState* c) {
   // an NMI already in service blocks another until the handler's IRET (SDM
   // vol.3 6.7.1). It takes the vector-2 gate with an external-interrupt frame
   // (no error code) and clears IF/TF on entry like any interrupt gate.
-  if (s->nmi_pending && !s->nmi_blocked) {
+  if (s->nmi_pending && !s->nmi_blocked && !ss_shadow) {
     s->nmi_pending = 0;
     s->nmi_blocked = 1;
     cpu->wait = 0;
@@ -241,8 +260,21 @@ void STEP_FN(CpuState* c) {
     s->watch_hits = stub_hits;
     s->dr[6] |= stub_hits;  // recorded whether or not it vectors: the hit happened
   }
-  if (s->bt_pending || (!d.delivered && ((d.watch_hit & ~stub_hits) || tf0))) {
-    s->dr[6] |= dr6set;
+  // MOV SS/POP SS defer the guest-visible causes to the boundary after the
+  // next instruction (SDM vol.3 6.8.3; CVE-2018-8897). The gdb stub's own
+  // watchpoint is still reported now: it is the debugger's observation, not a
+  // guest #DB, and the stub reads watch_hits after this step.
+  uint32_t guest_dr6 = dr6set & ~stub_hits;
+  if (s->ss_inhibit) {
+    s->db_pending |= guest_dr6;
+    guest_dr6 = 0;
+  }
+  if (ss_shadow) {
+    guest_dr6 |= s->db_pending;
+    s->db_pending = 0;
+  }
+  if (s->bt_pending || (!d.delivered && guest_dr6)) {
+    s->dr[6] |= guest_dr6;
     s->bt_pending = 0;
     cpu->wait = 0;  // a #DB after hlt wakes the processor
 #if STEP_DBG

@@ -25,6 +25,7 @@ typedef struct LapicDevice {
   uint8_t tmr[32];     // trigger mode per vector, as last delivered (11.5.8)
   int64_t timer_base_us;  // host time the current count started from
   uint32_t timer_count;   // counts loaded at that instant (0 = timer idle)
+  int enabled;            // IA32_APIC_BASE.ENABLE (bit 11): gate the register file
   int irq_level;          // what this LAPIC last drove on the CPU's INTR line
   void (*set_irq)(void* ctx, int line, int level);
   void* irq_ctx;
@@ -36,6 +37,11 @@ typedef struct LapicDevice {
 
 void LapicInit(LapicDevice* d);
 void LapicRegister(Bus* bus, LapicDevice* d);
+// IA32_APIC_BASE.ENABLE changed (WRMSR 0x1B). QEMU's xAPIC keeps the MMIO
+// window at 0xFEE00000 but returns all ones from it while the global enable is
+// clear (hw/intc/apic.c apic_mem_read); disabling also clears the SVR software
+// enable, so software has to re-enable the APIC after a global disable.
+void LapicSetEnabled(LapicDevice* d, int enabled);
 void LapicSetIrqSink(LapicDevice* d, void (*set_irq)(void* ctx, int line, int level), void* ctx);
 void LapicSetEoiSink(LapicDevice* d, void (*eoi)(void* ctx, int vector), void* ctx);
 // The APIC's own id (ID register bits 31:24) and its flat-model logical mask

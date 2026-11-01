@@ -28,6 +28,7 @@
 #include "device/storage/ide.h"
 #include "device/timer/i8254.h"
 #include "device/video/vga.h"
+#include "debug/busdebug.h"
 #include "host/host.h"
 #include "util/log.h"
 
@@ -177,6 +178,9 @@ typedef struct X86Board {
   // fw_cfg; the bytes belong to this machine and live until it is destroyed.
   uint8_t* vgabios;
   uint32_t vgabios_size;
+  // The observing bus: a forwarding copy of the machine bus whose regions have
+  // no host pointer (debug/busdebug.h). NULL if allocation failed.
+  BusDebug* bus_debug;
   // Absolute pointer integration over the relative PS/2 mouse (D38). The
 } X86Board;
 
@@ -270,6 +274,14 @@ static void OnLapicIrq(void* ctx, int line, int level) {
   (void)line;
   xm->lapic_irq = level;
   UpdateIntr(xm);
+}
+
+// IA32_APIC_BASE.ENABLE (bit 11) changed: QEMU's xAPIC gates its register
+// file on this bit, so the board routes the CPU's MSR-side signal to the
+// device that answers the fixed 0xFEE00000 window.
+static void OnSetApicEnabled(void* ctx, int enabled) {
+  X86Board* xm = (X86Board*)ctx;
+  LapicSetEnabled(&xm->lapic, enabled);
 }
 
 // The I/O APIC hands a redirection entry's vector to the destination APIC: a
@@ -585,8 +597,11 @@ static int LoadVgaRom(X86Board* xm, FwCfgDevice* fwcfg, const char* path) {
   return 0;
 }
 
+static void SyncDebugBus(void* ctx) { BusDebugSync((BusDebug*)ctx); }
+
 static void X86Destroy(Board* m) {
   X86Board* xm = (X86Board*)m;
+  BusDebugDestroy(xm->bus_debug);
   free(xm->rom);
   free(xm->vgabios);
   IdeDestroy(&xm->ide);
@@ -653,6 +668,10 @@ static void WireDevices(X86Board* xm) {
   PicSetIrqSink(&xm->pic, OnPicIrq, xm);
   LapicSetIrqSink(&xm->lapic, OnLapicIrq, xm);
   LapicSetEoiSink(&xm->lapic, OnLapicEoi, xm);
+  // WRMSR IA32_APIC_BASE's enable bit reaches the LAPIC through the CPU's
+  // board hook, the same way the A20 and IGNNE# lines do.
+  m->cpu.set_apic_enabled = OnSetApicEnabled;
+  m->cpu.apic_dev = xm;
   PitSetIrqSink(&xm->pit, OnIsaIrq, &xm->irqbus);
   I8042SetIrqSink(&xm->kbd, OnIsaIrq, &xm->irqbus);
   // The controller's auxiliary port and the PS/2 mouse on the far side of it:
@@ -945,6 +964,17 @@ Board* X86BoardCreate(const BoardOpts* opts) {
 
   m->cpu.halted = kCpuRunning;
   m->cpu.bus = &m->bus;
+  m->cpu.real_bus = &m->bus;
+  m->cpu.fetch_bus = &m->bus;
+  // The observing bus is a forwarding copy with no host pointers. It costs
+  // nothing unless BoardRunSteps installs it for a mem/bus/watch run.
+  xm->bus_debug = BusDebugCreate(&m->bus);
+  if (xm->bus_debug) {
+    m->cpu.debug_bus = BusDebugDataBus(xm->bus_debug);
+    m->cpu.debug_fetch_bus = BusDebugFetchBus(xm->bus_debug);
+    m->cpu.debug_bus_sync = SyncDebugBus;
+    m->cpu.debug_bus_ctx = xm->bus_debug;
+  }
   m->cpu.io = &m->io;
   m->bin_base = kBootSectorLoad;
   m->default_isa = "x86";  // a BIOS reset has no image to name its ISA

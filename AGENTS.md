@@ -135,35 +135,54 @@ ISA 头，`virt.c` 仅引 `platform.h`。
 
 ### 命令限时与 I/O 预算（用户裁决，硬性）
 
-- 本仓的**每一条**命令都必须带超时，且**不超过 2 分钟**；后台任务同样以 2 分钟为
-  上限，到点即停。单条命令的宿主读写不得超过 **50MB**，整个会话累计不得超过
-  **500MB**。
+- 本仓的**每一条 shell/构建/运行命令**都必须带超时，且**不超过 2 分钟**；后台任务
+  同样以 2 分钟为上限，到点即停。文件读取/搜索这类工具调用不是“运行”，不受此限，
+  但同样不得用来整盘扫描或批量复制镜像。
+- **宿主侧调试产物**（复制/转格式的镜像、日志、trace/state/mem 捕获、dump、抓包）
+  单条命令不得超过 **50MB**，整个会话累计不得超过 **500MB**。计数器算的是宿主
+  写入与人为复制；客户机对**原镜像**的按需扇区读取是运行的必要部分，不计入这
+  两个数，但也**不得**整盘扫描、整盘复制、或用 `qemu-img`/`dd` 生成多份副本。
 - **禁止复制整套磁盘镜像做实验**（Win95 是 450MB 级，复制一次就违规）：用原镜像
-  或既有副本，实验产生的副本用完立即删除。观测设施拖慢启动不是放宽这两条的理由
-  ——慢就改设施，不是加时。
+  或既有副本，写入一律用 `-snapshot`/copy-on-write，实验产生的副本用完立即删除。
+  观测设施拖慢启动不是放宽限时的理由——慢就改设施，不是加时。
+- **客户机内存按机器默认值或镜像需求给**。禁止为了省事开 GB 级 `--mem`（例如
+  Win95 用默认 32MB 就够，不要 `--mem 1024`）；确需大内存时必须在当轮说明理由。
 - **所有**运行一律限时——run.sh 用 `timeout` 包裹 cemu 调用；会话内的临时手跑
   （调试观测、state 对拍、探针复现）同样必须前置 `timeout <秒>`，防止被测程序
   死循环导致不退出的挂起（任一格挂死都必须由 timeout 收住；realmode 现在自行以
   debug-exit 收场，但判据仍只看输出）。
+- **全量回归是唯一例外**：`test/run.sh` 或四个 `check*` 目标只在用户当轮明确
+  发话后执行，整包时限由用户当轮给出；单格仍由脚本内 `timeout` 收住。
 
-### 测试只能跑探针，不许跑 bios/img/iso（用户裁决）
+### 套件只能跑探针；调试可以跑真实镜像（用户裁决）
 
-套件里任何一格都不得引导固件镜像、软盘镜像或光盘镜像。理由是它们慢（一个 SeaBIOS
-自举到 DOS 就要千万条指令、一分多钟），且依赖库外的产物（本仓的 `build/` 与
-`../seabios/out/` 都不在版本控制里，换台机器那几格只能 SKIP，计数也随之漂移）。
-设备语义一律用**自足探针**钉：探针自己编程那台设备（`test/*/probe/`，multiboot ELF
-或引导扇区，从 `-bios`/`-fda`/`-cdrom` 起来的都不算），`timeout` 内在秒级跑完。
-会话内的临时手跑同样受此约束。**违反此条的格直接删除，不改写成探针**（用户裁决）：
-片 26/27 引入的 `floppy` 与 `vga` 两格（`-bios ../seabios/out/bios.bin -vgabios ...
--fda`）已从 `test/x86/run.sh` 删除，覆盖改由两个自足探针承担（`vga_core` 直接写
-0x3C4/0x3CE/0x3C0 与孔径；`fdc_dma` 自己下 8272A/8237 命令与 DMA 编程，都不借
-SeaBIOS 的手），x86 套件 50 格（42 个自足探针 + kvm-unit-tests 7 镜像 + realmode 1）。
+- **套件（`test/run.sh` 与 `test/<isa>/run.sh`）里**任何一格都不得引导固件镜像、
+  软盘镜像或光盘镜像。理由是它们慢（一个 SeaBIOS 自举到 DOS 就要千万条指令、
+  一分多钟），且依赖库外的产物（本仓的 `build/` 与 `../seabios/out/` 都不在版本
+  控制里，换台机器那几格只能 SKIP，计数也随之漂移）。设备语义一律用**自足探针**
+  钉：探针自己编程那台设备（`test/*/probe/`，multiboot ELF 或引导扇区，从
+  `-bios`/`-fda`/`-cdrom` 起来的都不算），`timeout` 内在秒级跑完。
+- **调试/定位/复现不受上一条限制**：Win95、Linux、真实固件这些镜像正是调试对象，
+  该跑就跑。但调试运行必须服从“命令限时与 I/O 预算”，并优先用最小手段：
+  - 原镜像就地打开，写入用 `-snapshot`，不复制、不多份、不转格式；
+  - 用 `--max-inst` 与 `CEMU_DEBUG` 的 `inst=`/`skip=`/`budget=`/`pcshot=`/
+    `watchl=`/`dump=` 把窗口收窄，不跑整场、不取整盘；
+  - 观测落盘受“落盘体积”的 5MB/文件与会话 500MB 预算约束，**不写 GB 级日志**；
+    要更长的窗口就加 `skip=`/`inst=`/采样，不是加大文件；
+  - 客户机内存按机器默认值或镜像需求给，不开 GB 级。
+- **套件里的违规格直接删除，不改写成探针**（用户裁决）：片 26/27 引入的
+  `floppy` 与 `vga` 两格（`-bios ../seabios/out/bios.bin -vgabios ... -fda`）
+  已从 `test/x86/run.sh` 删除，覆盖改由两个自足探针承担（`vga_core` 直接写
+  0x3C4/0x3CE/0x3C0 与孔径；`fdc_dma` 自己下 8272A/8237 命令与 DMA 编程，都不借
+  SeaBIOS 的手），x86 套件 59 格（47 个自足探针 + kvm-unit-tests 11 镜像 + realmode 1）。
 
 ### 落盘体积
 
 **任何**写入文件不得超过 5MB——测试对拍数据/捕获文件、CEMU_DEBUG 观测落盘
-（`2>file` 的 trace/state/mem/regs 等）一律算；超出即视为违规，须改用采样、截断
-或 CEMU_DEBUG `budget=` 抑制等手段收敛体积。
+（`2>file` 的 trace/state/mem/regs 等）一律算；整个会话的宿主侧产物累计不得超过
+**500MB**。超出即视为违规，须改用采样、截断、`inst=`/`skip=` 窗口或
+CEMU_DEBUG `budget=` 抑制等手段收敛体积；**不要写 GB 级日志**。`dump=` 按段
+5MB（最多 4 段）与 `fbdump=` 单张 5MB 的限额不变。
 
 ## 三、执行模型铁律（V3 巨型 switch 直执）
 
@@ -213,8 +232,8 @@ cemu 的哪些文件，把这些文件**整份读完**（不是只读"看起来�
 不许写进报告。
 
 **0b. 每一次修改都必须给出理由（用户裁决，硬性）**：我的记忆一律不可信——手册条文、
-QEMU/参考实现的行为、"我记得是这样"都不算证据，写进注释、报告或提交前必须重新取证。
-提交任何修改或功能添加时，回复里必须附上下面两样之一：
+QEMU/参考实现的行为、"我记得是这样"都不算证据，写进注释、报告或落盘前必须重新取证。
+落盘任何修改或功能添加时，回复里必须附上下面两样之一：
 - **官方 SDM 原文**：贴出该指令 Operation 段或该条款的原文，并给出抓取 URL；
 - **QEMU 的实际实现**：贴出文件路径、函数名与关键行原文（`web_fetch` 可取
   `gitlab.com/qemu-project/qemu/-/raw/master/...`）。
@@ -251,19 +270,19 @@ QEMU/参考实现的行为、"我记得是这样"都不算证据，写进注释�
    然后一次跑出答案。补设施的成本永远低于试跑加猜，且设施留下的是可复用
    的观测能力；试跑只留下时间。
 10. **补设施不许伤热路径**：观测成本必须落在**已经为调试打开的路径**上。禁止在
-   每字节译码、每次访存、每条指令的常路径里新增判定或函数调用——"每次译码都测
-   一个 `if`"就是 bug，哪怕它看起来只有一个位。正确做法二选一：
-   - 复用一次解析好的门控（`g_dbg_any` / `g_mem_slow` / `g_record_raw` 这类），
-     匹配挂在**已被门控的调用点**上（`DebugInsn` / `DebugMem` / `DebugTrap`）；
-   - 若确实需要落在取指/译码内部，先把该路径改成已门控（像 `g_record_raw` 那样
-     一次解析、热路径只读一个全局），并说明为什么既有门控不够用。
-   性能是验收项：加设施后要能说出"关闭该设施时热路径多了几条指令"，只允许
-   **一次已解析全局的门控读取**（`fetch8`/`phys_load` 的 `g_mem_slow`、
-   step 的 `g_dbg_any` 这类）；不允许每字节/每访存做匹配、格式化或函数调用。
-   要连这次读取也去掉，只能把快/慢做成两条流（step 已有 `isa_ops.step_debug`；
-   取指/访存路径没有复制，代价是每字节一次可预测分支）。
+   每字节译码、每次访存、每条指令的常路径里出现任何观测判定或函数调用——"每次
+   译码都测一个 `if`"就是 bug，哪怕它看起来只有一个位。正确做法：
+   - 匹配挂在**已被门控的调用点**上（`DebugInsn` / `DebugMem` / `DebugTrap`）；
+   - 若确实需要落在取指/访存内部，就把观测点移出正常路径：x86 的 `x86_step`
+     用真实 bus，`x86_step_debug` 用 `debug_bus`（`debug/busdebug.c` 的转发
+     副本，`BusRamPage` 永远失败，所有访问都过包装器），正常 `fetch8` /
+     `phys_load` / `phys_store` / `lin_load` / `lin_store` 里没有判定；
+     raw 字节由 debug fetch bus 在取指时追加到 `fr->rec.raw`。
+   性能是验收项：加设施后要能说出"关闭该设施时热路径多了几条指令"，答案必须是
+   **零**。端口 I/O 的 `bus` 行与段加载的 `mark` 行不在取指/数据访存热路径上，
+   仍是调用点上的位测试；若以后它们进入热路径，按同一规则移出。
 
-## 五、CEMU_DEBUG 语法（常驻调试设施，唯一调试入口）
+## 五、CEMU_DEBUG 语法（常驻观测设施，唯一观测入口）
 
 ```
 CEMU_DEBUG = item[,item...]
@@ -294,25 +313,25 @@ CEMU_DEBUG = item[,item...]
   gdb                       gdb stub 的协议包（tx/rx）与状态机行（attach/detach、
                             stop 原因）。排查"客人该停没停/停错地方"用
   watch=ADDR:SIZE[:r|w|rw]  地址观测（可重复逗号分隔；数字按 C 字面量解析，
-                            **十六进制必须写 0x**，否则静默丢弃——现已改为报错）。
+                            **十六进制必须写 0x**，否则报错（旧实现是静默丢弃）。
                             **地址按物理地址匹配**：x86 开分页后要看内核某个符号
                             必须先减去映射偏移（内核 .data 的 0xc02c0180 是物理
                             0x2c0180），写线性地址会一行都不出
                             watch 的命中行同样吃 `budget=`/`skip=`（自成一类）：不设预算
                             时，一片客人频繁拷贝的区域能在 5MB 硬顶之前写满磁盘
-  watchl=ADDR:SIZE[:r|w|rw] 线性地址观测（**x86-only**：匹配点在 x86 的
-                            lin_load/lin_store；riscv 尚未接线）：与 watch= 同形，
-                            但**按线性地址匹配**。
+  watchl=ADDR:SIZE[:r|w|rw] 线性地址观测（**x86-only**；riscv 尚未接线）：与
+                            watch= 同形，但**按线性地址匹配**。
                             分页打开后内核结构（VxD 数据槽、内核对象）的物理页
                             每次运行都可能不同，watch= 报不出"谁写了这个槽"；
-                            这条在 ISA 的线性漏斗（x86 的 lin_load/lin_store）
-                            里匹配，因此也把 g_mem_slow 打开。命中行 DETAIL 用
+                            这条由 debug bus 在数据访问后经 `phys_to_lin` 从
+                            x86 的 TLB 反查线性地址再匹配。命中行 DETAIL 用
                             `lr`/`lw` 与物理的 `r`/`w` 区分，同样吃 budget=/skip=。
                             例：`watchl=0xc001e1f7:4:rw`（读/写该线性地址的指令）
-                            **注意：mem/bus/watch/watchl 会打开 g_mem_slow，绕过
-                            TLB 逐次走查；A/D 位与到达时序可能与正常跑不同。
-                            定时敏感的问题用 trace/state/pcshot（不改访存路径），
-                            内存观测只用来回答"谁碰了这个地址"。**
+                            **注意：任何 debug step 都安装 debug bus（转发副本，
+                            没有 host 指针），数据/取指都经包装器；A/D 位与到达
+                            时序可能与正常跑不同。定时敏感的问题用
+                            trace/state/pcshot（不输出 mem/bus 行，但同样走 debug
+                            bus），内存观测只用来回答"谁碰了这个地址"。**
   exec=LO-HI[:COUNT]       区间跨越行（可重复，上限 4 条；COUNT 数**打印的行**，
                             被 inst=/skip=/budget= 抑制的跨越不占 COUNT）：下一条指令的**线性 PC
                             落入 [LO,HI) 且上一步不在该区间**时打一行——PC/MNEMONIC
@@ -401,7 +420,8 @@ CEMU_DEBUG = item[,item...]
                             `b` 十六进制（位掩码与地址要能直接读）。现有 name：
                             isa(中断线) intr(CPU INTR 线) inta(INTA 向量)
                             pic0/pic1-imr|eoi|base|icw1 ioapic lapic-irr|ack|eoi
-                            lidt/lgdt gate(门描述符) hostkey kbd-byte kbd-irq
+                            lidt/lgdt seg(段加载：a=(段号&lt;&lt;16)|选择子，b=基址)
+                            gate(门描述符) hostkey kbd-byte kbd-irq
                             aux-byte aux-irq(IRQ12) hostmouse mouse-inj key-inj
                             gatecall int=<向量> ax= bx= cx= dx= si= ds= es= at=<cs:ip>
                             gateret ax= bx= cx= dx= cf= at=<cs:ip> —— x86 软件 INT n
@@ -464,10 +484,11 @@ CEMU_DEBUG = item[,item...]
 
 - 输出走 stderr，`2>file` 留档。step 有两条流：正常跑走 `isa_ops.step`
   （`STEP_DBG=0`，预处理已把 debug 块删掉，连 `dbg` 参数都没有），观测跑走
-  `isa_ops.step_debug`；`g_dbg_insn`/`g_dbg_frame`
-  分别决定 `DebugInsn`/`DebugSetFrame`，`g_mem_slow`/`g_record_raw` 决定访存
-  慢路径与原始字节。关闭时的代价是每取指字节/每访存一次已解析全局测试，不做
-  匹配或格式化。
+  `isa_ops.step_debug`；`g_dbg_insn` 决定 `DebugInsn`，debug step 每个指令都
+  发布 frame（`g_dbg_frame` 只决定无帧行是否附 `pc=`）。关闭时的热路径代价
+  必须是**零**：正常 step 用真实 bus，debug step 用 `debug_bus` 转发副本；正常
+  `fetch8`/`phys_load`/`phys_store`/`lin_load`/`lin_store` 没有观测判定，raw 由
+  debug fetch bus 在取指时追加。
 - 事件表统一列 `KIND │ PC │ RAW │ MNEMONIC │ DETAIL │ FLAGS`（DETAIL 宽 88：
   一行 BIOS 调用要装下 `int/ax/bx/cx/dx/ds/es/at`，宽度不够就等于为它加宽了列
   还是把它截了），KIND：
@@ -494,48 +515,48 @@ CEMU_DEBUG = item[,item...]
 
 ```bash
 # 语义对拍基线（重构/改语义后）
-CEMU_DEBUG=state ./cemu.exe ... img >/dev/null 2> base.state   # 改动前
-CEMU_DEBUG=state ./cemu.exe ... img >/dev/null 2> new.state    # 改动后
+CEMU_DEBUG=state timeout 110 ./cemu.exe ... img >/dev/null 2> base.state   # 改动前
+CEMU_DEBUG=state timeout 110 ./cemu.exe ... img >/dev/null 2> new.state    # 改动后
 diff base.state new.state | head
 
 # 某条指令行为可疑：看它的逐指令行为 + 上下文（前 200 条后停）
-CEMU_DEBUG="trace:table,state,mem,budget=200" ./cemu.exe ... img 2> t.txt
+CEMU_DEBUG="trace:table,state,mem,budget=200" timeout 110 ./cemu.exe ... img 2> t.txt
 
 # 某地址的写入不知来自哪条指令（watch 行自带 PC/RAW/MNEMONIC）
-CEMU_DEBUG="trace:line,watch=c0e4:4:w" ./cemu.exe ... img 2> w.txt
+CEMU_DEBUG="trace:line,watch=c0e4:4:w" timeout 110 ./cemu.exe ... img 2> w.txt
 
 # 异常去向不明 / 设备寄存器被谁读写
-CEMU_DEBUG="trap,trace:line" ./cemu.exe ... img 2> t.txt
-CEMU_DEBUG="bus,trace:line" ./cemu.exe ... img 2> b.txt
+CEMU_DEBUG="trap,trace:line" timeout 110 ./cemu.exe ... img 2> t.txt
+CEMU_DEBUG="bus,trace:line" timeout 110 ./cemu.exe ... img 2> b.txt
 # 设备/端口里出现怪东西，要问"是哪条指令干的"：bus 按端口或设备名收窄，
 # 每行自带线性 PC 与本条指令；再接 hist 就得到它之前的整段来路
-CEMU_DEBUG="mark,bus:0x402,hist=16" ./cemu.exe ... img 2> d.txt
+CEMU_DEBUG="mark,bus:0x402,hist=16" timeout 110 ./cemu.exe ... img 2> d.txt
 
 # 客人对宿主的输出字节（调试口 0x402 / COM1）逐字节归因
-CEMU_DEBUG="mark,hist=8,budget=40" ./cemu.exe ... img 2> c.txt   # 看 debugcon-tx/uart-tx 行
+CEMU_DEBUG="mark,hist=8,budget=40" timeout 110 ./cemu.exe ... img 2> c.txt   # 看 debugcon-tx/uart-tx 行
 
 # 访问故障（load/store access fault）：trap 行先给 paddr；若总线里明明有
 # 这个设备，就是 PMP 拒绝，再用 pmp 看命中的是哪个条目、解码成了什么区间
-CEMU_DEBUG="trap,pmp" ./cemu.exe ... img 2> p.txt
+CEMU_DEBUG="trap,pmp" timeout 110 ./cemu.exe ... img 2> p.txt
 
 # 卡死：哪两类事件在打转（退出汇总的 suppressed 计数暴露循环构成）
-CEMU_DEBUG="trace:line,mem,budget=50000" ./cemu.exe ... img 2> t.txt
+CEMU_DEBUG="trace:line,mem,budget=50000" timeout 110 ./cemu.exe ... img 2> t.txt
 
 # 定期全寄存器现场
-CEMU_DEBUG="regs=100000" ./cemu.exe ... img 2> r.txt
+CEMU_DEBUG="regs=100000" timeout 110 ./cemu.exe ... img 2> r.txt
 
 # 中断"送不到"：先看线（isa=设备侧到控制器，intr=控制器到 CPU），再看 ack/eoi
 # （三者都不出 = 控制器没present；intr 有而 inta 无 = CPU 没取；inta 有而无 eoi
 #  = 处理程序没跑完，多半交付落到了错的桩）
-CEMU_DEBUG="mark" ./cemu.exe ... img 2> m.txt
+CEMU_DEBUG="mark" timeout 110 ./cemu.exe ... img 2> m.txt
 
 # 交付到了哪个桩：gate 给出该向量门描述符里的 handler 偏移（无帧标记，十六进制）
 # 门内容可疑时再按物理地址 watch 整个 IDT（x86 内核 .data 要减 0xc0000000）
-CEMU_DEBUG="mark" ./cemu.exe ... img 2> m.txt
-CEMU_DEBUG="watch=0x2c0000:0x800:w" ./cemu.exe ... img 2> idt.txt
+CEMU_DEBUG="mark" timeout 110 ./cemu.exe ... img 2> m.txt
+CEMU_DEBUG="watch=0x2c0000:0x800:w" timeout 110 ./cemu.exe ... img 2> idt.txt
 
 # 客机只往显存打（内核早期 console=tty0）：screen 给整行控制台镜像
-CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
+CEMU_DEBUG="screen" timeout 110 ./cemu.exe ... img 2> c.txt
 ```
 
 - **两模型同一条字节流的抓手是固件的 debugcon 口（0x402），不是 COM1。** SeaBIOS 的
@@ -562,7 +583,9 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 
 - 交互式调试器/REPL、反汇编器、GUI 输出立项为阶段 3.5（见 arch.md 阶段计划：
   gdb RSP stub / Win32 显示通道 / 图形调试前端；前端不内置反汇编，反汇编一律
-  走外部工具）。在 3.5 落地前 CEMU_DEBUG 仍是唯一调试入口（mnemonic 由译码表给出）。
+  走外部工具）。阶段 3.5 的 gdb RSP stub 已落地（`-gdb`/`-s`/`-S`，协议包由
+  `CEMU_DEBUG=gdb` 记录，cemugui 是配套前端）：**CEMU_DEBUG 仍是唯一的观测
+  入口**，交互式单步/断点走 gdb/cemugui；两者不是替代关系。
 
 ## 六、简化登记（在册的规格缺口台账）
 
@@ -582,10 +605,10 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
 | D35 | riscv64/csr.c、riscv32/csr.c 的 misa 写路径 | `csrw misa` 的掩码 `(val & kMisaSupported) \| kMisaI` 只挡"未实现的位"，不挡"只读位"：客机写 0 能把 S 与 U 位清掉，而清掉之后本机照样进 U 模式、照样按 PTE.U 判权限（状态与自述脱钩）。这两位在规范里是否强制只读**缺手册 §3.1.1 的原文**，未据裁决（先例：DAS 的 18 处分歧按实机、计数器抑制只实现有测试覆盖的一侧——这里两侧都无证据，故不猜） | 特权规范 3.1.1 misa 的 WARL 措辞（原文待核）；dearchap-tinyemu riscv_cpu.c:1306 只组装 misa、无 csrw misa 路径可参照 | 核到手册原文后：若 S/U 强制只读，则把这两位从可改掩码里摘出并补一个自足探针（写 misa 后读回） | 登记中 |
 | D36 | riscv64/csr.c、riscv32/csr.c 的 MHPM 计数器 | **MHPM 计数器只存储不自增**：`mhpmcounter3..18` 在 cemu 里没有事件源，写进去的值能读回，但从不增长；`mhpmevent3..18` 同样只存储。mcycle/minstret 不受影响（step.c 每步自增）。OpenSBI 按 CSR 存在探测计数器数量，拿到的是"能读但不动"的计数器 | QEMU target/riscv/csr.c 的 pmu 计数（Zihpm 允许实现定义事件）；特权规范 3.1.11 | 出现依赖性能计数器/剖析的客户机或工具时 | 登记中 |
 | D38 | x86 窗口指针（PS/2） | **PS/2 鼠标只有相对计数，没有绝对包**，所以 x86 窗口把宿主指针的位移按相对增量投给 PS/2（与 QEMU 对 PS/2 的做法一致），不做板级绝对换算——回零/追赶式换算假设客人 1:1 应用计数并自己钳边，客人驱动一缩放或 warp 光标就被放大成光标乱窜（Windows 1.01 实测）。缺的是**指针抓取/隐藏**：光标顶到窗口边缘后宿主指针还能继续外移，两者幅度会脱节；客人光标是否与宿主指针重合取决于它自己的驱动。绝对定位只留给原生绝对设备（virtio-tablet、Oberon） | PS/2 鼠标协议（相对计数，9 位二补码）；QEMU 对 PS/2 用相对 + 指针 grab，绝对输入另走 USB tablet/vmmouse；真实绝对需要客人驱动 | 需要窗口指针与客人光标严格重合时（实现指针抓取/隐藏，或引入支持绝对包的输入设备） | 登记中 |
-| D39 | x86 后端（exec.c / fpu.c / x86.h） | 已实现 AC 对齐检查（#AC 在页走查之后、只查 2/4/8 字节 CPL-3 访问）、PSE-36、SYSENTER/SYSEXIT、MMX/SSE/SSE2、FXSAVE/FXRSTOR、MTRR/PAT、MCE 寄存器组、架构性能计数器（0x3C/0xC0）、RDTSC/RDTSCP、CR4 WARL 与 CPUID 广告（EDX 含 FPU/MMX/FXSR/SSE/SSE2/APIC/PSE36/PAT/MTRR/MCE/SEP/TSC，leaf 0x0B 报单线程/单核拓扑）。剩下：**VME 的软件中断重定向位图未实现**（V86 下的 INT n 一律反射到监视器；参考实现 QEMU 11.1.50 同样只广告不实现：`target/i386/tcg` 无 `HF_VME`、`seg_helper.c` 无位图代码，`I486_FEATURES` 却带 `CPUID_VME`，实测 `-cpu pentium` + CR4.VME=1 + 位图位置 0x20/0x0B 也一律反射，`GP ec=5a` 即 0x0B 的门索引；本机与之一致，CPUID.VME 不广告）；**性能计数器只计数 0x3C/0xC0，其余 event select、PEBS/PMI 未实现**；长模式另立项 | SDM vol.2/vol.3（20.3 VME、21 PVI、19 PMU）；QEMU target/i386；v86 cpu.rs/instructions_0f.rs；`test/x86/probe/sys686.asm`、`sse.asm`、`ac.asm`、`pse36.asm` | VME/PVI 位图在出现依赖它的 V86 客户机时；PMU 其余事件在出现剖析工具时 | 登记中 |
-| D40 | exec.c MsrRead/MsrWrite 的 IA32_MISC_ENABLE（0x1A0） | **该 MSR 只读**：RDMSR 返回常量 0x1801（fast-strings 位），任何 WRMSR 都落到 `gp_fault(0)`。真实处理器的该寄存器可写，kvm-unit-tests `x86/msr.c` 写 0x400c51889（避开它自己列出的保留位 1:2、4:6、8:10、13:15、17、19:21、24:33、35:63）并读回同值，本机同一镜像在通过三个 IA32_SYSENTER_* 用例后死在这条 WRMSR 的 #GP 上（`test/x86/msr.elf` 未入库） | SDM vol.4 IA32_MISC_ENABLE 的位表（原文待取）；kvm-unit-tests x86/msr.c 的 msr_info[]；QEMU target/i386 的 MSR_IA32_MISC_ENABLE 写路径（原文待取） | 出现读写该 MSR 的客户机时（Pentium 4 之后的固件/驱动可能探测它） | 登记中 |
+| D39 | x86 后端（exec.c / fpu.c / x86.h） | 已实现 AC 对齐检查（#AC 在页走查之后、只查 2/4/8 字节 CPL-3 访问）、PSE-36、SYSENTER/SYSEXIT、MMX/SSE/SSE2、FXSAVE/FXRSTOR、MTRR/PAT、MCE 寄存器组、架构性能计数器（0x3C/0xC0、RDPMC）、RDTSC/RDTSCP、CR4 WARL 与 CPUID 广告（EDX 含 FPU/MMX/FXSR/SSE/SSE2/APIC/PSE36/PAT/MTRR/MCE/SEP/TSC，leaf 0x0B 报单线程/单核拓扑）。剩下：**VME 的软件中断重定向位图未实现**（V86 下的 INT n 一律反射到监视器；参考实现 QEMU 11.1.50 同样只广告不实现：`target/i386/tcg` 无 `HF_VME`、`seg_helper.c` 无位图代码，`I486_FEATURES` 却带 `CPUID_VME`，实测 `-cpu pentium` + CR4.VME=1 + 位图位置 0x20/0x0B 也一律反射，`GP ec=5a` 即 0x0B 的门索引；本机与之一致，CPUID.VME 不广告）；**性能计数器只计数 0x3C/0xC0，其余 event select、PEBS/PMI 未实现**；长模式见 D42 | SDM vol.2/vol.3（20.3 VME、21 PVI、19 PMU）；QEMU target/i386；v86 cpu.rs/instructions_0f.rs；`test/x86/probe/sys686.asm`、`sse.asm`、`ac.asm`、`pse36.asm` | VME/PVI 位图在出现依赖它的 V86 客户机时；PMU 其余事件在出现剖析工具时 | 登记中 |
 | D41 | device/timer/i8254.c 的 BCD 位 | **BCD 计数模式只存不建模**：控制字的 BCD 位（bit0）被保存到 `PitChannel.bcd`，但之后的计数与读回一律按二进制算，BCD 模式下硬件应按十进制计数（0x9999 之后是 0x0000）并返回 BCD 字节。影响面：客人若用 BCD 模式读计数器做校准会拿到二进制值（本机的 DOS/Win95 都用二进制模式，目前未触发） | Intel 8254 datasheet（控制字 bit0 的 BCD 选择与计数序列）；QEMU hw/timer/i8254_common.c 的 bcd 处理（原文待取） | 出现用 BCD 模式计时/校准的客户机时 | 登记中 |
-| E1 | fp.c 用宿主 float/double/long double 模拟 IEEE | 偏离参考：QEMU/spike 用 Berkeley softfloat；宿主 long double 有 x87→float 双舍入长尾风险 | QEMU fpu/softfloat.c（BSD） | Linux 阶段出现浮点偏差时移植 softfloat | 登记中 |
+| D42 | x86 后端（exec.c / x86.h） | **长模式（IA-32e / x86_64）未实现**：没有 EFER.LME/LMA、4 级页表（PML4/PDPT 的 64 位模式）、64 位 GPR/寻址、REX 前缀、64 位模式下的指令宽度与 SYSCALL/SYSRET；CPUID 0x80000001 不广告 LM，当前按 32 位保护模式语义执行 | SDM vol.1 3.4.1/3.7、vol.3 4.5/9.8、vol.2 SYSCALL/SYSRET；QEMU target/i386/tcg（64 位路径） | 阶段 6（arm/mips 之前或之后按用户排期） | 登记中 |
+| E1 | riscv64/riscv32 fp.c 的 F/D | **用宿主 float/double/long double 模拟 IEEE**：宿主 `long double` 是 x87 80-bit，存在 double rounding 长尾风险；x86 x87 已走树内 SoftFloat 3e（D13），不在本行。偏离参考：QEMU/spike 用 Berkeley softfloat | QEMU fpu/softfloat.c（BSD）；riscv 非特权规范 F/D | Linux/riscv 阶段出现浮点偏差时移植 softfloat | 登记中 |
 
 ## 七、显示窗口指针契约（所有主板）
 
@@ -639,6 +662,14 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
   定义），QEMU TCG 32 位与 cemu 双绿 8/8——批准作为 A 档
   验收件。
 
+- **MOV SS/POP SS 的宽阴影**：这两条指令在**下一条指令之后**的边界前抑制
+  INTR、NMI、数据断点和单步陷阱（SDM vol.3 6.8.3；CVE-2018-8897）。实现是
+  `x86_state.ss_inhibit` + `db_pending`：MOV SS/POP SS 置位，`step_body.inc`
+  在下一步挡 NMI，并把该步的 DR6 原因合并到下一步边界再投递；STI 仍只置
+  `intr_inhibit`（只挡 INTR）。LSS **不**抑制（Intel 80386 Programmer's
+  Reference Manual §3.10；QEMU 的 `gen_movl_seg` 注释同样写
+  “MOV or POP to SS (but not LSS)”）。
+
 - **x86 处理器内部访问 = 超级权限**：描述符表（GDT/IDT/
   LDT）、TSS，以及换栈后压入的投递帧，都是**处理器自己的访问**，忽略 U/S 位；
   只有程序自己的访问才按 CPL 检查（SDM vol.3 4.6）。硬性判据：ring 3 的段加载
@@ -675,10 +706,12 @@ CEMU_DEBUG="screen" ./cemu.exe ... img 2> c.txt
   槽。验收：test/x86/probe/paging32.asm 的 t2b（重映射 PDE[4] 后 INVLPG 一个
   4KB 子页，另一个子页的旧缓存也必须消失）。
 
-- **x86 慢路径优先**：`CEMU_DEBUG=mem|bus|watch=` 任一开启时 `g_mem_slow=1`，
-  `lin_load/lin_store` 退回逐次走查 + `phys_load/phys_store` 事件路径，保证
-  观测流与 TLB 引入前一致；`trace/state` 不改变访存路径，只打开 `g_record_raw`
-  与 `DebugInsn` 门控。
+- **x86 观测走 debug bus**：任何 debug step 安装 `debug_bus`（真实 bus 的转发
+  副本，region 的 `host` 为 NULL，`BusRamPage` 永远失败），取指与数据访问都经
+  包装器；正常 step 用真实 bus，`fetch8`/`phys_load`/`lin_load` 里没有观测判定。
+  `watchl=` 由包装器经 `CpuState.phys_to_lin` 从 TLB 反查线性地址；`trace/state`
+  也走 debug bus（为了记录 raw 字节），但不输出 mem/bus 行。`Bus.version` 在
+  BAR/设备窗口移动时自增，debug bus 在 debug step 入口按版本重建。
 
 - **x87 CR0.NE=0 的 FERR#**：未屏蔽 x87 异常在 NE=0 时拉高 FERR#，板级接到
   8259 的 IRQ13；FNCLEX/FNINIT 清异常状态即撤销（电平由状态字导出，不另设

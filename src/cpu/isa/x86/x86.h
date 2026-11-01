@@ -58,7 +58,15 @@ enum { kDrLenCount = 4, kDrCount = 4 };
 // tables; WP makes supervisor stores honor read-only pages (486+; wired
 // because SDM vol.3 4.6 defines the flag); TS/EM/MP ride along for
 // LMSW/CLTS.
-enum { kCr0Pe = 1u, kCr0Mp = 2u, kCr0Em = 4u, kCr0Ts = 8u, kCr0Ne = 1u << 5,
+enum { kCr0Pe = 1u, kCr0Mp = 2u, kCr0Em = 4u, kCr0Ts = 8u,
+       // ET (bit 4) is the coprocessor extension type: hardwired to 1 on
+       // 486 and later (SDM vol.3 2.5). QEMU's cpu_x86_update_cr0 writes
+       // `env->cr[0] = new_cr0 | CR0_ET_MASK`
+       // (target/i386/helper.c,
+       // https://gitlab.com/qemu-project/qemu/-/raw/master/target/i386/helper.c),
+       // and a guest that reads it back to choose an FPU path must see the
+       // same bit this machine's CPUID advertises.
+       kCr0Et = 1u << 4, kCr0Ne = 1u << 5,
        kCr0Wp = 1u << 16, kCr0Am = 1u << 18, kCr0Pg = 1u << 31 };
 // CR4: PSE gates 4MB pages; PAE selects the three-level 64-bit-entry walk;
 // PGE makes global translations survive a CR3 reload (SDM vol.3 2.5, 4.3,
@@ -72,13 +80,24 @@ enum {
   kCr4Pse = 0x10u,
   kCr4Pae = 0x20u,
   kCr4Pge = 0x80u,
+  kCr4Pce = 0x100u,        // RDPMC at CPL>0 (SDM vol.2 RDPMC)
   kCr4Osfxsr = 0x200u,     // FXSAVE/FXRSTOR + SSE state enable (SDM 13.5)
   kCr4Osxmmexcpt = 0x400u, // SSE unmasked exceptions report #XM
 };
 // The CR4 bits this machine implements. A write is WARL: unsupported bits
 // read back zero (SDM vol.3 2.5 "CR4 ... may be ... reserved").
 enum { kCr4Supported = kCr4Vme | kCr4Pvi | kCr4Tsd | kCr4De | kCr4Pse | kCr4Pae |
-                         kCr4Pge | kCr4Osfxsr | kCr4Osxmmexcpt };
+                         kCr4Pge | kCr4Pce | kCr4Osfxsr | kCr4Osxmmexcpt };
+// IA32_APIC_BASE (MSR 0x1B): base[31:12], BSP bit 8, global enable bit 11
+// (SDM vol.3 11.4.3). QEMU's xAPIC keeps the MMIO window at 0xFEE00000 and
+// uses the enable bit to gate the register file (hw/intc/apic.c
+// apic_mem_read/apic_set_base), so this machine stores the base image and
+// lets the board gate the LAPIC with the enable bit.
+enum {
+  kApicBaseMask = 0xfffff000u,
+  kApicBaseBsp = 1u << 8,
+  kApicBaseEnable = 1u << 11,
+};
 // IA32_EFER (MSR 0xC0000080): only NX enable is meaningful without long mode.
 enum { kEferNxe = 1ull << 11 };
 // Page-directory / page-table entry flags for 4KB pages (SDM vol.3 4.3):
@@ -190,6 +209,10 @@ typedef struct x86_state {
   // continues from the written value (SDM vol.3 17.17).
   uint64_t tsc_offset;
   uint32_t tsc_aux;   // IA32_TSC_AUX (0xc0000103), returned by RDTSCP
+  // IA32_MISC_ENABLE (0x1A0): QEMU stores whatever WRMSR writes and reads it
+  // back (target/i386/tcg/system/misc_helper.c), and the reset value is its
+  // MSR_IA32_MISC_ENABLE_DEFAULT (bit 0, fast strings).
+  uint64_t misc_enable;
   // SYSENTER/SYSEXIT state (SDM vol.2 SYSENTER/SYSEXIT; MSRs 0x174-0x176).
   // IA32_SYSENTER_CS/ESP/EIP are 64-bit MSRs: WRMSR stores EDX:EAX whole
   // (SDM vol.2 WRMSR: "Writes the contents of registers EDX:EAX into the
@@ -254,7 +277,14 @@ typedef struct x86_state {
                      // forced low while it is off (PC/AT); the board drives it
                      // through CpuState.set_a20
   int intr_pending;  // the machine's INTR line is asserted
-  int intr_inhibit;  // SDM window: instruction after STI takes no INTR
+  int intr_inhibit;  // SDM window: instruction after STI/MOV SS/POP SS takes no INTR
+  // MOV SS and POP SS additionally inhibit NMI, data breakpoints and the
+  // single-step trap at the boundary after the next instruction (SDM vol.3
+  // 6.8.3; CVE-2018-8897's "MOV SS/POP SS blocking"). `ss_inhibit` is set by
+  // those two instructions, `db_pending` carries the DR6 causes that must be
+  // delivered one instruction later.
+  int ss_inhibit;
+  uint32_t db_pending;
   int nmi_pending;   // the machine's NMI pin has been asserted
   int nmi_blocked;   // an NMI is being serviced: held until the next IRET
                      // (SDM vol.3 6.7.1)

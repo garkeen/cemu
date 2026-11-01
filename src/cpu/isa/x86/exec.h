@@ -57,6 +57,7 @@ typedef struct dec {
   int w32, a32;  // operand / address size is 32-bit (else 16)
   int seg;       // segment override, -1 = default
   int rep;       // 0 none, 1 = F3 (repe), 2 = F2 (repne)
+  int lock;      // F0 seen: validated against the opcode and a memory destination
   int op2;       // the second byte for 0f opcodes, else 0
   uint32_t nxt;  // eip after the whole instruction, both arms know it
 

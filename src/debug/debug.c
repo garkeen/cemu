@@ -18,13 +18,13 @@
 static uint32_t g_mask;
 static int g_inited;
 // Hot-path gates (see debug.h): the board reads g_dbg_any once to pick the
-// step stream; the debug stream reads g_dbg_insn/g_dbg_frame, and the memory
-// funnels read g_mem_slow/g_record_raw. None is a getenv or a per-byte match.
-int g_mem_slow;
+// step stream; the debug stream reads g_dbg_insn/g_dbg_frame, and fills raw
+// bytes when g_record_raw is on. None is a getenv or a per-byte match.
 int g_record_raw;
 int g_dbg_any;
 int g_dbg_insn;
 int g_dbg_frame;
+static int DebugBusNeeded(void);
 static int g_ascii = 1;  // plain borders by default (console codepages
                          // mangle UTF-8); `utf8` switches on
 static int g_header_every = 40;
@@ -129,15 +129,16 @@ int DebugWatchHit(uint64_t addr, int size, int is_load) {
 // funnels only know the translated address; a protected-mode structure (a VxD
 // data slot, a kernel object) has no stable physical address across runs --
 // paging decides it -- so "who wrote this slot" cannot be asked there. The
-// match is made in the ISA's linear funnel (cpu/isa/x86/exec.c lin_load/
-// lin_store) while `g_mem_slow` is on, which a linear watch forces exactly the
-// way a physical one does.
+// match is made by the debug bus wrapper, which recovers the linear address
+// from the CPU's live TLB (CpuState.phys_to_lin) after each data access.
 static struct {
   uint64_t addr;
   int size;
   int rw;  // 1 read, 2 write, 3 both
 } g_watchl[kMaxWatches];
 static int g_nwatchl;
+
+int DebugLinWatchActive(void) { return g_nwatchl != 0; }
 
 int DebugLinWatchHit(uint64_t addr, int size, int is_load) {
   int want = is_load ? 1 : 2;
@@ -200,7 +201,7 @@ static const uint64_t kDumpLimit = 5ULL * 1024 * 1024;
 // window's budget and timer I/O moves the count between runs, so neither can
 // name "the state at this PC". The gdb stub can stop by linear PC but runs the
 // whole boot through its per-step callback (several times slower than the
-// interpreter). This item keeps the match in the ordinary fast path: after the
+// interpreter). This item keeps the match in the ordinary path: after the
 // commit, the frame's next linear PC is compared against the checkpoint, and
 // the canonical state row is printed when the guest is about to execute that
 // address. That is the boundary a QEMU gdb breakpoint stops on, so the two
@@ -963,11 +964,9 @@ void DebugInit(void) {
     g_tbl = TableOpen(kEventCols, 6, g_ascii, g_header_every);
     TableHeader(g_tbl);
   }
-  // One-time resolution of the per-access/per-instruction gates. The hot
-  // interpreters test these plain globals instead of calling DebugOn on every
-  // byte of every instruction; a category that needs the event-emitting path
-  // disables the fast memory path wholesale.
-  g_mem_slow = ((g_mask & (kDbgMem | kDbgBus)) != 0) || g_nwatch != 0 || g_nwatchl != 0;
+  // One-time resolution of the per-instruction gates. A category that needs
+  // every access observed selects the debug bus (DebugBusNeeded), not a
+  // per-access test in the interpreter.
   // Raw bytes feed the line/table formats and the rows that quote the
   // instruction that caused an event (exec=, trap). Recording them only for the
   // trace formats left exec=/trap-only runs with a blank RAW column.
@@ -983,10 +982,10 @@ void DebugInit(void) {
                           kDbgHist | kDbgExec)) != 0 ||
                g_regs_period > 0;
   // screen rows are frameless; only screenstop needs the live frame (it stops
-  // the CPU on a matching line), so a plain `screen` session stays on the fast
-  // stream.
+  // the CPU on a matching line), so a plain `screen` session stays on the
+  // normal stream.
   g_dbg_frame = (g_mask & (kDbgMark | kDbgVirtio | kDbgPmp)) != 0 || g_screen_stop[0] != 0;
-  g_dbg_any = g_dbg_insn || g_dbg_frame || g_mem_slow || (g_mask & kDbgTrap) != 0;
+  g_dbg_any = g_dbg_insn || g_dbg_frame || DebugBusNeeded() || (g_mask & kDbgTrap) != 0;
   g_regs_next = g_regs_period > 0 ? (uint64_t)g_regs_period : 0;
   // One line that says the range item armed: a range that parsed to nothing
   // used to be indistinguishable from one that never saw a crossing.
@@ -998,6 +997,10 @@ void DebugInit(void) {
 }
 
 int DebugOn(uint32_t cat) { return g_inited && ((g_mask & cat) || (g_nwatch && cat == kDbgMem)); }
+
+static int DebugBusNeeded(void) {
+  return ((g_mask & (kDbgMem | kDbgBus)) != 0) || g_nwatch != 0 || g_nwatchl != 0;
+}
 
 // ---- rendering helpers ------------------------------------------------------
 
@@ -1074,6 +1077,7 @@ int DebugAccountOut(size_t n) {
 static void CellRaw(Table* t, const frame* f) {
   char c[32];
   int n = 0;
+  c[0] = 0;  // raw_len 0 must print an empty cell, not uninitialized stack
   for (int i = 0; i < f->rec.raw_len && i < 8; i++)
     n += snprintf(c + n, sizeof(c) - (size_t)n, "%02x ", f->rec.raw[i]);
   if (n) c[n - 1] = 0;  // trailing blank
@@ -1131,6 +1135,20 @@ static uint64_t FrameDnpc(frame* f) {
 // Definitions; the contract and the reasoning live in debug.h.
 
 void DebugSetFrame(frame* f) { g_frame = f; }
+frame* DebugFrame(void) { return g_frame; }
+
+// The fetch bus appends each byte to the current instruction's RAW column as
+// it is handed out -- the same place the old per-byte fetch gate wrote it.
+// Recording before execution is what keeps RAW correct across a far jump, a
+// CR3 change and a fault; the interpreter has no per-byte test.
+void DebugFetchBegin(void) {
+  if (g_frame) g_frame->rec.raw_len = 0;
+}
+
+void DebugFetchByte(uint8_t b) {
+  if (g_record_raw && g_frame && g_frame->rec.raw_len < sizeof(g_frame->rec.raw))
+    g_frame->rec.raw[g_frame->rec.raw_len++] = b;
+}
 
 // " pc=<linear>": the address of the instruction the machine was running when
 // the event fired, appended to a row that has no frame of its own.

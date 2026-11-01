@@ -32,6 +32,11 @@ typedef struct Bus {
   BusRegion regions[32];
   int count;
   BusRegion* last;  // one-entry FindRegion cache (validated by overlaps/base)
+  // Bumped whenever the region set moves (device BAR programming, VGA
+  // detach/attach). The debug bus copy watches this and rebuilds only when it
+  // changes, so a BAR move during firmware boot is reflected without touching
+  // the normal bus.
+  uint32_t version;
 } Bus;
 
 // Registers an MMIO device window (accesses go through ops->Read/Write).
