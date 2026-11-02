@@ -677,7 +677,7 @@ static void AddExec(const char* spec) {
 }
 // ---- synthetic host input (mouse=) -----------------------------------------
 
-enum { kMaxInj = 4 };
+enum { kMaxInj = 16 };
 static struct {
   int kind;
   int dx, dy, dz, buttons;  // mouse
@@ -685,17 +685,25 @@ static struct {
   int extended, up;         // key
   uint64_t period;          // instructions between events
   uint64_t next_at;         // the instruction count of the next one
+  int once;                 // '@N!': deliver at N only, then retire
 } g_inj[kMaxInj];
 static int g_ninj;
 
 int DebugNextInjection(uint64_t inst_count, DebugInjection* out) {
   for (int i = 0; i < g_ninj; i++) {
     if (inst_count < g_inj[i].next_at) continue;
-    // Catch up in one step if the item came due while nobody was looking, so a
-    // backlog does not arrive as a burst.
-    do {
-      g_inj[i].next_at += g_inj[i].period;
-    } while (g_inj[i].next_at <= inst_count);
+    if (g_inj[i].once) {
+      // One-shot: retire the item so the same key is not pressed again later
+      // (a periodic item repeats, which is wrong for reproducing one menu
+      // selection: the repeat lands in the middle of the guest's boot).
+      g_inj[i].next_at = ~0ull;
+    } else {
+      // Catch up in one step if the item came due while nobody was looking, so a
+      // backlog does not arrive as a burst.
+      do {
+        g_inj[i].next_at += g_inj[i].period;
+      } while (g_inj[i].next_at <= inst_count);
+    }
     out->kind = g_inj[i].kind;
     out->dx = g_inj[i].dx;
     out->dy = g_inj[i].dy;
@@ -714,8 +722,11 @@ int DebugNextInjection(uint64_t inst_count, DebugInjection* out) {
 }
 
 // The @N suffix every injection item carries: the period in instructions, which
-// is required — a default would silently pick a cadence for the caller.
-static int ParseInjectionPeriod(char* body, const char* spec, uint64_t* out) {
+// is required — a default would silently pick a cadence for the caller. A
+// trailing '!' makes it one-shot: `key=0x1c@5000000!` presses Enter once at
+// instruction 5,000,000 and never again (the way to script a single menu
+// selection without the repeat landing in the guest's boot).
+static int ParseInjectionPeriod(char* body, const char* spec, uint64_t* out, int* once) {
   char* at = strrchr(body, '@');
   if (!at) {
     LogError("debug: injection needs '@N' (the period in instructions): '%s'", spec);
@@ -724,6 +735,11 @@ static int ParseInjectionPeriod(char* body, const char* spec, uint64_t* out) {
   *at = 0;
   char* end = NULL;
   long period = strtol(at + 1, &end, 0);
+  *once = 0;
+  if (end && end[0] == '!' && end[1] == 0) {
+    *once = 1;
+    end++;
+  }
   if (!end || *end || period <= 0) {
     LogError("debug: injection period must be a positive number ('%s')", spec);
     return 0;
@@ -764,7 +780,8 @@ static void AddMouseInjection(const char* spec) {
   }
   strcpy(body, spec);
   uint64_t period = 0;
-  if (!ParseInjectionPeriod(body, spec, &period)) return;
+  int once = 0;
+  if (!ParseInjectionPeriod(body, spec, &period, &once)) return;
   long vals[4] = {0, 0, 0, 0};
   if (!ParseInjectionFields(body, spec, vals, 3, 4)) return;
   if (g_ninj >= kMaxInj) {
@@ -777,6 +794,7 @@ static void AddMouseInjection(const char* spec) {
   g_inj[g_ninj].buttons = (int)vals[2];
   g_inj[g_ninj].dz = (int)vals[3];
   g_inj[g_ninj].period = period;
+  g_inj[g_ninj].once = once;
   g_inj[g_ninj].next_at = period;
   g_ninj++;
 }
@@ -790,7 +808,8 @@ static void AddKeyInjection(const char* spec) {
   }
   strcpy(body, spec);
   uint64_t period = 0;
-  if (!ParseInjectionPeriod(body, spec, &period)) return;
+  int once = 0;
+  if (!ParseInjectionPeriod(body, spec, &period, &once)) return;
   long vals[3] = {0, 0, 0};
   if (!ParseInjectionFields(body, spec, vals, 1, 3)) return;
   if (vals[0] < 0 || vals[0] > 0x7f) {
@@ -806,6 +825,7 @@ static void AddKeyInjection(const char* spec) {
   g_inj[g_ninj].extended = (int)vals[1];
   g_inj[g_ninj].up = (int)vals[2];
   g_inj[g_ninj].period = period;
+  g_inj[g_ninj].once = once;
   g_inj[g_ninj].next_at = period;
   g_ninj++;
 }
@@ -1382,13 +1402,21 @@ void DebugTrap(frame* f) {
   if (g_trap_cause >= 0 && (int)f->trap.cause != g_trap_cause) return;
   if (!DebugOn(kDbgTrap) || !Allow(kDbgTrap)) return;
   RowBegin(g_tbl, 'T', f);
-  char det[128];
+  char det[160];
   const char* cn = f->isa->cause_name ? f->isa->cause_name(f->trap.cause) : NULL;
   int n = snprintf(det, sizeof(det), "%s=%llu tval=%016llx", cn ? cn : "cause",
                    (unsigned long long)f->trap.cause, (unsigned long long)f->trap.tval);
+  if (f->trap.has_vaddr)
+    n += snprintf(det + n, sizeof(det) - (size_t)n, " vaddr=%016llx",
+                  (unsigned long long)f->trap.vaddr);
   if (f->trap.has_paddr)
     n += snprintf(det + n, sizeof(det) - (size_t)n, " paddr=%016llx",
                   (unsigned long long)f->trap.paddr);
+  // The retired-instruction count puts the trap on the same clock the K rows
+  // and --max-inst use: a trap is otherwise impossible to place relative to the
+  // event that followed it (the banner a guest printed, a halt, a reset).
+  n += snprintf(det + n, sizeof(det) - (size_t)n, " inst=%llu",
+                (unsigned long long)f->cpu->inst_count);
   snprintf(det + n, sizeof(det) - (size_t)n, " -> %016llx", (unsigned long long)FrameDnpc(f));
   TableRowCell(g_tbl, det);
   CellFlags(g_tbl, f);

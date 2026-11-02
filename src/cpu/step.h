@@ -44,6 +44,12 @@ typedef struct trap_rec {
   // denial came from PMP or from an unmapped device.
   uint64_t paddr;
   int has_paddr;
+  // The faulting linear address where the ISA keeps it apart from tval: x86's
+  // #PF puts the error code in tval and CR2 in vaddr (SDM vol.3 4.7). riscv's
+  // tval already IS the address, so it leaves has_vaddr = 0 and the line does
+  // not print the same number twice.
+  uint64_t vaddr;
+  int has_vaddr;
 } trap_rec;
 
 // One step's world: the CPU, the ISA-private state, the record, and the
@@ -66,6 +72,7 @@ enum { acc_ifetch = 0, acc_read, acc_write, acc_amo };
 // instruction atomicity.
 _Noreturn void raise_(frame* f, uint64_t cause, uint64_t tval);
 _Noreturn void raise_paddr_(frame* f, uint64_t cause, uint64_t tval, uint64_t paddr);
+_Noreturn void raise_vaddr_(frame* f, uint64_t cause, uint64_t tval, uint64_t vaddr);
 
 // ---- the ops table ----------------------------------------------------------
 

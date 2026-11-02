@@ -481,11 +481,15 @@ static int LoadRom(X86Board* xm, const char* path) {
   return 0;
 }
 
-// The romfile name firmware looks under for a VGA BIOS that has no PCI device
-// of its own: SeaBIOS runs every file named "vgaroms/*" as a VGA option ROM
-// (src/optionroms.c run_file_roms("vgaroms/", isvga=1)) and shadows it to
-// 0xc0000 itself (rom_reserve), which is where a display card's ROM belongs —
-// so the machine does not have to place it, and the card needs no PCI function.
+// The romfile name firmware looks under for the VGA BIOS: SeaBIOS runs every
+// file named "vgaroms/*" as a VGA option ROM (src/optionroms.c
+// run_file_roms("vgaroms/", isvga=1)) and shadows it to 0xc0000 itself
+// (rom_reserve), so the machine does not have to place it. The card is also a
+// PCI function (VgaPciInit), but this board keeps the file-ROM path: a SeaVGABIOS
+// built without CONFIG_VGA_PCI has no PCIR structure for the PCI ROM scan, so it
+// would be rejected there anyway. Such a ROM runs without a BDF, its VBE setup
+// falls back to the Bochs fixed LFB window 0xe0000000, and the card decodes that
+// window alongside the PCI BAR (device/video/vga.c kVgaLegacyLfbBase).
 static const char kVgaRomFileName[] = "vgaroms/vgabios.bin";
 
 // The memory map this machine hands the firmware. It is the board's to publish

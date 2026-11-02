@@ -294,7 +294,7 @@ _Noreturn static void ts_fault(uint32_t code) { raise_(fr, vec_ts, code); }
 // carries P|W|U (vol.3 table 6-1; the 386 defines no RSVD/I bits).
 _Noreturn static void pf_fault(uint64_t lin, uint32_t code) {
   s->cr2 = (uint32_t)lin;
-  raise_(fr, vec_pf, code);
+  raise_vaddr_(fr, vec_pf, code, lin);
 }
 
 // The per-access segment checks, protected mode only (SDM vol.3 5.3): the
@@ -4583,7 +4583,16 @@ static void run_op2(uint8_t op2) {
         } else {
           ok = !((op2 == 0x02 ? kLarBadTypes : kLslBadTypes) >> ty & 1) && dpl_ok;
         }
-        if (ok) val = op2 == 0x02 ? v.hi & 0x00f0ff00u : v.limit;
+        // LAR returns descriptor bytes 5-6 (access rights and flags). Bits
+        // 19:16 are the limit's high nibble and the SDM declares them
+        // undefined; real silicon returns the descriptor's bits, and Win95's
+        // DPMI client depends on it: it does `lar` + `shr 8` + `bts bit12`
+        // (AVL) and writes the word back with DPMI 0x0009, so a zeroed nibble
+        // silently shrinks a >64K selector (limit 0x1241F becomes 0x241F and
+        // the next huge-bitmap blit takes #GP). tiny386 (primary oracle,
+        // i386.c:3528), Bochs (protect_ctrl.cc: dword2 & 0x00ffff00) and v86
+        // (misc_instr.rs) all keep the nibble.
+        if (ok) val = op2 == 0x02 ? v.hi & 0x00ffff00u : v.limit;
       }
       fl->zf = ok;
       if (ok) {

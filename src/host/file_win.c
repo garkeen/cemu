@@ -6,6 +6,8 @@
 
 #include "host/host.h"
 
+#include "util/log.h"
+
 // A read-write image can be opened as a copy-on-write view (-snapshot): the
 // base file is read-only and every touched 4KiB block is copied into a
 // throwaway overlay before the write lands there. Reads consult the overlay
@@ -21,6 +23,7 @@ struct HostFile {
   HANDLE overlay;  // NULL unless this is a copy-on-write view
   uint8_t* dirty;  // one bit per 4KiB block of the overlay
   int64_t size;    // bytes in the base file
+  int snapshot;    // opened under -snapshot: the base file is read-only
 };
 
 static int g_snapshot;
@@ -82,28 +85,94 @@ static HostFile* OpenImage(const char* path, DWORD access) {
 
 HostFile* HostFileOpenRead(const char* path) { return OpenImage(path, GENERIC_READ); }
 
+// A directory the overlay can be created in. GetTempPathA returns TMP even
+// when the directory does not exist, and CreateFileA then fails; checking the
+// attributes and trying TEMP next is what keeps a stale TMP from turning the
+// whole guest disk read-only (QEMU's create_tmp_file fails loudly instead:
+// block.c "Could not open temporary file"). The image's own directory and the
+// current directory are the last resorts -- both are places the caller could
+// already read the image from.
+static int DirExists(const char* path) {
+  DWORD a = GetFileAttributesA(path);
+  return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static int EnvDir(const char* name, char* out, size_t cap) {
+  DWORD n = GetEnvironmentVariableA(name, out, (DWORD)cap);
+  if (n == 0 || n >= cap) return 0;
+  return DirExists(out);
+}
+
+static int ImageDir(const char* path, char* out, size_t cap) {
+  const char* slash = strrchr(path, '\\');
+  const char* fslash = strrchr(path, '/');
+  if (!slash || (fslash && fslash > slash)) slash = fslash;
+  if (!slash) return 0;
+  size_t len = (size_t)(slash - path) + 1;
+  if (len >= cap) return 0;
+  memcpy(out, path, len);
+  out[len] = 0;
+  return 1;
+}
+
+static int PickOverlayDir(const char* image, char* out, size_t cap) {
+  if (EnvDir("TMP", out, cap)) return 1;
+  if (EnvDir("TEMP", out, cap)) return 1;
+  if (ImageDir(image, out, cap) && DirExists(out)) return 1;
+  DWORD n = GetCurrentDirectoryA((DWORD)cap, out);
+  return n > 0 && n < cap;
+}
+
 HostFile* HostFileOpenReadWrite(const char* path) {
   HostFile* f = OpenImage(path, g_snapshot ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE));
   if (!f) return NULL;
-  if (g_snapshot && f->size > 0) {
+  f->snapshot = g_snapshot;
+  if (g_snapshot) {
+    // A snapshot's base file is read-only, so without an overlay every write
+    // would fail. Refuse the open instead: a silent read-only disk is a data
+    // loss trap the guest cannot report (Win95 pages its own code from disk
+    // and dies later with an unrelated-looking blue screen).
     char dir[MAX_PATH], tmp[MAX_PATH];
-    DWORD n = GetTempPathA(sizeof(dir), dir);
-    if (n && n < sizeof(dir)) {
-      // PINNED: one overlay per process, deleted when the handle closes.
-      snprintf(tmp, sizeof(tmp), "%scemu-snap-%lu.img", dir,
-               (unsigned long)GetCurrentProcessId());
-      HANDLE ov = CreateFileA(tmp, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
-      if (ov != INVALID_HANDLE_VALUE) {
-        int64_t blocks = (f->size + kSnapBlock - 1) >> kSnapBlockLog2;
-        f->dirty = (uint8_t*)calloc((size_t)((blocks + 7) / 8), 1);
-        if (f->dirty) {
-          f->overlay = ov;
-        } else {
-          CloseHandle(ov);
-        }
-      }
+    if (!PickOverlayDir(path, dir, sizeof(dir))) {
+      LogError("snapshot: no usable temp directory for the copy-on-write overlay");
+      CloseHandle(f->handle);
+      free(f);
+      return NULL;
     }
+    size_t len = strlen(dir);
+    if (len && dir[len - 1] != '\\' && dir[len - 1] != '/') {
+      if (len + 1 >= sizeof(dir)) {
+        LogError("snapshot: temp directory path too long ('%s')", dir);
+        CloseHandle(f->handle);
+        free(f);
+        return NULL;
+      }
+      dir[len++] = '\\';
+      dir[len] = 0;
+    }
+    // PINNED: one overlay per process, deleted when the handle closes.
+    snprintf(tmp, sizeof(tmp), "%scemu-snap-%lu.img", dir,
+             (unsigned long)GetCurrentProcessId());
+    HANDLE ov = CreateFileA(tmp, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (ov == INVALID_HANDLE_VALUE) {
+      LogError("snapshot: cannot create copy-on-write overlay '%s' (error %lu)", tmp,
+               (unsigned long)GetLastError());
+      CloseHandle(f->handle);
+      free(f);
+      return NULL;
+    }
+    int64_t blocks = (f->size + kSnapBlock - 1) >> kSnapBlockLog2;
+    size_t map = (size_t)((blocks + 7) / 8);
+    f->dirty = (uint8_t*)calloc(map ? map : 1, 1);
+    if (!f->dirty) {
+      LogError("snapshot: out of memory for the overlay bitmap");
+      CloseHandle(ov);
+      CloseHandle(f->handle);
+      free(f);
+      return NULL;
+    }
+    f->overlay = ov;
   }
   return f;
 }
@@ -155,7 +224,13 @@ size_t HostFileReadAt(HostFile* f, int64_t off, void* buf, size_t n) {
 
 size_t HostFileWriteAt(HostFile* f, int64_t off, const void* buf, size_t n) {
   if (n == 0 || off < 0) return 0;
-  if (!f->overlay) return RawWriteAt(f->handle, off, buf, n);
+  if (!f->overlay) {
+    // Under -snapshot the base handle is read-only: a write here means the
+    // overlay was never installed, and it must fail rather than fall through
+    // to the image (open refuses that case; this is the last line of defense).
+    if (f->snapshot) return 0;
+    return RawWriteAt(f->handle, off, buf, n);
+  }
   size_t total = 0;
   while (total < n) {
     int64_t pos = off + (int64_t)total;

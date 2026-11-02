@@ -3613,3 +3613,92 @@ the iret at 0xB65 then reloads it into the CPU once per emulated instruction.
   修前 inst=170M traps=13621，屏幕 `Windows protection error`；
   修后 traps=374（260M 时 1008），无报错，fbdump 是 Windows 95 启动画面
   （640x400，build/win95_fb.ppm）。
+
+## Win95 normal 模式蓝屏：不是输入触发；快照覆盖层修复（2026-11-02）
+
+- 更正：此前认为蓝屏只在窗口手动输入后出现。实测两键 `1`+回车（全程自动注入）
+  同样蓝屏，崩溃时刻在 581M/583.6M/588.8M 之间随时序漂移，蓝屏文本恒为
+  `A fatal exception 0E ... 0137:BFF9A3C0`。手动输入只是改变了启动时序。
+- 崩溃链：桌面加载时 32 位系统 DLL 的 `MOVSB` 触发 #GP(0)（CS=0x357、
+  DS=0x0C36、limit=0x241F、SI=0x4ED2，源偏移超出 9KB 段限；该函数是跨段
+  大指针复制/解压）。3.3k 条指令后 SEH 处理器页 0xBFFB8CF8 取指 #PF；
+  VMM 用 int 13h AH=42h 从 LBA 186322 读 16 扇区（总线数据与镜像逐字节
+  相同），随后打印蓝屏。0xBFF9A3C0 在 cemu 中从未被取指/访问，是异常记录
+  里的固定值。投递帧本身正确：[esp+4]=0x2BB6（段内 EIP）、CS=0x357、
+  EFLAGS 带 RF。
+- 已排除：BIOS（QEMU 同 BIOS 正常）、VGA option ROM（换 QEMU 的
+  vgabios-stdvga 仍崩）、SSE/SSE2（CPUID 屏蔽后同 inst 仍崩）、调页数据。
+- 快照修复：`HostFileOpenReadWrite` 原来只用 `GetTempPathA`，TMP 指向不存在
+  目录时 `CreateFileA` 失败、overlay 静默为空，写入落到只读句柄。现按
+  TMP -> TEMP -> 镜像目录 -> 当前目录选**存在**的目录；仍失败则
+  `LogError("snapshot: cannot create ...")` 并返回 NULL（板级报
+  `cannot attach -hda image` 退出）；`HostFileWriteAt` 在 snapshot 下绝不
+  写基础镜像。验证：TMP 指向不存在目录时 overlay 建在 TEMP（9.5MB）。
+- 设施：`key=`/`mouse=` 支持 `@N!` 一次性；`trap` 行带 `inst=`；
+  `trap` 行带 `vaddr=`（x86 #PF 的 CR2；`tval=` 是错误码）。
+- 下一步：QEMU gdb（D:/mingw64/bin/gdb.exe）在 DLL 偏移 0x2BB6 或 #GP
+  处理器上做条件断点，确认 QEMU 是否也在这条 MOVSB 上 #GP；QEMU 的
+  `-d int` 全量日志超过 5MB，不能用。
+
+## Win95 蓝屏根因：LAR 丢掉描述符 limit 高半字节（2026-11-02）
+
+- 根因：`src/cpu/isa/x86/exec.c` 的 LAR 用 `v.hi & 0x00f0ff00` 组装返回值，
+  把描述符 byte6 的低半字节（limit 19:16）清成 0。tiny386（本仓 x86 主 oracle，
+  i386.c:3528）、Bochs（protect_ctrl.cc: `dword2 & 0x00ffff00`）、v86
+  （misc_instr.rs）都保留这四位；Intel SDM 对 LAR 的 bits 19:16 只写
+  “undefined”，实机返回描述符里的原值，Win95 的 DPMI 客户端依赖它。
+- 崩溃链（指令级）：Win95 的 DPMI 客户端在 `1F14E lar ecx,ebx` 后
+  `shr ecx,8`、`bts ecx,12`（置 AVL），再 `mov ax,9; call 0x205F3`
+  走 DPMI 0009h（Set Descriptor Access Rights and Flags）；服务端
+  `20664 mov [bx+5],cx` 把整个 16 位字写回 LDT。LAR 清掉 limit 19:16 后
+  CX=0x10F3，描述符从 limit 0x1241F（626x119 8bpp DDB，bits 在
+  selector 0x0C36 偏移 0x30，需要 ≥0x1232E）缩成 0x241F；随后 16 位 GDI
+  的大指针 blit 在 row 0x20 读 DS:0x4ED2 > limit，`MOVSB` 吃 #GP(0)。
+  异常经 VMM 反射到 ring3 的 KERNEL32 异常分发器，最终打
+  `A fatal exception 0E has occurred at 0137:BFF9A3C0` 蓝屏。
+- 取证：`watchl=0x8008ac30:8:w` 抓到 LDT 项 0x0C36 的全部 6 次写：
+  0x2062B 写 byte6=0x01（limit 0x1241F），0x20664 写 0x10F3（limit 0x241F）。
+  DPMI 客户端调用点在 `1F14E/1F169`；服务端在 `205F3/20664`（段基址
+  0x1AE60，EIP 0x5793/0x5801）。QEMU 侧同一窗口 1460 次 #GP 无
+  CS=0x357 / EIP=0x2BB6，且 0x8015EBB6 的 MOVSB 根本没执行。
+- 修复：LAR 掩码改为 `0x00ffff00`。验证：同一 LDT 项最后一次写变成
+  `11F3`（limit 保持 0x1241F）；`CEMU_DEBUG` 的 trap 流在
+  583M/650M/720M 都不再出现 0x8015EBB6 的 #GP，蓝屏文本不再出现
+  （650M/720M 的 fbdump 是 1024x768 图形模式，无 80x25 蓝屏）。
+- 仍待查：修复后客人越过旧崩溃点继续启动（559.6M 切到 1024x768），
+  但在 650M/720M 仍是黑屏；regs 快照显示它在 VMM idle 与设备初始化之间
+  长时间等待（c038400f / c11a3ea5 各停留约 100M 条），像设备初始化超时，
+  与本次蓝屏无关，另立条目继续。
+
+## Win95 黑屏根因：VBE LFB 固定窗口 0xE0000000 未解码（2026-11-02）
+
+- 症状：LAR 修复后蓝屏消失，但正常模式在 559.6M 切到 1024x768 后一直黑屏；
+  safe mode（标准 VGA 驱动，走 0xA0000 aperture）正常。
+- 取证：正常模式的显示驱动把物理 0xE0000000 映射到线性 0xC38D8000
+  （pcshot=0x80151ED9 时 CR3=0x6B2000，PTE[0xD8]=0xE0000A67），随后
+  0x80151ED9 的 `rep stosd` 清屏。修复前 `bus` 行是
+  `io-st unclaimed-mem:e0000000:4 = 0`：写入落在没人认领的 PCI 空洞，
+  `phys_store` 的 BusProbe 失败后静默丢弃，所以卡上 VRAM 始终是黑的。
+- 为什么是 0xE0000000：`-vgabios ../seabios/out/vgabios.bin` 是
+  CONFIG_VGA_PCI=n 的构建（无 PCIR；autoconf.h 的 CONFIG_VGA_VID/DID=0），
+  SeaBIOS 把它当普通 option ROM 运行、不传 BDF，bochsvga_setup 的
+  `if (CONFIG_VGA_PCI && bdf >= 0)` 整段被编译掉，VBE_framebuffer 取
+  VBE_DISPI_LFB_PHYSICAL_ADDRESS（seabios vgasrc/bochsvga.h:41）= 0xE0000000，
+  而不是 BAR0。SeaBIOS 实际把 VGA BAR0 放在 0xFD000000（PCI 配置写序列
+  0x80001010 -> 0xFD000000；QEMU 同样把 BAR0 放在 0xFD000000）。
+- 参考：Bochs 的非 PCI VGA 路径注册的正是这个固定窗口
+  （bochs/iodev/display/vga.cc：`if (!pci_enabled) {
+  vbe.base_address = VBE_DISPI_LFB_PHYSICAL_ADDRESS;
+  DEV_register_memory_handlers(...); }`）。本机总是有 PCI VGA function，
+  但 VGA BIOS 仍以 file ROM 方式提供，所以卡同时解码 PCI BAR 与这个固定
+  窗口。带 PCI ROM 头的 VGA BIOS 会读 BAR0，仍走 BAR 窗口。
+- 修复：src/device/video/vga.c 增加 kVgaLegacyLfbBase=0xE0000000 的
+  vga-lfb 窗口（同一份 vram，VgaRegister 注册；VgaPciDetach 只移动 BAR，
+  不动这个固定窗口）。
+- 验证：同一 `rep stosd` 现在出
+  `io-st vga-lfb:e0000000:4 = 0`；650M 条指令的 fbdump 是 1024x768
+  桌面（teal + NE2000 警告对话框），与 QEMU 参考截图逐像素一致；
+  旧蓝屏 trap 不再出现。
+- 附注：QEMU 用同一个 legacy vgabios.bin 作为 PCI ROM 时会在
+  map_pcirom 里被拒（无 PCIR），客人根本没有 VGA BIOS；QEMU 默认的
+  vgabios-stdvga.bin 是 CONFIG_VGA_PCI=y 构建，所以它能读 BAR0。

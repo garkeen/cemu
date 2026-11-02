@@ -292,7 +292,9 @@ CEMU_DEBUG = item[,item...]
                             跨重构恒定；x86 打 g0..g7/s0..s5/x，riscv 打
                             g0..g31/f0..f31/x）
   mem[:ld|:st]              访存事件
-  trap                      异常/中断/陷入事件
+  trap                      异常/中断/陷入事件（每行带 inst=<退休指令数>，与
+                            `--max-inst`/K 行同一口径，用来把一次 trap 放到
+                            客人打印的横幅/停机/复位之间的准确位置）
   bus[:ADDR|:NAME]          MMIO / IO 端口命中（**不含指令取指**：固件在 ROM 窗口
                             执行时取指行会淹没一切）。`bus:ADDR` 只留该端口/MMIO 地址，
                             `bus:NAME` 只留该设备（`DeviceOps.name`，如 `bus:i8042`）——
@@ -468,6 +470,9 @@ CEMU_DEBUG = item[,item...]
                             硬编码寄存器）靠它把整场启动的模式序列读出来
   mouse=DX:DY:BUTTONS[:WHEEL]@N
   key=SCAN[:EXT[:UP]]@N
+                            `@N` 是周期（每 N 条指令发一次）；写成 `@N!` 表示
+                            只在该指令数发一次——复现一次菜单选择（上/上/回车）
+                            时用它，避免周期重复落进客人启动中段
                             合成宿主输入（探针作为客人按不了鼠标、也按不了键，
                             宿主事件路径只有这一条自动化通道；QEMU 侧的对应物
                             是监视器的 mouse_move/mouse_button/sendkey）。每 N
@@ -499,8 +504,11 @@ CEMU_DEBUG = item[,item...]
   还是把它截了），KIND：
   I 指令 / L 读 / S 写 / T 陷阱 / B 设备 / W 观测点 / K 标记
   （K 与 screen 都是无帧行：K 走事件表，screen 走整行文本）。T 行的 DETAIL 在
-  访问故障时带 `paddr=`（被访问的物理地址；页表走查本身故障时是 PTE 地址）：
-  tval 只给虚拟地址，PMP 拒绝与未映射设备在它上面分不开。
+  访问故障时带 `paddr=`（被访问的物理地址；页表走查本身故障时是 PTE 地址）。
+  **x86 的 #PF 是唯一把地址和错误码分开的**：`tval=` 给的是错误码（P|W|U，SDM
+  vol.3 4.7），故障线性地址在 `vaddr=`（CR2）；riscv 的 `tval=` 本身就是虚拟地址，
+  因此没有 `vaddr=`。只看 x86 的 `tval=` 会把错误码 2/4/6 误当成地址。`inst=`
+  是该次 trap 的退休指令数。
 - **PC 列打的是取指地址（线性地址），`->` 用同一条线性约定**：x86 实模式的
   `cpu->pc` 是 EIP；解释器在取指时把 CS base + EIP 记进 `rec.pc_lin`，提交后把
   新 CS base + dnpc 记进 `rec.dnpc_lin`，所以一行里的 `->` 就是下一行的 `pc=`

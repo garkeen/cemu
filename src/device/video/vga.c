@@ -193,6 +193,23 @@ typedef struct VgaPicture {
 
 static void VgaComputePicture(const VgaDevice* d, VgaPicture* p);
 
+// The Bochs VBE DISPI's fixed linear-framebuffer window. A SeaVGABIOS built
+// without CONFIG_VGA_PCI has no PCIR structure, so SeaBIOS runs it as a plain
+// option ROM with no BDF, bochsvga_setup's `if (CONFIG_VGA_PCI && bdf >= 0)`
+// branch is compiled out, and VBE_framebuffer gets VBE_DISPI_LFB_PHYSICAL_ADDRESS
+// (seabios vgasrc/bochsvga.h:41, 0xE0000000) instead of BAR0. Bochs registers
+// this same window for a non-PCI VGA (iodev/display/vga.cc:
+// `if (!pci_enabled) { vbe.base_address = VBE_DISPI_LFB_PHYSICAL_ADDRESS;
+// DEV_register_memory_handlers(...); }`). This machine always has the PCI
+// function, but it also supports the legacy ROM path, so the card decodes its
+// VRAM through both windows; firmware still discovers the relocatable BAR, and a
+// PCI-enabled VGA BIOS keeps using that one.
+static const uint64_t kVgaLegacyLfbBase = 0xE0000000;
+
+// The legacy window's bus ops; the bodies live with the PCI function's LFB code
+// below, but VgaRegister installs the window before them.
+static const DeviceOps kVgaLegacyLfbOps;
+
 // --- reset state --------------------------------------------------------------
 // Power-on values: the VGA BIOS's standard text-mode tables (SeaVGABIOS
 // stdvgamodes.c) — the same numbers QEMU resets its VGA to: the CRTC is
@@ -283,6 +300,10 @@ void VgaRegister(Bus* bus, Bus* io, VgaDevice* d) {
   // the planes depends on the register file. It sits inside the board RAM,
   // which the bus resolves last.
   BusAddRegion(bus, kApertureBase, kApertureSize, &kVgaMemOps, d);
+  // The legacy VBE ROM's fixed window (see kVgaLegacyLfbBase): the same VRAM,
+  // decoded at the Bochs DISPI address even when the PCI BAR has been moved
+  // elsewhere by firmware.
+  BusAddRegion(bus, kVgaLegacyLfbBase, kVgaVramSize, &kVgaLegacyLfbOps, d);
   // One port block: 0x3B0-0x3DF. On a VGA the 0x3B0 and 0x3D0 halves are the
   // same registers seen through the monochrome and colour decodes, and the
   // miscellaneous output register's colour bit decides which one answers
@@ -1132,24 +1153,45 @@ const DeviceOps kVgaMemOps = {"vga-vram", VgaMemRead, VgaMemWrite};
 // the paired measurements that fixed it at 16MB (the option ROM sizes the mode
 // table against this number, so a card that reports less loses modes the
 // reference machine keeps).
-static uint64_t VgaLfbRead(void* dev, uint64_t addr, int size) {
-  VgaDevice* d = (VgaDevice*)dev;
-  uint64_t off = addr - d->lfb_base;
+static uint64_t VgaLfbReadOff(const VgaDevice* d, uint64_t off, int size) {
   uint64_t v = 0;
   for (int i = 0; i < size; i++)
     v |= (uint64_t)d->vram[(off + (uint64_t)i) & (kVgaVramSize - 1)] << (8 * i);
   return v;
 }
 
-static void VgaLfbWrite(void* dev, uint64_t addr, int size, uint64_t val) {
-  VgaDevice* d = (VgaDevice*)dev;
-  uint64_t off = addr - d->lfb_base;
+static void VgaLfbWriteOff(VgaDevice* d, uint64_t off, int size, uint64_t val) {
   for (int i = 0; i < size; i++)
     d->vram[(off + (uint64_t)i) & (kVgaVramSize - 1)] = (uint8_t)(val >> (8 * i));
   d->dirty = 1;
 }
 
+static uint64_t VgaLfbRead(void* dev, uint64_t addr, int size) {
+  VgaDevice* d = (VgaDevice*)dev;
+  return VgaLfbReadOff(d, addr - d->lfb_base, size);
+}
+
+static void VgaLfbWrite(void* dev, uint64_t addr, int size, uint64_t val) {
+  VgaDevice* d = (VgaDevice*)dev;
+  VgaLfbWriteOff(d, addr - d->lfb_base, size, val);
+}
+
 static const DeviceOps kVgaLfbOps = {"vga-lfb", VgaLfbRead, VgaLfbWrite};
+
+// The same VRAM at the fixed Bochs DISPI address (kVgaLegacyLfbBase above).
+static uint64_t VgaLegacyLfbRead(void* dev, uint64_t addr, int size) {
+  VgaDevice* d = (VgaDevice*)dev;
+  uint64_t off = (addr - kVgaLegacyLfbBase) & (kVgaVramSize - 1);
+  return VgaLfbReadOff(d, off, size);
+}
+
+static void VgaLegacyLfbWrite(void* dev, uint64_t addr, int size, uint64_t val) {
+  VgaDevice* d = (VgaDevice*)dev;
+  uint64_t off = (addr - kVgaLegacyLfbBase) & (kVgaVramSize - 1);
+  VgaLfbWriteOff(d, off, size, val);
+}
+
+static const DeviceOps kVgaLegacyLfbOps = {"vga-lfb", VgaLegacyLfbRead, VgaLegacyLfbWrite};
 
 // Region 2 of QEMU's standard-VGA function is a 4KB MMIO bar (the standard-VGA
 // specification): 0x000-0x3ff is the EDID blob, 0x400-0x41f are the VGA ports
