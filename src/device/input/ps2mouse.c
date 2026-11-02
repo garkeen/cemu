@@ -63,6 +63,7 @@ struct Ps2MouseState {
   int reported;    // the button state the last packet carried
   int dx, dy, dz;  // movement the host reported and the guest has not read
   int command;     // -1, or the command waiting for its parameter byte
+  uint64_t next_sample_ns;  // when the next sample is due (0 = arm on poll)
 };
 
 static void Tx(Ps2MouseDevice* d, uint8_t b) {
@@ -86,24 +87,26 @@ static int Scale21(int n) {
   }
 }
 
-// One packet. The counts are 9-bit two's complement — the dy8/dx8 sign bits
-// plus the 8-bit fields — so the range is -256..+255, and a count outside it
-// sets the matching overflow bit (PS/2 mouse protocol: "the movement in the X
-// and Y direction in 9-bit two's complement notation (range -256 to +255) and
-// an overflow indicator"). QEMU clamps to +-127 and never sets the overflow
-// bits (hw/input/ps2.c, "XXX: increase range to 8 bits ?"); v86 truncates
-// silently. This follows the protocol.
-static void SendPacket(Ps2MouseDevice* d, int dx, int dy, int dz) {
+// Each packet carries at most this many counts per axis. QEMU clamps every
+// packet to +/-127 (hw/input/ps2.c ps2_mouse_send_packet) and ps2_mouse_sync
+// splits a larger delta across packets. The PS/2 wire format also has a 9th
+// bit and overflow bits for +/-256, but guest drivers (Win95's) read a packet
+// outside the signed-byte range as a jump to the screen edge, and the overflow
+// bits make it worse; the split keeps every packet in the range every driver
+// handles.
+enum { kMaxPacketDelta = 127 };
+
+static int PacketBytes(const struct Ps2MouseState* st) {
+  return st->id == kIdImps2 ? 4 : 3;
+}
+
+// One packet. Returns 0 when the controller has no room for the whole packet;
+// the caller keeps its accumulator and retries later. The caller has already
+// split the movement into this packet's range.
+static int SendPacket(Ps2MouseDevice* d, int dx, int dy, int dz) {
   struct Ps2MouseState* st = d->st;
+  if (d->can_send && !d->can_send(d->can_send_ctx, PacketBytes(st))) return 0;
   uint8_t b0 = (uint8_t)(0x08 | (st->buttons & 0x07));
-  if (dx < -256 || dx > 255) {
-    b0 |= 0x40;
-    dx = dx < 0 ? -256 : 255;
-  }
-  if (dy < -256 || dy > 255) {
-    b0 |= 0x80;
-    dy = dy < 0 ? -256 : 255;
-  }
   if (dx < 0) b0 |= 0x10;
   if (dy < 0) b0 |= 0x20;
   Tx(d, b0);
@@ -112,31 +115,53 @@ static void SendPacket(Ps2MouseDevice* d, int dx, int dy, int dz) {
   // The wheel byte only exists on the 4-byte device; a plain mouse drops the
   // wheel movement (QEMU: "Just ignore the wheels if not supported").
   if (st->id == kIdImps2) Tx(d, (uint8_t)(dz & 0xff));
+  return 1;
+}
+
+// Take one packet's worth from the accumulator and send it. A full controller
+// queue leaves the rest for Ps2MousePoll or the next host event.
+static int SendOne(Ps2MouseDevice* d) {
+  struct Ps2MouseState* st = d->st;
+  if (st->id != kIdImps2) st->dz = 0;  // no wheel byte to carry it
+  int dx = st->dx, dy = st->dy, dz = st->dz;
+  if (dx > kMaxPacketDelta)
+    dx = kMaxPacketDelta;
+  else if (dx < -kMaxPacketDelta)
+    dx = -kMaxPacketDelta;
+  if (dy > kMaxPacketDelta)
+    dy = kMaxPacketDelta;
+  else if (dy < -kMaxPacketDelta)
+    dy = -kMaxPacketDelta;
+  if (dz > kMaxPacketDelta)
+    dz = kMaxPacketDelta;
+  else if (dz < -kMaxPacketDelta)
+    dz = -kMaxPacketDelta;
+  if (!SendPacket(d, dx, dy, dz)) return 0;
+  st->dx -= dx;
+  st->dy -= dy;
+  st->dz -= dz;
+  st->reported = st->buttons;
+  return 1;
 }
 
 // The device reports on its own while it is in stream mode: one packet per
-// host event that carries movement, or one that changes the button state — a
-// report is due when either changed since the last one (PS/2 mouse protocol,
-// stream mode). In remote mode the movement waits for the host's 0xeb poll
-// (QEMU ps2_mouse_sync; v86 keeps the delta in mouse_delta_x until then).
+// chunk of movement, plus one for a button change (PS/2 mouse protocol, stream
+// mode). A large host delta needs more than one 127-count packet; the loop
+// keeps sending until the accumulator is empty or the controller's output
+// queue is full, exactly like QEMU's ps2_mouse_sync. In remote mode the
+// movement waits for the host's 0xeb poll (QEMU's AUX_POLL).
 //
 // An event that reports neither is not a report: a zero-movement packet with
 // unchanged buttons says nothing, and a guest waiting for another device's
 // answer counts the unsolicited traffic as stray data (SeaBIOS's ps2_recvbyte
 // discards it and takes its "Discarding ps2 data" path, which in this ROM
 // prints into its own padding — see progress.log).
-static void Sync(Ps2MouseDevice* d) {
+static void Flush(Ps2MouseDevice* d) {
   struct Ps2MouseState* st = d->st;
-  if (st->remote) return;
-  if (st->dx == 0 && st->dy == 0 && st->dz == 0 && st->buttons == st->reported) return;
-  int dx = st->dx, dy = st->dy;
-  if (st->scale21) {
-    dx = Scale21(dx);
-    dy = Scale21(dy);
+  if (!st->enabled) return;  // no reports while the device is off
+  while (st->dx != 0 || st->dy != 0 || st->dz != 0 || st->buttons != st->reported) {
+    if (!SendOne(d)) return;
   }
-  SendPacket(d, dx, dy, st->dz);
-  st->reported = st->buttons;
-  st->dx = st->dy = st->dz = 0;
 }
 
 // 0xe9: the status byte, then the resolution code and the sample rate. The
@@ -186,6 +211,7 @@ static void SetDefaults(struct Ps2MouseState* st) {
   st->scale21 = 0;
   st->rate = kDefaultRate;
   st->res = kDefaultRes;
+  st->next_sample_ns = 0;
 }
 
 void Ps2MouseWrite(Ps2MouseDevice* d, uint8_t val) {
@@ -219,6 +245,7 @@ void Ps2MouseWrite(Ps2MouseDevice* d, uint8_t val) {
     }
     st->rate = val;
     Detect(d, val);
+    st->next_sample_ns = 0;  // apply the new period on the next poll
     Tx(d, kReplyAck);
     return;
   }
@@ -244,15 +271,16 @@ void Ps2MouseWrite(Ps2MouseDevice* d, uint8_t val) {
       break;
     case kCmdSetStream:
       st->remote = 0;
+      st->next_sample_ns = 0;
       Tx(d, kReplyAck);
       break;
     case kCmdPoll:
       // The poll is the remote-mode read: it answers with a packet built from
-      // whatever movement has accumulated, enabled or not (QEMU's AUX_POLL).
+      // whatever movement has accumulated, enabled or not (QEMU's AUX_POLL
+      // calls ps2_mouse_send_packet directly, even for the idle state). A full
+      // output queue defers the packet to the next poll.
       Tx(d, kReplyAck);
-      SendPacket(d, st->dx, st->dy, st->dz);
-      st->reported = st->buttons;
-      st->dx = st->dy = st->dz = 0;
+      SendOne(d);
       break;
     case kCmdSetWrap:
       st->wrap = 1;
@@ -268,6 +296,7 @@ void Ps2MouseWrite(Ps2MouseDevice* d, uint8_t val) {
       break;
     case kCmdEnable:
       st->enabled = 1;
+      st->next_sample_ns = 0;
       Tx(d, kReplyAck);
       break;
     case kCmdDisable:
@@ -307,10 +336,45 @@ void Ps2MouseEvent(Ps2MouseDevice* d, int dx, int dy, int dz, int buttons) {
   // device and then pressing reports the press. QEMU accumulates instead and
   // reports the backlog on the next event.
   if (!st->enabled) return;
+  // 2:1 scaling is a property of the sample the device reports, so apply it
+  // while accumulating rather than when a (possibly split) packet goes out:
+  // applying it to the remainder on every retry would compound the scaling.
+  if (st->scale21) {
+    dx = Scale21(dx);
+    dy = Scale21(dy);
+  }
   st->dx += dx;
   st->dy += dy;
   st->dz += dz;
-  Sync(d);
+  // The packet goes out from Ps2MousePoll at the programmed sample rate; a
+  // host event only updates the accumulator.
+}
+
+// Send what has accumulated since the previous sample. The board passes the
+// emulated clock, so the cadence is the guest's `rate` (40/100/200 Hz), not
+// the host's WM_MOUSEMOVE rate. A real PS/2 mouse samples at that rate and the
+// guest's acceleration is calibrated for it; sending per host event made the
+// cadence depend on how often the window pump happened to run.
+void Ps2MousePoll(Ps2MouseDevice* d, uint64_t now_ns) {
+  struct Ps2MouseState* st = d->st;
+  if (st->remote || !st->enabled) return;
+  uint64_t rate = st->rate > 0 ? (uint64_t)st->rate : (uint64_t)kDefaultRate;
+  uint64_t period = 1000000000ull / rate;
+  if (period == 0) period = 1;
+  if (st->next_sample_ns == 0) st->next_sample_ns = now_ns + period;
+  if (now_ns < st->next_sample_ns) return;
+  // If the poll was late, skip the missed sample slots instead of emitting a
+  // burst for each one.
+  do {
+    st->next_sample_ns += period;
+  } while (st->next_sample_ns <= now_ns);
+  Flush(d);
+}
+
+void Ps2MouseSampleNow(Ps2MouseDevice* d) {
+  struct Ps2MouseState* st = d->st;
+  if (st->remote || !st->enabled) return;
+  Flush(d);
 }
 
 void Ps2MouseInit(Ps2MouseDevice* d) {
@@ -323,13 +387,20 @@ void Ps2MouseInit(Ps2MouseDevice* d) {
   SetDefaults(d->st);
   d->st->id = kIdStandard;
   d->st->command = -1;
-  // A reset leaves the byte sink to the board's wiring pass, the same contract
+  // A reset leaves the byte sinks to the board's wiring pass, the same contract
   // I8042Init follows for its own sinks.
   d->tx = NULL;
   d->tx_ctx = NULL;
+  d->can_send = NULL;
+  d->can_send_ctx = NULL;
 }
 
 void Ps2MouseSetTxSink(Ps2MouseDevice* d, void (*tx)(void* ctx, uint8_t byte), void* ctx) {
   d->tx = tx;
   d->tx_ctx = ctx;
+}
+
+void Ps2MouseSetCanSendSink(Ps2MouseDevice* d, int (*can_send)(void* ctx, int bytes), void* ctx) {
+  d->can_send = can_send;
+  d->can_send_ctx = ctx;
 }

@@ -77,6 +77,12 @@ typedef struct Board {
   // afterwards (bit 0 left, bit 1 right, bit 2 middle). NULL = no pointer.
   void (*mouse_in)(void* ctx, int dx, int dy, int dz, int buttons);
   void* mouse_ctx;
+  // Test-only flush: a CEMU_DEBUG=mouse= event is one host event and must stay
+  // one packet, so a headless probe sees the byte stream a single event
+  // produced before the device started sampling at the guest's programmed
+  // rate. NULL on boards/devices without a sampled mouse.
+  void (*mouse_flush)(void* ctx);
+  void* mouse_flush_ctx;
   // Absolute pointer channel (all display boards): source-picture pixel
   // coordinates (X right, Y down, already clamped to the picture; the window
   // reports nothing outside the client area). A board with an absolute device

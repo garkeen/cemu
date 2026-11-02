@@ -396,11 +396,27 @@ static void OnHostMouse(void* ctx, int dx, int dy, int dz, int buttons) {
   Ps2MouseEvent(&xm->mouse, dx, dy, dz, buttons);
 }
 
+// CEMU_DEBUG=mouse= is a test fixture, not a host sample: flush it directly so
+// the probe sees one packet per synthetic event (the window path waits for the
+// device's programmed sample time).
+static void OnMouseFlush(void* ctx) {
+  X86Board* xm = (X86Board*)ctx;
+  Ps2MouseSampleNow(&xm->mouse);
+}
+
 // The 8042's auxiliary wire, both directions: command 0xd4 hands the device a
 // byte, and whatever the device answers lands in the controller's AUX queue.
 static void OnKbdToAux(void* ctx, uint8_t byte) {
   X86Board* xm = (X86Board*)ctx;
   Ps2MouseWrite(&xm->mouse, byte);
+}
+
+// The mouse may start a packet only when the whole packet fits the controller's
+// output queue (the queue drops on overflow, and one lost byte shifts every
+// later packet). QEMU's ps2_mouse_send_packet checks its queue the same way.
+static int OnAuxCanSend(void* ctx, int bytes) {
+  X86Board* xm = (X86Board*)ctx;
+  return I8042AuxFree(&xm->kbd) >= bytes;
 }
 
 static void OnAuxByte(void* ctx, uint8_t byte) {
@@ -616,6 +632,11 @@ static void X86Poll(Board* m) {
   X86Board* xm = (X86Board*)m;
   PitPoll(&xm->pit);
   VgaPoll(&xm->vga);
+  // A PS/2 packet that did not fit the 8042's output queue waits here; the
+  // guest drains the queue between polls, so the rest of the movement follows
+  // without another host event. The device also samples at its programmed rate
+  // here, which is what the guest's acceleration expects.
+  Ps2MousePoll(&xm->mouse, (uint64_t)HostTimerNowNs());
   // The APIC timer is the machine's clock: xv6 preempts on it, and its count
   // is derived from the host clock rather than from steps.
   LapicPoll(&xm->lapic);
@@ -682,6 +703,7 @@ static void WireDevices(X86Board* xm) {
   // command 0xd4's bytes go down, the device's answers come back up.
   I8042SetAuxSink(&xm->kbd, OnKbdToAux, xm);
   Ps2MouseSetTxSink(&xm->mouse, OnAuxByte, xm);
+  Ps2MouseSetCanSendSink(&xm->mouse, OnAuxCanSend, xm);
   I8042SetKbdSink(&xm->kbd, OnKbdToDev, xm);
   Ps2KbdSetTxSink(&xm->ps2kbd, OnKbdByte, xm);
   I8042SetTranslateSink(&xm->kbd, OnKbdTranslate, xm);
@@ -963,6 +985,8 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   // backdoor), not to this one.
   m->mouse_in = opts->mouse == kMouseSerial ? OnHostMouseSerial : OnHostMouse;
   m->mouse_ctx = xm;
+  m->mouse_flush = opts->mouse == kMouseSerial ? NULL : OnMouseFlush;
+  m->mouse_flush_ctx = xm;
   m->serial_in = OnHostSerial;
   m->serial_ctx = xm;
 

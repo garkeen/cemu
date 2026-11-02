@@ -76,5 +76,10 @@ void I8042SetTranslateSink(I8042Device* d, void (*set_translate)(void* ctx, int 
 void I8042KbdByte(I8042Device* d, uint8_t scancode);
 // One byte from the auxiliary device (the mouse) into the AUX output queue.
 void I8042AuxByte(I8042Device* d, uint8_t byte);
+// Free bytes in the AUX output queue. The mouse checks this before starting a
+// packet: the queue drops on overflow, and a dropped byte shifts every later
+// packet, which the guest sees as a jump. QEMU's ps2_mouse_send_packet checks
+// its queue the same way.
+int I8042AuxFree(const I8042Device* d);
 
 #endif

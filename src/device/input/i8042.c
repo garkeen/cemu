@@ -387,3 +387,8 @@ void I8042AuxByte(I8042Device* d, uint8_t byte) {
   QueuePush(&d->st->aux, byte);
   I8042SyncIrq(d);
 }
+
+int I8042AuxFree(const I8042Device* d) {
+  if (!d->st) return 0;
+  return kI8042Queue - 1 - QueueCount(&d->st->aux);
+}

@@ -85,6 +85,9 @@ int BoardRunSteps(Board* m, uint64_t max_inst, int (*stop_cb)(void* ctx, CpuStat
       while (DebugNextInjection(m->cpu.inst_count, &inj)) {
         if (inj.kind == kInjMouse) {
           if (m->mouse_in) m->mouse_in(m->mouse_ctx, inj.dx, inj.dy, inj.dz, inj.buttons);
+          // Synthetic events are test fixtures: one event is one packet, even
+          // though the real window path samples at the guest's programmed rate.
+          if (m->mouse_flush) m->mouse_flush(m->mouse_flush_ctx);
         } else {
           if (m->key_in) m->key_in(m->key_ctx, inj.scan, inj.extended, inj.up);
         }

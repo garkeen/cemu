@@ -18,6 +18,10 @@
 
 // Pump cadence: process messages / check for repaints at most this often.
 enum { kPumpIntervalUs = 4000 };
+// How close to the client edge the grabbed pointer may get before it is
+// warped back to the center. The movement that reached the edge is still
+// reported; the warp itself is not (the base is reset to the center).
+enum { kGrabMargin = 8 };
 
 struct HostDisplay {
   HWND hwnd;
@@ -42,7 +46,22 @@ struct HostDisplay {
   // and wheel events outside the client (capture) still have a position to
   // report.
   int mouse_x, mouse_y, mouse_valid, mouse_buttons;
+  // Relative channel: fractional source-picture counts carried between host
+  // events. The picture is scaled into the client by ClientPictureRect; a
+  // relative device has to apply the same scale or the guest cursor moves
+  // faster/slower than the host pointer when the window is resized (a
+  // maximized 1024x768 picture on a 1080p screen is ~1.4x).
+  int64_t rel_acc_x, rel_acc_y;
   int abs_x, abs_y, abs_valid;
+  // Relative-only pointer grab (D38): the host cursor is hidden and warped
+  // back to the client center when it nears an edge, so the guest can keep
+  // moving past its own screen edge and the host pointer never runs out of
+  // window. Ctrl+Alt (or focus loss) releases it.
+  int grabbed;
+  int cursor_hidden;
+  int focused;
+  int ctrl_down, alt_down;  // Ctrl+Alt releases the grab
+  int grab_suppressed;      // released: wait for a click before grabbing again
   uint32_t shown_version;
   int64_t next_pump_us;
   int closed;
@@ -105,6 +124,103 @@ static int MapPointer(HostDisplay* d, int cx, int cy, int* sx, int* sy) {
   return 1;
 }
 
+// Client-pixel delta -> source-picture counts. The relative channel reports a
+// delta, not a position, but the picture is scaled uniformly into the client;
+// applying the same scale is what keeps the guest cursor under the host
+// pointer's displacement when the window is resized. The 16.16 accumulator
+// keeps the fraction of a count that a small movement leaves over.
+static void RelativeDelta(HostDisplay* d, int cdx, int cdy, int* gdx, int* gdy) {
+  *gdx = cdx;
+  *gdy = cdy;
+  RECT client, pic;
+  if (!ClientPictureRect(d, &client, &pic)) {
+    d->rel_acc_x = 0;
+    d->rel_acc_y = 0;
+    return;
+  }
+  int pw = pic.right - pic.left, ph = pic.bottom - pic.top;
+  if (pw <= 0 || ph <= 0) return;
+  int64_t sx = ((int64_t)d->width << 16) / pw;
+  int64_t sy = ((int64_t)d->height << 16) / ph;
+  d->rel_acc_x += (int64_t)cdx * sx;
+  d->rel_acc_y += (int64_t)cdy * sy;
+  *gdx = (int)(d->rel_acc_x / 65536);
+  *gdy = (int)(d->rel_acc_y / 65536);
+  d->rel_acc_x -= (int64_t)*gdx * 65536;
+  d->rel_acc_y -= (int64_t)*gdy * 65536;
+}
+
+// Put the hidden pointer back at the client center so the next movement has
+// room in every direction. The warp itself must not become a relative delta:
+// mouse_x/mouse_y are set to the same center point.
+static void RecenterPointer(HostDisplay* d) {
+  RECT rc;
+  GetClientRect(d->hwnd, &rc);
+  POINT p;
+  p.x = (rc.left + rc.right) / 2;
+  p.y = (rc.top + rc.bottom) / 2;
+  ClientToScreen(d->hwnd, &p);
+  SetCursorPos(p.x, p.y);
+  d->mouse_x = (rc.left + rc.right) / 2;
+  d->mouse_y = (rc.top + rc.bottom) / 2;
+  d->mouse_valid = 1;
+  d->rel_acc_x = 0;
+  d->rel_acc_y = 0;
+}
+
+static int NearClientEdge(HostDisplay* d, int x, int y) {
+  RECT rc;
+  GetClientRect(d->hwnd, &rc);
+  int w = rc.right - rc.left, h = rc.bottom - rc.top;
+  if (w <= 2 * kGrabMargin || h <= 2 * kGrabMargin) return 1;
+  return x < rc.left + kGrabMargin || x >= rc.right - kGrabMargin ||
+         y < rc.top + kGrabMargin || y >= rc.bottom - kGrabMargin;
+}
+
+// Relative-only pointer grab (D38). PS/2 has no absolute packet, so the guest
+// cursor is moved by counts; without a grab the host pointer can reach the
+// window edge while the guest cursor is still in the middle (or vice versa),
+// and the lost movement comes back as a jump when the pointer re-enters. Hide
+// the host cursor, capture the pointer, and warp it to the center near an
+// edge: the guest gets unlimited relative movement and the only visible cursor
+// is the guest's own. Ctrl+Alt (or losing focus) releases it.
+static void GrabPointer(HostDisplay* d) {
+  if (d->grabbed || !d->mouse_cb || d->mouse_abs_cb) return;
+  d->grabbed = 1;
+  d->grab_suppressed = 0;
+  d->mouse_valid = 0;
+  d->rel_acc_x = 0;
+  d->rel_acc_y = 0;
+  d->ctrl_down = 0;
+  d->alt_down = 0;
+  SetCapture(d->hwnd);
+  if (!d->cursor_hidden) {
+    ShowCursor(FALSE);
+    d->cursor_hidden = 1;
+  }
+  RecenterPointer(d);
+}
+
+static void ReleasePointer(HostDisplay* d) {
+  if (!d->grabbed) {
+    if (d->cursor_hidden) {
+      ShowCursor(TRUE);
+      d->cursor_hidden = 0;
+    }
+    return;
+  }
+  d->grabbed = 0;
+  d->grab_suppressed = 1;  // no auto-grab until the user clicks the display
+  if (GetCapture() == d->hwnd) ReleaseCapture();
+  if (d->cursor_hidden) {
+    ShowCursor(TRUE);
+    d->cursor_hidden = 0;
+  }
+  d->mouse_valid = 0;
+  d->rel_acc_x = 0;
+  d->rel_acc_y = 0;
+}
+
 // The only blit path: the picture is scaled to the client area, preserving its
 // aspect ratio, and the area around it is black. The window is resizable (a
 // VGA's modes come in several sizes) and the version counter is consumed here
@@ -153,7 +269,30 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
     case WM_ERASEBKGND:
       return 1;  // Blit paints the whole client area (picture plus letterbox)
+    case WM_SETFOCUS:
+      d->focused = 1;
+      d->mouse_valid = 0;
+      d->rel_acc_x = 0;
+      d->rel_acc_y = 0;
+      return 0;
+    case WM_SETCURSOR:
+      // A grabbed relative pointer has no visible host cursor: the guest
+      // draws its own. Outside the client (title bar/border) the normal arrow
+      // comes back, which is also the way to reach the window buttons after
+      // releasing the grab.
+      if (d->grabbed && LOWORD(lp) == HTCLIENT) {
+        SetCursor(NULL);
+        return TRUE;
+      }
+      return DefWindowProcA(hwnd, msg, wp, lp);
     case WM_SIZE:
+      // The client geometry changed: the old mouse_x/mouse_y are in the old
+      // coordinate system, so the next WM_MOUSEMOVE would otherwise be a
+      // spurious delta (and the scale may have changed too). Re-establish the
+      // relative base on the next move.
+      d->mouse_valid = 0;
+      d->rel_acc_x = 0;
+      d->rel_acc_y = 0;
       InvalidateRect(hwnd, NULL, FALSE);  // the picture scales to the client area
       return 0;
     case WM_KEYDOWN:
@@ -161,6 +300,22 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case WM_KEYUP:
     case WM_SYSKEYUP: {
       if (!d->key_cb) return DefWindowProcA(hwnd, msg, wp, lp);  // Alt+F4 etc. stay
+      // Ctrl+Alt releases the relative grab (QEMU's convention). Track the
+      // modifiers from the key messages themselves: GetKeyState is thread
+      // state and can lag a synthetic/queued key event. The first half of the
+      // chord may already have reached the guest; the second is consumed so
+      // the release itself is not typed into the guest.
+      if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
+        if (wp == VK_CONTROL) d->ctrl_down = 1;
+        if (wp == VK_MENU) d->alt_down = 1;
+        if (d->grabbed && d->ctrl_down && d->alt_down) {
+          ReleasePointer(d);
+          return 0;
+        }
+      } else {
+        if (wp == VK_CONTROL) d->ctrl_down = 0;
+        if (wp == VK_MENU) d->alt_down = 0;
+      }
       // lp bits 16-23 carry the keyboard's own make code — the set-1 byte the
       // PC/AT sends — and bit 24 marks the 0xe0-prefixed keys (Win32
       // WM_KEYDOWN). The model adds the break bit from `up`.
@@ -170,7 +325,6 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
       return 0;
     }
     case WM_MOUSEMOVE: {
-      if (!d->mouse_abs_cb && !d->mouse_cb) return DefWindowProcA(hwnd, msg, wp, lp);
       int x = (int)(short)LOWORD(lp), y = (int)(short)HIWORD(lp);
       if (d->mouse_abs_cb) {
         // Absolute channel: the picture position, clamped to the nearest edge
@@ -183,33 +337,100 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
           d->abs_valid = 1;
           d->mouse_abs_cb(d->mouse_abs_ctx, sx, sy, 0, d->mouse_buttons);
         }
-      } else {
-        // Relative channel (PS/2): Win32 client coordinates grow downward,
-        // the PS/2 mouse reports Y positive upward, so the vertical delta is
-        // negated. The first event after entering only establishes the base.
-        if (d->mouse_valid)
-          d->mouse_cb(d->mouse_ctx, x - d->mouse_x, d->mouse_y - y, 0, d->mouse_buttons);
+        d->mouse_x = x;
+        d->mouse_y = y;
+        d->mouse_valid = 1;
+        // Ask for WM_MOUSELEAVE so the delta base is dropped when the pointer
+        // leaves; Win32 sends it once per TrackMouseEvent call.
+        TRACKMOUSEEVENT tme;
+        memset(&tme, 0, sizeof(tme));
+        tme.cbSize = sizeof(tme);
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = hwnd;
+        TrackMouseEvent(&tme);
+        return 0;
+      }
+      if (!d->mouse_cb) return DefWindowProcA(hwnd, msg, wp, lp);
+      if (!d->focused) {
+        // Hovering an inactive window must not move the guest cursor.
+        d->mouse_x = x;
+        d->mouse_y = y;
+        d->mouse_valid = 0;
+        return 0;
+      }
+      if (!d->grabbed && d->grab_suppressed) {
+        // Released with Ctrl+Alt: keep the host cursor visible and do not
+        // move the guest until the user clicks the display again.
+        d->mouse_x = x;
+        d->mouse_y = y;
+        d->mouse_valid = 0;
+        return 0;
+      }
+      if (!d->grabbed) {
+        // First movement over a focused relative-only display: grab the
+        // pointer (hide the host arrow, recenter, capture). This event only
+        // establishes the new base; the next one carries the movement.
+        GrabPointer(d);
+        return 0;
+      }
+      // Relative channel (PS/2): Win32 client coordinates grow downward,
+      // the PS/2 mouse reports Y positive upward, so the vertical delta is
+      // negated. The delta is in source-picture counts: the picture is scaled
+      // into the client, so raw client pixels would make the guest cursor
+      // faster/slower whenever the window is not 1:1.
+      if (d->mouse_valid) {
+        int gdx, gdy;
+        RelativeDelta(d, x - d->mouse_x, d->mouse_y - y, &gdx, &gdy);
+        if (gdx || gdy)
+          d->mouse_cb(d->mouse_ctx, gdx, gdy, 0, d->mouse_buttons);
       }
       d->mouse_x = x;
       d->mouse_y = y;
       d->mouse_valid = 1;
-      // Ask for WM_MOUSELEAVE so the delta base is dropped when the pointer
-      // leaves; Win32 sends it once per TrackMouseEvent call.
-      TRACKMOUSEEVENT tme;
-      memset(&tme, 0, sizeof(tme));
-      tme.cbSize = sizeof(tme);
-      tme.dwFlags = TME_LEAVE;
-      tme.hwndTrack = hwnd;
-      TrackMouseEvent(&tme);
+      // Keep the hidden host pointer inside the window so the relative
+      // movement never runs out; the movement that reached the margin was
+      // already reported above, and the warp itself is not a delta.
+      if (NearClientEdge(d, x, y)) RecenterPointer(d);
       return 0;
     }
     case WM_MOUSELEAVE:
+    case WM_NCMOUSEMOVE:
+    case WM_NCMOUSELEAVE:
+      // The pointer left the client (including into the title bar or a resize
+      // border): the next client move must only establish a new base, or the
+      // distance crossed in the non-client area becomes one huge relative
+      // delta (a jump to the screen edge).
       d->mouse_valid = 0;
+      d->rel_acc_x = 0;
+      d->rel_acc_y = 0;
+      if (msg == WM_MOUSELEAVE || msg == WM_NCMOUSELEAVE) return 0;
+      return DefWindowProcA(hwnd, msg, wp, lp);
+    case WM_CAPTURECHANGED:
+      // Capture can be lost without a matching button-up (another window takes
+      // it). Our own SetCapture/ReleaseCapture pair has lParam == hwnd and is
+      // not a loss; anyone else taking it ends the grab and brings the host
+      // cursor back.
+      if (d->grabbed && (HWND)lp != hwnd) {
+        d->grabbed = 0;
+        if (d->cursor_hidden) {
+          ShowCursor(TRUE);
+          d->cursor_hidden = 0;
+        }
+      }
+      d->mouse_valid = 0;
+      d->rel_acc_x = 0;
+      d->rel_acc_y = 0;
       return 0;
     case WM_KILLFOCUS:
-      // Focus going away costs us the pointer too: without this the next
-      // WM_MOUSEMOVE after the user comes back would report one huge delta.
+      // Focus going away costs us the pointer too: release the grab, show the
+      // host cursor, and make the next WM_MOUSEMOVE re-establish the base.
+      d->focused = 0;
+      ReleasePointer(d);
+      d->ctrl_down = 0;
+      d->alt_down = 0;
       d->mouse_valid = 0;
+      d->rel_acc_x = 0;
+      d->rel_acc_y = 0;
       return DefWindowProcA(hwnd, msg, wp, lp);
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP:
@@ -224,6 +445,12 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 : (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP)   ? 0x02
                                                                    : 0x04;
       int down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
+      // A click into a focused relative-only display starts the grab; the
+      // click itself still reaches the guest with the new button state.
+      if (down && !d->mouse_abs_cb && d->mouse_cb) {
+        d->grab_suppressed = 0;
+        if (!d->grabbed) GrabPointer(d);
+      }
       if (down)
         d->mouse_buttons |= bit;
       else
@@ -246,11 +473,15 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         d->mouse_cb(d->mouse_ctx, 0, 0, 0, d->mouse_buttons);
       }
       // Keep reporting while a button is held even if the pointer leaves the
-      // client area — that is what a drag is.
-      if (down)
-        SetCapture(hwnd);
-      else if (!d->mouse_buttons)
-        ReleaseCapture();
+      // client area — that is what a drag is. The relative grab owns capture
+      // already and stays grabbed after the button is released (Ctrl+Alt
+      // releases it); only the absolute/ungrabbed path captures per drag.
+      if (d->mouse_abs_cb || !d->grabbed) {
+        if (down)
+          SetCapture(hwnd);
+        else if (!d->mouse_buttons)
+          ReleaseCapture();
+      }
       return 0;
     }
     case WM_MOUSEWHEEL: {
@@ -279,9 +510,11 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
       return 0;
     }
     case WM_CLOSE:
+      ReleasePointer(d);
       DestroyWindow(hwnd);
       return 0;
     case WM_DESTROY:
+      ReleasePointer(d);
       d->closed = 1;
       return 0;
     default:
@@ -401,6 +634,7 @@ void HostDisplaySetMouseAbsSink(HostDisplay* d,
 
 void HostDisplayFree(HostDisplay* d) {
   if (!d) return;
+  ReleasePointer(d);
   if (d->hwnd) DestroyWindow(d->hwnd);
   if (d->back_dc) DeleteDC(d->back_dc);
   if (d->back_bmp) DeleteObject(d->back_bmp);
