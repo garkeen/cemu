@@ -60,10 +60,18 @@ enum {
 // Device control register bits (§7.10.10 device control).
 enum { kDevCtrlNien = 0x02, kDevCtrlSrst = 0x04, kDevCtrlHd15 = 0x08 };
 
+// How long BSY stays visible after a software reset (SRST). The reset itself is
+// synchronous here, but the wire protocol is not: the device raises BSY when
+// SRST is asserted and clears it when the reset completes (QEMU
+// ide_ctrl_write() sets BUSY_STAT on both drives and schedules
+// ide_bus_perform_srst()).
+enum { kSrstBusyUs = 50 };
+
 // The ATA command set a disk implements (ATA-6 for the extended commands the
 // images need). A command outside this table aborts, which is how a drive
 // answers one it does not support (§6.3 command protocol).
 enum {
+  kCmdRecalibrate = 0x10,  // RECALIBRATE: no-op on an LBA-capable drive
   kCmdReadSectors = 0x20,
   kCmdReadSectorsExt = 0x24,
   kCmdReadDmaExt = 0x25,
@@ -71,6 +79,7 @@ enum {
   kCmdWriteSectorsExt = 0x34,
   kCmdWriteDmaExt = 0x35,
   kCmdReadVerify = 0x40,
+  kCmdSeek = 0x70,
   kCmdReadMultiple = 0xc4,
   kCmdWriteMultiple = 0xc5,
   kCmdSetMultiple = 0xc6,
@@ -296,7 +305,10 @@ static IdeDrive* Selected(IdeChannel* ch) { return &ch->drives[ch->selected]; }
 // nIEN in the device control register holds the line down while it is set
 // (device control register §7.10.10; QEMU hw/ide/core.c ide_set_irq).
 static void UpdateIrq(IdeChannel* ch) {
-  int level = (ch->irq_pending && !(ch->devctrl & kDevCtrlNien)) ? 1 : 0;
+  // BSY and the completion interrupt are mutually exclusive: while the command
+  // is busy the line stays low, and IdePoll raises it when the busy window
+  // ends. This is what lets the driver observe BSY first and the result after.
+  int level = (ch->irq_pending && !ch->busy && !(ch->devctrl & kDevCtrlNien)) ? 1 : 0;
   if (ch->dev->set_irq) ch->dev->set_irq(ch->dev->irq_ctx, ch->irq_line, level);
 }
 
@@ -428,6 +440,8 @@ static void ResetChannel(IdeChannel* ch) {
   ch->refill = 0;
   ch->block_size = kAtaBlockSize;
   ch->limit = kAtaBlockSize;
+  ch->busy = 0;
+  ch->busy_until_us = 0;
   // A reset stops the bus-master engine and clears its interrupt (PIIX3 status
   // register; the descriptor pointer is the host's and survives).
   ch->bmdma_cmd = 0;
@@ -716,9 +730,12 @@ static void MoveBytes(IdeChannel* ch, int size) {
       MediumReadFailed(ch);
       return;
     }
-    // A packet device reports every round to the host; the ATA register command
-    // set only interrupts when the whole command is done (§6.3, §9.6).
-    if (ch->drives[ch->active].atapi) RaiseIrq(ch);
+    // Every PIO round is one block, and the device asserts INTRQ when that
+    // block is ready (read) or committed (write); the host takes one block per
+    // interrupt. QEMU does the same: cmd_read_pio sets req_nb_sectors = 1, and
+    // ide_sector_read_cb / ide_sector_write_cb call ide_bus_set_irq() whenever
+    // they start the next block (hw/ide/core.c).
+    RaiseIrq(ch);
     return;
   }
   EndCommand(ch);
@@ -1606,6 +1623,17 @@ static void ExecCommand(IdeChannel* ch, uint8_t cmd) {
       RaiseIrq(ch);
       return;
     }
+    case kCmdRecalibrate:
+    case kCmdSeek:
+      // RECALIBRATE/SEEK move the heads to the addressed cylinder. The drive
+      // is LBA-addressed and already at the requested position, so both are
+      // no-ops that complete with DSC set and an interrupt (ATA/ATAPI-7 §8.7,
+      // §8.8; QEMU maps WIN_RECAL to cmd_nop and WIN_SEEK to cmd_seek, both
+      // with SET_DSC).
+      dr->error = 0;
+      dr->status = kStatusReady;
+      RaiseIrq(ch);
+      return;
     case kCmdReadVerify: {
       int ok = 0;
       int64_t lba = CommandLba(ch, dr, &ok);
@@ -1629,14 +1657,17 @@ static void ExecCommand(IdeChannel* ch, uint8_t cmd) {
       return;
     }
     case kCmdInitializeParams: {
-      // The geometry the task file names becomes the one IDENTIFY reports and
-      // the one CHS commands translate through (§8.5).
-      if (ch->count == 0 || ch->lba_low == 0) {
+      // INITIALIZE DEVICE PARAMETERS takes the sectors per track from the
+      // sector count register and the maximum head number from bits 3:0 of the
+      // device/head register; the LBA registers are not part of the command
+      // (ATA/ATAPI-7 §8.5; QEMU cmd_specify reads nsector and ATA_DEV_HS the
+      // same way).
+      if (ch->count == 0) {
         Abort(ch, dr);
         return;
       }
       dr->sectors_per_track = ch->count;
-      dr->heads = ch->lba_low;
+      dr->heads = (uint8_t)((ch->head & 0x0f) + 1);
       int64_t per_cylinder = (int64_t)dr->heads * dr->sectors_per_track;
       int64_t cylinders = (dr->blocks + per_cylinder - 1) / per_cylinder;
       dr->cylinders = cylinders > 0xffff ? 0xffff : (uint16_t)cylinders;
@@ -1709,6 +1740,12 @@ static void ExecCommand(IdeChannel* ch, uint8_t cmd) {
 // is retired and the line drops (§7.10.9; QEMU ide_status_read does the same,
 // and it serves the alternate status port too).
 static uint64_t ReadStatus(IdeChannel* ch) {
+  // While the command is busy the status register reports BSY and the ready
+  // bits; the command's result and its interrupt are hidden until the busy
+  // window ends (ATA/ATAPI-7 §7.10.9: other status bits are not valid while
+  // BSY is set). A status read in this window must not acknowledge the
+  // completion, because the interrupt has not been raised yet.
+  if (ch->busy) return (uint64_t)(Selected(ch)->status | kStatusBsy);
   ClearIrq(ch);
   return Selected(ch)->status;
 }
@@ -1791,6 +1828,23 @@ static void CtrlWrite(void* dev, uint64_t addr, int size, uint64_t val) {
   ch->devctrl = (uint8_t)val;
   if (!(old & kDevCtrlSrst) && (ch->devctrl & kDevCtrlSrst)) {
     ResetChannel(ch);
+    // QEMU sets BUSY_STAT on both drives before scheduling the reset; the
+    // reset's result is ready here, but the status register still reports the
+    // reset's busy phase before it (ATA/ATAPI-7 §7.10.9).
+    ch->busy = 1;
+    ch->busy_until_us = (uint64_t)HostTimerNow() + kSrstBusyUs;
+    // The diagnostic command a software reset ends with reports error 0x01
+    // ("device 0 passed") and interrupts on a disk; a packet device completes
+    // without an interrupt (QEMU cmd_exec_dev_diagnostic). ResetChannel clears
+    // the error and the IRQ, so put both back before the busy window closes.
+    int disk = 0;
+    for (int i = 0; i < kIdeDrivesPerChannel; i++) {
+      IdeDrive* dr = &ch->drives[i];
+      if (!dr->image) continue;
+      dr->error = 0x01;
+      if (!dr->atapi) disk = 1;
+    }
+    if (disk) RaiseIrq(ch);
     return;
   }
   // Clearing nIEN lets a request that arrived while interrupts were disabled
@@ -1932,6 +1986,19 @@ void IdeReset(IdeDevice* d) {
     // reset clears it (SRST, by contrast, leaves the host's table in place).
     ch->bmdma_prd = 0;
     memset(ch->buf, 0, sizeof(ch->buf));
+  }
+}
+
+void IdePoll(IdeDevice* d) {
+  uint64_t now = (uint64_t)HostTimerNow();
+  for (int i = 0; i < 2; i++) {
+    IdeChannel* ch = &d->channels[i];
+    if (!ch->busy || now < ch->busy_until_us) continue;
+    ch->busy = 0;
+    // The reset already left the selected drive in its ready state; now a
+    // pending interrupt (if any) may be asserted, and the next status read
+    // acknowledges it (ReadStatus -> ClearIrq).
+    UpdateIrq(ch);
   }
 }
 

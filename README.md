@@ -118,6 +118,12 @@ build/cemu.exe --machine oberon -dsk disk.img -display win32
 与 Oberon 鼠标寄存器是原生绝对设备，客户区坐标直接映射到源画面像素；x86 的
 PS/2 与 `-mouse serial` 只有相对协议，投的是宿主指针的位移（漂移边界见 D38）。
 
+聚焦窗口内首次移动即抓取指针并隐藏宿主光标；绝对设备同样抓取但不回中，坐标
+映射不受影响。**Ctrl+Alt+G** 释放抓取、宿主光标回来，点击窗口重新抓取。
+宿主侧的 Ctrl+Alt+Del 由 Windows 自己收走（winlogon 的 SAS），窗口收不到，
+用 **Ctrl+Alt+End**（RDP 写法）或 **Ctrl+Alt+Insert**（VMware 写法）代发
+Delete；这三条手势对所有主板一致。
+
 ## 测试
 
 ```sh

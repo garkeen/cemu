@@ -632,6 +632,7 @@ static void X86Poll(Board* m) {
   X86Board* xm = (X86Board*)m;
   PitPoll(&xm->pit);
   VgaPoll(&xm->vga);
+  IdePoll(&xm->ide);
   // A PS/2 packet that did not fit the 8042's output queue waits here; the
   // guest drains the queue between polls, so the rest of the movement follows
   // without another host event. The device also samples at its programmed rate

@@ -53,14 +53,25 @@ struct HostDisplay {
   // maximized 1024x768 picture on a 1080p screen is ~1.4x).
   int64_t rel_acc_x, rel_acc_y;
   int abs_x, abs_y, abs_valid;
-  // Relative-only pointer grab (D38): the host cursor is hidden and warped
-  // back to the client center when it nears an edge, so the guest can keep
-  // moving past its own screen edge and the host pointer never runs out of
-  // window. Ctrl+Alt (or focus loss) releases it.
+  // Pointer grab (D38): the host cursor is hidden and the pointer captured, so
+  // only the guest's own cursor is visible. A relative device is additionally
+  // warped back to the client center near an edge, so the guest can keep moving
+  // past its own screen edge and the host pointer never runs out of window; an
+  // absolute device is never warped. Ctrl+Alt+G (or focus loss) releases it.
   int grabbed;
   int cursor_hidden;
   int focused;
-  int ctrl_down, alt_down;  // Ctrl+Alt releases the grab
+  // Ctrl+Alt+G releases the grab — QEMU's grab-release chord: Ctrl+Alt alone
+  // is the guest's secure-attention sequence, so the release takes a third key.
+  // `swallow_key` remembers the key whose make was consumed, so its break is
+  // consumed too and the guest never sees half a key. `sas_key` is the host key
+  // that was translated into the guest's Delete: Windows delivers Ctrl+Alt+Del
+  // to winlogon (the secure attention sequence) and never to a window, so the
+  // remote-desktop spellings Ctrl+Alt+End (RDP) and Ctrl+Alt+Insert (VMware)
+  // stand in for it.
+  int ctrl_down, alt_down;
+  int swallow_key;
+  int sas_key;
   int grab_suppressed;      // released: wait for a click before grabbing again
   uint32_t shown_version;
   int64_t next_pump_us;
@@ -177,15 +188,18 @@ static int NearClientEdge(HostDisplay* d, int x, int y) {
          y < rc.top + kGrabMargin || y >= rc.bottom - kGrabMargin;
 }
 
-// Relative-only pointer grab (D38). PS/2 has no absolute packet, so the guest
-// cursor is moved by counts; without a grab the host pointer can reach the
-// window edge while the guest cursor is still in the middle (or vice versa),
-// and the lost movement comes back as a jump when the pointer re-enters. Hide
-// the host cursor, capture the pointer, and warp it to the center near an
-// edge: the guest gets unlimited relative movement and the only visible cursor
-// is the guest's own. Ctrl+Alt (or losing focus) releases it.
+// Pointer grab (D38, AGENTS §七). PS/2 has no absolute packet, so without a
+// grab the host pointer can reach the window edge while the guest cursor is
+// still in the middle (or vice versa), and the lost movement comes back as a
+// jump when the pointer re-enters. Absolute devices (virtio-tablet, the Oberon
+// mouse register) do not have that problem, but they get the same grab so only
+// the guest's own cursor is visible: the host arrow is hidden and the pointer
+// captured on the first move, and Ctrl+Alt+G (or losing focus) releases it.
+// A relative device is recentred when it nears an edge so the guest can keep
+// moving past its own screen edge; an absolute one is never warped, because its
+// position IS the report.
 static void GrabPointer(HostDisplay* d) {
-  if (d->grabbed || !d->mouse_cb || d->mouse_abs_cb) return;
+  if (d->grabbed || (!d->mouse_cb && !d->mouse_abs_cb)) return;
   d->grabbed = 1;
   d->grab_suppressed = 0;
   d->mouse_valid = 0;
@@ -198,7 +212,7 @@ static void GrabPointer(HostDisplay* d) {
     ShowCursor(FALSE);
     d->cursor_hidden = 1;
   }
-  RecenterPointer(d);
+  if (!d->mouse_abs_cb) RecenterPointer(d);
 }
 
 static void ReleasePointer(HostDisplay* d) {
@@ -300,32 +314,78 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case WM_KEYUP:
     case WM_SYSKEYUP: {
       if (!d->key_cb) return DefWindowProcA(hwnd, msg, wp, lp);  // Alt+F4 etc. stay
-      // Ctrl+Alt releases the relative grab (QEMU's convention). Track the
-      // modifiers from the key messages themselves: GetKeyState is thread
-      // state and can lag a synthetic/queued key event. The first half of the
-      // chord may already have reached the guest; the second is consumed so
-      // the release itself is not typed into the guest.
-      if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
+      const int down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+      // lp bits 16-23 carry the keyboard's own make code — the set-1 byte the
+      // PC/AT sends — and bit 24 marks the 0xe0-prefixed keys (Win32
+      // WM_KEYDOWN). The model adds the break bit from `up`.
+      const uint32_t scan = (uint32_t)((lp >> 16) & 0xff);
+      const int ext = (int)((lp >> 24) & 1);
+
+      // Ctrl+Alt+G releases the relative grab, QEMU's grab-release chord. The
+      // guest's Ctrl+Alt+Del secure-attention sequence is a different gesture
+      // and must reach the guest whole, which is why the release takes a third
+      // key; both halves of the gesture are consumed, so the guest never sees
+      // the G. The modifiers are tracked from the key messages themselves
+      // (GetKeyState is thread state and can lag a synthetic/queued event).
+      if (down) {
         if (wp == VK_CONTROL) d->ctrl_down = 1;
         if (wp == VK_MENU) d->alt_down = 1;
-        if (d->grabbed && d->ctrl_down && d->alt_down) {
+        if (d->grabbed && d->ctrl_down && d->alt_down && wp == 'G') {
+          d->swallow_key = (int)wp;
           ReleasePointer(d);
+          return 0;
+        }
+        if (d->ctrl_down && d->alt_down && (wp == VK_END || wp == VK_INSERT)) {
+          // The host never delivers the guest's own Ctrl+Alt+Del (winlogon owns
+          // that sequence), so the two remote-desktop spellings of the same
+          // request stand in: Ctrl+Alt+End is RDP's and Ctrl+Alt+Insert is
+          // VMware's. The host key is swallowed and the guest sees Delete.
+          d->sas_key = (int)wp;
+          d->key_cb(d->key_ctx, 0x53, 1, 0);  // Delete make, 0xe0 prefix
           return 0;
         }
       } else {
         if (wp == VK_CONTROL) d->ctrl_down = 0;
         if (wp == VK_MENU) d->alt_down = 0;
+        if (d->sas_key && wp == (WPARAM)d->sas_key) {
+          d->sas_key = 0;
+          d->key_cb(d->key_ctx, 0x53, 1, 1);  // Delete break
+          return 0;
+        }
+        if (d->swallow_key && wp == (WPARAM)d->swallow_key) {
+          d->swallow_key = 0;
+          return 0;
+        }
       }
-      // lp bits 16-23 carry the keyboard's own make code — the set-1 byte the
-      // PC/AT sends — and bit 24 marks the 0xe0-prefixed keys (Win32
-      // WM_KEYDOWN). The model adds the break bit from `up`.
-      uint32_t scan = (uint32_t)((lp >> 16) & 0xff);
-      int up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
-      d->key_cb(d->key_ctx, scan, (int)((lp >> 24) & 1), up);
+      d->key_cb(d->key_ctx, scan, ext, !down);
       return 0;
     }
     case WM_MOUSEMOVE: {
       int x = (int)(short)LOWORD(lp), y = (int)(short)HIWORD(lp);
+      if (!d->mouse_cb && !d->mouse_abs_cb) return DefWindowProcA(hwnd, msg, wp, lp);
+      if (!d->focused) {
+        // Hovering an inactive window must not move the guest cursor.
+        d->mouse_x = x;
+        d->mouse_y = y;
+        d->mouse_valid = 0;
+        return 0;
+      }
+      if (!d->grabbed && d->grab_suppressed) {
+        // Released with Ctrl+Alt+G: keep the host cursor visible and do not
+        // move the guest until the user clicks the display again.
+        d->mouse_x = x;
+        d->mouse_y = y;
+        d->mouse_valid = 0;
+        return 0;
+      }
+      if (!d->grabbed) {
+        // First movement over a focused display: grab the pointer (hide the
+        // host arrow, capture). A relative device also recentres and needs the
+        // next event to carry the delta from the new base; an absolute one
+        // already has its position, so this very event is delivered.
+        GrabPointer(d);
+        if (!d->mouse_abs_cb) return 0;
+      }
       if (d->mouse_abs_cb) {
         // Absolute channel: the picture position, clamped to the nearest edge
         // in the letterbox; nothing at all outside the client area (a captured
@@ -348,29 +408,6 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         tme.dwFlags = TME_LEAVE;
         tme.hwndTrack = hwnd;
         TrackMouseEvent(&tme);
-        return 0;
-      }
-      if (!d->mouse_cb) return DefWindowProcA(hwnd, msg, wp, lp);
-      if (!d->focused) {
-        // Hovering an inactive window must not move the guest cursor.
-        d->mouse_x = x;
-        d->mouse_y = y;
-        d->mouse_valid = 0;
-        return 0;
-      }
-      if (!d->grabbed && d->grab_suppressed) {
-        // Released with Ctrl+Alt: keep the host cursor visible and do not
-        // move the guest until the user clicks the display again.
-        d->mouse_x = x;
-        d->mouse_y = y;
-        d->mouse_valid = 0;
-        return 0;
-      }
-      if (!d->grabbed) {
-        // First movement over a focused relative-only display: grab the
-        // pointer (hide the host arrow, recenter, capture). This event only
-        // establishes the new base; the next one carries the movement.
-        GrabPointer(d);
         return 0;
       }
       // Relative channel (PS/2): Win32 client coordinates grow downward,
@@ -423,11 +460,18 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
       return 0;
     case WM_KILLFOCUS:
       // Focus going away costs us the pointer too: release the grab, show the
-      // host cursor, and make the next WM_MOUSEMOVE re-establish the base.
+      // host cursor, and make the next WM_MOUSEMOVE re-establish the base. The
+      // Delete translated from Ctrl+Alt+End/Insert is broken here: its own
+      // key-up will not arrive once the window is unfocused.
       d->focused = 0;
       ReleasePointer(d);
+      if (d->sas_key) {
+        if (d->key_cb) d->key_cb(d->key_ctx, 0x53, 1, 1);
+        d->sas_key = 0;
+      }
       d->ctrl_down = 0;
       d->alt_down = 0;
+      d->swallow_key = 0;
       d->mouse_valid = 0;
       d->rel_acc_x = 0;
       d->rel_acc_y = 0;
@@ -445,9 +489,9 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 : (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP)   ? 0x02
                                                                    : 0x04;
       int down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
-      // A click into a focused relative-only display starts the grab; the
-      // click itself still reaches the guest with the new button state.
-      if (down && !d->mouse_abs_cb && d->mouse_cb) {
+      // A click into a focused display starts the grab (for both channels);
+      // the click itself still reaches the guest with the new button state.
+      if (down && (d->mouse_cb || d->mouse_abs_cb)) {
         d->grab_suppressed = 0;
         if (!d->grabbed) GrabPointer(d);
       }
@@ -472,16 +516,10 @@ static LRESULT CALLBACK DisplayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         // packet carries the buttons, and the device sends one for the event.
         d->mouse_cb(d->mouse_ctx, 0, 0, 0, d->mouse_buttons);
       }
-      // Keep reporting while a button is held even if the pointer leaves the
-      // client area — that is what a drag is. The relative grab owns capture
-      // already and stays grabbed after the button is released (Ctrl+Alt
-      // releases it); only the absolute/ungrabbed path captures per drag.
-      if (d->mouse_abs_cb || !d->grabbed) {
-        if (down)
-          SetCapture(hwnd);
-        else if (!d->mouse_buttons)
-          ReleaseCapture();
-      }
+      // The grab owns the capture and keeps it after the button is released
+      // (Ctrl+Alt+G releases it), so the press/release pair above never has to
+      // manage capture per drag; a button dragged outside the client keeps
+      // reporting because the capture is still ours.
       return 0;
     }
     case WM_MOUSEWHEEL: {

@@ -154,6 +154,12 @@ typedef struct IdeChannel {
   int refill;      // the buffer is reloaded at every block boundary — a medium
                    // transfer, as opposed to a reply that already sits in it
   int multi;       // sectors per DRQ round for READ/WRITE MULTIPLE (0 = plain)
+  // The software-reset (SRST) busy window: BSY is asserted when SRST is
+  // written and stays visible until IdePoll expires it, even though the reset
+  // is modelled synchronously (QEMU ide_ctrl_write sets BUSY_STAT before
+  // ide_bus_perform_srst).
+  int busy;
+  uint64_t busy_until_us;  // HostTimerNow() deadline for the SRST busy window
   int irq_pending;  // a completion to report (masked by devctrl nIEN)
   // Bus-master DMA (PIIX3 "Bus Master IDE"): the two registers the host
   // programs, the descriptor table it points at, and the engine's own start
@@ -188,6 +194,11 @@ int IdeAttach(IdeDevice* d, int channel, int drive, const char* path, int media)
 void IdeRegister(Bus* io, IdeDevice* d);
 // The address space the bus-master engine moves data through.
 void IdeSetDmaBus(IdeDevice* d, Bus* mem);
+// Expire the software-reset (SRST) busy window; the board's poll calls this.
+// The reset completes synchronously, but BSY has to remain visible long enough
+// for the status read that follows SRST (QEMU ide_ctrl_write sets BUSY_STAT
+// before scheduling ide_bus_perform_srst).
+void IdePoll(IdeDevice* d);
 void IdeSetIrqSink(IdeDevice* d, void (*set_irq)(void* ctx, int line, int level), void* ctx);
 // Closes the attached images.
 void IdeDestroy(IdeDevice* d);

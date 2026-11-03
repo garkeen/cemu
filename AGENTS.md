@@ -617,7 +617,7 @@ CEMU_DEBUG="screen" timeout 110 ./cemu.exe ... img 2> c.txt
 | D34 | mmu.c Sv39 PTE 高位 | **Svnapot 与 Svpbmt 未实现**：叶 PTE 的 bit63:54（N 与 PBMT）任一位置起即按保留位报 page fault，本机不解释 NAPOT 大页也不解释 PBMT 内存类型。后果要说清楚：`rv64ssvnapot-p-napot` 那格走的是**验收件自带的 skip 分支**（件源 `riscv-tests/isa/rv64ssvnapot/napot.S` 的 `mtvec_handler` 见 store page fault + `mepc=napot_store` + `mtval=MY_VA` 就跳 `pass`），所以它在套件里是绿的，但**没钉任何东西**——64KB NAPOT 区间与 PBMT 属性在本机无验证。别和已实现的那半混淆：PMP 的 NAPOT 区间编码是实现了的（mmu.c 的 PMP 段） | 特权规范 4.3.2（叶 PTE 保留位与 N/PBMT 字段）；Svnapot v1.0、Svpbmt v1.0；QEMU target/riscv 的 RV_PTE_NAPOT 与 pbmt 解码；件源 riscv-tests isa/rv64ssvnapot/napot.S | 出现依赖 NAPOT 大页或 PBMT 的客户机时（当前 Linux 0.11/2.6.34 都不用；riscv 侧 xv6-riscv 验收时若 OpenSBI 要求再核） | 登记中 |
 | D35 | riscv64/csr.c、riscv32/csr.c 的 misa 写路径 | `csrw misa` 的掩码 `(val & kMisaSupported) \| kMisaI` 只挡"未实现的位"，不挡"只读位"：客机写 0 能把 S 与 U 位清掉，而清掉之后本机照样进 U 模式、照样按 PTE.U 判权限（状态与自述脱钩）。这两位在规范里是否强制只读**缺手册 §3.1.1 的原文**，未据裁决（先例：DAS 的 18 处分歧按实机、计数器抑制只实现有测试覆盖的一侧——这里两侧都无证据，故不猜） | 特权规范 3.1.1 misa 的 WARL 措辞（原文待核）；dearchap-tinyemu riscv_cpu.c:1306 只组装 misa、无 csrw misa 路径可参照 | 核到手册原文后：若 S/U 强制只读，则把这两位从可改掩码里摘出并补一个自足探针（写 misa 后读回） | 登记中 |
 | D36 | riscv64/csr.c、riscv32/csr.c 的 MHPM 计数器 | **MHPM 计数器只存储不自增**：`mhpmcounter3..18` 在 cemu 里没有事件源，写进去的值能读回，但从不增长；`mhpmevent3..18` 同样只存储。mcycle/minstret 不受影响（step.c 每步自增）。OpenSBI 按 CSR 存在探测计数器数量，拿到的是"能读但不动"的计数器 | QEMU target/riscv/csr.c 的 pmu 计数（Zihpm 允许实现定义事件）；特权规范 3.1.11 | 出现依赖性能计数器/剖析的客户机或工具时 | 登记中 |
-| D38 | x86 窗口指针（PS/2） | **PS/2 鼠标只有相对计数，没有绝对包**，x86 窗口只能把宿主指针的位移按相对增量投给 PS/2；回零/追赶式绝对换算会被客人驱动的缩放/钳边放大成光标乱窜（Windows 1.01 实测）。指针抓取/隐藏已实现：聚焦窗口首次移动自动抓取并隐藏宿主指针、接近客户区边缘回中、Ctrl+Alt 释放、失焦/改尺寸/非客户区清增量基准；但抓取状态下必须 Ctrl+Alt 才能把指针移出窗口，宿主与客人光标仍不保证重合。仍然缺**绝对定位**：需要客人侧的绝对设备驱动（VMware VMMouse/QEMouse 一类），x86 目前没有；原生绝对设备（virtio-tablet、Oberon）不经此路径 | PS/2 鼠标协议（相对计数，9 位二补码）；QEMU 对 PS/2 用相对 + 指针 grab（`hw/input/ps2.c`、`ui/input.c`），绝对输入另走 `hw/i386/vmmouse.c` 或 USB tablet；QEMouse（`qemus/qemouse`）是 QEMU vmmouse 的 Win9x 驱动 | 需要宿主/客人光标严格重合、且镜像可安装客人驱动时（实现 VMPort+VMMouse：端口 0x5658、命令 39/40/41） | 登记中 |
+| D38 | x86 窗口指针（PS/2） | **PS/2 鼠标只有相对计数，没有绝对包**，x86 窗口只能把宿主指针的位移按相对增量投给 PS/2；回零/追赶式绝对换算会被客人驱动的缩放/钳边放大成光标乱窜（Windows 1.01 实测）。指针抓取/隐藏已实现：聚焦窗口首次移动自动抓取并隐藏宿主指针、接近客户区边缘回中、Ctrl+Alt+G 释放（宿主侧手势，G 的两半都吞掉，Ctrl+Alt 本身留给客人）、失焦/改尺寸/非客户区清增量基准；Ctrl+Alt+Del 由 winlogon 独占、窗口收不到，Ctrl+Alt+End（RDP）与 Ctrl+Alt+Insert（VMware）代发 Delete；但抓取状态下必须 Ctrl+Alt+G 才能把指针移出窗口，宿主与客人光标仍不保证重合。仍然缺**绝对定位**：需要客人侧的绝对设备驱动（VMware VMMouse/QEMouse 一类），x86 目前没有；原生绝对设备（virtio-tablet、Oberon）不经此路径 | PS/2 鼠标协议（相对计数，9 位二补码）；QEMU 对 PS/2 用相对 + 指针 grab（`hw/input/ps2.c`、`ui/input.c`），绝对输入另走 `hw/i386/vmmouse.c` 或 USB tablet；QEMouse（`qemus/qemouse`）是 QEMU vmmouse 的 Win9x 驱动 | 需要宿主/客人光标严格重合、且镜像可安装客人驱动时（实现 VMPort+VMMouse：端口 0x5658、命令 39/40/41） | 登记中 |
 | D39 | x86 后端（exec.c / fpu.c / x86.h） | 已实现 AC 对齐检查（#AC 在页走查之后、只查 2/4/8 字节 CPL-3 访问）、PSE-36、SYSENTER/SYSEXIT、MMX/SSE/SSE2、FXSAVE/FXRSTOR、MTRR/PAT、MCE 寄存器组、架构性能计数器（0x3C/0xC0、RDPMC）、RDTSC/RDTSCP、CR4 WARL 与 CPUID 广告（EDX 含 FPU/MMX/FXSR/SSE/SSE2/APIC/PSE36/PAT/MTRR/MCE/SEP/TSC，leaf 0x0B 报单线程/单核拓扑）。剩下：**VME 的软件中断重定向位图未实现**（V86 下的 INT n 一律反射到监视器；参考实现 QEMU 11.1.50 同样只广告不实现：`target/i386/tcg` 无 `HF_VME`、`seg_helper.c` 无位图代码，`I486_FEATURES` 却带 `CPUID_VME`，实测 `-cpu pentium` + CR4.VME=1 + 位图位置 0x20/0x0B 也一律反射，`GP ec=5a` 即 0x0B 的门索引；本机与之一致，CPUID.VME 不广告）；**性能计数器只计数 0x3C/0xC0，其余 event select、PEBS/PMI 未实现**；长模式见 D42 | SDM vol.2/vol.3（20.3 VME、21 PVI、19 PMU）；QEMU target/i386；v86 cpu.rs/instructions_0f.rs；`test/x86/probe/sys686.asm`、`sse.asm`、`ac.asm`、`pse36.asm` | VME/PVI 位图在出现依赖它的 V86 客户机时；PMU 其余事件在出现剖析工具时 | 登记中 |
 | D41 | device/timer/i8254.c 的 BCD 位 | **BCD 计数模式只存不建模**：控制字的 BCD 位（bit0）被保存到 `PitChannel.bcd`，但之后的计数与读回一律按二进制算，BCD 模式下硬件应按十进制计数（0x9999 之后是 0x0000）并返回 BCD 字节。影响面：客人若用 BCD 模式读计数器做校准会拿到二进制值（本机的 DOS/Win95 都用二进制模式，目前未触发） | Intel 8254 datasheet（控制字 bit0 的 BCD 选择与计数序列）；QEMU hw/timer/i8254_common.c 的 bcd 处理（原文待取） | 出现用 BCD 模式计时/校准的客户机时 | 登记中 |
 | D42 | x86 后端（exec.c / x86.h） | **长模式（IA-32e / x86_64）未实现**：没有 EFER.LME/LMA、4 级页表（PML4/PDPT 的 64 位模式）、64 位 GPR/寻址、REX 前缀、64 位模式下的指令宽度与 SYSCALL/SYSRET；CPUID 0x80000001 不广告 LM，当前按 32 位保护模式语义执行 | SDM vol.1 3.4.1/3.7、vol.3 4.5/9.8、vol.2 SYSCALL/SYSRET；QEMU target/i386/tcg（64 位路径） | 阶段 6（arm/mips 之前或之后按用户排期） | 登记中 |
@@ -630,10 +630,13 @@ CEMU_DEBUG="screen" timeout 110 ./cemu.exe ... img 2> c.txt
 - 原生绝对设备（virtio-tablet、Oberon 鼠标寄存器）：指针在画面矩形内时把客户区坐标
   映射成**源画面像素**（X 向右、Y 向下）直接发出；画面外的黑边钳到最近的边缘，绝不
   发画面外坐标；指针离开客户区完全停发；按住键拖出客户区时移动停发，但**释放事件用
-  最后一次有效画面位置发出**，避免客人卡住按键。
+  最后一次有效画面位置发出**，避免客人卡住按键。抓取与相对设备同款（聚焦窗口内首次
+  移动即隐藏宿主光标并捕获指针，Ctrl+Alt+G 释放），但**绝不回中**：抓取只影响宿主指针
+  的可见性，绝对设备的坐标映射不受影响。
 - 相对设备（x86 PS/2、`-mouse serial`）：把宿主指针的**位移**按相对增量投递，不做
   回零/追赶式绝对定位。PS/2 协议里没有绝对包，换算模型会被客人驱动的缩放与钳位放大
-  （Windows 1.01 上表现为光标乱窜）；错位边界见 D38。
+  （Windows 1.01 上表现为光标乱窜）；错位边界见 D38。抓取期间指针接近客户区边缘时
+  回中，让相对位移永远不跑出窗口。
 - 画面矩形按 Blit 的 fit/letterbox 规则**每次事件重算**，窗口缩放/模式变化都不缓存几何
   （原"先固定窗口大小"的待做项直接实现，不留待做）。
 - 每个移动/按键/滚轮包以 `EV_SYN`/`SYN_REPORT` 结束（virtio-input 路径）。
@@ -643,6 +646,8 @@ CEMU_DEBUG="screen" timeout 110 ./cemu.exe ... img 2> c.txt
   绝对 sink（`Board.mouse_abs`）或相对 sink（`Board.mouse_in`）。
 
 ## 附：关键行为裁决存档（修复时的先例依据）
+
+- **i8042 的 aux 禁用只在中断上生效**：命令字节 bit5（DisAux）既不拦 0x60→鼠标的命令，也不丢鼠标的回复；发一个字节给鼠标本身会清掉该位（QEMU pckbd.c `kbd_write_data` 的 `KBD_CCMD_WRITE_MOUSE`：`ps2_write_mouse(...)` 之后 `s->mode &= ~KBD_MODE_DISABLE_MOUSE`，注释 "sending data to the mouse reenables PS/2 communication"；键盘方向同理）。NT 3.1 的 i8042prt 先写带 DisAux 的命令字节、再发 `0xD4 0xFF` 复位鼠标，按"禁用就把字节丢掉"的模型复位到不了设备。
 
 - **计数器抑制**：写哪个计数器，抑制哪个自身的本步自增，无跨计数器连累
   （写 minstret 后下一条读到写入值；写 mcycle 不冻结 minstret）。QEMU 在

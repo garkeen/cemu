@@ -111,11 +111,9 @@ static int AuxOnOffer(const struct I8042State* st) {
 
 // Each interrupt is a level, and it belongs to whichever device's byte is on
 // offer: a waiting keyboard byte holds IRQ1 up, a waiting mouse byte IRQ12,
-// gated by the command byte's interrupt enables (PC/AT Technical Reference;
-// QEMU pckbd.c kbd_update_irq_lines). The guest drops a line by reading the
-// byte or by masking the mode bit. Command 0xa7 needs no gate here: it stops
-// the bytes at the wire (see I8042AuxByte), so nothing is left to ask for the
-// line.
+// gated by the command byte's interrupt enables and the keyboard's disable bit
+// (PC/AT Technical Reference; QEMU pckbd.c kbd_update_irq_lines). The guest
+// drops a line by reading the byte or by masking the mode bit.
 static void I8042SyncIrq(I8042Device* d) {
   struct I8042State* st = d->st;
   int kbd = 0, aux = 0;
@@ -248,19 +246,22 @@ static void I8042WriteData(I8042Device* d, uint8_t val) {
       I8042SyncA20(d);
       break;
     case kExpectAuxData:
-      // A byte for the auxiliary device: it goes down the mouse wire, and
-      // whatever the device answers (its ACK, its replies, a packet) comes
-      // back through I8042AuxByte into the AUX queue. With the interface shut
-      // down the wire is dead in this direction too.
-      if (!(st->cmd_byte & kModeDisAux) && d->write_aux)
-        d->write_aux(d->write_aux_ctx, val);
+      // The byte goes down the mouse wire. The command byte's aux-disable bit
+      // does not stop the host-to-device direction, and the transfer itself
+      // re-enables the interface: QEMU's kbd_write_data (KBD_CCMD_WRITE_MOUSE)
+      // calls ps2_write_mouse and then clears KBD_MODE_DISABLE_MOUSE with the
+      // comment "sending data to the mouse reenables PS/2 communication".
+      if (d->write_aux) d->write_aux(d->write_aux_ctx, val);
+      st->cmd_byte &= (uint8_t)~kModeDisAux;
       break;
     default:
       // A byte for the keyboard device: ps2kbd.c owns its command set, its
       // ACKs and its scancodes, exactly as ps2mouse.c owns the auxiliary
-      // device's.
+      // device's. The keyboard-side disable bit clears the same way (QEMU
+      // kbd_write_data case 0).
       st->last_data = val;
       if (d->write_kbd) d->write_kbd(d->write_kbd_ctx, val);
+      st->cmd_byte &= (uint8_t)~kModeDisKbd;
       break;
   }
   st->expecting = kExpectNone;
@@ -377,12 +378,11 @@ void I8042KbdByte(I8042Device* d, uint8_t scancode) {
 }
 
 void I8042AuxByte(I8042Device* d, uint8_t byte) {
-  // Command 0xa7 shuts the auxiliary interface down: the controller holds the
-  // device's clock line low, so what the device sends while it is off never
-  // reaches the output queue (PC/AT Technical Reference). QEMU keeps queueing
-  // it and gates only the interrupt; v86 stops the stream, which is the same
-  // idea.
-  if (d->st->cmd_byte & kModeDisAux) return;
+  // The device's bytes reach the output queue whether the interface is
+  // disabled or not; the command byte gates the interrupt, not the data (QEMU
+  // pckbd keeps the mouse queue and only kbd_update_irq_lines looks at the
+  // mode). A guest that disabled the interface to send a command still reads
+  // the reply from 0x60.
   if (DebugOn(kDbgMark)) DebugMark("aux-byte", (int)byte, 0);
   QueuePush(&d->st->aux, byte);
   I8042SyncIrq(d);
