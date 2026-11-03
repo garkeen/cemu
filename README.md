@@ -13,57 +13,6 @@ x86 已接入，之后 arm / mips），加载 `.bin` / `.elf` / `.img`，按真�
 - **阶梯上全是真实软件**：riscv-tests → OpenSBI → xv6 → Linux，无 cemu 定制成分。
 - cesdk（AM 式构建系统）排在真实 OS 跑通之后，其 API 才有设计依据。
 
-## 现状
-
-阶段 0–3.5 完成（ISA 一致性、真实固件、x86 保护模式与分页、调试器与 GUI；
-gdb 的硬件观察点走 CPU 自己的 DR0-DR7，只读观察点因 DR7 没有该编码而拒接、
-riscv 侧尚未接 trigger 模块，两处记在 D6）。
-
-**阶段 4（设备全集与真实 OS）进行中。** x86 的 PC 设备模型全集到位：VGA 家族核
-（VBE/DISPI、链式 256 色、EDID）、PS/2 键鼠与串口鼠标、8259/8254、8272 FDC +
-8237 DMA、IDE/ATAPI（LBA-48、multi-sector）、LAPIC/IOAPIC（含 NMI 交付）、
-PIIX4 PM（SCI、S5）、SMBus 主机 + SPD EEPROM、XBCS、IGNNE#；riscv 侧 virt 板带
-virtio-mmio（blk/console/keyboard/tablet），oberon 板按参考模拟器逐契约复刻。
-余下规格缺口按 AGENTS.md §六 的 D17/D19 在册。
-
-验收阶梯（全部是真实软件，无 cemu 定制成分）：
-
-- **xv6-x86 ✅**：SeaBIOS → IDE 盘 → shell。
-- **Linux ✅**：引导越过 `VFS: Mounted root (ext2 filesystem)`，控制台出提示符。
-- **Windows 1.01 ✅**：EGA 640×350 的 MS-DOS Executive 桌面，`fbdump` 帧与
-  QEMU 基线逐像素相同，PS/2 指针可移动。
-- **Windows 2.0 ✅**：过 logo（此前卡死是 vgabios 的 int10 用客人栈写穿客人代码），
-  帧与 QEMU 逐色相同，详见 progress.log。
-- **Windows 3.1 ✅**：1024×768 桌面（此前的红花屏是 vgabios 用了"标准 VGA"构建、
-  与 Bochs stdvga 卡不匹配；重建为 Bochs VBE 后对上）。
-- **HelenOS 0.14.1 riscv64 ✅**：内核全量引导零异常，止于上游未实现的 S→U 交接
-  （QEMU 执行同一镜像停在同一处 `j .`）。
-- **SPDOS/DOS7 软盘 ✅**：经 SeaBIOS 进 DOS；WPS 卡死经 QEMU 对拍判为 CHLIB
-  依赖真机 BIOS 约定（0x80 的几何、段寄存器跨调用保持），不是 cemu 缺陷。
-- **Windows 95 进行中**：旧结论（VMCB `0x120` 对 `0`、根因未定）已推翻——那是
-  VMCB 位每几千条指令翻转一次的采样相位差。真根因是 **POPF 在特权检查前就推进了
-  ESP**：V86/IOPL<3 的 #GP 是 fault，不许改 ESP，cemu 却先弹后查，V86 监视器按
-  保存的 SP 读到的不是 flags 而是 `call` 压入的返回地址 `0x0FB7`（TF=1），于是
-  把客户置成单步模式，在零页 `0x3C87` 上一条指令一次 #DB，最后报
-  `Windows protection error`。已修（`exec.c` case 0x9d：先 peek，检查完再提交
-  ESP/flags）。同脚本实测 traps 13621 → 374，保护错误消失，安全模式可进桌面；
-  普通模式切到 1024×768 之后仍会蓝屏（显示驱动/VGA 侧，下一步）。见 progress.log 片 43。
-- **xv6-riscv 未开始**：镜像与 OpenSBI fw_jump 素材未取；riscv 侧的真实 OS 验收
-  目前由 HelenOS 承担。
-
-CPU 面：x86 到 i686（x87 走树内 Berkeley SoftFloat 3e、MMX/SSE/SSE2、RDTSC(P)、
-SYSENTER/SYSEXIT、MTRR/PAT、MCE 寄存器组、性能计数器、AC、PSE-36、FXSAVE/FXRSTOR）；
-APIC 的 CPUID/leaf 0x0B 拓扑已广告，CR0.NE=0 的 FERR# 接到 8259 IRQ13；余下
-VME/PVI 重定向与 PMU 细节记在 D39，port 0xF0/IGNNE# 记在 D19。riscv 侧
-RV64IMAFDC + Sv39/Sv48 + PMP，RV32 是独立后端（RV32IMAFDC + Sv32）。
-
-回归：**riscv64 136 格、riscv32 104 格、x86 59 格，全绿**（x86 = 51 个自足探针 +
-7 个 kvm-unit-tests 镜像 + realmode 1 格，127 PASS/0 FAIL；realmode 偶见对 PIT
-IRQ0 到达时机的敏感，见 progress.log）。依赖边 `dep: ok`。逐轮记录见
-[progress.log](progress.log)。
-x86 固件（SeaBIOS + 显卡 option ROM）来自库外的一棵源码树，其现状、重建步骤与配置
-快照见库外 `../seabios/firmware.md`（不随本仓库跟踪）。
-
 ## 构建
 
 依赖只有 clang 与 mingw-w64 sysroot；第三方代码只有树内 vendored 的 Berkeley
@@ -78,6 +27,9 @@ cmake --build build
 `x86_64-w64-mingw32`；mingw-w64 的 sysroot 由 clang 依 PATH 上的
 `x86_64-w64-mingw32-gcc` 定位。**换机器改这个文件里的两行即可**（ninja 不在
 PATH 时前置 `PATH=/d/ninja:$PATH`）。要求 `-Wall -Wextra` 零告警。
+
+x86 固件（SeaBIOS + 显卡 option ROM）来自库外的一棵源码树，其重建步骤与配置
+快照见库外 `../seabios/firmware.md`（不随本仓库跟踪）。
 
 ## 使用
 

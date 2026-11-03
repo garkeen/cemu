@@ -22,7 +22,7 @@ static void RefreshBus(Bus* bus) {
 }
 
 void BusAddRegion(Bus* bus, uint64_t base, uint64_t size, const DeviceOps* ops, void* dev) {
-  if (bus->count >= (int)ARRAY_SIZE(bus->regions))
+  if (bus->count >= kBusMaxRegions)
     Fatal("bus full, cannot map %s at %llx", ops->name, (unsigned long long)base);
   BusRegion* r = &bus->regions[bus->count++];
   r->base = base;

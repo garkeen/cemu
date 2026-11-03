@@ -35,8 +35,9 @@ target_include_directories(cemu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set_target_properties(cemu PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build")
 if(WIN32)
-  # host/sock_win.c (gdb stub) and host/display_win.c (GDI display backend)
-  target_link_libraries(cemu PRIVATE ws2_32 gdi32 user32)
+  # host/sock_win.c (gdb stub), host/display_win.c (GDI display backend) and
+  # host/audio_win.c (waveOut PCM output)
+  target_link_libraries(cemu PRIVATE ws2_32 gdi32 user32 winmm)
 endif()
 
 # --- cemugui: the RSP debug front-end (阶段 3.5 片 3) ------------------------

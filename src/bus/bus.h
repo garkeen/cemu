@@ -28,8 +28,14 @@ typedef struct BusRegion {
   uint8_t* host;
 } BusRegion;
 
+// A PC's port space carries the chipset's fixed blocks plus every ISA device
+// (the SB16 alone adds one); 32 was the old ceiling and the PIIX4 PM block
+// moving to its firmware-programmed base pushed it over. The table is small
+// and static, so the extra entries cost nothing.
+enum { kBusMaxRegions = 64 };
+
 typedef struct Bus {
-  BusRegion regions[32];
+  BusRegion regions[kBusMaxRegions];
   int count;
   BusRegion* last;  // one-entry FindRegion cache (validated by overlaps/base)
   // Bumped whenever the region set moves (device BAR programming, VGA

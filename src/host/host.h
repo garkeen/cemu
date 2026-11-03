@@ -101,6 +101,22 @@ int HostSockWrite(HostSock* s, const void* buf, int n);
 int HostSockReadable(HostSock* s);
 void HostSockClose(HostSock* s);
 
+// ---- Audio output (audio_win.c; waveOut, same thread as the run loop) ------
+// One PCM playback stream. The device owns the sample format: an SB16 can ask
+// for unsigned 8-bit or signed 16-bit (the WAVE_FORMAT_PCM encodings) and also
+// for the two sign-flipped variants, which the host layer converts. A NULL
+// return means the host has no output device: the caller keeps running, but
+// silently -- a guest's DMA and IRQ timing must not depend on a speaker.
+typedef struct HostAudio HostAudio;
+HostAudio* HostAudioOpen(int rate, int channels, int bits, int is_signed);
+// Queues up to len bytes and returns how many were accepted (0 = the queue is
+// full). The stream plays asynchronously; poll HostAudioFree for room.
+int HostAudioWrite(HostAudio* a, const void* buf, int len);
+// Bytes that can be queued now without waiting for the device.
+int HostAudioFree(const HostAudio* a);
+// Stops the stream and releases it (NULL is a no-op).
+void HostAudioClose(HostAudio* a);
+
 // ---- Display window (display_win.c; GDI, same thread as the run loop) ------
 // Shows a device picture through the DisplaySourceOps vtable (device/video/display.h):
 // the window reads the size, the XRGB pixel buffer and a change counter from

@@ -46,6 +46,12 @@ enum {
   // A channel's count register holds "bytes to move minus one", so a
   // transfer of N bytes is programmed as N-1 (Intel 8237A datasheet).
   kI8237CountBias = 1,
+  // The slave chip's channels are the 16-bit half of the ISA bus: their
+  // address register counts words (A16..A1), their count register counts
+  // words, and the page latch still supplies A23..A16 of the byte address
+  // (Intel 8237A datasheet; PC/AT Technical Reference). The floppy only uses
+  // an 8-bit channel, but the Sound Blaster's 16-bit DMA channel 5 does not.
+  kI8237WordBytes = 2,
 };
 
 // Mode register fields (Intel 8237A datasheet).
@@ -121,5 +127,10 @@ void I8237SetMemBus(I8237Device* d, Bus* mem);
 // bytes moved, 0 when the channel is masked, the controller is disabled, the
 // mode asks for a verify, or the count is already spent.
 int I8237Transfer(I8237Device* d, int channel, uint8_t* buf, int len);
+// Bytes still owed by the channel's current programming, counting a 16-bit
+// channel's words as two bytes each. A device that runs its own block clock
+// (the SB16) uses this to tell the controller's terminal count from the end of
+// its own block; the floppy never needs the distinction.
+int I8237Left(const I8237Device* d, int channel);
 
 #endif

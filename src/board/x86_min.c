@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "board/board.h"
+#include "device/audio/sb16.h"
 #include "device/char/uart16550.h"
 #include "device/dma/i8237.h"
 #include "device/input/i8042.h"
@@ -41,7 +42,9 @@
 // wakes hlt), COM1 at 0x3F8-0x3FF, the debug-exit device at 0xF4, fw_cfg at
 // 0x510/0x511 (QEMU contract) and the kvm-unit-tests IRQ injection window at
 // 0x2000-0x200F (device/misc/testdev.c) — all in a separate x86 I/O space
-// (CpuState.io) —
+// (CpuState.io) — plus the Sound Blaster 16 at 0x220-0x22F, IRQ5, DMA
+// channels 1/5 (device/audio/sb16.c; its host PCM sink is optional, so a
+// headless or sound-less host still gets the card's DMA and IRQ timing) —
 // and the Local APIC register page at 0xFEE00000 on the memory bus. The display
 // card (阶段 4 图形切片) is the VGA family core: its aperture is the
 // 0xA0000-0xBFFFF window on the memory bus and its register file sits at
@@ -138,6 +141,9 @@ typedef struct IrqBus {
 typedef struct X86Board {
   Board base;
   Uart16550 uart;
+  // The Sound Blaster 16 at 0x220, IRQ5, DMA1/DMA5: the card a Windows 95
+  // image has a driver for, and the model QEMU's -device sb16 provides.
+  Sb16Device sb16;
   DebugExitDevice dexit;
   PicDevice pic;
   PitDevice pit;
@@ -449,6 +455,18 @@ static int OnFdcDma(void* ctx, uint8_t* buf, int len) {
   return I8237Transfer(&xm->dma, kFdcDmaChannel, buf, len);
 }
 
+// The Sound Blaster's DMA channel: 1 for 8-bit playback, 5 for 16-bit. The
+// SB16 raises its block IRQ from its own sample clock, so it also needs to
+// know whether this call reached the controller's terminal count; the floppy
+// only looks at how many bytes moved.
+static int OnSb16Dma(void* ctx, int channel, uint8_t* buf, int len, int* terminal) {
+  X86Board* xm = (X86Board*)ctx;
+  int left = I8237Left(&xm->dma, channel);
+  int moved = I8237Transfer(&xm->dma, channel, buf, len);
+  *terminal = moved > 0 && moved == left;
+  return moved;
+}
+
 // Chipset -> CPU: A20 is one line, driven by the keyboard controller's output
 // port (command 0xd1) and by System Control Port A bit 1.
 static void OnA20(void* ctx, int on) {
@@ -624,6 +642,7 @@ static void X86Destroy(Board* m) {
   BusDebugDestroy(xm->bus_debug);
   free(xm->rom);
   free(xm->vgabios);
+  Sb16Destroy(&xm->sb16);
   IdeDestroy(&xm->ide);
   FdcDestroy(&xm->fdc);
 }
@@ -632,6 +651,9 @@ static void X86Poll(Board* m) {
   X86Board* xm = (X86Board*)m;
   PitPoll(&xm->pit);
   VgaPoll(&xm->vga);
+  // The card's sample clock: it pulls DMA bytes and raises IRQ5 at block
+  // boundaries. Host audio only limits how far ahead it may run.
+  Sb16Poll(&xm->sb16);
   IdePoll(&xm->ide);
   // A PS/2 packet that did not fit the 8042's output queue waits here; the
   // guest drains the queue between polls, so the rest of the movement follows
@@ -719,6 +741,10 @@ static void WireDevices(X86Board* xm) {
   // DMA engine for its sector data.
   FdcSetIrqSink(&xm->fdc, OnIsaIrq, &xm->irqbus);
   FdcSetDmaSink(&xm->fdc, OnFdcDma, xm);
+  // The Sound Blaster's IRQ5 and its two DMA channels (1 for the 8-bit DSP
+  // path, 5 for the 16-bit one).
+  Sb16SetIrqSink(&xm->sb16, OnIsaIrq, &xm->irqbus);
+  Sb16SetDmaSink(&xm->sb16, OnSb16Dma, xm);
   // The kvm-unit-tests injection window drives the same ISA wires the devices
   // do, so it reaches both controllers through the same fan-out.
   TestDevSetIrqSink(&xm->testdev, OnIsaIrq, &xm->irqbus);
@@ -780,6 +806,7 @@ static void X86Reset(Board* m) {
   CmosReset(&xm->cmos);
   I8237Reset(&xm->dma);
   FdcReset(&xm->fdc);
+  Sb16Reset(&xm->sb16);
   // The PCI bus forgets its device list on reset (the devices keep their
   // configuration), so the three functions are re-enumerated here.
   PciInit(&xm->pci);
@@ -880,6 +907,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   TestDevInit(&xm->testdev);
   I8237Init(&xm->dma);
   FdcInit(&xm->fdc);
+  Sb16Init(&xm->sb16);
   PciInit(&xm->pci);
   I440fxInit(&xm->fx, kPciBus0, kHostBridgeDev);
   Piix3BridgeInit(&xm->piix, kPciBus0, kPiixDev);
@@ -951,6 +979,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   // address space the peripheral never touches.
   I8237SetMemBus(&xm->dma, &m->bus);
   FdcRegister(&m->io, &xm->fdc);
+  Sb16Register(&m->io, &xm->sb16);
   // The bus-master engine moves a transfer through system memory (the PRD table
   // and the host's buffers), so the controller needs the address space the task
   // file never touches.

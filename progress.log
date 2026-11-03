@@ -1,12 +1,47 @@
 # cemu 开发日志（progress.log）
 
-按时间倒序，最新在最上。本文件只记过程、证据与裁决；当前状态摘要见
-README.md，架构与阶段见 arch.md，规格缺口台账见 AGENTS.md §六。
+按时间倒序，最新在最上。本文件只记过程、证据与裁决；当前状态见本文件最新
+条目，架构与阶段见 arch.md，规格缺口台账见 AGENTS.md §六。
 
 > 本文件里的章节号是写作当时的编号，按原文保留、不逐条改写。2026-11-01 的
 > AGENTS.md 重写后：旧 §五/§六 → §一·5/§一·6，旧 §七/§八 → §二/§三，
 > 旧 §九 → §四，旧 §十/§X（调试设施）→ §五，旧 §十一 → §七；`§X Dnn`
 > 指现在的 §六 台账。
+
+## x86 SB16 声音设备：DSP 播放 + 8/16 位 DMA + 宿主 waveOut（2026-11-03）
+
+- `host/audio_win.c`：通用 PCM 输出（waveOut；8/16 位、单/双声道、有/无符号转换），
+  `HostAudioOpen/Write/Free/Close`。没有宿主音频设备时只记一条日志并静默继续，
+  客人看到的 DMA 与 IRQ 时序不受影响。
+- `device/audio/sb16.c`：QEMU `hw/audio/sb16.c` 的 DSP 播放模型（复位 0xAA、版本
+  0x0405、0x40/0x41/0x48、0x14/0x1C/0x90/0x91/0xB0-0xCF、0xD0-0xDA、0xE1-0xE4、
+  0xF2/0xF3、mixer 0x00-0xFF、0x22E/0x22F 中断应答），ISA 0x220-0x22F、IRQ5、
+  DMA1/DMA5。
+- `device/dma/i8237.c`：16 位通道按字计数/字地址传送、在 128KiB 内回绕（通道 4-7）；
+  新增 `I8237Left`，SB16 用它区分自己的块边界与控制器 terminal count。
+- 板级：x86 板把 IRQ5 接进 8259/IOAPIC 的 ISA fan-out，把 DMA1/5 接进 8237；
+  `X86Poll` 驱动采样时钟。镜像里装有 `SB16.VXD`/`SB16SND.DRV`，驱动被激活后
+  启动声音走这条路径。
+- `bus/bus.h`：region 表 32→64。PC 的 I/O 空间在加入 SB16 后超过 32 个窗口，
+  否则 PIIX4 PM 的 firmware-programmed base 会 `bus full`（本轮实测）。
+- Win95 现状：无按键注入会停在启动菜单默认的 3（Safe mode），Safe mode 不加载
+  声音驱动，所以 `bus:sb16` 一条都没有；按 130M 注入 `1`+Enter 进 Normal 后，
+  驱动正常访问 0x220。首版卡在 DSP 命令 0xE3：驱动读版权串后等结尾的 NUL，
+  而代码把 `sizeof-1` 写成了 `sizeof-2`，NUL 没发出去，驱动一直轮询 0x22E=0，
+  后面的 DMA/播放命令根本没发出。已改为按 QEMU `sb16.c` 的 `sizeof(e3)-1`
+  把 NUL 一并压入（LIFO 读出顺序仍是正文在前、NUL 最后）。
+- 验证：两个自足引导扇区探针（8 位通道 1 的 64 字节单周期块、16 位通道 5 的
+  64 字单周期块）在 `--machine x86 --isa x86` 下都通过：mixer 0x82 的对应 IRQ
+  状态位、0x22E/0x22F 应答、8237 terminal count（0xFFFF）全部符合预期。
+- 缺口按 D43 在册：FM/MPU-401、ADC/ADPCM、高页 DMA、混音器音量缩放、游戏端口。
+
+## Win95 进桌面、NT 3.1 引导到登录（2026-11-03）
+
+- **Windows 95**：正常模式进 1024×768 桌面，`fbdump` 与 QEMU 参考逐像素相同
+  （0/786432）；安全模式 640×480 无回归。根因链是 POPF 的 fault 原子性、LAR 的
+  limit 19:16、VBE 固定 LFB `0xE0000000` 三处，见下方 2026-11-01/02 各节。
+- **NT 3.1**：引导到登录界面，PS/2 鼠标可用；IDE 的 SRST/参数/寻道/PIO 中断与
+  i8042 的 aux 禁用语义见 `385ce9d`。
 
 ## Win95：即时失败链落到 int 1Ch 服务 0x1C；VMCB 嵌套位 cemu 0x120 / QEMU 0（2026-11-01）
 
@@ -3561,22 +3596,22 @@ int21 读文件里的 int13 调用把 ES 留成了 BIOS 段、DOS 未恢复；QE
 调试设施补缺：`CEMU_DEBUG=regs=N` 原先只设周期不置类别位，`DebugInsn` 从不
 触发；现在同时置 `kDbgRegs`（周期表与退出表都能出）。
 
-## Win95 ��������TF ����·���� cemu ���еķ��磨2026-11-01��
+## Win95 保护错误：TF 单步路径是 cemu 独有的分歧（2026-11-01）
 
-- ȫ�� trap ץȡ��build/cemu_trap_keys.txt��13621 �У�����ʵ�쳣ֻ��ǰ 200 ����
-  ����ȫ�� #DB ������ǰ 200 ���� QEMU -d int �������루���������Ե�ַȫͬ����
-  ˵���� inst=169.4M Ϊֹ����·��û�з��硣
-- ����㣺inst=169,454,108 ��V86 �ͻ��� CS=0x00C9 ִ�� ret������ 0x1D33����
-  ���� 0x2FF7 �������� CS=0x00C9 -> ���� 0x3C87��dumpl ʵ��Ϊ��ҳ����TF=1��
-  ÿ��ָ��һ�� #DB��ֱ�� 170M ������
-- QEMU ���գ�Ĭ�� CPU ȫ�� 70s -d int ��һ�� v=01��-cpu qemu32,-vme
-  ��VME ����棬�� cemu CPUID һ�£��Խ� 1024x768 ���棬40-44s ����ͬ���� #DB��
-  �� TF ������ cemu ����·�������ǿ��˱��ߵ�·��
-- �ֳ���VMM �� 0xC0002573��mov [esi],eax=0xFCB22FF7����0xC0002578
-  ��mov [esi+4],ax=0x0092/0x0096/0x0002��TF=0����0xC002F1BA
-  ��mov [esi+6],eax=0x00C910A3 -> CS=0x00C9,EIP=0x10A3���ȴ����� V86 iret ֡��
-  �� 0xB3C1 ���� iret ������ EFLAGS=0x23F97��TF=1������һ������ס���� iret
-  ʵ�ʵ�����֡���� exec.c pm_iret �� V86 ��֧��Լ 1816-1853 �У��� TF ��װ�ء�
+- 全量 trap 抓取（build/cemu_trap_keys.txt，13621 行）：真实异常只有前 200 条，
+  其余全是 #DB 单步。前 200 条与 QEMU -d int 逐条对齐（向量与线性地址全同），
+  说明到 inst=169.4M 为止故障路径没有分歧。
+- 分歧点：inst=169,454,108 起，V86 客户在 CS=0x00C9 执行 ret（线性 0x1D33），
+  弹出 0x2FF7 后仍留在 CS=0x00C9 -> 线性 0x3C87（dumpl 实测为零页），TF=1，
+  每条指令一次 #DB，直至 170M 结束。
+- QEMU 对照：默认 CPU 全程 70s -d int 无一条 v=01；-cpu qemu32,-vme
+  （VME 不广告，与 cemu CPUID 一致）仍进 1024x768 桌面，40-44s 窗口同样无 #DB。
+  即 TF 单步是 cemu 独有路径，不是客人必走的路。
+- 现场：VMM 在 0xC0002573（mov [esi],eax=0xFCB22FF7）、0xC0002578
+  （mov [esi+4],ax=0x0092/0x0096/0x0002，TF=0）、0xC002F1BA
+  （mov [esi+6],eax=0x00C910A3 -> CS=0x00C9,EIP=0x10A3）等处构造 V86 iret 帧；
+  而 0xB3C1 那条 iret 交付的 EFLAGS=0x23F97（TF=1）。下一步：钉住这条 iret
+  实际弹出的帧，核 exec.c pm_iret 的 V86 分支（约 1816-1853 行）对 TF 的装载。
 
 ## Win95: tfset= sniffs the first TF=1 (2026-11-01)
 
@@ -3595,110 +3630,110 @@ own copy of the client EFLAGS at inst=169453089 (0x20FB7, reserved bit 5 set),
 834 instructions before the CPU ever saw TF, so the bit is the VMM's decision;
 the iret at 0xB65 then reloads it into the CPU once per emulated instruction.
 
-## Win95 ��������ĸ���POPF ��Ȩ���ǰ�͵���ջ��2026-11-01��Ƭ 43��
+## Win95 保护错误的根因：POPF 特权检查前就弹了栈（2026-11-01，片 43）
 
-- ֢״����󶤵���V86 �ͻ��� EFLAGS ��д�� 0x20FB7��TF=1������λ 5����
-  �������ݴ˵������ͻ�����ҳ 0x3C87 ��һ��һ #DB����� protection error��
-- 0x20FB7 ����Դ���������� 0xC0002B6E �� `movzx eax,[eax+esi]` �ӿͻ�ջ
-  SS:SP �� flags��SP=0xFFF8����ȷ�� popf Ӧ�� 0xFFF6��thunk �� pushf �ۣ���
-  0xFFF8 �� `call 0x1087` ѹ��ȥ�ķ��ص�ַ 0x0FB7��TF=1��bit5=1����
-- SP Ϊʲô�� 2��`src/cpu/isa/x86/exec.c` �� case 0x9d �� `pop_w()` �ټ����Ȩ��
-  V86/IOPL<3 �� #GP �� fault��fault ���ı� ESP��SDM vol.2 POPF
-  ��Virtual-8086 Mode Exceptions����`#GP(0) If IOPL < 3 and VME is not enabled.`��
-  fault ����ָ��ִ��ǰ״̬��vol.3 6.5��table 6-1����QEMU ��˳����
-  load ���� -> helper_popf������ #GP��-> gen_stack_update�����Բ��ƽ� ESP��
-- �޸���popf �� `stack_peek(pw,0)` ��ȡ�������л� fault �ļ�����꣬
-  �����ύ ESP �� flags��VME ��֧ͬ���ύ�������ݶϵ�� WatchData ����ԭ����
-- ���գ�ͬ����ͬ BIOS��ͬ������-icount shift=8����
-  ��ǰ inst=170M traps=13621����Ļ `Windows protection error`��
-  �޺� traps=374��260M ʱ 1008�����ޱ�����fbdump �� Windows 95 ��������
-  ��640x400��build/win95_fb.ppm����
+- 症状链最后钉到：V86 客户端 EFLAGS 被写成 0x20FB7（TF=1、保留位 5），
+  监视器据此单步，客户在零页 0x3C87 上一条一 #DB，最后 protection error。
+- 0x20FB7 的来源：监视器在 0xC0002B6E 用 `movzx eax,[eax+esi]` 从客户栈
+  SS:SP 读 flags，SP=0xFFF8；正确的 popf 应读 0xFFF6（thunk 的 pushf 槽），
+  0xFFF8 是 `call 0x1087` 压进去的返回地址 0x0FB7（TF=1、bit5=1）。
+- SP 为什么高 2：`src/cpu/isa/x86/exec.c` 的 case 0x9d 先 `pop_w()` 再检查特权，
+  V86/IOPL<3 的 #GP 是 fault，fault 不改变 ESP。SDM vol.2 POPF
+  （Virtual-8086 Mode Exceptions）：`#GP(0) If IOPL < 3 and VME is not enabled.`；
+  fault 保存指令执行前状态（vol.3 6.5、table 6-1）。QEMU 的顺序是
+  load 镜像 -> helper_popf（可能 #GP）-> gen_stack_update，所以不推进 ESP。
+- 修复：popf 用 `stack_peek(pw,0)` 先取镜像，所有会 fault 的检查做完，
+  最后才提交 ESP 与 flags（VME 分支同样提交）；数据断点的 WatchData 保持原样。
+- 验收（同镜像、同 BIOS、同按键、-icount shift=8）：
+  修前 inst=170M traps=13621，屏幕 `Windows protection error`；
+  修后 traps=374（260M 时 1008），无报错，fbdump 是 Windows 95 启动画面
+  （640x400，build/win95_fb.ppm）。
 
-## Win95 normal ģʽ�������������봥�������ո��ǲ��޸���2026-11-02��
+## Win95 normal 模式蓝屏：不是输入触发；快照覆盖层修复（2026-11-02）
 
-- ��������ǰ��Ϊ����ֻ�ڴ����ֶ��������֡�ʵ������ `1`+�س���ȫ���Զ�ע�룩
-  ͬ������������ʱ���� 581M/583.6M/588.8M ֮����ʱ��Ư�ƣ������ı���Ϊ
-  `A fatal exception 0E ... 0137:BFF9A3C0`���ֶ�����ֻ�Ǹı�������ʱ��
-- ���������������ʱ 32 λϵͳ DLL �� `MOVSB` ���� #GP(0)��CS=0x357��
-  DS=0x0C36��limit=0x241F��SI=0x4ED2��Դƫ�Ƴ��� 9KB ���ޣ��ú����ǿ��
-  ��ָ�븴��/��ѹ����3.3k ��ָ��� SEH ������ҳ 0xBFFB8CF8 ȡָ #PF��
-  VMM �� int 13h AH=42h �� LBA 186322 �� 16 ���������������뾵�����ֽ�
-  ��ͬ��������ӡ������0xBFF9A3C0 �� cemu �д�δ��ȡָ/���ʣ����쳣��¼
-  ��Ĺ̶�ֵ��Ͷ��֡������ȷ��[esp+4]=0x2BB6������ EIP����CS=0x357��
-  EFLAGS �� RF��
-- ���ų���BIOS��QEMU ͬ BIOS ��������VGA option ROM���� QEMU ��
-  vgabios-stdvga �Ա�����SSE/SSE2��CPUID ���κ�ͬ inst �Ա�������ҳ���ݡ�
-- �����޸���`HostFileOpenReadWrite` ԭ��ֻ�� `GetTempPathA`��TMP ָ�򲻴���
-  Ŀ¼ʱ `CreateFileA` ʧ�ܡ�overlay ��ĬΪ�գ�д���䵽ֻ��������ְ�
-  TMP -> TEMP -> ����Ŀ¼ -> ��ǰĿ¼ѡ**����**��Ŀ¼����ʧ����
-  `LogError("snapshot: cannot create ...")` ������ NULL���弶��
-  `cannot attach -hda image` �˳�����`HostFileWriteAt` �� snapshot �¾���
-  д����������֤��TMP ָ�򲻴���Ŀ¼ʱ overlay ���� TEMP��9.5MB����
-- ��ʩ��`key=`/`mouse=` ֧�� `@N!` һ���ԣ�`trap` �д� `inst=`��
-  `trap` �д� `vaddr=`��x86 #PF �� CR2��`tval=` �Ǵ����룩��
-- ��һ����QEMU gdb��D:/mingw64/bin/gdb.exe���� DLL ƫ�� 0x2BB6 �� #GP
-  ���������������ϵ㣬ȷ�� QEMU �Ƿ�Ҳ������ MOVSB �� #GP��QEMU ��
-  `-d int` ȫ����־���� 5MB�������á�
+- 更正：此前认为蓝屏只在窗口手动输入后出现。实测两键 `1`+回车（全程自动注入）
+  同样蓝屏，崩溃时刻在 581M/583.6M/588.8M 之间随时序漂移，蓝屏文本恒为
+  `A fatal exception 0E ... 0137:BFF9A3C0`。手动输入只是改变了启动时序。
+- 崩溃链：桌面加载时 32 位系统 DLL 的 `MOVSB` 触发 #GP(0)（CS=0x357、
+  DS=0x0C36、limit=0x241F、SI=0x4ED2，源偏移超出 9KB 段限；该函数是跨段
+  大指针复制/解压）。3.3k 条指令后 SEH 处理器页 0xBFFB8CF8 取指 #PF；
+  VMM 用 int 13h AH=42h 从 LBA 186322 读 16 扇区（总线数据与镜像逐字节
+  相同），随后打印蓝屏。0xBFF9A3C0 在 cemu 中从未被取指/访问，是异常记录
+  里的固定值。投递帧本身正确：[esp+4]=0x2BB6（段内 EIP）、CS=0x357、
+  EFLAGS 带 RF。
+- 已排除：BIOS（QEMU 同 BIOS 正常）、VGA option ROM（换 QEMU 的
+  vgabios-stdvga 仍崩）、SSE/SSE2（CPUID 屏蔽后同 inst 仍崩）、调页数据。
+- 快照修复：`HostFileOpenReadWrite` 原来只用 `GetTempPathA`，TMP 指向不存在
+  目录时 `CreateFileA` 失败、overlay 静默为空，写入落到只读句柄。现按
+  TMP -> TEMP -> 镜像目录 -> 当前目录选**存在**的目录；仍失败则
+  `LogError("snapshot: cannot create ...")` 并返回 NULL（板级报
+  `cannot attach -hda image` 退出）；`HostFileWriteAt` 在 snapshot 下绝不
+  写基础镜像。验证：TMP 指向不存在目录时 overlay 建在 TEMP（9.5MB）。
+- 设施：`key=`/`mouse=` 支持 `@N!` 一次性；`trap` 行带 `inst=`；
+  `trap` 行带 `vaddr=`（x86 #PF 的 CR2；`tval=` 是错误码）。
+- 下一步：QEMU gdb（D:/mingw64/bin/gdb.exe）在 DLL 偏移 0x2BB6 或 #GP
+  处理器上做条件断点，确认 QEMU 是否也在这条 MOVSB 上 #GP；QEMU 的
+  `-d int` 全量日志超过 5MB，不能用。
 
-## Win95 ��������LAR ���������� limit �߰��ֽڣ�2026-11-02��
+## Win95 蓝屏根因：LAR 丢掉描述符 limit 高半字节（2026-11-02）
 
-- ����`src/cpu/isa/x86/exec.c` �� LAR �� `v.hi & 0x00f0ff00` ��װ����ֵ��
-  �������� byte6 �ĵͰ��ֽڣ�limit 19:16����� 0��tiny386������ x86 �� oracle��
-  i386.c:3528����Bochs��protect_ctrl.cc: `dword2 & 0x00ffff00`����v86
-  ��misc_instr.rs������������λ��Intel SDM �� LAR �� bits 19:16 ֻд
-  ��undefined����ʵ���������������ԭֵ��Win95 �� DPMI �ͻ�����������
-- ��������ָ�����Win95 �� DPMI �ͻ����� `1F14E lar ecx,ebx` ��
-  `shr ecx,8`��`bts ecx,12`���� AVL������ `mov ax,9; call 0x205F3`
-  �� DPMI 0009h��Set Descriptor Access Rights and Flags���������
-  `20664 mov [bx+5],cx` ������ 16 λ��д�� LDT��LAR ��� limit 19:16 ��
-  CX=0x10F3���������� limit 0x1241F��626x119 8bpp DDB��bits ��
-  selector 0x0C36 ƫ�� 0x30����Ҫ ��0x1232E������ 0x241F����� 16 λ GDI
-  �Ĵ�ָ�� blit �� row 0x20 �� DS:0x4ED2 > limit��`MOVSB` �� #GP(0)��
-  �쳣�� VMM ���䵽 ring3 �� KERNEL32 �쳣�ַ��������մ�
-  `A fatal exception 0E has occurred at 0137:BFF9A3C0` ������
-- ȡ֤��`watchl=0x8008ac30:8:w` ץ�� LDT �� 0x0C36 ��ȫ�� 6 ��д��
-  0x2062B д byte6=0x01��limit 0x1241F����0x20664 д 0x10F3��limit 0x241F����
-  DPMI �ͻ��˵��õ��� `1F14E/1F169`��������� `205F3/20664`���λ�ַ
-  0x1AE60��EIP 0x5793/0x5801����QEMU ��ͬһ���� 1460 �� #GP ��
-  CS=0x357 / EIP=0x2BB6���� 0x8015EBB6 �� MOVSB ����ûִ�С�
-- �޸���LAR �����Ϊ `0x00ffff00`����֤��ͬһ LDT �����һ��д���
-  `11F3`��limit ���� 0x1241F����`CEMU_DEBUG` �� trap ����
-  583M/650M/720M �����ٳ��� 0x8015EBB6 �� #GP�������ı����ٳ���
-  ��650M/720M �� fbdump �� 1024x768 ͼ��ģʽ���� 80x25 ��������
-- �Դ��飺�޸������Խ���ɱ��������������559.6M �е� 1024x768����
-  ���� 650M/720M ���Ǻ�����regs ������ʾ���� VMM idle ���豸��ʼ��֮��
-  ��ʱ��ȴ���c038400f / c11a3ea5 ��ͣ��Լ 100M ���������豸��ʼ����ʱ��
-  �뱾�������޹أ�������Ŀ������
+- 根因：`src/cpu/isa/x86/exec.c` 的 LAR 用 `v.hi & 0x00f0ff00` 组装返回值，
+  把描述符 byte6 的低半字节（limit 19:16）清成 0。tiny386（本仓 x86 主 oracle，
+  i386.c:3528）、Bochs（protect_ctrl.cc: `dword2 & 0x00ffff00`）、v86
+  （misc_instr.rs）都保留这四位；Intel SDM 对 LAR 的 bits 19:16 只写
+  “undefined”，实机返回描述符里的原值，Win95 的 DPMI 客户端依赖它。
+- 崩溃链（指令级）：Win95 的 DPMI 客户端在 `1F14E lar ecx,ebx` 后
+  `shr ecx,8`、`bts ecx,12`（置 AVL），再 `mov ax,9; call 0x205F3`
+  走 DPMI 0009h（Set Descriptor Access Rights and Flags）；服务端
+  `20664 mov [bx+5],cx` 把整个 16 位字写回 LDT。LAR 清掉 limit 19:16 后
+  CX=0x10F3，描述符从 limit 0x1241F（626x119 8bpp DDB，bits 在
+  selector 0x0C36 偏移 0x30，需要 ≥0x1232E）缩成 0x241F；随后 16 位 GDI
+  的大指针 blit 在 row 0x20 读 DS:0x4ED2 > limit，`MOVSB` 吃 #GP(0)。
+  异常经 VMM 反射到 ring3 的 KERNEL32 异常分发器，最终打
+  `A fatal exception 0E has occurred at 0137:BFF9A3C0` 蓝屏。
+- 取证：`watchl=0x8008ac30:8:w` 抓到 LDT 项 0x0C36 的全部 6 次写：
+  0x2062B 写 byte6=0x01（limit 0x1241F），0x20664 写 0x10F3（limit 0x241F）。
+  DPMI 客户端调用点在 `1F14E/1F169`；服务端在 `205F3/20664`（段基址
+  0x1AE60，EIP 0x5793/0x5801）。QEMU 侧同一窗口 1460 次 #GP 无
+  CS=0x357 / EIP=0x2BB6，且 0x8015EBB6 的 MOVSB 根本没执行。
+- 修复：LAR 掩码改为 `0x00ffff00`。验证：同一 LDT 项最后一次写变成
+  `11F3`（limit 保持 0x1241F）；`CEMU_DEBUG` 的 trap 流在
+  583M/650M/720M 都不再出现 0x8015EBB6 的 #GP，蓝屏文本不再出现
+  （650M/720M 的 fbdump 是 1024x768 图形模式，无 80x25 蓝屏）。
+- 仍待查：修复后客人越过旧崩溃点继续启动（559.6M 切到 1024x768），
+  但在 650M/720M 仍是黑屏；regs 快照显示它在 VMM idle 与设备初始化之间
+  长时间等待（c038400f / c11a3ea5 各停留约 100M 条），像设备初始化超时，
+  与本次蓝屏无关，另立条目继续。
 
-## Win95 ��������VBE LFB �̶����� 0xE0000000 δ���루2026-11-02��
+## Win95 黑屏根因：VBE LFB 固定窗口 0xE0000000 未解码（2026-11-02）
 
-- ֢״��LAR �޸���������ʧ��������ģʽ�� 559.6M �е� 1024x768 ��һֱ������
-  safe mode����׼ VGA �������� 0xA0000 aperture��������
-- ȡ֤������ģʽ����ʾ���������� 0xE0000000 ӳ�䵽���� 0xC38D8000
-  ��pcshot=0x80151ED9 ʱ CR3=0x6B2000��PTE[0xD8]=0xE0000A67�������
-  0x80151ED9 �� `rep stosd` �������޸�ǰ `bus` ����
-  `io-st unclaimed-mem:e0000000:4 = 0`��д������û������� PCI �ն���
-  `phys_store` �� BusProbe ʧ�ܺ�Ĭ���������Կ��� VRAM ʼ���Ǻڵġ�
-- Ϊʲô�� 0xE0000000��`-vgabios ../seabios/out/vgabios.bin` ��
-  CONFIG_VGA_PCI=n �Ĺ������� PCIR��autoconf.h �� CONFIG_VGA_VID/DID=0����
-  SeaBIOS ��������ͨ option ROM ���С����� BDF��bochsvga_setup ��
-  `if (CONFIG_VGA_PCI && bdf >= 0)` ���α��������VBE_framebuffer ȡ
-  VBE_DISPI_LFB_PHYSICAL_ADDRESS��seabios vgasrc/bochsvga.h:41��= 0xE0000000��
-  ������ BAR0��SeaBIOS ʵ�ʰ� VGA BAR0 ���� 0xFD000000��PCI ����д����
-  0x80001010 -> 0xFD000000��QEMU ͬ���� BAR0 ���� 0xFD000000����
-- �ο���Bochs �ķ� PCI VGA ·��ע�����������̶�����
-  ��bochs/iodev/display/vga.cc��`if (!pci_enabled) {
+- 症状：LAR 修复后蓝屏消失，但正常模式在 559.6M 切到 1024x768 后一直黑屏；
+  safe mode（标准 VGA 驱动，走 0xA0000 aperture）正常。
+- 取证：正常模式的显示驱动把物理 0xE0000000 映射到线性 0xC38D8000
+  （pcshot=0x80151ED9 时 CR3=0x6B2000，PTE[0xD8]=0xE0000A67），随后
+  0x80151ED9 的 `rep stosd` 清屏。修复前 `bus` 行是
+  `io-st unclaimed-mem:e0000000:4 = 0`：写入落在没人认领的 PCI 空洞，
+  `phys_store` 的 BusProbe 失败后静默丢弃，所以卡上 VRAM 始终是黑的。
+- 为什么是 0xE0000000：`-vgabios ../seabios/out/vgabios.bin` 是
+  CONFIG_VGA_PCI=n 的构建（无 PCIR；autoconf.h 的 CONFIG_VGA_VID/DID=0），
+  SeaBIOS 把它当普通 option ROM 运行、不传 BDF，bochsvga_setup 的
+  `if (CONFIG_VGA_PCI && bdf >= 0)` 整段被编译掉，VBE_framebuffer 取
+  VBE_DISPI_LFB_PHYSICAL_ADDRESS（seabios vgasrc/bochsvga.h:41）= 0xE0000000，
+  而不是 BAR0。SeaBIOS 实际把 VGA BAR0 放在 0xFD000000（PCI 配置写序列
+  0x80001010 -> 0xFD000000；QEMU 同样把 BAR0 放在 0xFD000000）。
+- 参考：Bochs 的非 PCI VGA 路径注册的正是这个固定窗口
+  （bochs/iodev/display/vga.cc：`if (!pci_enabled) {
   vbe.base_address = VBE_DISPI_LFB_PHYSICAL_ADDRESS;
-  DEV_register_memory_handlers(...); }`�������������� PCI VGA function��
-  �� VGA BIOS ���� file ROM ��ʽ�ṩ�����Կ�ͬʱ���� PCI BAR ������̶�
-  ���ڡ��� PCI ROM ͷ�� VGA BIOS ��� BAR0������ BAR ���ڡ�
-- �޸���src/device/video/vga.c ���� kVgaLegacyLfbBase=0xE0000000 ��
-  vga-lfb ���ڣ�ͬһ�� vram��VgaRegister ע�᣻VgaPciDetach ֻ�ƶ� BAR��
-  ��������̶����ڣ���
-- ��֤��ͬһ `rep stosd` ���ڳ�
-  `io-st vga-lfb:e0000000:4 = 0`��650M ��ָ��� fbdump �� 1024x768
-  ���棨teal + NE2000 ����Ի��򣩣��� QEMU �ο���ͼ������һ�£�
-  ������ trap ���ٳ��֡�
-- ��ע��QEMU ��ͬһ�� legacy vgabios.bin ��Ϊ PCI ROM ʱ����
-  map_pcirom �ﱻ�ܣ��� PCIR�������˸���û�� VGA BIOS��QEMU Ĭ�ϵ�
-  vgabios-stdvga.bin �� CONFIG_VGA_PCI=y �������������ܶ� BAR0��
+  DEV_register_memory_handlers(...); }`）。本机总是有 PCI VGA function，
+  但 VGA BIOS 仍以 file ROM 方式提供，所以卡同时解码 PCI BAR 与这个固定
+  窗口。带 PCI ROM 头的 VGA BIOS 会读 BAR0，仍走 BAR 窗口。
+- 修复：src/device/video/vga.c 增加 kVgaLegacyLfbBase=0xE0000000 的
+  vga-lfb 窗口（同一份 vram，VgaRegister 注册；VgaPciDetach 只移动 BAR，
+  不动这个固定窗口）。
+- 验证：同一 `rep stosd` 现在出
+  `io-st vga-lfb:e0000000:4 = 0`；650M 条指令的 fbdump 是 1024x768
+  桌面（teal + NE2000 警告对话框），与 QEMU 参考截图逐像素一致；
+  旧蓝屏 trap 不再出现。
+- 附注：QEMU 用同一个 legacy vgabios.bin 作为 PCI ROM 时会在
+  map_pcirom 里被拒（无 PCIR），客人根本没有 VGA BIOS；QEMU 默认的
+  vgabios-stdvga.bin 是 CONFIG_VGA_PCI=y 构建，所以它能读 BAR0。

@@ -225,6 +225,12 @@ void I8237Register(Bus* io, I8237Device* d) {
 
 void I8237SetMemBus(I8237Device* d, Bus* mem) { d->mem = mem; }
 
+int I8237Left(const I8237Device* d, int channel) {
+  if (channel < 0 || channel >= kI8237Channels) return 0;
+  int width = channel >= kI8237MasterChannels ? kI8237WordBytes : 1;
+  return ((int)d->ch[channel].count + kI8237CountBias) * width;
+}
+
 int I8237Transfer(I8237Device* d, int channel, uint8_t* buf, int len) {
   if (channel < 0 || channel >= kI8237Channels) return 0;
   if (d->command & kI8237CmdDisable) return 0;
@@ -237,29 +243,50 @@ int I8237Transfer(I8237Device* d, int channel, uint8_t* buf, int len) {
   // things that decide whether and how much this transfer moves.
   if (DebugOn(kDbgMark))
     DebugMark("dma-xfer", (int)c->count, ((int)c->mode << 8) | (channel << 4) | c->masked);
-  // The count register holds "bytes minus one", so the channel still owes
-  // count+1 bytes; a request for more than that stops at the count, which is
-  // how a device whose command asks for a whole track gets cut off at the
-  // boundary the guest programmed.
-  int left = (int)c->count + kI8237CountBias;
+  // The count register holds "units minus one". A byte channel's unit is a
+  // byte; a 16-bit channel's unit is a word (Intel 8237A datasheet), so the
+  // byte count doubles. A request ending inside a word is rounded down: the
+  // 16-bit half of the bus has no byte-enable for the 8237's cycles.
+  int width = channel >= kI8237MasterChannels ? kI8237WordBytes : 1;
+  int left = ((int)c->count + kI8237CountBias) * width;
   int n = len < left ? len : left;
+  n -= n % width;
   if (n <= 0) return 0;
-  // The page latch extends the 16-bit address but is NOT part of the counter:
-  // the chip's own address wraps inside its 64KiB page, which is the PC's
-  // well-known DMA boundary (Intel 8237A datasheet; SeaBIOS src/hw/dma.c
-  // refuses a transfer that would cross one).
-  uint32_t addr = ((uint32_t)c->page << 16) | c->addr;
   int decrement = (c->mode & kI8237ModeDecrement) != 0;
   int to_memory = direction != kI8237DirRead;
-  for (int i = 0; i < n; i++) {
-    uint32_t a = decrement ? addr - (uint32_t)i : addr + (uint32_t)i;
-    if (to_memory)
-      BusWrite(d->mem, a, 1, buf[i]);
-    else
-      buf[i] = (uint8_t)BusRead(d->mem, a, 1);
+  if (width == 1) {
+    // The page latch extends the 16-bit address but is NOT part of the
+    // counter: the chip's own address wraps inside its 64KiB page, which is
+    // the PC's well-known DMA boundary (Intel 8237A datasheet; SeaBIOS
+    // src/hw/dma.c refuses a transfer that would cross one).
+    uint32_t addr = ((uint32_t)c->page << 16) | c->addr;
+    for (int i = 0; i < n; i++) {
+      uint32_t a = decrement ? addr - (uint32_t)i : addr + (uint32_t)i;
+      if (to_memory)
+        BusWrite(d->mem, a, 1, buf[i]);
+      else
+        buf[i] = (uint8_t)BusRead(d->mem, a, 1);
+    }
+  } else {
+    // 16-bit channels: the address register counts words (A16..A1), the page
+    // latch still supplies A23..A16 of the byte address, and the chip wraps
+    // inside its 128KiB page. Each cycle moves one little-endian word.
+    for (int i = 0; i < n / kI8237WordBytes; i++) {
+      uint16_t word = (uint16_t)(c->addr + (decrement ? -i : i));
+      uint32_t a = ((uint32_t)c->page << 16) | ((uint32_t)word << 1);
+      if (to_memory) {
+        uint16_t v = (uint16_t)(buf[i * 2] | ((uint16_t)buf[i * 2 + 1] << 8));
+        BusWrite(d->mem, a, 2, v);
+      } else {
+        uint16_t v = (uint16_t)BusRead(d->mem, a, 2);
+        buf[i * 2] = (uint8_t)(v & 0xff);
+        buf[i * 2 + 1] = (uint8_t)(v >> 8);
+      }
+    }
   }
-  c->addr = (uint16_t)((addr + (decrement ? -(uint32_t)n : (uint32_t)n)) & 0xffff);
-  c->count = (uint16_t)(left - n - kI8237CountBias);
+  int units = n / width;
+  c->addr = (uint16_t)((c->addr + (decrement ? -units : units)) & 0xffff);
+  c->count = (uint16_t)((left - n) / width - kI8237CountBias);
   if (n == left) {
     // The channel reached terminal count: the status bit latches (the guest
     // reads it back from the command/status register) and an autoinit channel
