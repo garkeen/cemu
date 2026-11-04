@@ -229,7 +229,7 @@ realmode（kvm-unit-tests 官方实模式套件）127 PASS/0 FAIL。
 - 完成归档（2026-11-04）：上述三片交付面全部达成；x86 的 DR0-DR7 与
   riscv32/64 的 trigger 内部槽位都已接入 RSP。
 
-### 阶段 4：设备全集与真实 OS（此后为纯设备/IO 阶段；进行中）
+### 阶段 4：设备全集与真实 OS ✅
 - PC 设备模型全集（VGA 家族核、PS/2、PIC、PIT、UART、IDE/ATAPI、软盘 FDC+8237、LAPIC、
   IOAPIC、**PIIX4 PM function（ACPI PM timer）**）✅
   —— 片 1–14 逐项落地，片 26 补软盘通路，片 27 补显示家族，片 35 补 PM function（固件的
@@ -327,13 +327,76 @@ realmode（kvm-unit-tests 官方实模式套件）127 PASS/0 FAIL。
   `CEMU_DEBUG=fbdump=FILE`：落二进制 P6 PPM，与 QEMU `screendump` 同格式可逐字节
   diff（win101 桌面帧与 QEMU 基线即以此核对）。
 
-### 阶段 5：cesdk（放后：真实 OS 跑通后再做 SDK）
-- 交付：crun 运行时（_start、putch→UART、halt→sifive_test）、klib、
-  链接脚本、构建前端（先批处理形态）。
-- 验收：hello 的 .bin 与 .elf 在 cemu 与真 QEMU 上行为一致。
-- 蓝本：AM 源码逐文件对照移植。D11（HTIF syscall）在此销账。
-- 工具链：构建前端统一 LLVM 系列（clang riscv64 交叉；riscv 客户机由
-  xpack gcc 切换，x86 侧已在用 D:/LLVM 23.1）。
+- **验收（2026-11-04，本阶段完成）**：
+  - xv6-x86：SeaBIOS → IDE → shell，`ls` 正常。
+  - Linux：到控制台提示符（ext2 根挂载）。
+  - Windows 1.01 / 2.0 / 3.1：桌面；1.01 的帧缓冲与 QEMU 基线逐像素一致。
+  - Windows 95：正常模式 1024×768 桌面（NE2000 驱动未装，故带其警告对话框；
+    见 progress.log 的 VBE LFB 固定窗口一节）。
+  - HelenOS 0.14.1 riscv64：全量引导。
+  - xv6-riscv：virtio-mmio modern v2 + 逐指令中断投递，到 shell 并跑 `ls`。
+  仍留在 §六 台账的是设备细节（D17 的 CRTC 回绕/过扫描/NTSC，D19 的
+  SMI/INIT、PIRQ、S3/S4、XBCS 锁、IGNNE# bit0 等），属"出现依赖它们的
+  客户机再做"的项，不阻塞本阶段验收。
+
+### 阶段 5：cesdk 与自举链
+
+- 目标：交付本项目的客户机 SDK，并把它推进成一条**自举链** —— 从一块完全空的
+  块设备开始，用本项目的固件、引导契约、内核与安装器装出可启动系统。固件、
+  内核、用户态是三份独立程序，彼此靠运行期契约衔接。
+- 交付（SDK 侧）：crun 运行时（`_start`、putch→UART/COM1、halt）、klib、
+  链接脚本、构建前端（LLVM/clang）；hello 的 `.bin` 与 `.elf` 在 cemu 与真
+  QEMU 上行为一致。D11（HTIF syscall）在此销账。
+- 抽象（两件东西）：
+  - **引导契约 `cemu_boot_info`**：版本化、纯数据的机器描述，固件填、内核读一次
+    后接管。权威定义在 `cesdk/include/cemu_boot.h`。
+  - **两层后端**：`arch/<isa>/` 只放 ISA 规定的东西（入口、陷阱、页表、上下文、
+    原子、时钟）；`machine/<machine>/` 只放机器的东西（设备在哪、怎么初始化）。
+  - 记录内容：内存图、控制台、块设备、帧缓冲、**中断控制器拓扑**（PIC/IOAPIC/
+    PLIC 的基址、上下文号、输出线）、**PCI 枚举窗口**（CF8/CFC 或 ECAM）、
+    DTB/ACPI、命令行、根分区块设备与分区窗口、交接墙钟。
+  - 数组按“物理地址 + count + stride”给出，未知 `kind` 跳过；记录与它指向的
+    一切在交接后不可变，内核早期把它拷进自己的内存。
+  - 入口状态固定：x86 为 32 位保护模式、分页关、IF=0、
+    `EAX=magic`/`EBX=&info`；riscv64 为 S 模式、satp=0、`a0=hartid`/`a1=&info`。
+    riscv 固件驻留 M 模式，只提供标准 SBI 子集（TIME/IPI/RFENCE）；x86 固件
+    交接即退场。
+- 做法：
+  - **固件**：POST（内存探测、CPU 特性、控制台、x86 的 CMOS/RTC、PCI 或 DTB
+    枚举、块设备识别、帧缓冲）→ 启动顺序 → 读 LBA0 → MBR/GPT → 找 FAT32 分区
+    → 读 `/boot/cemu.elf` → ELF 装载（按 ISA 校验 ELFCLASS）→ 填记录、关中断/
+    停 DMA → 跳内核。
+  - **内核**：校验并拷贝记录 → 用自己的驱动初始化控制台/中断/定时/块设备 →
+    建页表与分配器 → VFS/FAT32 → 用户态。
+  - **安装器**：跑在自家内核上，经内核的块设备接口写 GPT + FAT32 + 内核文件；
+    自举期第一块盘由 `cesdk/tools/mkdisk.py` 生成，同时作为安装器的对拍基准。
+- 基线：固件与内核各自的基础职责清单在 `cesdk/PLAN.md` §3，按里程碑逐项验收
+  —— 固件侧是 CPU 入口态、内存发现、POST、控制台、时钟/RTC、设备枚举、中断
+  控制器、存储栈、分区/FAT32、启动管理、ELF 装载、交接、复位/看门狗；内核侧
+  是启动、虚拟内存、中断/异常、并发、调度与进程、用户态与系统调用、驱动、VFS/
+  FAT32、时间、用户程序、错误处理、安装器、日志。
+- 固件执行态：x86 走 cemu 现成的 multiboot 入口（32 位平坦保护模式），riscv 走
+  `-bios` 的 M 模式 ELF；只为这条链需要的初始化与服务负责。
+- 目录：仓内 `cesdk/`（独立 CMake 工程，不进 cemu 的 `src/` 构建，不参与依赖边
+  检查），布局、构建命令与里程碑见 `cesdk/PLAN.md`。
+- 排期：
+  - **5.0 crun**：freestanding 入口（`_start`）、putch/getch、halt、klib、
+    链接脚本；固件与内核共用。两个 ISA 的 hello 已在 cemu 上打印并正常退出
+    （riscv exit=0、x86 exit=11）；`.bin` 形态与真 QEMU 的对拍待补。✅
+  - **5.1 riscv 固件**：M 模式 → DTB 解析 → 内存地图 → MBR/GPT+FAT32 读 →
+    ELF 装载 → 交接 S 模式；UART/CLINT/PLIC/virtio-blk + SBI 子集。
+  - **5.2 x86 固件**：multiboot 入口 → POST（CMOS/RTC/PCI）→ ATA/帧缓冲/PIT
+    → MBR/GPT+FAT32 → ELF 装载 → 交接。
+  - **5.2b（可选）**：实模式前端 + 最小 INT 13h/10h，真把控制权交给 0x7C00
+    的 MBR 链。
+  - **5.3 内核**：arch 后端（页表、陷入、时钟、上下文切换）+ 可移植核心
+    （块设备、FAT32、shell）；同一份源码编出 x86 与 riscv 两个内核。
+  - **5.4 安装器**：GPT + FAT32 格式化与写盘，空盘验收。
+- 收益：一份内核源码编两次（ISA 差异只在 `arch/`）；宿主能合成记录，内核不经
+  固件即可测；固件与内核可独立替换；没有跨模式回调；版本 + stride 只追加字段，
+  旧内核仍能启动。
+- 验收：空块设备 + 安装器镜像 → 安装 → 重启 → 两个 ISA 上同一份 OS 源码进
+  shell；宿主侧用十六进制查看能验出 GPT 与 FAT32 结构。
 
 ### 阶段 6：arm、mips 与 x86 长模式
 - x86 长模式（IA-32e / x86_64）：EFER.LME/LMA、四级页表（PML4/PDPT）、64 位
