@@ -869,7 +869,12 @@ t13_done:
   mov eax, 0xDEADBEEF
   mov ax, SEL_LDTCODE
   lar eax, ax                              ; rights byte of the 4 GiB code seg:
-  cmp eax, 0x00c09b00                      ; mask 00FxFF00 zeroes the limit nibble
+  ; Bits 19:16 (the limit's high nibble) are architecturally undefined (SDM
+  ; vol.2 LAR, "Bits 19:16 are undefined"). This model keeps the descriptor's
+  ; nibble (0xf here): Win95's DPMI client reads the AVL bit out of the flags
+  ; byte LAR returns, and Bochs/v86/tiny386 keep it the same way. QEMU zeroes
+  ; it, which is why the QEMU transcript has this probe's older expectation.
+  cmp eax, 0x00cf9b00
   jne .t22_done
   mov ax, SEL_LDT0
   lsl eax, ax                              ; the raw 0x1ff limit (no G)
@@ -881,7 +886,7 @@ t13_done:
   jne .t22_done
   mov ax, SEL_LDT3                         ; DPL3 data from CPL 0: dpl >= cpl
   lar eax, ax
-  cmp eax, 0x00c0f200
+  cmp eax, 0x00cff200                      ; same undefined nibble, kept
   jne .t22_done
   mov eax, 0xDEADBEEF
   mov ecx, 0x34                            ; out of table: ZF=0, dest kept

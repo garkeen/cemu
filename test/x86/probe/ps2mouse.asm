@@ -179,11 +179,13 @@ _start:
   mov al, [unk]
   call puthex8
 
-  ; 0xa7 shuts the auxiliary interface down: the controller holds the device's
-  ; clock line low, so its answer never reaches the output queue and
-  ; output-buffer-full stays clear. The bit is printed, not asserted — QEMU
-  ; keeps queueing the answer and only v86 and the hardware agree with this
-  ; model. 0xa8 brings the interface back.
+  ; 0xa7 disables the mouse port by setting bit 5 of the command byte and
+  ; driving the clock line low (win.tue.nl keyboard controller reference
+  ; §11.2/§11.3). The 0xd4/0xf2 that follows is transmitted to the mouse, and a
+  ; transmission clears that bit ("sending data to the mouse reenables PS/2
+  ; communication", QEMU pckbd.c kbd_write_data) — so the answer is queued and
+  ; output-buffer-full reads 1. The bit is printed, not asserted; 0xa8 brings
+  ; the port back explicitly.
   mov al, 0xa7
   out 0x64, al
   mov al, 0xd4
@@ -290,9 +292,8 @@ _start:
   mov al, [irr]
   and al, 0x10                 ; IRQ12 must have been requested
   CHK 0x10
-  ; `auxoff` is the third divergence and stays unasserted for the same reason
-  ; (QEMU answers the probe's 0xf2 while the interface is off); run.sh checks
-  ; the value in the report line instead.
+  ; `auxoff` stays unasserted: run.sh checks the value in the report line
+  ; instead (v86 answers nothing there; this model and QEMU queue the reply).
   mov esi, m_ok
   call puts
   mov al, 5

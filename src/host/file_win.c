@@ -150,9 +150,14 @@ HostFile* HostFileOpenReadWrite(const char* path) {
       dir[len++] = '\\';
       dir[len] = 0;
     }
-    // PINNED: one overlay per process, deleted when the handle closes.
-    snprintf(tmp, sizeof(tmp), "%scemu-snap-%lu.img", dir,
-             (unsigned long)GetCurrentProcessId());
+    // PINNED: one overlay per process, deleted when the handle closes. The
+    // sequence number keeps a machine with several images (xv6's -hda + -hdb,
+    // a CD-ROM beside a disk) from reusing the same path: the second
+    // CreateFileA would hit the first handle's share mode and fail with
+    // ERROR_SHARING_VIOLATION.
+    static unsigned s_overlay_seq;
+    snprintf(tmp, sizeof(tmp), "%scemu-snap-%lu-%u.img", dir,
+             (unsigned long)GetCurrentProcessId(), ++s_overlay_seq);
     HANDLE ov = CreateFileA(tmp, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                             FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
     if (ov == INVALID_HANDLE_VALUE) {

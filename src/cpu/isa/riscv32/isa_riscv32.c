@@ -100,9 +100,14 @@ static int riscv32_has_fpr(frame* f) {
 
 static void riscv32_debug_state_line(char* buf, int cap, frame* f) {
   Riscv32State* s = f->priv;
-  snprintf(buf, (size_t)cap, "x: priv=%d mstatus=%08llx mie=%08llx mip=%08llx wait=%d", s->priv,
-           (unsigned long long)(uint32_t)s->mstatus, (unsigned long long)(uint32_t)s->mie,
-           (unsigned long long)(uint32_t)s->mip, f->cpu->wait);
+  // mip is the architectural OR of the software-writable bits and the
+  // device-driven lines (csr.c's mip view); printing s->mip alone would hide
+  // a pending PLIC/CLINT line.
+  snprintf(buf, (size_t)cap, "x: priv=%d mstatus=%08llx mie=%08llx mip=%08llx ext=%08llx wait=%d",
+           s->priv, (unsigned long long)(uint32_t)s->mstatus,
+           (unsigned long long)(uint32_t)s->mie,
+           (unsigned long long)(uint32_t)(s->mip | s->ext_irq),
+           (unsigned long long)(uint32_t)s->ext_irq, f->cpu->wait);
 }
 
 // ---- gdb stub (stage 3.5) -----------------------------------------------------

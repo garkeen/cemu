@@ -98,8 +98,13 @@ static int riscv_has_fpr(frame* f) {
 
 static void riscv_debug_state_line(char* buf, int cap, frame* f) {
   RiscvState* s = f->priv;
-  snprintf(buf, (size_t)cap, "x: priv=%d mstatus=%016llx mie=%016llx mip=%016llx wait=%d", s->priv,
-           (unsigned long long)s->mstatus, (unsigned long long)s->mie, (unsigned long long)s->mip,
+  // mip is the architectural OR of the software-writable bits and the
+  // device-driven lines (csr.c MipAll); printing s->mip alone would hide a
+  // pending PLIC/CLINT line, which is exactly what an interrupt diagnosis
+  // asks about.
+  snprintf(buf, (size_t)cap, "x: priv=%d mstatus=%016llx mie=%016llx mip=%016llx ext=%016llx wait=%d",
+           s->priv, (unsigned long long)s->mstatus, (unsigned long long)s->mie,
+           (unsigned long long)(s->mip | s->ext_irq), (unsigned long long)s->ext_irq,
            f->cpu->wait);
 }
 

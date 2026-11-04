@@ -85,7 +85,9 @@ enum {
   kVirtioMaxQueue = 64,
   kVirtioMaxQueueNum = 1024,
   kVirtioConfigSize = 256,
-  // Vendor ID every cemu virtio-mmio transport reports ("CUM " little-endian).
+  // Vendor ID is implementation-defined (VirtIO 1.2 §4.2.2, Vendor ID).
+  // cemu's virtio-mmio transports identify as "CUM " little-endian; the
+  // transport owns this value, not a device backend or a reference model.
   kVirtioVendorId = 0x4345554d,
 };
 

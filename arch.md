@@ -251,8 +251,8 @@ realmode（kvm-unit-tests 官方实模式套件）127 PASS/0 FAIL。
   所以 kvm-unit-tests 的 `.elf` 不需要"编成 .bin"这一步；xv6 验收走的是
   SeaBIOS 路线，bin 路线未被使用。
 - 验收阶梯：xv6-x86 → Linux（参照 v86/tests/full 清单）；riscv 侧的真实 OS
-  验收由 HelenOS 0.14.1 承担（xv6-riscv 仍未开始，镜像与 OpenSBI fw_jump
-  素材未取）。
+  验收由 HelenOS 0.14.1 承担。xv6-riscv 作为补充件直接以 ELF 从 0x80000000
+  起跑（不经 OpenSBI），2026-11-04 已到 shell，见 progress.log 同名节。
 - D13 已在片 40 销账：x87 算术走树内 Berkeley SoftFloat 3e（FXSAVE/FXRSTOR、#NM、
   FERR#/IRQ13 同批），MMX/SSE/SSE2、RDTSC/RDTSCP、SYSENTER/SYSEXIT、MTRR/PAT、MCE
   寄存器组、性能计数器（0x3C/0xC0）、AC、PSE-36 一并落地；余下 VME/PVI 与 PMU 细节
@@ -291,6 +291,16 @@ realmode（kvm-unit-tests 官方实模式套件）127 PASS/0 FAIL。
   开始。Windows 95 卡在两个 logo（`cs=0x9000` 的页帧被客人自己清零后仍被 `jmp`
   进去），见 progress.log 最新节。回归：riscv64 136/0、riscv32 104/0、x86 **50/0**、
   依赖边 ok。
+- **现状（2026-11-04）**：xv6-riscv 在 virt 板到 shell（直接 ELF 装载，不经
+  OpenSBI）：virtio-mmio 提供 modern v2（version 2 + `VIRTIO_F_VERSION_1`，
+  QueueDesc/Avail/Used 地址寄存器与 QueueReady 走规范 4.2.2；vendor ID 仍是
+  cemu 自己的实现定义值），并且 RISC-V 的中断投递改回"任意指令边界"，不再只在
+  1024 步服务点采样——后者会让"只开一条指令的 SIE"的客人（xv6 的
+  `intr_on(); intr_off();`）因相位对齐永远收不到 PLIC 的 SEI。两个后端同步，
+  见 progress.log 同名节。同一轮核对 x86：INTR 本就每步采样，1024 只是设备轮询
+  步长，无此缺口；xv6-x86 经 SeaBIOS 到 shell 并跑 `ls`，回归
+  **x86 63/0**（两处过期判据与 `-snapshot` 多盘 overlay 撞名一并修掉，见
+  progress.log 同日 x86 节）。
 - **验收 4（Windows 1.01）与显示实现形状**（2026-09-24 用户裁决；2026-09-29 落地）：验收件
   `build/windows/windows101.img`（1.44MB、MS-DOS 3.3 引导软盘，卷标 WIN101），QEMU
   基线是 **EGA 640×350** 下的 MS-DOS Executive 桌面（7 秒时截屏）。它给出两条硬前置：

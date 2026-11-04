@@ -641,8 +641,15 @@ CEMU_DEBUG="screen" timeout 110 ./cemu.exe ... img 2> c.txt
 
 ## 附：关键行为裁决存档（修复时的先例依据）
 
-- **i8042 的 aux 禁用只在中断上生效**：命令字节 bit5（DisAux）既不拦 0x60→鼠标的命令，也不丢鼠标的回复；发一个字节给鼠标本身会清掉该位（QEMU pckbd.c `kbd_write_data` 的 `KBD_CCMD_WRITE_MOUSE`：`ps2_write_mouse(...)` 之后 `s->mode &= ~KBD_MODE_DISABLE_MOUSE`，注释 "sending data to the mouse reenables PS/2 communication"；键盘方向同理）。NT 3.1 的 i8042prt 先写带 DisAux 的命令字节、再发 `0xD4 0xFF` 复位鼠标，按"禁用就把字节丢掉"的模型复位到不了设备。
+- **i8042 的 aux 禁用只在中断上生效**：命令字节 bit5（DisAux）既不拦 0x60→鼠标的命令，也不丢鼠标的回复；发一个字节给鼠标本身会清掉该位（QEMU pckbd.c `kbd_write_data` 的 `KBD_CCMD_WRITE_MOUSE`：`ps2_write_mouse(...)` 之后 `s->mode &= ~KBD_MODE_DISABLE_MOUSE`，注释 "sending data to the mouse reenables PS/2 communication"；键盘方向同理）。NT 3.1 的 i8042prt 先写带 DisAux 的命令字节、再发 `0xD4 0xFF` 复位鼠标，按"禁用就把字节丢掉"的模型复位到不了设备。0xA7/0xA8 就是同一个 bit5 的置/清（PC/AT：Disable mouse port 置位并拉低时钟线；win.tue.nl 控制器参考 §11.2/§11.3），所以 0xA7 之后的一次 0xD4 传输同样清掉它——`test/x86/probe/ps2mouse.elf` 的 `auxoff=01` 即由此而来；v86 把 0xA7 做成粘滞直到 0xA8，属少数派。
 
+- **x86 LAR 的 bits 19:16 保留**：SDM vol.2 LAR 明写 "Bits 19:16 are undefined"；
+  QEMU 按 0x00F0FF00 把它们清零，cemu 保留描述符的 limit 高半字节
+  （`v.hi & 0x00ffff00`）。依据是真机行为：Win95 的 DPMI 客户端把 LAR 结果
+  `shr 8` 后读 AVL 位再写回，清零会让 >64K 选择子的 limit 缩水；Bochs
+  （protect_ctrl.cc `dword2 & 0x00ffff00`）、v86、tiny386 同样保留。
+  验收：test/x86/pm/pm_smoke.asm 的 t22 钉住 `0x00cf9b00` / `0x00cff200`
+  （QEMU 在这一格与 cemu 分歧，见 progress.log 2026-11-04 x86 节）。
 - **计数器抑制**：写哪个计数器，抑制哪个自身的本步自增，无跨计数器连累
   （写 minstret 后下一条读到写入值；写 mcycle 不冻结 minstret）。QEMU 在
   mcycle 侧与规格分歧，只实现有测试覆盖的一侧，不模仿。

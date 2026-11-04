@@ -3854,3 +3854,81 @@ the iret at 0xB65 then reloads it into the CPU once per emulated instruction.
 - 附注：QEMU 用同一个 legacy vgabios.bin 作为 PCI ROM 时会在
   map_pcirom 里被拒（无 PCIR），客人根本没有 VGA BIOS；QEMU 默认的
   vgabios-stdvga.bin 是 CONFIG_VGA_PCI=y 构建，所以它能读 BAR0。
+
+## xv6-riscv 在 virt 板到 shell：virtio-mmio modern v2 与逐指令中断投递（2026-11-04）
+
+- 目标：xv6-riscv（本机 CMake/clang 构建，`xv6-build/out/riscv/{kernel,fs.img}`）
+  直接以 ELF 从 0x80000000 起跑：`--machine virt --isa riscv64 -bios kernel
+  -dsk fs.img -snapshot`。不经 OpenSBI（`-bios` 走 board/loader.c 的 ELF 路径）。
+- 缺口一（设备契约）：virtio-mmio 只提供 legacy v1，而现代驱动先读 version，
+  非 2 就走不通。VirtIO 1.2 §4.2.2 的 modern 寄存器半套（QueueDesc/Avail/Used
+  三个 64 位地址、QueueReady）本就实现在 virtio.c，virtio_blk.c 只是仍以
+  version=1、无特性位初始化。改为 version=2 + `1<<VIRTIO_F_VERSION_1`，特性协商
+  走 DriverFeaturesSel 的高低两半（QEMU hw/virtio/virtio-mmio.c 的
+  virtio_mmio_read/write 同款语义）。vendor ID 保持 cemu 的 0x4345554d：
+  规范写明该字段 implementation-defined，不照抄参考模型的值。
+- 缺口二（中断投递）：磁盘请求完成（used.idx=1、avail.idx=1、PLIC 侧
+  pending+enable+priority 都成立）但客人 `traps=0`，进程睡死在
+  `virtio_disk_rw` 的 sleep 上。取证（pcshot + state 行）：xv6 的调度器每轮做
+  `intr_on(); intr_off();`（kernel/proc.c scheduler），SIE=1 只覆盖一条指令；
+  `pcshot=0x8000392c`（`csrsi sstatus,2`）现场是
+  `mstatus=...0082 mie=0x220 mip=0x220`——SEIP(bit9) 与 Sstc 的 STIP(bit5)
+  都已挂起且已使能，按特权规范 3.1.9 应在下一条指令前陷入，但 riscv64 的
+  step 只在 `inst_count % 1024 == 0` 的服务点调 riscv_deliver_interrupt，
+  循环长度与该周期保持相位时这个一指令窗口永远落不到服务点上，中断被饿死。
+- 修复：step_body.inc 每步做 `(mip|ext_irq) & mie` 的待决测试并立即投递；
+  1024 步边界只留给 riscv_sync_timer 的宿主时钟采样（Sstc 的 STIP 刷新）。
+  riscv32 同模板同改（同一语义缺口，不是某台机器的事）。
+- 连带：Sstc 的 STIP 是 stimecmp 比较器的电平而不是锁存，逐指令投递后如果仍
+  只在 1024 步边界重算，客人的 trap handler 写完新 stimecmp 会被旧的 STIP
+  重复陷入到下一个服务点。故 STIP 挂起期间每步重算一次（宿主时钟只在
+  "正在报定时器"的窗口里读），写 stimecmp 后下一条指令即撤销请求；
+  riscv32/64 同步。
+- 观测设施：riscv 的 `state` 行原先把 `mip` 打成 `s->mip`（只有软件可写那半），
+  把 PLIC 挂起的 SEIP 藏掉了；改为架构值 `s->mip | s->ext_irq` 并追加
+  `ext=` 字段（riscv32/64 同步）。这就是本轮定位所缺的那一眼，属设施修补。
+- 客户机侧：xv6-riscv 的 virtio_disk_init 硬编码 `VENDOR_ID == 0x554d4551`，
+  那是 QEMU 的身份、非可移植假设；改的是客户机源码（删除 vendor 判断，
+  保留 magic/version/device id 三项契约），cemu 不改自己的 vendor 值。
+- 验证：同一命令到
+  `xv6 kernel is booting / init: starting sh / $`，随后 `ls` 列出 fs.img 的
+  完整目录（README、cat、sh、usertests…），再回提示符。串口输入走 stdin
+  （host/input_win.c 的管道路径）。
+- 参考：特权规范 3.1.9（中断在指令边界取，且不得无限延迟）；VirtIO 1.2
+  §4.2.2（version/vendor/队列地址寄存器/QueueReady）；QEMU
+  hw/virtio/virtio-mmio.c（modern 寄存器读写）。
+
+## x86 侧对照：中断采样、xv6-x86 验收与两处过期判据（2026-11-04）
+
+- 问题：riscv 侧刚修完"中断只在 1024 步服务点采样"的中断饿死，x86 是否同病。
+  结论：**没有**。x86 的 `intr_pending` 在每一步 `do_step()` 之前都采样
+  （cpu/isa/x86/step_body.inc：`if (s->intr_pending && !intr_shadow && ints_on &&
+  cpu->int_ack)`），1024 只是板级的**设备轮询步长**（board/run.c
+  `kPollStrideLog2 = 10`）。设备晚一拍拉线只是延迟：8259/IOAPIC 的请求是锁存
+  的，`cli` 区间里来的 IRQ 在 `sti` 后的第一个指令边界就投递，不会丢。
+- xv6-x86 验收：`--machine x86 --mem 256 -bios seabios/out/bios.bin
+  -hda out/x86/xv6.img -hdb out/x86/fs.img`，SeaBIOS 引导 → `xv6...` →
+  `init: starting sh` → `$`；用 `CEMU_DEBUG=key=`（set-1 扫描码 l/s/回车）注入
+  `ls`，列出 fs.img 目录并回到提示符。
+- 真 bug（被这次验收暴露）：`-snapshot` 的 overlay 文件名只有 pid
+  （`cemu-snap-<pid>.img`），第二块盘用同一路径 `CREATE_ALWAYS`，撞上第一块盘
+  handle 的无共享模式 → 错误 32（`cannot attach -hdb image`）。修：
+  `src/host/file_win.c` 加进程内自增序号（`cemu-snap-<pid>-<seq>.img`）。
+  验证：`-hda + -hdb` 双盘正常引导，单盘 `-hda` 照旧。
+- 过期判据一（ps2mouse）：锁定行要求 `auxoff=00`，实际 01。根因是 `385ce9d`
+  把 8042 的 aux 语义改成 QEMU 模型（命令字节 bit5 只门控，写数据清位）后没更新
+  这一格。参考：0xA7 "Disable mouse port" 置命令字节 bit5（win.tue.nl keyboard
+  controller reference §11.2/§11.3），而 0xD4 的传输会清掉该位（QEMU pckbd.c
+  `kbd_write_data` case `KBD_CCMD_WRITE_MOUSE`："sending data to the mouse
+  reenables PS/2 communication"），所以 0xF2 的应答进队列，auxoff=01。v86 保持
+  端口关闭，是少数派。改 run.sh 期望值与探针注释（探针逻辑未动）。
+- 过期判据二（pm t22）：LAR 期望 `0x00c09b00`，实际 `0x00cf9b00`。根因是
+  `e13644e`（Win95 DPMI）把 LAR 的 bit19:16 改成保留描述符的 limit 高位，探针
+  没跟上。SDM vol.2 LAR 原文："Bits 19:16 are undefined"；QEMU 把它们清零，
+  cemu 保留（Win95 的 DPMI 客户端依赖 LAR 返回的 flags 字节），Bochs/v86/tiny386
+  同样保留。改探针两个期望值（`0x00cf9b00` / `0x00cff200`）并在注释里记成第三处
+  QEMU 分歧；nasm + ld.lld 重建 `pm_smoke.elf`。
+- 回归：`bash test/x86/run.sh` → **63 passed, 0 failed**。CI
+  （`.github/workflows/ci.yml`）随之补齐：加 `check-riscv32`，格数改成
+  riscv64 136 / riscv32 104 / x86 63，nasm 的说明改成"21 个探针的 .elf
+  不入库、现场编"，并写明 xv6/SeaBIOS/Win95 这类真实镜像验收不进 CI。

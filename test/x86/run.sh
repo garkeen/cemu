@@ -391,11 +391,15 @@ fi
 # Dual run against qemu-system-i386 -kernel (monitor: `mouse_button 1` then
 # `mouse_move 10 10 -1` — its Y/Z axes are screen-oriented, so the same host
 # movement is spelled with the signs flipped) passes with the same status 11 and
-# a byte-identical packet. Three divergences, all recorded in progress.log and
-# all in the report line rather than asserted: the power-on command byte (41 vs
-# 47), an unknown command's answer (nothing vs the resend QEMU's own source
-# has), and 0xa7 (QEMU keeps queueing the device's answer while this model stops
-# it at the wire — the spec's reading, and v86's).
+# a byte-identical packet. Two divergences, both recorded in progress.log and
+# both in the report line rather than asserted: the power-on command byte (41 vs
+# 47) and an unknown command's answer (nothing vs the resend QEMU's own source
+# has). 0xa7 is *not* a divergence: it sets bit 5 of the command byte
+# (win.tue.nl keyboard controller reference §11.3), and a 0xd4 write to the
+# mouse clears that bit — "sending data to the mouse reenables PS/2
+# communication" (QEMU pckbd.c kbd_write_data, case KBD_CCMD_WRITE_MOUSE) — so
+# the 0xf2 answer is queued and auxoff reads 01 in both models. v86 keeps the
+# port shut, which is the outlier.
 mouseelf="$dir/probe/ps2mouse.elf"
 if [ ! -f "$mouseelf" ] && command -v nasm > /dev/null 2>&1; then
   nasm -f elf32 -o "$dir/probe/ps2mouse.o" "$dir/probe/ps2mouse.asm" &&
@@ -405,7 +409,7 @@ if [ -f "$mouseelf" ]; then
   out=$(CEMU_DEBUG="mouse=0:0:1@100000,mouse=10:-10:1:1@100000" timeout 60 "$CEMU" \
         --machine x86 --isa x86 "$mouseelf" 2>&1)
   rc=$?
-  if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'unk=fe auxoff=00 irr=10 pkt=09000000290af601' &&
+  if [ "$rc" -eq 11 ] && echo "$out" | grep -q 'unk=fe auxoff=01 irr=10 pkt=09000000290af601' &&
      echo "$out" | grep -q 'ps2mouse ok'; then
     pass=$((pass + 1))
   else
@@ -857,15 +861,18 @@ fi
 # IP/FLAGS/GPRs/selectors read and written at the fig 7-2 offsets).
 # Self-reports 26 "tN ok" lines then "pm-smoke done", exits status 11.
 #
-# Calibration: byte-identical to qemu-system-i386 -kernel on 24 of 26 tests
+# Calibration: byte-identical to qemu-system-i386 -kernel on 23 of 26 tests
 # (pm_qemu4.txt). Two divergences, same root: this qemu build (10.2.92,
 # v11.0.0-rc2-12119-gaa7f0eb8d8-dirty) does NOT execute data-segment limit
 # checks in TCG — t7 (ring-3 store past a GDT data segment limit) and t20
 # check 1 (store past an LDT segment limit; LSL confirms limit 0x1ff, the
 # store still lands) both let the store through where SDM vol.3 5.2.1/5.3
 # mandate #GP. cemu faults and the judge below counts on cemu's output.
-# QEMU (same build) DOES emulate A/D bits (t17, t25) and computes LAR per the
-# 00FxFF00 mask with the undefined nibble zeroed (t22).
+# QEMU (same build) DOES emulate A/D bits (t17, t25). t22's third divergence is
+# LAR bits 19:16, which the SDM leaves undefined (vol.2 LAR, "Bits 19:16 are
+# undefined"): QEMU zeroes the limit nibble, cemu keeps the descriptor's (the
+# probe pins cemu's answer — Win95's DPMI client reads AVL out of the flags
+# byte LAR returns, and Bochs/v86/tiny386 keep the nibble too).
 # Pending: recalibrate t7/t20 against a clean QEMU build.
 expected_pm=26
 out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$dir/pm/pm_smoke.elf" 2>&1)

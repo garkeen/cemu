@@ -27,13 +27,12 @@ static int GdbTrapSignal(uint64_t cause) {
   }
 }
 
-// Interrupt delivery and the Sstc timer line are sampled at the board's
-// 1024-step service boundaries, not every instruction (TinyEMU
-// riscv_cpu_interp checks between blocks). Any instruction boundary is an
-// architecturally valid delivery point, so this only bounds latency; aligning
-// with the board means a line raised by the device poll is taken in the same
-// batch. A sleeping CPU samples every step so wfi still wakes on the first
-// pending line.
+// The Sstc timer line is refreshed on the board's 1024-step service
+// boundaries (TinyEMU riscv_cpu_interp refreshes between blocks), and on every
+// step while STIP is asserted so a stimecmp write retires the request at the
+// next boundary. The interrupt pending test itself runs every step: delivery
+// may not be tied to the batch phase (priv spec 3.1.9), or a guest that
+// enables SIE for a single instruction can starve forever.
 enum { kStepBatch = 1 << 10 };
 
 // Two streams from one body: the normal run's function has no debug branch

@@ -28,7 +28,11 @@ void STEP_FN(CpuState* c) {
   // boundaries (the board polls while the CPU sleeps, so a sleeping guest
   // still wakes on time) — well under the timer's own period.
   int boundary = cpu->wait || (cpu->inst_count & (kStepBatch - 1)) == 0;
-  if (boundary) riscv_sync_timer(cpu, rs);
+  // STIP is the stimecmp comparator's output, not a latch: while it is
+  // asserted, re-evaluate every step so the trap handler's stimecmp write
+  // retires the request at the next instruction boundary instead of
+  // re-trapping until the next service point.
+  if (boundary || (rs->ext_irq & kIrqStip)) riscv_sync_timer(cpu, rs);
 
   // wfi sleep: no fetch until an enabled interrupt is pending; cpu->wait is
   // the one sleep flag and the board run loop keeps the timers running.
@@ -36,7 +40,14 @@ void STEP_FN(CpuState* c) {
     if (((rs->mip | rs->ext_irq) & rs->mie) == 0) return;
     cpu->wait = 0;
   }
-  if (boundary) {
+  // Interrupts are taken at *any* instruction boundary (priv spec 3.1.9), so
+  // the pending test cannot be deferred to the batch boundary: a guest that
+  // enables SIE for a single instruction (the scheduler's intr_on/intr_off
+  // pair) would then miss every service point whenever the loop length and
+  // the batch period stay in phase. The batch boundary only paces the routine
+  // host clock read in riscv_sync_timer (which also runs while STIP is
+  // asserted).
+  if ((rs->mip | rs->ext_irq) & rs->mie) {
     riscv_deliver_interrupt(cpu, rs);
     if (cpu->halted) return;
   }

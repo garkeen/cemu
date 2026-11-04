@@ -93,6 +93,11 @@ cmake --build build --target check-x86      # x86 套件
 测试镜像已入库，不需要客户机工具链；x86 探针的 `.bin` 由 nasm 现生成
 （没装 nasm 则对应那格 SKIP）。所有运行都限时（脚本内 `timeout` 包裹）。
 
+GitHub Actions（`.github/workflows/ci.yml`）在每次 push/PR 跑构建、依赖边与
+三个套件（riscv64 / riscv32 / x86）。xv6、SeaBIOS、Win95 这类真实镜像验收
+不在 CI：它们依赖仓外的 `seabios/out` 与 `xv6-build` 产物，而且套件按
+AGENTS.md §二 不引导固件/软盘/光盘镜像，只在开发机手跑。
+
 ## 调试
 
 观测统一走常驻设施 `CEMU_DEBUG`（唯一调试入口，语法见 AGENTS.md §五）：

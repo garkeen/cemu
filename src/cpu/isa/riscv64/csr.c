@@ -59,8 +59,9 @@ void riscv_sync_timer(CpuState* cpu, RiscvState* s) {
   // Sstc: when the machine provides mtime, stimecmp drives the STIP line
   // (QEMU target/riscv does not gate the CSR on menvcfg.STCE). Skipped
   // while stimecmp holds its reset all-ones value so the common path costs
-  // no host clock reads. step.c calls this on the idle cadence and every
-  // 1024 steps, not per instruction.
+  // no host clock reads. step.c calls this on the idle cadence, every 1024
+  // steps, and on every step while STIP is asserted (the comparator is a
+  // level, so a stimecmp write must retire the request at once).
   if (cpu->timer_read && s->stimecmp != ~0ULL)
     riscv_set_ext_irq(cpu, kIrqStip, cpu->timer_read(cpu->timer_dev) >= s->stimecmp);
 }
