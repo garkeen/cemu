@@ -27,7 +27,8 @@
 // hook's dx/dy straight through, so one host movement means the same thing to
 // either device.
 typedef struct MsMouseDevice {
-  // One byte towards the serial port's receiver (Uart16550Receive).
+  // One byte towards the serial port's receiver (Uart16550HostReceive on the
+// board).
   void (*tx)(void* ctx, uint8_t byte);
   void* tx_ctx;
   struct MsMouseState* st;  // private model state

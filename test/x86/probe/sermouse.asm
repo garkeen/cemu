@@ -194,14 +194,9 @@ putc:
   ret
 
 ; COM1 the way a serial-mouse driver sets it up: 1200 baud (divisor 96), 7 data
-; bits, no parity, one stop bit, receiver FIFO on. The format is not what makes
-; the probe work (the emulated receiver hands the bytes over whatever it says),
-; but the FIFO is: a 16550 with FCR.FE = 0 holds exactly one byte and drops the
-; rest of the burst with an overrun, and a mouse packet is three bytes sent
-; back to back, so a receiver that never enables the FIFO can never assemble
-; one. QEMU's serial_receive1 is the arbiter here — cemu's receiver buffers
-; regardless of FCR.FE (AGENTS.md D32), so only a FIFO-enabled probe runs the
-; same way on both.
+; bits, no parity, one stop bit, receiver FIFO on. The FIFO is the ordinary
+; driver setup; a one-byte receiver works too now that host input is held
+; outside the chip (sermouse_burst.asm pins that).
 uart_init:
   mov dx, 0x3fb
   mov al, 0x82                 ; DLAB set, 7 bits, no parity, 1 stop

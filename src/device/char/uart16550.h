@@ -44,6 +44,20 @@ typedef struct Uart16550 {
   int64_t rx_timeout_at;  // host microseconds when it expires
   int rx_timeout_ip;      // the timeout interrupt is pending (IIR 0b110)
   int thr_ip;             // THR-empty interrupt pending (one-shot, 16550D)
+  // The last byte received with FCR.FE=0. QEMU's serial_ioport_read returns it
+  // when the guest reads RBR with DR clear; the chip's one-deep receiver keeps
+  // it until the next byte arrives.
+  uint8_t rbr;
+
+  // Host-side hold, the role QEMU gives its chardev: bytes pushed by the host
+  // wait here while the receiver has no room and are fed in by
+  // Uart16550Poll. QEMU's frontend asks serial_can_receive and holds the burst;
+  // this machine has no separate chardev layer, so the device owns the hold.
+  // 4096 matches QEMU's CHR_READ_BUF_LEN.
+  uint8_t host_fifo[4096];
+  int host_head;
+  int host_tail;
+  int host_count;
 
   void (*set_irq)(void* ctx, int src, int level);
   void* irq_ctx;
@@ -52,9 +66,11 @@ typedef struct Uart16550 {
 void Uart16550Init(Uart16550* u);
 uint8_t Uart16550Read(Uart16550* u, uint64_t off);
 void Uart16550Write(Uart16550* u, uint64_t off, uint8_t val);
-// Host input -> the receiver, one byte at a time, exactly as SIN would deliver
-// it (dropped while the port loops back: loopback disconnects SIN).
-void Uart16550Receive(Uart16550* u, int ch);
+// Host input -> the receiver: hold a burst (up to 4096 bytes) until the
+// receiver has room, then feed it through the same receive path. This is the
+// chardev backpressure QEMU gets from serial_can_receive, so a serial-mouse
+// burst is not lost.
+void Uart16550HostReceive(Uart16550* u, int ch);
 // Character-timeout expiry, from the board's poll. The timeout is the one
 // receiver event with no register access to hang off: a byte arriving is the
 // guest's business, but the chip decides on its own that a partial FIFO has

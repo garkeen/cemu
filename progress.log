@@ -8,6 +8,24 @@
 > 旧 §九 → §四，旧 §十/§X（调试设施）→ §五，旧 §十一 → §七；`§X Dnn`
 > 指现在的 §六 台账。
 
+## D32/D41 销账：16550 主机保持 + RBR 回读；8254 BCD（2026-11-04）
+
+- **D32**：`Uart16550HostReceive` 给宿主输入一个 4096 字节的保持队列（QEMU
+  `CHR_READ_BUF_LEN`），`Uart16550Poll`/`Uart16550Read` 在接收器有空位时喂入，
+  对应 QEMU `serial_can_receive` + chardev 的位置；SIN 线路径
+  `Uart16550Receive` 不变，仍按芯片过载。RBR 在 FIFO 关闭且 DR=0 时返回上一次
+  收到的字节（QEMU `serial_ioport_read` 的 `ret = s->rbr`），FIFO 开且空返回 0。
+  探针：`uart_rx.asm` 增加 `again=42 empty=00`（QEMU 双跑逐字节相同）；新增
+  `sermouse_burst.asm`——同一指令 8 个鼠标事件共 24 字节，在 FIFO 关闭的单字节
+  接收器上全部按序到达（旧模型只活最后一个字节）。
+- **D41**：8254 的 BCD 位不再只存：装载按十进制解码（0x0000 = 10000），
+  `PitGetCount`/锁存/读回按 BCD 转换，模式 0/1/4/5 的 BCD 回绕走 10000 个码。
+  QEMU 不建模这一位（`hw/timer/i8254.c` 只存 `s->bcd`，状态锁存处写着
+  `XXX: add BCD`），所以 `pit_bcd.asm` 是 lock 格；QEMU 在第一个非十进制半字节
+  0x0f 处失败，该行记进校准文件。
+- 验证只跑相关格：`uart_rx`、`sermouse`、`sermouse_burst`、`pit_bcd`、
+  `pit_irq`；未跑指令集套件。
+
 ## 套件补 SB16 两个探针；D35 销账（2026-11-04）
 
 - **SB16 探针入库**：`test/x86/probe/sb16_dma8.asm` 与 `sb16_dma16.asm` 进

@@ -1,0 +1,26 @@
+Dual run of test/x86/probe/pit_bcd.asm, 2026-11-04:
+
+  cemu --machine x86 --isa x86 pit_bcd.elf                      -> status 11
+  qemu-system-i386 -machine pc -m 32 -kernel pit_bcd.elf \
+      -display none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x4 \
+      -serial file:pit_bcd_qemu.txt                            -> status 3
+
+Lock cell: there is no reference implementation to match. QEMU's
+hw/timer/i8254.c stores the control word's BCD bit (s->bcd) but the counter
+stays binary; its status-latch comment still says "XXX: add BCD and null
+count". The probe therefore fails on QEMU at the first sample that would be a
+non-decimal nibble (0x0f), which is the line below.
+
+  pit-bcd ok
+
+What the probe pins (Intel 8254 datasheet, control word bit 0):
+
+  hi     load 0x1234 in BCD mode and latch immediately. The high byte is 0x12;
+         a binary countdown of 1234 decimal reads 0x04 (0x04d2).
+  tens   re-program with 8-bit access and BCD 0x0016, then sample the low byte
+         200000 times. Every sample must have both nibbles <= 9, and at least
+         one sample must be 0x11..0x16. A binary counter walks through
+         0x0a..0x0f, which are not BCD digits.
+
+cemu pit-bcd ok
+qemu pit-bcd FAIL at=03 got=0f

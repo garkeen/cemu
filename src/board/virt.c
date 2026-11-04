@@ -215,7 +215,7 @@ static void OnHostMouseAbs(void* ctx, int x, int y, int dz, int buttons) {
 static void OnHostSerial(void* ctx, int ch) {
   VirtBoard* vm = (VirtBoard*)ctx;
   if (DebugOn(kDbgMark)) DebugMark("hostserial", ch, 0);
-  Uart16550Receive(&vm->uart, ch);
+  Uart16550HostReceive(&vm->uart, ch);
   if (vm->con) VirtioConsoleReceive(vm->con, ch);
 }
 

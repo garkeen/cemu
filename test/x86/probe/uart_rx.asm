@@ -13,7 +13,10 @@
 ;   keep   RBR then: the newest byte survives (QEMU keeps buf[0] in RBR and
 ;          latches OE for the byte it displaced)
 ;   clear  LSR after that read: DR and OE both gone
+;   again  RBR after DR cleared: the last byte again (the non-FIFO branch of
+;          QEMU's serial_ioport_read returns s->rbr)
 ;   fifo   LSR after four bytes with the FIFO on: DR, no OE
+;   empty  RBR with the FIFO on and empty: 0
 ;   bytes  the four, in order
 ;   full   the overrun bit seen after a seventeenth byte into a full FIFO. It
 ;          is the OR of 64 LSR samples: reading LSR is what clears a latched
@@ -131,9 +134,15 @@ _start:
   mov [keep], al
   GETLSR
   mov [clear], al
+  ; RBR keeps the byte after DR clears (QEMU's non-FIFO branch); an empty
+  ; FIFO reads 0 instead.
+  GETRBR
+  mov [again], al
 
   ; FIFO on: four bytes fit, the receiver asks for service once and keeps order.
   SETFCR 0x07
+  GETRBR
+  mov [empty], al
   TX 0x43
   TX 0x44
   TX 0x45
@@ -207,8 +216,14 @@ _start:
   P m_clear
   mov al, [clear]
   call hex8
+  P m_again
+  mov al, [again]
+  call hex8
   P m_fifo
   mov al, [fifo]
+  call hex8
+  P m_empty
+  mov al, [empty]
   call hex8
   P m_bytes
   mov al, [b0]
@@ -288,7 +303,9 @@ hold:   db 0
 over:   db 0
 keep:   db 0
 clear:  db 0
+again:  db 0
 fifo:   db 0
+empty:  db 0
 b0:     db 0
 b1:     db 0
 b2:     db 0
@@ -301,7 +318,9 @@ m_head:  db "uart hold=", 0
 m_over:  db " over=", 0
 m_keep:  db " keep=", 0
 m_clear: db " clear=", 0
+m_again: db " again=", 0
 m_fifo:  db " fifo=", 0
+m_empty: db " empty=", 0
 m_bytes: db " bytes=", 0
 m_full:  db " full=", 0
 m_headb: db " head=", 0

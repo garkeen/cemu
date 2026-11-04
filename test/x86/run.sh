@@ -290,6 +290,14 @@ else
   echo "SKIP (pit-irq: no nasm and no prebuilt probe bin)"
 fi
 
+# 8254 BCD counting (test/x86/probe/pit_bcd.asm): the control word's BCD bit is
+# not just stored -- the counter decrements the decimal value and the count
+# register reads back BCD digits (0x1234 stays 0x12 0x34; 16..10 are 0x16..0x10,
+# never 0x0a..0x0f). Lock cell: QEMU's hw/timer/i8254.c stores s->bcd but keeps
+# counting binary (its status-latch comment says "XXX: add BCD"), so it fails
+# the probe at 0x0f; the calibration records both lines.
+elf_cell pit_bcd 11 lock
+
 # Machine reset (test/x86/probe/reset.asm, D18 closed): a boot sector that
 # pulls the three ways a PC guest reboots the machine — port 0xCF9's reset
 # control register (SeaBIOS pci_reboot), port 0x92 bit 0 (INIT_NOW) and the
@@ -482,6 +490,41 @@ if [ -f "$mouselff" ]; then
   fi
 else
   echo "SKIP (sermouse: no nasm and no prebuilt probe elf)"
+fi
+
+# Host input hold: eight host mouse events at the same instruction push
+# 24 bytes at COM1 while its receiver is one byte deep (FCR.FE=0). QEMU's
+# chardev holds such a burst when serial_can_receive says the device is full;
+# Uart16550HostReceive now does the same. Without the hold the one-deep receiver
+# keeps only the last byte and 23 are lost to overruns. No QEMU dual run (the
+# monitor's mouse commands go to the PS/2 handler, as in sermouse).
+burstelf="$dir/probe/sermouse_burst.elf"
+if [ ! -f "$burstelf" ] && command -v nasm > /dev/null 2>&1; then
+  nasm -f elf32 -o "$dir/probe/sermouse_burst.o" "$dir/probe/sermouse_burst.asm" &&
+    ld.lld -m elf_i386 -T "$dir/probe/sermouse.ld" -o "$burstelf" \
+      "$dir/probe/sermouse_burst.o"
+fi
+if [ -f "$burstelf" ]; then
+  burstdbg=""
+  i=0
+  while [ "$i" -lt 8 ]; do
+    burstdbg="${burstdbg}mouse=10:-10:1@100000!,"
+    i=$((i + 1))
+  done
+  burstdbg=${burstdbg%,}
+  out=$(CEMU_DEBUG="$burstdbg" timeout 30 "$CEMU" --machine x86 --isa x86 \
+        -mouse serial "$burstelf" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 11 ] &&
+     echo "$out" | grep -q 'pkt=6c0a366c0a366c0a366c0a366c0a366c0a366c0a366c0a36' &&
+     echo "$out" | grep -q 'sermouse-burst ok'; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "sermouse_burst: rc=$rc"
+  fi
+else
+  echo "SKIP (sermouse_burst: no nasm and no prebuilt probe elf)"
 fi
 
 # VGA family core, guest-driven (test/x86/probe/vga_core.asm). No firmware: the
@@ -700,11 +743,12 @@ elf_cell xbcs 11 ref
 # 16550 receiver depth and overrun (test/x86/probe/uart_rx.asm): the two receive
 # depths FCR.FE selects (one byte with the FIFO off -- the next byte replaces it
 # and latches LSR.OE -- sixteen with it on, the seventeenth dropped and OE
-# latched), the ordering inside the queue, and a change of FE emptying it. The
-# probe drives all of it through the chip's own loopback, so no host input is
-# involved. ref cell: the transcript is byte-identical. Before this was modelled
-# the same probe answered `over=61 keep=41 ... off=61`; the remaining difference
-# from QEMU (its chardev holds a burst the device cannot take) is §六 D32.
+# latched), the ordering inside the queue, a change of FE emptying it, and the
+# RBR read-back rule (the last non-FIFO byte after DR clears, 0 from an empty
+# FIFO). The probe drives all of it through the chip's own loopback, so no host
+# input is involved; the separate sermouse_burst cell covers the host hold.
+# ref cell: the transcript is byte-identical. Before this was modelled the same
+# probe answered `over=61 keep=41 ... off=61`.
 elf_cell uart_rx 11 ref
 
 # IGNNE#, port 0xF0 (test/x86/probe/ignne.asm): with CR0.NE=0 an unmasked x87

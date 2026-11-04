@@ -141,11 +141,14 @@ static void FlushRx(Uart16550* u) {
 // off the receiver holds a single byte, so a byte that arrives while that one is
 // still unread replaces it and latches OE (16550D "FIFO Control Register" bit 0;
 // QEMU serial_receive1's else branch keeps the newest byte in RBR and sets
-// UART_LSR_OE). A driver that never enables the FIFO therefore loses the front
-// of a burst here exactly as it would on the wire: this port has no flow control
-// to hold the host back (简化登记 D32).
+// UART_LSR_OE). This is the wire path, so a loopback burst still loses its front
+// exactly as the chip would; host input goes through Uart16550HostReceive's hold
+// first, which is where QEMU's chardev would keep it.
 static void PushRx(Uart16550* u, uint8_t ch) {
   if (!(u->fcr & kFcrEnable)) {
+    // QEMU keeps the newest byte in rbr; a read after DR clears still returns
+    // it (serial_ioport_read's non-FIFO branch).
+    u->rbr = ch;
     if (u->rx_count > 0) {
       u->lsr |= kLsrOe;  // the byte waiting there is lost, this one takes its place
       u->rx_fifo[u->rx_tail] = ch;
@@ -173,6 +176,25 @@ static void PushRx(Uart16550* u, uint8_t ch) {
   UpdateIrq(u);
 }
 
+// The receiver can take another byte: one with the FIFO off, up to 16 with it
+// on. This is QEMU's serial_can_receive, used by the host hold below.
+static int ReceiverHasRoom(const Uart16550* u) {
+  return (u->fcr & kFcrEnable) ? u->rx_count < kRxFifoSize : u->rx_count == 0;
+}
+
+// Feed held host bytes into the receiver while it has room. The hold exists so
+// a host burst (a serial-mouse packet train, a pasted console block) waits
+// outside the one-deep receiver instead of being overwritten there; QEMU's
+// chardev does the same with serial_can_receive.
+static void DrainHost(Uart16550* u) {
+  while (u->host_count > 0 && ReceiverHasRoom(u)) {
+    uint8_t ch = u->host_fifo[u->host_tail];
+    u->host_tail = (u->host_tail + 1) % (int)sizeof(u->host_fifo);
+    u->host_count--;
+    PushRx(u, ch);
+  }
+}
+
 void Uart16550Init(Uart16550* u) {
   // Preserve the sink: a board may install it before or after Init.
   void (*sink)(void*, int, int) = u->set_irq;
@@ -192,16 +214,22 @@ uint8_t Uart16550Read(Uart16550* u, uint64_t off) {
     case 0:
       if (u->lcr & kLcrDlab) return (uint8_t)(u->divider & 0xff);
       {
-        uint8_t v = 0;
+        uint8_t v;
         if (u->rx_count > 0) {
           v = u->rx_fifo[u->rx_tail];
           u->rx_tail = (u->rx_tail + 1) % kRxFifoSize;
           u->rx_count--;
+        } else {
+          // QEMU serial_ioport_read: with the FIFO off, RBR keeps the last
+          // received byte; an empty FIFO reads 0.
+          v = (u->fcr & kFcrEnable) ? 0 : u->rbr;
         }
         // Reading the data retires the timeout interrupt and its timer: the
-        // FIFO it was waiting on is no longer waiting.
+        // FIFO it was waiting on is no longer waiting. A freed slot lets the
+        // held host burst continue, which may arm a new timeout.
         u->rx_timeout_ip = 0;
         u->rx_timeout_armed = 0;
+        DrainHost(u);
         RefreshLsr(u);
         UpdateIrq(u);
         return v;
@@ -282,6 +310,7 @@ void Uart16550Write(Uart16550* u, uint64_t off, uint8_t val) {
       // never busy (a THR write leaves at once).
       u->rx_trigger = kTriggerLevels[(val >> 6) & 3];
       RefreshLsr(u);
+      DrainHost(u);  // a cleared/enlarged receiver can take the held burst
       UpdateIrq(u);
       break;
     }
@@ -310,12 +339,25 @@ void Uart16550Write(Uart16550* u, uint64_t off, uint8_t val) {
   }
 }
 
-void Uart16550Receive(Uart16550* u, int ch) {
+void Uart16550HostReceive(Uart16550* u, int ch) {
   if (u->mcr & kMcrLoop) return;  // loopback disconnects SIN
-  PushRx(u, (uint8_t)ch);
+  if (u->host_count >= (int)sizeof(u->host_fifo)) {
+    // The host source cannot be paused here (stdin and a synthetic mouse push
+    // without a can_receive callback); QEMU's chardev would stop reading the
+    // source instead. 4096 is QEMU's own read-buffer size, so any burst that
+    // would fit its frontend fits this hold.
+    return;
+  }
+  u->host_fifo[u->host_head] = (uint8_t)ch;
+  u->host_head = (u->host_head + 1) % (int)sizeof(u->host_fifo);
+  u->host_count++;
+  DrainHost(u);
 }
 
 void Uart16550Poll(Uart16550* u) {
+  // The receiver may have room since the last read (a guest that drains a
+  // burst); feed it before deciding whether the character timeout is due.
+  DrainHost(u);
   if (!u->rx_timeout_armed || HostTimerNow() < u->rx_timeout_at) return;
   u->rx_timeout_armed = 0;
   // The timeout reports data that has waited long enough; with the FIFO

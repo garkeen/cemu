@@ -372,7 +372,7 @@ static void OnHostMouseSerial(void* ctx, int dx, int dy, int dz, int buttons) {
 
 static void OnMsMouseByte(void* ctx, uint8_t byte) {
   X86Board* xm = (X86Board*)ctx;
-  Uart16550Receive(&xm->uart, byte);
+  Uart16550HostReceive(&xm->uart, byte);
 }
 
 // The 8042's keyboard wire, both directions, plus the translation bit.
@@ -435,7 +435,7 @@ static void OnAuxByte(void* ctx, uint8_t byte) {
 static void OnHostSerial(void* ctx, int ch) {
   X86Board* xm = (X86Board*)ctx;
   if (DebugOn(kDbgMark)) DebugMark("hostserial", ch, 0);
-  Uart16550Receive(&xm->uart, ch);
+  Uart16550HostReceive(&xm->uart, ch);
 }
 
 // COM1's interrupt line into the ISA fan-out (the UART's own source number is

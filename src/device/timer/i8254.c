@@ -77,6 +77,12 @@ static int PitGetCount(PitChannel* s) {
     case 1:
     case 4:
     case 5:
+      if (s->bcd) {
+        // The BCD counter wraps 0 -> 9999 (not 0 -> ffff): count+1 states per
+        // sweep, and a programmed 0 (10000) sweeps all 10000 codes.
+        uint32_t cycle = s->count >= 10000 ? 10000u : s->count + 1u;
+        return (int)(s->count - (d % cycle));
+      }
       return (s->count - d) & 0xffff;
     case 3:
       // square wave: odd counts behave slightly differently (QEMU comment).
@@ -125,21 +131,50 @@ static void PitDriveOut(PitDevice* pit, PitChannel* s) {
   }
 }
 
-static void PitLoadCount(PitDevice* pit, PitChannel* s, int val) {
-  if (val == 0) val = 0x10000;
+static uint32_t BcdToDec(uint32_t v) {
+  return ((v >> 12) & 0xf) * 1000u + ((v >> 8) & 0xf) * 100u + ((v >> 4) & 0xf) * 10u +
+         (v & 0xf);
+}
+
+// The count register in BCD mode shows decimal digits; 10000 has no four-digit
+// representation and reads as 0x0000 (the datasheet's BCD zero).
+static uint16_t DecToBcd(uint32_t v) {
+  v %= 10000u;
+  return (uint16_t)(((v / 1000u) % 10u) << 12 | ((v / 100u) % 10u) << 8 |
+                    ((v / 10u) % 10u) << 4 | (v % 10u));
+}
+
+// Load a count already expressed in PIT ticks. The re-anchor in PitPoll uses
+// this: its value is the decoded decimal/binary count, not a programmed BCD
+// byte, so it must not go through the radix conversion again.
+static void PitSetCount(PitDevice* pit, PitChannel* s, uint32_t count) {
   // 0 = unarmed: the anchor is armed on the first Poll after this load so
   // that machine construction / image loading wall time is not counted as
   // elapsed PIT ticks (the counter only runs while the guest does).
   s->count_load_time = s->armed ? (uint64_t)HostTimerNowNs() : 0;
   s->last_irq_count = 0;
-  s->count = (uint32_t)val;
+  s->count = count;
   s->armed = 1;
   if (s->mode == 3) PitDriveOut(pit, s);
 }
 
+static void PitLoadCount(PitDevice* pit, PitChannel* s, int val) {
+  uint32_t count;
+  if (s->bcd) {
+    // BCD mode: the programmed value is a decimal number, and 0 means 10000
+    // (the datasheet's BCD zero), not 65536.
+    count = BcdToDec((uint32_t)val & 0xffffu);
+    if (count == 0) count = 10000;
+  } else {
+    count = val == 0 ? 0x10000u : (uint32_t)val;
+  }
+  PitSetCount(pit, s, count);
+}
+
 static void PitLatchCount(PitChannel* s) {
   if (!s->count_latched) {
-    s->latched_count = (uint16_t)PitGetCount(s);
+    uint32_t v = (uint32_t)PitGetCount(s);
+    s->latched_count = s->bcd ? DecToBcd(v) : (uint16_t)v;
     s->count_latched = s->rw_mode;
   }
 }
@@ -216,6 +251,7 @@ static uint8_t PitIoRead(PitDevice* pit, uint16_t addr) {
     }
   }
   int count = PitGetCount(s);
+  if (s->bcd) count = DecToBcd((uint32_t)count);
   switch (s->read_state) {
     case kRwLsb:
       return count & 0xff;
@@ -236,6 +272,7 @@ static void PitReset(PitDevice* pit) {
   for (int i = 0; i < 3; i++) {
     PitChannel* s = &pit->channels[i];
     s->mode = 3;
+    s->bcd = 0;
     s->gate = (i != 2);
     s->irq = -1;
     s->out_level = 0;
@@ -287,7 +324,7 @@ void PitPoll(PitDevice* pit) {
         // old microsecond form used 1<<31 us (~35 min), so keep the same span
         // in the nanosecond clock (1<<41 ns ~ 2200 s).
         if ((uint64_t)HostTimerNowNs() - s->count_load_time > (1ULL << 41))
-          PitLoadCount(pit, s, s->count);
+          PitSetCount(pit, s, s->count);
       } else if (s->out_level) {
         // A poll later OUT is low again: drop the line so the next terminal
         // count is a fresh rising edge (and a level-sensitive controller does
