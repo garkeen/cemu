@@ -187,35 +187,47 @@ realmode（kvm-unit-tests 官方实模式套件）127 PASS/0 FAIL。
 - 验收：kvm-unit-tests 32 位保护模式用例 + multiboot 平段内核开分页冒烟。
 - riscv 侧无新增语义（S 态/Sv39 阶段 2 已落地）。
 
-### 阶段 3.5：调试器与 GUI ✅（x86 硬件观察点已接；riscv 侧与"只读"编码按 D6 在册；VGA 图形模式与 ramfb 按 D17 挪入阶段 4）
-三片独立可交付，顺序可调；显示通道是阶段 4 图形 OS 的硬前置。
+### 阶段 3.5：调试器与 GUI ✅
+三片独立可交付，顺序可调；显示通道是阶段 4 图形 OS 的硬前置。三片交付面
+（观测中枢 / RSP 调试器 / 图形前端）已全部完成；riscv32/riscv64 的 gdb
+硬件观察点也在本阶段接到 trigger.c 的内部 mcontrol 槽位（与 x86 的 DR0-DR7
+同一契约），见下。
 - 前置任务：exec.c 逐 case 填 insn_rec.mnemonic（名字级，SDM/手册指令名；
   语法级不做）。CEMU_DEBUG 事件表的 MNEMONIC 列在 case 入口即有值，
   故障指令同样可读；state 基线不受影响。
 - 显示通道：host/ 加 Win32 GDI 窗口与显示后端，device/ 加显示设备。
-  x86 CGA 文本模式先行（realmode 即可点亮验收），VGA 图形模式、
-  riscv ramfb 随后——阶段 4 设备清单中的 CGA 在此提前消化。
+  x86 CGA 文本模式先行（realmode 即可点亮验收，阶段 4 设备清单中的 CGA
+  在此提前消化）；VGA 图形模式与 riscv ramfb 归阶段 4（D17），不在本阶段
+  交付面内。
 - 调试器内核：gdb 远程串行协议（RSP）over TCP（host/ 加 winsock），
-  断点/单步/读写现场复用 raise 通道与 CEMU_DEBUG 基建。软件断点不依赖
-  D6；硬件断点已接：`hbreak`（Z1）与普通断点共用**按线性 PC 匹配**的断点表，
-  不往客机内存 patch 0xCC —— 为此 `isa_ops` 加了 `gdb_pc` 接缝（x86 交
-  CS base + EIP，riscv 留 NULL），否则实模式给 gdb 的是段内偏移，`x/i $pc`
-  反汇编取错字节、按 gdb 说得出的地址下的断点永不触发。
-  **`watch`/`awatch`（Z2/Z4）已接**：走 `isa_ops` 的三个新接缝
-  （`gdb_set_watch`/`gdb_clear_watch`/`gdb_watch_hits`）落到 CPU 自己的 DR0-DR7，
-  装一次只有一份匹配器；命中**报给 stub、不投递给客机**（`x86_state.gdb_watch_mask`
-  记下这四个槽里哪些是调试器装的）——否则一个没有 #DB 处理程序的裸引导扇区会把
+  断点/单步/读写现场复用 raise 通道与 CEMU_DEBUG 基建。`hbreak`（Z1）
+  与普通断点共用**按线性 PC 匹配**的断点表，不往客机内存 patch 0xCC ——
+  为此 `isa_ops` 加了 `gdb_pc` 接缝（x86 交 CS base + EIP；riscv 的 pc
+  本身就是线性地址，留 NULL 是正确口径），否则实模式给 gdb 的是段内偏移，
+  `x/i $pc` 反汇编取错字节、按 gdb 说得出的地址下的断点永不触发。
+  **`watch`/`awatch`（Z2/Z4）已接**：走 `isa_ops` 的三个接缝
+  （`gdb_set_watch`/`gdb_clear_watch`/`gdb_watch_hits`）。x86 落到 DR0-DR7；
+  riscv32/riscv64 落到 `trigger.c` 的四个内部 mcontrol 槽位（地址范围 +
+  load/store 类别，不占用 guest 可见的 tdata1..3）。装一次只有一份匹配器；
+  命中**报给 stub、不投递给客机**（x86 的 `x86_state.gdb_watch_mask` 记下
+  哪些槽是调试器装的）——否则一个没有 #DB / 断点处理程序的裸引导扇区会把
   这个陷阱变成三重故障和复位环，gdb 还没看到值客机就重启了（实测过一次）。
-  **`rwatch`（Z3）回空包**：DR7 的 R/W 字段没有"只读"编码（SDM vol.3 表 17-2），
-  本机不把它偷偷放宽成"读写"，gdb 因此退回自己的软件观察点；riscv 一侧三个接缝
-  留 NULL，trigger 模块与 RSP 之间那条通道记在 D6。`vCont?` 现在如实报
+  **`rwatch`（Z3）**：x86 回空包是最终行为，DR7 的 R/W 字段没有"只读"编码
+  （SDM vol.3 表 17-2），gdb 因此退回自己的软件观察点；riscv 用 mcontrol6
+  的 load 位表达只读 watch（debug spec 5.3.12），Z2/Z3/Z4 三种 kind 都接受。
+  riscv 的槽位是 stub 私有的，guest 的 trigger 文件不被改写（QEMU 的 gdbstub
+  同样把 watchpoint 放在 `CPUState.watchpoints`，见 `system/watchpoint.c` 的
+  `cpu_watchpoint_insert`）。`vCont?` 现在如实报
   `vCont;c;s`（解析分支只认这两个动作，所以不 advertise `t`/`r`）。
 - 图形调试前端：依赖前两片，纯 RSP 客户端（寄存器/内存/断点/单步控制），
   不内置反汇编（反汇编一律外部工具——gdb/lldb
   attach 同一 stub 客户端侧反汇编，或 llvm-objdump 离线看镜像）。cemu
   本体保持纯 C 零新依赖。
-- 验收：真 gdb attach 设断点/单步/看现场；CGA 窗口点亮 realmode hello；
-  图形 OS 显示前置就绪，衔接阶段 4。
+- 验收：真 gdb attach 设断点/单步/看现场；硬件观察点（x86 Z2/Z4，
+  riscv32/64 Z2/Z3/Z4）；CGA 窗口点亮 realmode hello；图形 OS 显示前置
+  就绪，衔接阶段 4。
+- 完成归档（2026-11-04）：上述三片交付面全部达成；x86 的 DR0-DR7 与
+  riscv32/64 的 trigger 内部槽位都已接入 RSP。
 
 ### 阶段 4：设备全集与真实 OS（此后为纯设备/IO 阶段；进行中）
 - PC 设备模型全集（VGA 家族核、PS/2、PIC、PIT、UART、IDE/ATAPI、软盘 FDC+8237、LAPIC、

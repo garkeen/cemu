@@ -118,3 +118,93 @@ void Riscv32TriggerWriteTdata1(Riscv32State* s, uint64_t val) {
 void Riscv32TriggerWriteTdata3(Riscv32State* s, uint64_t val) {
   s->tdata3[s->tselect] = val & kXlenMask;
 }
+
+// ---- gdb stub watchpoints ---------------------------------------------------
+//
+// RSP Z2/Z3/Z4 name a write/read/access watchpoint at a virtual address and
+// length (GDB Remote Serial Protocol, "Watchpoint Packets").  RISC-V
+// mcontrol6 expresses the same three classes with its store/load bits (debug
+// spec 5.3.12) and the address match in tdata2; QEMU nevertheless keeps gdb
+// watchpoints in a separate CPU watchpoint list (system/watchpoint.c,
+// cpu_watchpoint_insert) instead of reprogramming the guest's tdata CSRs, so
+// the guest's two triggers are untouched.  This is that same split: the
+// match semantics are mcontrol6's load/store classes, the storage is private
+// to the stub.  A hit is reported to the stub after the step and is never
+// vectored, because a bare guest has no breakpoint handler (cpu/isa/x86/step.c
+// documents the same rule for DR0-DR7).
+
+// True when the RSP kind selects this operation class: 2 = write (store),
+// 3 = read (load), 4 = access (either).
+static int GdbWatchKindMatch(int kind, int op) {
+  switch (kind) {
+    case 2:
+      return (op & kTrigOpStore) != 0;
+    case 3:
+      return (op & kTrigOpLoad) != 0;
+    case 4:
+      return (op & (kTrigOpLoad | kTrigOpStore)) != 0;
+    default:
+      return 0;
+  }
+}
+
+// Record a stub watchpoint hit for one memory operation.  The access is
+// [addr, addr+size); the watch range is [base, base+len).  Any overlap is a
+// hit, the same rule as x86's WatchData (cpu/isa/x86/exec.c) and QEMU's
+// watchpoint range check: a wider access that covers one watched byte counts.
+void Riscv32GdbWatchCheck(Riscv32State* s, int op, uint64_t addr, int size) {
+  if (size <= 0) return;
+  uint64_t a_last = addr + (uint64_t)size - 1;
+  if (a_last < addr) return;  // an access that wraps the address space
+  for (int i = 0; i < kGdbWatchCount; i++) {
+    if (!(s->gdb_watch_mask & (1u << i)) ||
+        !GdbWatchKindMatch(s->gdb_watch_kind[i], op))
+      continue;
+    uint64_t w_lo = s->gdb_watch_addr[i];
+    uint64_t w_last = w_lo + (uint64_t)s->gdb_watch_len[i] - 1;
+    if (addr <= w_last && w_lo <= a_last) s->gdb_watch_hits |= 1u << i;
+  }
+}
+
+// Arm one stub watchpoint.  The RSP length is an exact byte range; mcontrol6's
+// size field names the common 1/2/4/8 sizes, but this matcher (like QEMU's
+// CPU watchpoint list, system/watchpoint.c) keeps the range gdb asked for.
+// RV32 addresses are 32 bits; a request outside that space can never match and
+// is refused rather than silently truncated.  The overflow rule is QEMU's
+// cpu_watchpoint_insert: an empty range or one that runs off the end is invalid.
+int Riscv32GdbSetWatch(CpuState* cpu, uint64_t addr, uint32_t len, int kind) {
+  Riscv32State* s = (Riscv32State*)cpu->priv;
+  if (kind < 2 || kind > 4) return -1;
+  if (len == 0) return -1;
+  if (addr > kXlenMask || addr + (uint64_t)len - 1 > kXlenMask) return -1;
+  for (int i = 0; i < kGdbWatchCount; i++) {
+    if (s->gdb_watch_mask & (1u << i)) continue;
+    s->gdb_watch_mask |= 1u << i;
+    s->gdb_watch_kind[i] = (uint8_t)kind;
+    s->gdb_watch_addr[i] = addr;
+    s->gdb_watch_len[i] = len;
+    s->gdb_watch_hits &= ~(1u << i);
+    return i;
+  }
+  return -1;  // all four slots are in use
+}
+
+// Disarm a stub watchpoint.  The slot number is the one gdb_set_watch
+// returned; a guest trigger was never touched, so there is nothing else to
+// restore.
+int Riscv32GdbClearWatch(CpuState* cpu, int slot) {
+  Riscv32State* s = (Riscv32State*)cpu->priv;
+  if (slot < 0 || slot >= kGdbWatchCount ||
+      !(s->gdb_watch_mask & (1u << slot)))
+    return -1;
+  s->gdb_watch_mask &= ~(1u << slot);
+  s->gdb_watch_hits &= ~(1u << slot);
+  return 0;
+}
+
+// The slots that fired on the step just committed (cpu/step.h gdb_watch_hits).
+// step_body.inc clears the mask at the start of every step, so a hit is
+// reported exactly once.
+uint32_t Riscv32GdbWatchHits(CpuState* cpu) {
+  return ((Riscv32State*)cpu->priv)->gdb_watch_hits;
+}

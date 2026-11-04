@@ -162,10 +162,12 @@ const isa_ops k_isa_riscv64 = {
     riscv_gdb_write_regs,
     riscv_gdb_last_trap,
     NULL,  // gdb_pc: the committed pc is already linear here (cpu/step.h)
-    NULL,  // gdb_set_watch / gdb_clear_watch / gdb_watch_hits: no RSP channel
-           // onto the trigger module yet (AGENTS.md 简化登记 D6)
-    NULL,
-    NULL,
+    // gdb stub hardware watchpoints: trigger.c's internal range matchers, with
+    // the guest-visible tdata1..3 left to the guest. QEMU keeps its gdb
+    // watchpoints in CPUState.watchpoints (system/watchpoint.c) the same way.
+    RiscvGdbSetWatch,
+    RiscvGdbClearWatch,
+    RiscvGdbWatchHits,
     2,  // ELFCLASS64 (riscv32 shares e_machine 243; the loader matches class)
     NULL,  // read_lin: dumpl= has no riscv reader yet (the x86 VxD diagnosis
            // needed it first); the walk would take the same scratch-landing-pad

@@ -126,6 +126,16 @@ static const uint64_t kTd3MhMask = (0x7ULL << 48) | (0x1fffULL << 51);
 // Trigger operations: one check per operation class (debug spec 5.3).
 enum { kTrigOpExecute = 1, kTrigOpStore = 2, kTrigOpLoad = 4 };
 
+// gdb stub watchpoints (RSP Z2/Z3/Z4) are kept outside the guest-visible
+// trigger file.  QEMU does the same: system/watchpoint.c's
+// cpu_watchpoint_insert() stores vaddr/len/flags in CPUState.watchpoints, and
+// gdbstub/system.c's gdb_vm_state_change() reports the T05...watch: stop --
+// the guest's tdata1..3 (only two mcontrol6 triggers on this machine) are not
+// reprogrammed.  Four slots match the stub's kMaxWatchpoints; each is a
+// [addr, addr+len) range filtered by the RSP kind (2 = write, 3 = read,
+// 4 = access).
+enum { kGdbWatchCount = 4 };
+
 // Cache-block size for Zicboz/Zicbom (virt DTB riscv,cboz-block-size /
 // cbom-block-size = 64).
 enum { kCacheBlockSize = 64 };
@@ -267,6 +277,17 @@ typedef struct RiscvState {
   // mapping of the last cause (step.c, where the cause is in hand).
   uint64_t trap_seq;
   uint8_t trap_signal;
+  // gdb stub watchpoints (RSP Z2/Z3/Z4, cpu/step.h gdb_set_watch): internal
+  // range matchers, not guest-visible tdata slots. The hit mask is per step
+  // (cleared in step_body.inc) and is reported to the stub instead of being
+  // vectored, so a bare guest with no breakpoint handler does not reset.
+  // gdb_watch_mask is the fast-path gate: zero on every normal run, so the
+  // load/store funnels pay one test and no call when gdb is not watching.
+  uint32_t gdb_watch_mask;
+  uint64_t gdb_watch_addr[kGdbWatchCount];
+  uint32_t gdb_watch_len[kGdbWatchCount];
+  uint8_t gdb_watch_kind[kGdbWatchCount];
+  uint32_t gdb_watch_hits;
 } RiscvState;
 
 enum {
@@ -302,6 +323,13 @@ void riscv_mem_store(frame* f, uint64_t vaddr, int size, uint64_t val);
 void RiscvTriggerCheck(frame* f, RiscvState* s, int op, uint64_t addr);
 void RiscvTriggerWriteTdata1(RiscvState* s, uint64_t val);
 void RiscvTriggerWriteTdata3(RiscvState* s, uint64_t val);
+// gdb stub watchpoints (trigger.c): RSP kind 2 = write, 3 = read, 4 = access;
+// returns the slot 0..kGdbWatchCount-1 or -1. Hits are reported through
+// RiscvGdbWatchHits after the step; they are never delivered to the guest.
+int RiscvGdbSetWatch(CpuState* cpu, uint64_t addr, uint32_t len, int kind);
+int RiscvGdbClearWatch(CpuState* cpu, int slot);
+uint32_t RiscvGdbWatchHits(CpuState* cpu);
+void RiscvGdbWatchCheck(RiscvState* s, int op, uint64_t addr, int size);
 // Interrupt line input; installed as CpuState.set_irq so boards never name a
 // CPU-model function. `bit` is one of kIrq* (platform.h).
 void riscv_set_ext_irq(CpuState* cpu, uint64_t bit, int level);

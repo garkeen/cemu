@@ -8,6 +8,52 @@
 > 旧 §九 → §四，旧 §十/§X（调试设施）→ §五，旧 §十一 → §七；`§X Dnn`
 > 指现在的 §六 台账。
 
+## riscv32/64 gdb 硬件观察点（D6 销账，2026-11-04）
+
+- `cpu/isa/riscv{64,32}/trigger.c` 增加四个 stub 私有的 mcontrol 等价槽位：
+  RSP Z2 写 / Z3 读 / Z4 访问；长度按 gdb 给出的字节范围（QEMU 的 CPU
+  watchpoint 也接受任意非零长度），命中条件是访问 [vaddr, vaddr+size) 与
+  watch [addr, addr+len) 有任意字节重叠。槽位不写 guest 可见的 tdata1..3；
+  QEMU 的 gdbstub 同样把 watchpoint 放在 `CPUState.watchpoints`
+  （`system/watchpoint.c` 的 `cpu_watchpoint_insert`、`gdbstub/system.c` 的
+  watch 停止回复），不是 guest trigger CSR。
+- `exec.c` 的 load/store 漏斗在 guest trigger 之后调用 GdbWatchCheck；命中只
+  置每次 step 清空的 `gdb_watch_hits`，由 gdbstub 的 StopCb 停会话，不投递
+  断点异常。`step_body.inc` 在每步入口清位，避免一次命中重复报告。
+- `isa_riscv{64,32}.c` 的三个 gdb 接缝从 NULL 改为实现。Z3 在 riscv 上可表达
+  （mcontrol6 的 load 位，debug spec 5.3.12），x86 仍因 DR7 无只读编码回空包
+  （SDM vol.3 表 17-2）。
+- 顺带修了 detach 的收尾：`gdbstub.c` 的 `D` 原来只清断点表，不清 watchpoint；
+  现在逐个 WatchRemove，x86 与 riscv 都不会把 stub 拥有的观察点留给客人或下
+  一次 attach。
+- 验证（临时 RSP 客户端 + 两个裸机循环镜像，不入仓、不进套件）：
+  rv64 的 Z2 停在 store 之后 pc=0x80000014、Z3 停在 load 之后 pc=0x80000018、
+  Z4 同 Z2；rv32 分别为 0x80000010 / 0x80000014 / 0x80000010。三者安装与
+  删除均回 OK，detach 正常；四槽上限（第 5 个回空包）与零长度请求的拒绝
+  也验证。`probe_triggers.elf`、rv64ui-p-add、rv32ui-p-add
+  都 exit 0；构建零告警。未跑全量套件（按纪律需用户当轮另行发话）。
+- 文档：AGENTS.md D6 整行删除；arch.md 阶段 3.5 改为 x86 DR0-DR7 与
+  riscv32/64 的内部 trigger 槽位都已接入；README 同步。
+
+## 阶段 3.5 完成归档（2026-11-04）
+
+- 阶段 3.5 的三片交付面全部完成：CEMU_DEBUG 观测中枢、gdb RSP 调试器
+  （Z0/z0、Z1/hbreak、Z2/Z4 watch/awatch、c/s、0x03 异步中断、D detach、
+  qXfer target.xml）、CGA 文本显示通道 + Win32 输入、纯 RSP 前端 cemugui。
+  显示面的 VGA 图形模式与 riscv ramfb 仍归阶段 4（D17），不并入本阶段。
+- x86 侧：软件断点按线性 PC 匹配，不往客机内存 patch 0xCC；硬件观察点走
+  CPU 自己的 DR0-DR7，命中只报 stub、不投递给客机。`rwatch`（Z3）回空包是
+  最终行为——DR7 的 R/W 字段没有"只读"编码（SDM vol.3 表 17-2），gdb 因此
+  退回自己的软件观察点。
+- riscv 侧：`gdb_pc` 留 NULL 是正确口径（pc 本身是线性地址，无需段基址换算）。
+  本条归档时硬件观察点仍按 D6 登记；随后已由其上方的“riscv32/64 gdb 硬件
+  观察点”条实现并销账。
+- 文档同步：arch.md 阶段 3.5 标题去掉阶段级保留，验收段增加完成归档；
+  AGENTS.md D6 当时收窄为 riscv trigger 扩展，后来在实现后整行删除；
+  README 的调试段补一句现状。
+- 验收沿用 2026-09-13 片 2/片 3 的 GUI 全流程与无头 RSP 探针，以及
+  2026-10-21 的 x86/riscv 全量回归；该轮只做文档归档，不改代码。
+
 ## E1 销账：riscv F/D 改走 Berkeley SoftFloat 3e（2026-11-04）
 
 - SoftFloat 从 `src/cpu/isa/x86/softfloat/` 移到 `src/cpu/softfloat/`（x86

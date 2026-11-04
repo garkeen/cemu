@@ -123,25 +123,29 @@ typedef struct isa_ops {
   // fires. NULL = linear and the committed pc are the same thing.
   uint64_t (*gdb_pc)(CpuState* cpu);
   // A hardware watchpoint requested through gdb's RSP `Z2`/`Z3`/`Z4` packet,
-  // installed in the processor's own debug registers (x86: DR0-DR7, SDM
-  // vol.3 17.2) rather than in a second matcher: the same machine state a guest
-  // debugger programs with MOV DRn, so the trap that stops the session is the one
-  // the CPU already raises. `kind` is the RSP kind (2 = write, 3 = read,
-  // 4 = access) and `len` a byte count -- the mapping to the architecture's
-  // encoding is the ISA's, and whatever it cannot express it refuses here: x86
-  // has no read-only data breakpoint (R/W 11 means read OR write, SDM vol.3
-  // table 17-2). Returns the debug register slot used, or -1 -- no free slot, a
+  // installed in the processor's own hardware matcher (x86: DR0-DR7, SDM
+  // vol.3 17.2; riscv: trigger.c's internal mcontrol range slots) rather than
+  // in a second matcher. x86 shares the machine state a guest debugger
+  // programs with MOV DRn; riscv keeps the stub slots separate from the guest's
+  // tdata CSRs (QEMU likewise uses CPUState.watchpoints), so a guest trigger
+  // and a gdb watchpoint do not overwrite each other. `kind` is the RSP kind
+  // (2 = write, 3 = read, 4 = access) and `len` a byte count -- the mapping to
+  // the architecture's encoding is the ISA's, and whatever it cannot express it
+  // refuses here: x86 has no read-only data breakpoint (R/W 11 means read OR
+  // write, SDM vol.3 table 17-2), while riscv expresses it with mcontrol6's
+  // load bit. Returns the debug register slot used, or -1 -- no free slot, a
   // size or alignment the encoding forbids, or no such mechanism (NULL). The
   // stub answers -1 with an empty packet, which is what RSP says for an
   // unsupported operation, and gdb falls back to its software watchpoints.
   int (*gdb_set_watch)(CpuState* cpu, uint64_t addr, uint32_t len, int kind);
   int (*gdb_clear_watch)(CpuState* cpu, int slot);
   // The slots among those installed above that fired on the step just committed
-  // (x86: which DR6 B bits the watchpoint set). The stub stops a *free-running*
-  // session on this, which it does not do for a guest exception: a watchpoint the
-  // debugger asked for is not a fault of the guest's own, and it is reported
-  // rather than vectored (cpu/isa/x86/step.c's debug-trap block). NULL = no such
-  // report.
+  // (x86: which DR6 B bits the watchpoint set; riscv: which internal slot
+  // matched). The stub stops a *free-running* session on this, which it does
+  // not do for a guest exception: a watchpoint the debugger asked for is not a
+  // fault of the guest's own, and it is reported rather than vectored
+  // (cpu/isa/x86/step.c's debug-trap block and the riscv trigger checks in
+  // cpu/isa/riscv*/exec.c). NULL = no such report.
   uint32_t (*gdb_watch_hits)(CpuState* cpu);
 
   // The ELF class this model implements: 1 = ELFCLASS32, 2 = ELFCLASS64,

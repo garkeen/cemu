@@ -7,6 +7,10 @@
 void STEP_FN(CpuState* c) {
   cpu = c;
   rs = (RiscvState*)cpu->priv;
+  // gdb watchpoint hits are per step (cpu/step.h gdb_watch_hits): clear the
+  // report before any load/store of this instruction can set a bit. No
+  // installed slot means no bit can be set, so normal runs pay one test.
+  if (rs->gdb_watch_mask) rs->gdb_watch_hits = 0;
   static frame fbuf;
   frame* fr = &fbuf;
   fr->cpu = cpu;

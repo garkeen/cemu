@@ -594,11 +594,11 @@ CEMU_DEBUG="screen" timeout 110 ./cemu.exe ... img 2> c.txt
   之后 QEMU 照样 `set VGA mode 10` 进 640×350 桌面，而 cemu 用同一个 ROM 退回
   mode 3 —— 所以 win101 的分歧**在机器上，不在固件构建上**。见 progress.log 片 33。
 
-- 交互式调试器/REPL、反汇编器、GUI 输出立项为阶段 3.5（见 arch.md 阶段计划：
-  gdb RSP stub / Win32 显示通道 / 图形调试前端；前端不内置反汇编，反汇编一律
-  走外部工具）。阶段 3.5 的 gdb RSP stub 已落地（`-gdb`/`-s`/`-S`，协议包由
-  `CEMU_DEBUG=gdb` 记录，cemugui 是配套前端）：**CEMU_DEBUG 仍是唯一的观测
-  入口**，交互式单步/断点走 gdb/cemugui；两者不是替代关系。
+- 阶段 3.5 的交互式调试面已交付：gdb RSP stub（`-gdb`/`-s`/`-S`，协议包由
+  `CEMU_DEBUG=gdb` 记录）+ cemugui 图形前端；前端不内置反汇编，反汇编走
+  gdb/lldb/llvm-objdump 等外部工具。x86 的硬件观察点走 DR0-DR7，
+  riscv32/64 走 trigger 模块的内部槽位。**CEMU_DEBUG 仍是唯一的观测入口**，
+  交互式单步/断点走 gdb/cemugui；两者不是替代关系。
 
 ## 六、简化登记（在册的规格缺口台账）
 
@@ -607,7 +607,6 @@ CEMU_DEBUG="screen" timeout 110 ./cemu.exe ... img 2> c.txt
 
 | 编号 | 位置 | 缺失 | 参考出处 | 恢复阶段 | 状态 |
 |---|---|---|---|---|---|
-| D6 | gdbstub.c 硬件观察点 | **`Z3`（只读观察点）不实现，回空包**：x86 的 DR7 R/W 字段只有 写 / I/O / 读写 三种编码（SDM vol.3 表 17-2），没有"只读"，本机不把它偷偷放宽成"读写"（那会在客人从没要求过的存储上停住）；gdb 因此退回自己的软件观察点。riscv 侧 `gdb_set_watch/gdb_clear_watch/gdb_watch_hits` 三个接缝为 NULL，trigger 模块与 RSP 之间还没有那条通道。另外复位会清掉 DR7 与归属掩码（SDM vol.3 17.2），所以 guest 重启后 gdb 之前装的观察点全部失效，而 stub 的表不会主动收回；客人写 DR0-DR3/DR7 也会收回对应归属（同一份机器状态，寄存器被改写后 stub 的观察点即失效，`z` 不再清客人的槽）；protected-mode 的 `G` 包写 CS 只存可见选择子、不重走描述符，PC 按缓存基址换算（实模式按选择子合成基址；VM86 的 flags 写入不载入 VM，D14） | RSP 规范 `Z/z` 包；SDM vol.3 17.2（DR7 的 R/W 编码）与 17.3.1（数据断点在指令完成后以 #DB 报告）；匹配走 CPU 自己的 DR0-DR7，见 `src/cpu/isa/x86/exec.c` 的 `x86_gdb_set_watch` | riscv 一侧把三个接缝接到 `cpu/isa/riscv64/trigger.c` 的 mcontrol 上；x86 一侧的"只读"没有恢复计划（编码里就没有） | 登记中 |
 | D7 | LR/SC 单核预留集 | 无多核冲突语义 | spike 单核同款；规格允许 SC 假失败 | 多核引入时 | 登记中 |
 | D11 | htif.c HTIF syscall（dev0/cmd0）报错退出 | 无 fesvr syscall 设备 | fesvr htif_t::handle_syscall | 阶段 5 cesdk | 登记中 |
 | D17 | vga.c 渲染与显示通道 | DISPI/VBE（含 BANK、GETCAPS、模式寄存器联动）、链式 256 色（mode 13h 与 VBE 8/15/16/24/32bpp）、EDID（256 字节基础块 + DTA 扩展，QEMU 默认值的实测副本）、行比较/分屏、AR13 水平 pel 平移、按 CRTC 场周期推出的闪烁/光标相位均已实现。剩下：**CRTC R17 bit5 的 64K 地址回绕（AW）未建模**（QEMU 的 vga_draw_graphic 同样不读）；**过扫描边框不渲染**（显示通道发布活动画面，QEMU 也不把它画进 framebuffer）；**CGA 复合 NTSC 伪色未做**（没有宿主可见的监视器类型开关，QEMU 不建模）；光笔/开关感应/外部时钟在本卡上没有对应输入，输入状态 0 只报复位值 | IBM VGA Technical Reference；FreeVGA/VGAREGS；QEMU hw/display/vga.c（vbe_fixup_regs/vbe_update_vgaregs、line_compare、hpel、bank_offset）；seabios vgasrc/bochsvga.{h,c}；EDID 1.4（qemu_edid_generate 的默认 1280x800 两块的实测副本，test/x86/probe/edid_dump.asm 与 vbe_mode/PM 探针） | AW 在需要字模式回绕的客户机出现时；边框在需要模拟过扫描的显示通道出现时；NTSC 在出现宿主可选的复合监视器模式且色表可溯源时 | 登记中 |

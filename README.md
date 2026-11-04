@@ -102,6 +102,12 @@ CEMU_DEBUG="trace:table,state,mem,budget=200" \
   build/cemu.exe --machine x86 --isa x86 test/x86/realmode/realmode.elf
 ```
 
+阶段 3.5 的三片（CEMU_DEBUG 观测中枢、gdb RSP stub、cemugui）已完成；
+gdb 断点/单步/硬件观察点走 `-gdb tcp::PORT` / `-s` / `-S`，图形前端是
+`cemugui.exe`。x86 硬件观察点走 DR0-DR7，riscv32/64 走 trigger 模块的内部
+mcontrol 槽位；x86 的 `rwatch`（Z3）因 DR7 没有只读编码而回空包，riscv
+的写/读/访问三种 kind 都支持。
+
 ## 文档
 
 | 文件 | 内容 |

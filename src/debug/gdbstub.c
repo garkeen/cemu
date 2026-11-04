@@ -29,7 +29,8 @@ static Bus* GdbRealBus(Board* m) { return m->cpu.real_bus ? m->cpu.real_bus : m-
 enum {
   kPacketMax = 4096,       // matches the qSupported PacketSize we advertise
   kMaxBreakpoints = 64,
-  kMaxWatchpoints = 4,     // the x86 debug registers DR0-DR3 (SDM vol.3 17.2)
+  kMaxWatchpoints = 4,     // four DR0-DR3 (SDM vol.3 17.2), or riscv's four
+                           // internal trigger slots (cpu/isa/riscv*/trigger.c)
 };
 
 // What one RSP watchpoint request became: the debug register the ISA handed
@@ -338,9 +339,10 @@ static int StopCb(void* ctx, CpuState* cpu) {
   }
   // A watchpoint the stub armed stops the session even while the guest runs
   // free: what fired is the debugger's request, not a fault of the guest's own
-  // (cpu/step.h gdb_watch_hits, and cpu/isa/x86/step.c's debug-trap block for why
-  // the trap reaches no guest handler). This is the one reason besides a
-  // breakpoint that a free-running batch stops for.
+  // (cpu/step.h gdb_watch_hits; cpu/isa/x86/step.c's debug-trap block and
+  // cpu/isa/riscv*/trigger.c's stub slots explain why the guest never sees it).
+  // This is the one reason besides a breakpoint that a free-running batch stops
+  // for.
   if (g->nwatches && isa->gdb_watch_hits) {
     uint32_t hits = isa->gdb_watch_hits(cpu);
     for (int i = 0; i < g->nwatches; i++)
@@ -501,14 +503,16 @@ static int Session(GdbStub* g) {
         // bytes it would not run unattended -- measured while chasing win101,
         // where the patch itself changed the instruction stream being compared.
         //
-        // Kinds 2/3/4 (write / read / access) go through the ISA's debug-register
-        // door, so the CPU's own #DB is what stops the session and there is no
-        // second matcher to keep in step with it. The ISA answers -1 for whatever
-        // its encoding cannot express -- on x86 a read-only watchpoint, because
-        // DR7's R/W field has write, I/O and read-or-write but no read-only
-        // (SDM vol.3 table 17-2) -- and an empty packet is how RSP says
-        // "unsupported". gdb then uses its own software watchpoints rather than
-        // being handed one that also fires on stores it never asked for.
+        // Kinds 2/3/4 (write / read / access) go through the ISA's hardware
+        // matcher, so the CPU's own debug facility is what stops the session
+        // and there is no second matcher to keep in step with it. The ISA
+        // answers -1 for whatever its encoding cannot express -- on x86 a
+        // read-only watchpoint, because DR7's R/W field has write, I/O and
+        // read-or-write but no read-only (SDM vol.3 table 17-2); riscv maps
+        // read to mcontrol6's load bit and accepts all three (debug spec
+        // 5.3.12). An empty packet is how RSP says "unsupported". gdb then
+        // uses its own software watchpoints rather than being handed one that
+        // also fires on stores it never asked for.
         //
         // The hit stops the session instead of being vectored (StopCb reads the
         // ISA's report): QEMU does the same for its own watchpoints, and the
@@ -574,6 +578,10 @@ static int Session(GdbStub* g) {
       case 'D':  // detach: the guest runs free
         PktSend(g, "OK");
         g->nbps = 0;
+        // RSP detach removes the debugger's breakpoints; watches must be
+        // disarmed in the ISA too, or the guest keeps a stub-owned trigger
+        // after gdb is gone (and a later attach inherits the stale table).
+        while (g->nwatches > 0) WatchRemove(g, 0);
         HostSockClose(g->conn);
         g->conn = NULL;
         return 1;

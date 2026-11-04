@@ -74,7 +74,13 @@ uint64_t riscv_mem_load(frame* fr, uint64_t vaddr, int size, int acc) {
   // Load triggers fire on the effective address before the access happens,
   // so even an access that would fault triggers first (xiangshanNEMU checks
   // in the ldst templates before the rtl memory op). Fetches don't qualify.
-  if (acc != acc_ifetch) RiscvTriggerCheck(fr, rs, kTrigOpLoad, vaddr);
+  // gdb's own watchpoints are a separate internal list (trigger.c) and are
+  // checked after the guest trigger: a guest breakpoint that aborts the
+  // access means no gdb hit.
+  if (acc != acc_ifetch) {
+    RiscvTriggerCheck(fr, rs, kTrigOpLoad, vaddr);
+    if (rs->gdb_watch_mask) RiscvGdbWatchCheck(rs, kTrigOpLoad, vaddr, size);
+  }
   uint64_t paddr;
   uint8_t* host = NULL;
   // Translation enforces PMP for this access; its cache stores the host
@@ -98,7 +104,11 @@ uint64_t riscv_mem_load(frame* fr, uint64_t vaddr, int size, int acc) {
 }
 
 void riscv_mem_store(frame* fr, uint64_t vaddr, int size, uint64_t val) {
-  RiscvTriggerCheck(fr, rs, kTrigOpStore, vaddr);  // before the store commits
+  // Before the store commits, like the guest trigger: a guest breakpoint that
+  // aborts the access means no gdb hit; otherwise the stub reports the hit
+  // after the step and the access itself still happens (or faults).
+  RiscvTriggerCheck(fr, rs, kTrigOpStore, vaddr);
+  if (rs->gdb_watch_mask) RiscvGdbWatchCheck(rs, kTrigOpStore, vaddr, size);
   uint64_t paddr;
   uint8_t* host = NULL;
   RiscvTranslate(fr, rs, vaddr, size, acc_write, &paddr, &host);
