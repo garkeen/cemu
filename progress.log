@@ -8,6 +8,20 @@
 > 旧 §九 → §四，旧 §十/§X（调试设施）→ §五，旧 §十一 → §七；`§X Dnn`
 > 指现在的 §六 台账。
 
+## E1 销账：riscv F/D 改走 Berkeley SoftFloat 3e（2026-11-04）
+
+- SoftFloat 从 `src/cpu/isa/x86/softfloat/` 移到 `src/cpu/softfloat/`（x86
+  x87/SSE 与 riscv F/D 共用）；CMake、`fpu.h`、README/arch 的路径同步。
+- `riscv64/fp.c` 与 `riscv32/fp.c` 全部改用 softfloat：add/sub/mul/div/sqrt/
+  mulAdd、比较、min/max、f32↔f64、int↔float、float→int；舍入模式逐操作设置，
+  异常标志从 `softfloat_exceptionFlags` 折进 fflags。不再用宿主
+  float/double/long double，也不再手工判 inexact 或有向舍入。
+- NaN 结果统一 canonical（非特权规范 11.3）；unboxed 单精度按 canonical qNaN
+  解释（不再自行抬 NV）；float→int 的无效结果按 RISC-V 饱和值覆盖 SoftFloat
+  的 x86 integer indefinite。
+- 验收：rv64uf/rv64ud 23 个镜像全过，rv32uf/rv32ud 21 个全过；x86 的
+  x87/sse 探针仍 rc=11；依赖边检查 ok。未跑指令集全量。
+
 ## D32/D41 销账：16550 主机保持 + RBR 回读；8254 BCD（2026-11-04）
 
 - **D32**：`Uart16550HostReceive` 给宿主输入一个 4096 字节的保持队列（QEMU

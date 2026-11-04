@@ -56,7 +56,7 @@ cemu/
         riscv32/     同形状的 RV32 后端：riscv32.h  exec.h  platform.h  exec.c  step.c
                      csr.c  mmu.c(Sv32)  fp.c  trigger.c  isa_riscv32.c
         x86/         x86.h  exec.h  exec.c  step.c  fpu.h/.c  isa_x86.c
-                     softfloat/（Berkeley SoftFloat 3e 合并版，BSD-3，x87 用）
+        softfloat/   Berkeley SoftFloat 3e 合并版（BSD-3；x86 x87/SSE 与 riscv F/D 共用）
     bus/           bus.h/.c     地址空间与译码
     mem/           ram.h/.c     内存
     device/        外设，按类分
@@ -116,9 +116,10 @@ ISA 一份的 `execute.c` 大循环重写为 `exec.c`），遵循"代码简单�
   setjmp/raise 落地 + 单点提交 + 计数器。与 `exec.c` 共享的每步视图放在私有头
   `exec.h`（必须最后 include：它定义 `x`/`f`/`eax` 这类短宏）。
 - **共享语义后端**：不进 switch 的语义抽成函数——riscv64 的 `csr.c`（CSR/特权/
-  陷阱/xRET）、`mmu.c`（Sv39 + PMP）、`fp.c`（IEEE-754，宿主浮点模拟，见简化
-  登记 E1）；riscv32 目录是同形状的 RV32 副本（Sv32、RV32 CSR 布局、32 位本地
-  寄存器 bank）；x86 的 `exec.c` 内 helper（do_int/IVT/串操作）。
+  陷阱/xRET）、`mmu.c`（Sv39 + PMP）、`fp.c`（IEEE-754，Berkeley SoftFloat 3e，
+  与 x86 x87/SSE 共用 `cpu/softfloat/`）；riscv32 目录是同形状的 RV32 副本
+  （Sv32、RV32 CSR 布局、32 位本地寄存器 bank）；x86 的 `exec.c` 内 helper
+  （do_int/IVT/串操作）。
 - **中断注入**：主板只调 `CpuState.set_irq`（型号在自己的 init 里安装），不调
   型号函数。因此 `spike_min.c`、`x86_min.c` 完全不含 ISA 头；只有平台板
   `virt.c` 引 `cpu/isa/riscv64/platform.h` 取中断线号常量。

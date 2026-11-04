@@ -1,11 +1,11 @@
-#ifndef CEMU_CPU_ISA_X86_SOFTFLOAT_SOFTFLOAT_H
-#define CEMU_CPU_ISA_X86_SOFTFLOAT_SOFTFLOAT_H
+#ifndef CEMU_CPU_SOFTFLOAT_SOFTFLOAT_H
+#define CEMU_CPU_SOFTFLOAT_SOFTFLOAT_H
 
-// The slice of Berkeley SoftFloat 3e the x86 FPU/SSE engine calls. The
-// implementation is the unmodified 8086-SSE amalgamation (softfloat.c in this
-// directory, from v86's lib/softfloat, itself the upstream release); these
-// declarations must match its definitions exactly — the types are the
-// library's public ABI, not ours to reshape.
+// The slice of Berkeley SoftFloat 3e the x86 FPU/SSE engine and the riscv F/D
+// backend call. The implementation is the unmodified 8086-SSE amalgamation
+// (softfloat.c in this directory, from v86's lib/softfloat, itself the upstream
+// release); these declarations must match its definitions exactly — the types
+// are the library's public ABI, not ours to reshape.
 //
 // Reference: Hauser, "Berkeley SoftFloat Release 3e" (BSD-3-Clause, the
 // license text is at the top of softfloat.c); QEMU target/i386/tcg/
@@ -73,9 +73,12 @@ float32_t f32_sub(float32_t, float32_t);
 float32_t f32_mul(float32_t, float32_t);
 float32_t f32_div(float32_t, float32_t);
 float32_t f32_sqrt(float32_t);
+float32_t f32_mulAdd(float32_t, float32_t, float32_t);
 float32_t f32_roundToInt(float32_t, uint_fast8_t, bool);
 int_fast32_t f32_to_i32(float32_t, uint_fast8_t, bool);
 int_fast64_t f32_to_i64(float32_t, uint_fast8_t, bool);
+uint_fast32_t f32_to_ui32(float32_t, uint_fast8_t, bool);
+uint_fast64_t f32_to_ui64(float32_t, uint_fast8_t, bool);
 int_fast32_t f32_to_i32_r_minMag(float32_t, bool);
 int_fast64_t f32_to_i64_r_minMag(float32_t, bool);
 float64_t f32_to_f64(float32_t);
@@ -83,6 +86,10 @@ float32_t i32_to_f32(int32_t);
 float64_t i32_to_f64(int32_t);
 float32_t i64_to_f32(int64_t);
 float64_t i64_to_f64(int64_t);
+float32_t ui32_to_f32(uint32_t);
+float32_t ui64_to_f32(uint64_t);
+float64_t ui32_to_f64(uint32_t);
+float64_t ui64_to_f64(uint64_t);
 bool f32_eq(float32_t, float32_t);
 bool f32_le(float32_t, float32_t);
 bool f32_lt(float32_t, float32_t);
@@ -95,9 +102,12 @@ float64_t f64_sub(float64_t, float64_t);
 float64_t f64_mul(float64_t, float64_t);
 float64_t f64_div(float64_t, float64_t);
 float64_t f64_sqrt(float64_t);
+float64_t f64_mulAdd(float64_t, float64_t, float64_t);
 float64_t f64_roundToInt(float64_t, uint_fast8_t, bool);
 int_fast32_t f64_to_i32(float64_t, uint_fast8_t, bool);
 int_fast64_t f64_to_i64(float64_t, uint_fast8_t, bool);
+uint_fast32_t f64_to_ui32(float64_t, uint_fast8_t, bool);
+uint_fast64_t f64_to_ui64(float64_t, uint_fast8_t, bool);
 int_fast32_t f64_to_i32_r_minMag(float64_t, bool);
 int_fast64_t f64_to_i64_r_minMag(float64_t, bool);
 float32_t f64_to_f32(float64_t);

@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#include "cpu/isa/x86/softfloat/softfloat.h"
+#include "cpu/softfloat/softfloat.h"
 
 // The x87 FPU and SSE state (SDM vol.1 ch.8, 10, 11). The register stack is
 // kept in physical order; `top` lives in the status word's TOP field, exactly

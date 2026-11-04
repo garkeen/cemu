@@ -16,7 +16,7 @@ x86 已接入，之后 arm / mips），加载 `.bin` / `.elf` / `.img`，按真�
 ## 构建
 
 依赖只有 clang 与 mingw-w64 sysroot；第三方代码只有树内 vendored 的 Berkeley
-SoftFloat 3e（BSD-3，x87 用，`src/cpu/isa/x86/softfloat/`），不引入外部库：
+SoftFloat 3e（BSD-3，x86 x87/SSE 与 riscv F/D 共用，`src/cpu/softfloat/`），不引入外部库：
 
 ```sh
 cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE=tools/clang.cmake
