@@ -122,7 +122,7 @@ static void OpenAudio(Sb16Device* d) {
   d->audio_bits = bits;
   d->audio_signed = is_signed;
   d->audio_tried = 1;
-  if (!d->audio && !d->audio_warned) {
+  if (!d->audio && HostAudioEnabled() && !d->audio_warned) {
     LogInfo("sb16: no host audio output; the guest runs silent");
     d->audio_warned = 1;
   }
@@ -279,7 +279,8 @@ static void Complete(Sb16Device* d) {
     int d1 = DspGet(d);
     int d0 = DspGet(d);
     // Bit 3 of these commands selects the ADC (recording) direction. The
-    // playback path is the one this model implements; recording is D43.
+    // playback path is the one this model implements; recording is out of scope
+    // (user ruling), and QEMU's command() leaves that direction inert too.
     if (!(d->cmd & 8)) DmaCmd(d, (uint8_t)d->cmd, (uint8_t)d0, d1 + (d2 << 8));
     d->cmd = -1;
     return;
@@ -316,7 +317,7 @@ static void Complete(Sb16Device* d) {
       break;
     }
     case 0x10:
-      DspGet(d);  // direct ADC: recording is D43
+      DspGet(d);  // direct ADC: recording is out of scope (user ruling)
       break;
     case 0x14:
       DmaCmd8(d, 0, DspGetLohi(d) + 1);
@@ -398,7 +399,7 @@ static void Command(Sb16Device* d, uint8_t cmd) {
     // length high). Bit 3 selects the ADC (recording) direction; QEMU still
     // consumes its three parameter bytes before leaving the transfer inert,
     // and a guest that records would otherwise desynchronize the command
-    // stream. Recording itself is D43.
+    // stream. Recording itself is out of scope (user ruling).
     switch (cmd >> 4) {
       case 11:
       case 12:

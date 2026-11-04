@@ -33,6 +33,18 @@ struct HostAudio {
   int write_failed;  // the driver's first waveOutWrite failure is reported once
 };
 
+// Off by default (user ruling): a probe or the test suite must never make
+// sound. main.c turns it on only for an explicit -audio win32.
+static int g_audio_enabled;
+
+void HostAudioSetEnabled(int on) {
+  g_audio_enabled = on != 0;
+}
+
+int HostAudioEnabled(void) {
+  return g_audio_enabled;
+}
+
 // waveOut only takes unsigned 8-bit and signed 16-bit PCM. The SB16 can also
 // ask for signed 8-bit and unsigned 16-bit (the DSP format byte's bit 4), so
 // the conversion is done while copying into the waveOut block.
@@ -59,6 +71,7 @@ static void ConvertSamples(const HostAudio* a, uint8_t* dst, const uint8_t* src,
 }
 
 HostAudio* HostAudioOpen(int rate, int channels, int bits, int is_signed) {
+  if (!g_audio_enabled) return NULL;
   if (rate <= 0 || (channels != 1 && channels != 2) || (bits != 8 && bits != 16)) return NULL;
   HostAudio* a = (HostAudio*)calloc(1, sizeof(*a));
   if (!a) return NULL;

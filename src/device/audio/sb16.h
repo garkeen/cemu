@@ -22,8 +22,9 @@ struct HostAudio;
 // card: command byte order (0x41's two bytes are fetched high-first by
 // dsp_get_hilo), the single-rate 0x41/0x42 behaviour, the block-size shifts
 // for 16-bit and stereo, and the IRQ-status/ack ports are all QEMU's. The
-// gaps this model inherits (OPL3 FM, MPU-401, ADC/recording, ADPCM, mixer
-// volume scaling) are registered as D43 in AGENTS.md.
+// gaps this model inherits (OPL3 FM, MPU-401, ADPCM, the 0xE2 identification
+// answer, mixer volume scaling) are registered as D43 in AGENTS.md. The
+// recording direction is out of scope (user ruling).
 //
 // DMA is the board's 8237 (device/dma/i8237.c): the card only asks for bytes
 // and the controller walks guest memory, the same split the floppy uses. The

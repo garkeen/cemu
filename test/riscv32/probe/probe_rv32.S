@@ -27,6 +27,20 @@ _start:
   and t2, t1, t3
   bne t2, t3, fail
 
+  # Check 1b: misa's writable bits are only those whose clear the hart honors
+  # (D35). S/U are hardwired because the machine still enters both modes, and
+  # MXL is read-only (priv spec 3.1.1).
+  li s0, 9
+  csrr t1, misa
+  li t2, ~((1 << 18) | (1 << 20))
+  csrw misa, t2
+  csrr t3, misa
+  bne t1, t3, fail
+  li t2, (1 << 8) | (1 << 2)
+  csrw misa, t2
+  csrr t3, misa
+  bne t1, t3, fail
+
   # Check 2: satp Sv32 (bit31) round-trips; writing 0 selects Bare.
   li s0, 2
   li t2, 0x80001234

@@ -312,8 +312,12 @@ realmode（kvm-unit-tests 官方实模式套件）127 PASS/0 FAIL。
 - 工具链：构建前端统一 LLVM 系列（clang riscv64 交叉；riscv 客户机由
   xpack gcc 切换，x86 侧已在用 D:/LLVM 23.1）。
 
-### 阶段 6：arm 与 mips
-先引 LLVM 做交叉（本地无解释型参考，语义来源为官方手册）。
+### 阶段 6：arm、mips 与 x86 长模式
+- x86 长模式（IA-32e / x86_64）：EFER.LME/LMA、四级页表（PML4/PDPT）、64 位
+  GPR/寻址、REX 前缀、64 位模式下的指令宽度与 SYSCALL/SYSRET；CPUID 0x80000001
+  广告 LM。参考 SDM vol.1 3.4.1/3.7、vol.3 4.5/9.8、vol.2 SYSCALL/SYSRET 与
+  QEMU target/i386/tcg 的 64 位路径。当前按 32 位保护模式语义执行，且不广告 LM。
+- arm 与 mips：先引 LLVM 做交叉（本地无解释型参考，语义来源为官方手册）。
 
 ## 七、复用映射
 

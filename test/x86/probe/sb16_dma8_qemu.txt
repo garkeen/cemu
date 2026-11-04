@@ -1,0 +1,29 @@
+Dual run of test/x86/probe/sb16_dma8.asm, 2026-11-04:
+
+  cemu --machine x86 --isa x86 sb16_dma8.elf                    -> status 11
+  qemu-system-i386 -machine pc -m 32 -kernel sb16_dma8.elf \
+      -display none -no-reboot -audiodev none,id=snd0 \
+      -device sb16,audiodev=snd0 \
+      -device isa-debug-exit,iobase=0xf4,iosize=0x4 \
+      -serial file:sb16_dma8_qemu.txt                          -> status 11
+
+Lock cell: the SB16-visible fields agree, the 8237 fields do not. QEMU's sb16
+calls IsaDmaClass::read_memory, which on its i8257 answers the request without
+advancing the channel's count register or latching the terminal-count status
+bit; its transcript therefore reads tc=00 cnt=003f, the programmed values.
+This machine drives the board's 8237 through the DRQ/DACK handshake, so the
+controller spends its count and latches TC per the 8237A datasheet: tc=02,
+cnt=ffff. The IRQ latch/ack fields are the ones both models must agree on.
+
+  sb16-dma8 irq=01 tc=02 cnt=ffff ack=00 ok
+
+irq   mixer 0x82 after the block: bit 0, the 8-bit latch
+tc    8237 status register: channel 1's terminal-count bit
+cnt   channel 1 count register after the block: spent (0xffff)
+ack   mixer 0x82 after reading 0x22e: the latch cleared
+
+The guest fills its 64-byte buffer with 0x80 (unsigned 8-bit silence), and the
+host PCM output is off by default, so neither run makes sound.
+
+cemu sb16-dma8 irq=01 tc=02 cnt=ffff ack=00 ok
+qemu sb16-dma8 irq=01 tc=00 cnt=003f ack=00 ok

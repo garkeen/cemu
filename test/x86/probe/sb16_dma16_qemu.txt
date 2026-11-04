@@ -1,0 +1,27 @@
+Dual run of test/x86/probe/sb16_dma16.asm, 2026-11-04:
+
+  cemu --machine x86 --isa x86 sb16_dma16.elf                   -> status 11
+  qemu-system-i386 -machine pc -m 32 -kernel sb16_dma16.elf \
+      -display none -no-reboot -audiodev none,id=snd0 \
+      -device sb16,audiodev=snd0 \
+      -device isa-debug-exit,iobase=0xf4,iosize=0x4 \
+      -serial file:sb16_dma16_qemu.txt                         -> status 11
+
+Lock cell for the same reason as sb16_dma8: QEMU's IsaDma::read_memory path
+leaves the 8257's count/status alone (tc=00 cnt=003f), while cemu walks the
+board's 8237 through DRQ/DACK and the controller spends its word count and
+latches channel 5's TC (tc=02 cnt=ffff). The SB16-visible fields, the IRQ16
+latch and its 0x22f acknowledge, agree.
+
+  sb16-dma16 irq=02 tc=02 cnt=ffff ack=00 ok
+
+irq   mixer 0x82 after the block: bit 1, the 16-bit latch
+tc    8237 slave status register: channel 5's terminal-count bit
+cnt   channel 5 word count after the block: spent (0xffff)
+ack   mixer 0x82 after reading 0x22f: the latch cleared
+
+The guest fills its 128-byte buffer with zero, signed 16-bit silence, and the
+host PCM output is off by default, so neither run makes sound.
+
+cemu sb16-dma16 irq=02 tc=02 cnt=ffff ack=00 ok
+qemu sb16-dma16 irq=02 tc=00 cnt=003f ack=00 ok

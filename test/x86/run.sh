@@ -717,6 +717,17 @@ elf_cell uart_rx 11 ref
 # this existed the same probe answered `b=02 c=03` -- nothing was masked.
 elf_cell ignne 11 ref
 
+# Sound Blaster 16 DSP playback (test/x86/probe/sb16_dma8.asm,
+# sb16_dma16.asm): one single-cycle block on each half of the card, with the
+# guest programming the DSP and the board's 8237 itself. The transcript pins
+# the mixer 0x82 IRQ latch, its 0x22e/0x22f acknowledge, and the 8237's TC and
+# spent count. Lock cells: QEMU's sb16 reads memory through IsaDma without
+# advancing the 8257 (tc=00 cnt=003f), while cemu drives the controller per the
+# datasheet (tc=02 cnt=ffff); the calibration files record both. Host audio is
+# off by default, so these cells are silent.
+elf_cell sb16_dma8 11 lock
+elf_cell sb16_dma16 11 lock
+
 # MOV Sreg encoding (test/x86/probe/movsreg.asm): 0x8C stores exactly 16 bits
 # to memory whatever the operand size, a 32-bit register destination is
 # zero-extended, and reg=6/7 are #UD. One transcript line; the calibration file

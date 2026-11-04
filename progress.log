@@ -8,6 +8,45 @@
 > 旧 §九 → §四，旧 §十/§X（调试设施）→ §五，旧 §十一 → §七；`§X Dnn`
 > 指现在的 §六 台账。
 
+## 套件补 SB16 两个探针；D35 销账（2026-11-04）
+
+- **SB16 探针入库**：`test/x86/probe/sb16_dma8.asm` 与 `sb16_dma16.asm` 进
+  `test/x86/run.sh`（两个 `elf_cell`，lock）。客机自己编程 DSP 与 8237，
+  transcript 固定 mixer 0x82 的 IRQ 锁存（0x01/0x02）、0x22e/0x22f 应答、
+  8237 的 TC 状态与耗尽计数。QEMU 10.2.92 的 sb16 经 `IsaDma::read_memory`
+  不推进 8257（`tc=00 cnt=003f`），本机按 8237A 走 DRQ/DACK
+  （`tc=02 cnt=ffff`），分歧由校准文件记录为 lock。宿主音频默认关闭，两个
+  探针都灌静音样本，跑套件不会出声。
+- **D35 销账**：`misa` 的 WARL 可写位收窄到 C——只有 C 的清除被执行器真正
+  兑现（`step_body.inc` 把 IALIGN 切成 32 并让压缩字变非法）；S/U/F/D/A/M 与
+  MXL 恒置，避免"清掉后机器照样进 U 模式/照样执行该扩展"。参考：特权规范
+  3.1.1（Extensions 只有在实现允许修改 ISA 时才含可写位；MXL 只读）、
+  QEMU `target/riscv/csr.c` 的 `write_misa` 在默认 `misa_w=false` 时直接丢弃
+  写入。探针：`test/riscv64/probe/probe_misa.S`（新增）与
+  `test/riscv32/probe/probe_rv32.S` 的 Check 1b；改前 RV64 探针 exit=1，
+  改后 exit=0，RV32 探针 exit=0。
+
+## 音频默认关闭：-audio win32 才开宿主输出（2026-11-04）
+
+- 宿主 PCM 输出改为显式开启（用户裁决）：`HostAudio` 加全局开关，默认 0；
+  `main.c` 的 `-audio win32` 才置 1，`-audio none` 保持关闭。
+- 默认路径不调用 `waveOutOpen`，探针与 `test/*/run.sh` 不会发出声音；SB16 的
+  静音路径不变——`Sb16Poll` 只在 `d->audio` 非空时受宿主队列限速，DMA 仍按
+  采样率消费并按块发 IRQ。
+- 只有显式开启且 `waveOutOpen` 失败时才打印 “no host audio output”；
+  默认关闭不再刷这条日志。
+
+## 台账裁决：放弃绝对定位、SB16 不做录音、长模式归入阶段 6（2026-11-04）
+
+- **鼠标**：x86 窗口只投相对增量，不做 VMMouse/QEMouse 式绝对定位；D38 整行删除，
+  README 与 AGENTS.md §七 的悬空引用改成直接陈述契约，源码里残留的半截注释一并删除。
+- **SB16**：录音方向不做（0xB0-0xCF 的 ADC 位与 0x10 直接 ADC）。QEMU
+  `hw/audio/sb16.c` 的 `command()`/`complete()` 对 `cmd & 8` 同样只记
+  `LOG_UNIMP` 并让传输保持惰性，本机行为与之一致。D43 只保留播放侧缺口，并把
+  代码已引用却漏登的 0xE2 识别应答补进该行。
+- **长模式**：IA-32e 不再按“简化”记在 D42，列入阶段 6 的范围（arch.md）；
+  D39 里的交叉引用同步改为指向阶段 6。
+
 ## x86 SB16 声音设备：DSP 播放 + 8/16 位 DMA + 宿主 waveOut（2026-11-03）
 
 - `host/audio_win.c`：通用 PCM 输出（waveOut；8/16 位、单/双声道、有/无符号转换），

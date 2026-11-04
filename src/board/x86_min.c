@@ -187,7 +187,6 @@ typedef struct X86Board {
   // The observing bus: a forwarding copy of the machine bus whose regions have
   // no host pointer (debug/busdebug.h). NULL if allocation failed.
   BusDebug* bus_debug;
-  // Absolute pointer integration over the relative PS/2 mouse (D38). The
 } X86Board;
 
 static uint64_t UnclaimedRead(void* dev, uint64_t addr, int size) {
@@ -1011,8 +1010,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   // where it is only holds while the guest applies counts 1:1 and clamps at the
   // screen edges, and Windows 1.01 breaks both (it scales, it clips, it resets
   // its driver at mode changes), which made the pointer fly around. Absolute
-  // positioning belongs to a device that carries it (USB tablet, VMware
-  // backdoor), not to this one.
+  // positioning belongs to a device that reports it (a tablet), not to this one.
   m->mouse_in = opts->mouse == kMouseSerial ? OnHostMouseSerial : OnHostMouse;
   m->mouse_ctx = xm;
   m->mouse_flush = opts->mouse == kMouseSerial ? NULL : OnMouseFlush;

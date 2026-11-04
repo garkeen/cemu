@@ -53,7 +53,7 @@ struct HostDisplay {
   // maximized 1024x768 picture on a 1080p screen is ~1.4x).
   int64_t rel_acc_x, rel_acc_y;
   int abs_x, abs_y, abs_valid;
-  // Pointer grab (D38): the host cursor is hidden and the pointer captured, so
+  // Pointer grab (AGENTS §七): the host cursor is hidden and the pointer captured, so
   // only the guest's own cursor is visible. A relative device is additionally
   // warped back to the client center near an edge, so the guest can keep moving
   // past its own screen edge and the host pointer never runs out of window; an
@@ -188,7 +188,7 @@ static int NearClientEdge(HostDisplay* d, int x, int y) {
          y < rc.top + kGrabMargin || y >= rc.bottom - kGrabMargin;
 }
 
-// Pointer grab (D38, AGENTS §七). PS/2 has no absolute packet, so without a
+// Pointer grab (AGENTS §七). PS/2 has no absolute packet, so without a
 // grab the host pointer can reach the window edge while the guest cursor is
 // still in the middle (or vice versa), and the lost movement comes back as a
 // jump when the pointer re-enters. Absolute devices (virtio-tablet, the Oberon

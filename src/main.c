@@ -24,6 +24,7 @@ typedef struct Args {
   const char* vgabios;    // -vgabios FILE: the display card's option ROM
   const char* display_backend;  // -display win32; NULL = headless
   const char* mouse_name;       // -mouse ps2|serial (NULL = the board's default)
+  const char* audio_name;       // -audio win32|none (NULL = off, the guest silent)
   uint64_t mem_size;
   uint64_t mem_base;
   uint64_t bin_base;
@@ -76,6 +77,9 @@ static void Usage(void) {
       "                    RS232 channel instead of the card)\n"
       "  -vgabios FILE     x86: the display card's option ROM (int10 services)\n"
       "  -display win32    open a window on the machine's display card\n"
+      "  -audio win32      open the host PCM output; off by default, so a\n"
+      "                    probe or test run never makes sound (QEMU's\n"
+      "                    -audio convention, with the backend named)\n"
       "  -s                gdb stub on tcp::1234 (guest runs until attached)\n"
       "  -gdb tcp::PORT    gdb stub on PORT\n"
       "  -S                with -s: do not start until the client resumes\n";
@@ -183,6 +187,8 @@ static int ParseArgs(Args* a, int argc, char** argv) {
       a->vgabios = argv[++i];
     else if (strcmp(arg, "-mouse") == 0)
       a->mouse_name = argv[++i];
+    else if (strcmp(arg, "-audio") == 0)
+      a->audio_name = argv[++i];
     else if (arg[0] == '-' && arg[1] == '-')
       return -1;
     else
@@ -230,6 +236,18 @@ int main(int argc, char** argv) {
       mouse = kMouseSerial;
     else {
       LogError("-mouse expects ps2 or serial");
+      return kExitHostFailure;
+    }
+  }
+
+  // -audio: host PCM output is opt-in (user ruling). Without it waveOut is
+  // never opened, so a probe or the test suite is silent; QEMU's `-audio none`
+  // is accepted as the explicit off form.
+  if (a.audio_name) {
+    if (strcmp(a.audio_name, "win32") == 0)
+      HostAudioSetEnabled(1);
+    else if (strcmp(a.audio_name, "none") != 0) {
+      LogError("-audio expects win32 or none");
       return kExitHostFailure;
     }
   }

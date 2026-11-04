@@ -438,10 +438,11 @@ int riscv_csr_write(RiscvState* s, uint64_t addr, uint64_t val, uint64_t next_pc
       return 0;
     }
     case 0x301: {
-      // WARL (priv spec 3.1.10): only implemented extensions stick, I is
-      // always set. Clearing C is rejected when the next fetch would violate
-      // IALIGN=32 (gem5 isa.cc implements the same check).
-      uint64_t new_misa = (val & kMisaSupported) | kMisaI;
+      // WARL (priv spec 3.1.1): only bits whose clearing the hart honors are
+      // writable; MXL and the extensions with no disable path are read-only.
+      // Clearing C is rejected when the next fetch would violate IALIGN=32
+      // (gem5 isa.cc implements the same check).
+      uint64_t new_misa = (val & kMisaWritable) | (kMisaSupported & ~kMisaWritable);
       if ((s->misa & kMisaC) && !(new_misa & kMisaC) && (next_pc % 4)) new_misa |= kMisaC;
       s->misa = new_misa;
       return 0;

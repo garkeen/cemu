@@ -107,7 +107,13 @@ void HostSockClose(HostSock* s);
 // for the two sign-flipped variants, which the host layer converts. A NULL
 // return means the host has no output device: the caller keeps running, but
 // silently -- a guest's DMA and IRQ timing must not depend on a speaker.
+//
+// Output is opt-in (-audio win32): the host device stays closed unless main.c
+// enables it, so a probe or a test suite never makes sound by accident. A
+// muted card still consumes DMA at the programmed rate.
 typedef struct HostAudio HostAudio;
+void HostAudioSetEnabled(int on);
+int HostAudioEnabled(void);
 HostAudio* HostAudioOpen(int rate, int channels, int bits, int is_signed);
 // Queues up to len bytes and returns how many were accepted (0 = the queue is
 // full). The stream plays asynchronously; poll HostAudioFree for room.

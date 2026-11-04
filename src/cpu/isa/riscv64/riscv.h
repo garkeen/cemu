@@ -75,6 +75,14 @@ static const uint64_t kMisaU = 1ULL << 20;  // misa bit letters: S=18, U=20
 // riscv_cpu.c sets MCPUID_USER alongside MCPUID_SUPER).
 static const uint64_t kMisaSupported =
     kMisaMxl64 | kMisaA | kMisaC | kMisaD | kMisaF | kMisaI | kMisaM | kMisaS | kMisaU;
+// Only C is writable: step_body.inc honors a cleared C (IALIGN becomes 32 and
+// compressed words turn illegal). The interpreter has no path that stops
+// entering S/U or executing F/D/A/M after their bits are cleared, and MXL is
+// read-only (priv spec 3.1.1,
+// https://docs.riscv.org/reference/isa/_attachments/riscv-privileged.pdf), so
+// those bits are hardwired. QEMU reaches the same end by dropping the write
+// with its default `misa_w=false` (target/riscv/csr.c write_misa).
+static const uint64_t kMisaWritable = kMisaC;
 // tcontrol MTE/MPTE (RISC-V debug spec, tcontrol register)
 static const uint64_t kTcontrolMte = 1ULL << 7;
 static const uint64_t kTcontrolMpte = 1ULL << 6;
