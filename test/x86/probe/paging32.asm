@@ -99,7 +99,10 @@ _start:
   mov edi, PD
   rep stosd
 
-  mov dword [PDPT], PD | 3
+  ; Legacy PAE PDPTE has no R/W or U/S bits: SDM vol.3 table 4-8 makes
+  ; 2:1 and 8:5 reserved (must be 0). Only P and the page-directory address
+  ; are valid here; the PDE/PTE supply the access rights.
+  mov dword [PDPT], PD | 1
   mov dword [PD], PT0 | 3
   mov dword [PD + 8], PT1 | 3
   mov dword [PD + 4 * 8], 0x01000000 | 0x83   ; 2MB leaf VA 8MB -> PA 16MB
@@ -143,6 +146,11 @@ _start:
   mov cr3, eax
   mov eax, cr0
   or eax, 0x80000000
+  mov cr0, eax
+  ; CR0.WP proves the PDPTE is not a permission level: a supervisor write
+  ; must still consult the PDE/PTE R/W bits, not the PDPTE's reserved bit1.
+  mov eax, cr0
+  or eax, 0x00010000
   mov cr0, eax
 
   ; t1: 4KB PAE leaf.

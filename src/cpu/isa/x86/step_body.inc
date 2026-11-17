@@ -34,6 +34,7 @@ void STEP_FN(CpuState* c) {
   // w32/a32/seg are set below. This avoids an 80-byte memset per instruction.
   g.watch_hit = 0;
   g.rf_load = 0;
+  g.rep_cont = 0;
   g.delivered = 0;
   g.op2 = 0;
   g.rep = 0;
@@ -225,8 +226,10 @@ void STEP_FN(CpuState* c) {
 #endif
   // RF clears after the instruction it protected completed successfully —
   // unless this instruction itself loaded an EFLAGS image (iret/popf/task
-  // switch), whose RF is the authoritative one (SDM vol.3 17.3.1).
-  if (!d.rf_load) fl->rf = 0;
+  // switch), whose RF is the authoritative one (SDM vol.3 17.3.1), or a REP
+  // iteration asked to run again: the whole REP is one instruction, so RF
+  // stays set until the final iteration (QEMU decode-new.c.inc's REP arm).
+  if (!d.rf_load && !d.rep_cont) fl->rf = 0;
   // The reserved bits are constants of the register, not state: bit 1 reads 1
   // and bits 3, 5 and 15 read 0 (SDM vol.1 3.4.3 table 3-1). An image an
   // instruction loaded from the stack or a TSS may hold anything there, so the

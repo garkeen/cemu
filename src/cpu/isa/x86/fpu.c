@@ -188,20 +188,34 @@ void fpu_free(x86_fpu* f, int i) {
 void fpu_exchange(x86_fpu* f, int i) {
   int t = fpu_top(f);
   int p = (t + i) & 7;
-  extFloat80_t tmp = f->st[t];
-  f->st[t] = f->st[p];
-  f->st[p] = tmp;
-  uint16_t tt = fpu_tag(f, t), tp = fpu_tag(f, p);
-  f->tw = (uint16_t)((f->tw & ~((3u << (2 * t)) | (3u << (2 * p)))) |
-                     ((unsigned)tp << (2 * t)) | ((unsigned)tt << (2 * p)));
+  int et = fpu_tag(f, t) == kFpuTagEmpty;
+  int ep = fpu_tag(f, p) == kFpuTagEmpty;
+  extFloat80_t a = f->st[t], b = f->st[p];
+  if (et || ep) {
+    // SDM FXCH "Numeric Exceptions": #IS when either register is empty.
+    // Bochs fpu_misc.cc FXCH_STi sets IE|SF and, if masked, substitutes the
+    // indefinite QNaN for the empty side before exchanging.
+    f->sw |= kFpuIe | kFpuSf;
+    if (et) a = kIndefinite;
+    if (ep) b = kIndefinite;
+    UpdateEs(f);
+  }
+  f->st[t] = b;
+  f->st[p] = a;
+  fpu_mark(f, t);
+  fpu_mark(f, p);
   f->sw &= (uint16_t)~kFpuC1;
 }
 
-static void DenormalOperands(x86_fpu* f, extFloat80_t a, extFloat80_t b) {
-  if (F80IsDenormal(a) || F80IsDenormal(b)) {
+static void DenormalOperand(x86_fpu* f, extFloat80_t a) {
+  if (F80IsDenormal(a)) {
     f->sw |= kFpuDe;
     UpdateEs(f);
   }
+}
+static void DenormalOperands(x86_fpu* f, extFloat80_t a, extFloat80_t b) {
+  DenormalOperand(f, a);
+  DenormalOperand(f, b);
 }
 
 void fpu_arith(x86_fpu* f, int op, int dst, extFloat80_t b) {
@@ -245,6 +259,7 @@ static uint32_t CompareBits(extFloat80_t a, extFloat80_t b) {
 
 void fpu_compare(x86_fpu* f, extFloat80_t b, int quiet) {
   extFloat80_t a = fpu_get(f, 0);
+  DenormalOperands(f, a, b);  // FCOM/FUCOM/FICOM: #D on a denormal operand
   int invalid = F80IsNan(a) || F80IsNan(b) ? (!quiet || F80IsSnan(a) || F80IsSnan(b)) : 0;
   if (invalid) f->sw |= kFpuIe;
   f->sw &= (uint16_t)~(kFpuC0 | kFpuC1 | kFpuC2 | kFpuC3);
@@ -258,6 +273,7 @@ void fpu_compare(x86_fpu* f, extFloat80_t b, int quiet) {
 uint32_t fpu_compare_i(x86_fpu* f, extFloat80_t b, int quiet) {
   enum { kCf = 1u << 0, kPf = 1u << 2, kZf = 1u << 6 };
   extFloat80_t a = fpu_get(f, 0);
+  DenormalOperands(f, a, b);  // FCOMI/FUCOMI: #D on a denormal operand
   int unordered = F80IsNan(a) || F80IsNan(b);
   int invalid = unordered ? (!quiet || F80IsSnan(a) || F80IsSnan(b)) : 0;
   if (invalid) f->sw |= kFpuIe;
@@ -341,6 +357,7 @@ static long double Ln2(void) { return 0.693147180559945309417232121458176568L; }
 
 void fpu_f2xm1(x86_fpu* f) {
   extFloat80_t a = fpu_get(f, 0);
+  DenormalOperand(f, a);  // F2XM1: #D on a denormal source
   if (F80IsNan(a)) {
     if (F80IsSnan(a)) {
       f->sw |= kFpuIe;
@@ -367,6 +384,7 @@ void fpu_f2xm1(x86_fpu* f) {
 void fpu_fyl2x(x86_fpu* f) {
   extFloat80_t x = fpu_get(f, 0);
   extFloat80_t y = fpu_get(f, 1);
+  DenormalOperands(f, x, y);  // FYL2X: #D on either denormal source
   if (F80IsNan(x) || F80IsNan(y)) {
     if (F80IsSnan(x) || F80IsSnan(y)) f->sw |= kFpuIe;
     fpu_set(f, 1, F80IsNan(x) ? x : y);
@@ -407,6 +425,7 @@ void fpu_fyl2x(x86_fpu* f) {
 
 void fpu_fptan(x86_fpu* f) {
   extFloat80_t a = fpu_get(f, 0);
+  DenormalOperand(f, a);  // FPTAN: #D on a denormal source
   if (F80IsNan(a)) {
     if (F80IsSnan(a)) f->sw |= kFpuIe;
     fpu_set(f, 0, a);
@@ -431,6 +450,7 @@ void fpu_fptan(x86_fpu* f) {
 void fpu_fpatan(x86_fpu* f) {
   extFloat80_t x = fpu_get(f, 0);   // ST0
   extFloat80_t y = fpu_get(f, 1);   // ST1
+  DenormalOperands(f, x, y);  // FPATAN: #D on either denormal source
   if (F80IsNan(x) || F80IsNan(y)) {
     if (F80IsSnan(x) || F80IsSnan(y)) f->sw |= kFpuIe;
     fpu_set(f, 1, F80IsNan(x) ? x : y);
@@ -449,6 +469,7 @@ void fpu_fpatan(x86_fpu* f) {
 
 void fpu_fxtract(x86_fpu* f) {
   extFloat80_t v = fpu_get(f, 0);
+  DenormalOperand(f, v);  // FXTRACT: #D on a denormal source
   if (F80IsZero(v)) {
     f->sw |= kFpuZe;
     fpu_set(f, 0, F80(0x8000000000000000ULL, 0xffff));  // -inf
@@ -486,6 +507,7 @@ void fpu_fxtract(x86_fpu* f) {
 void fpu_fprem(x86_fpu* f, int ieee) {
   extFloat80_t a = fpu_get(f, 0);
   extFloat80_t b = fpu_get(f, 1);
+  DenormalOperands(f, a, b);  // FPREM/FPREM1: #D on either denormal source
   f->sw &= (uint16_t)~(kFpuC0 | kFpuC1 | kFpuC2 | kFpuC3);
   if (F80IsNan(a) || F80IsNan(b) || F80IsZero(b) || F80IsInf(a) || F80IsZero(a)) {
     fpu_begin(f);
@@ -550,6 +572,7 @@ void fpu_fincstp(x86_fpu* f) {
 void fpu_fyl2xp1(x86_fpu* f) {
   extFloat80_t x = fpu_get(f, 0);
   extFloat80_t y = fpu_get(f, 1);
+  DenormalOperands(f, x, y);  // FYL2XP1: #D on either denormal source
   if (F80IsNan(x) || F80IsNan(y)) {
     if (F80IsSnan(x) || F80IsSnan(y)) f->sw |= kFpuIe;
     fpu_set(f, 1, F80IsNan(x) ? x : y);
@@ -577,6 +600,7 @@ void fpu_fyl2xp1(x86_fpu* f) {
 
 void fpu_fsqrt(x86_fpu* f) {
   extFloat80_t a = fpu_get(f, 0);
+  DenormalOperand(f, a);  // FSQRT: #D on a denormal source
   f->sw &= (uint16_t)~(kFpuC0 | kFpuC1 | kFpuC2 | kFpuC3);
   if (F80Sign(a) && !F80IsZero(a) && !F80IsNan(a)) f->sw |= kFpuC2;
   fpu_begin(f);
@@ -588,6 +612,7 @@ void fpu_fsqrt(x86_fpu* f) {
 
 void fpu_fsincos(x86_fpu* f) {
   extFloat80_t a = fpu_get(f, 0);
+  DenormalOperand(f, a);  // FSINCOS: #D on a denormal source
   if (F80IsNan(a)) {
     if (F80IsSnan(a)) f->sw |= kFpuIe;
     fpu_set(f, 0, a);
@@ -612,6 +637,7 @@ void fpu_fsincos(x86_fpu* f) {
 
 void fpu_frndint(x86_fpu* f) {
   extFloat80_t a = fpu_get(f, 0);
+  DenormalOperand(f, a);  // FRNDINT: #D on a denormal source
   fpu_begin(f);
   extFloat80_t r;
   extF80M_roundToInt(&a, softfloat_roundingMode, true, &r);
@@ -622,6 +648,7 @@ void fpu_frndint(x86_fpu* f) {
 void fpu_fscale(x86_fpu* f) {
   extFloat80_t a = fpu_get(f, 0);
   extFloat80_t b = fpu_get(f, 1);
+  DenormalOperands(f, a, b);  // FSCALE: #D on either denormal source
   if (F80IsNan(a) || F80IsNan(b)) {
     if (F80IsSnan(a) || F80IsSnan(b)) f->sw |= kFpuIe;
     fpu_set(f, 0, F80IsNan(a) ? a : b);
@@ -654,6 +681,7 @@ void fpu_fscale(x86_fpu* f) {
 
 void fpu_fsin(x86_fpu* f) {
   extFloat80_t a = fpu_get(f, 0);
+  DenormalOperand(f, a);  // FSIN: #D on a denormal source
   if (F80IsNan(a)) {
     if (F80IsSnan(a)) f->sw |= kFpuIe;
     fpu_set(f, 0, a);
@@ -676,6 +704,7 @@ void fpu_fsin(x86_fpu* f) {
 
 void fpu_fcos(x86_fpu* f) {
   extFloat80_t a = fpu_get(f, 0);
+  DenormalOperand(f, a);  // FCOS: #D on a denormal source
   if (F80IsNan(a)) {
     if (F80IsSnan(a)) f->sw |= kFpuIe;
     fpu_set(f, 0, a);
@@ -700,7 +729,7 @@ void fpu_fcos(x86_fpu* f) {
 
 extFloat80_t fpu_load_f32(x86_fpu* f, uint32_t bits) {
   // A load does not raise the denormal-operand exception; the arithmetic
-  // that consumes the value does (fpu_arith's DenormalOperands).
+  // instruction that consumes the value does (DenormalOperand(s)).
   float32_t v = {bits};
   extFloat80_t r;
   softfloat_exceptionFlags = 0;

@@ -79,6 +79,11 @@ typedef struct dec {
   uint32_t watch_hit;
   int rf_load;
   int delivered;  // the instruction delivered an exception frame (do_int)
+  // A REP iteration asked to run again (string_op set nxt=0). RF belongs to
+  // the whole REP instruction, not to one iteration: an execution breakpoint
+  // must not fire again between iterations (QEMU decode-new.c.inc's REP arm
+  // keeps RF set "throughout the repetition").
+  int rep_cont;
   // A control transfer wrote eip. The commit must keep that target even when
   // it equals the instruction's own address; an equality test against the
   // start cannot tell that from "no transfer" and would add the length.

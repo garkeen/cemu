@@ -29,7 +29,9 @@ enum {
 // Where a delivered vector came from (SDM vol.2 INT Operation / vol.3 table
 // 6-1): only a CPU-raised exception pushes the vector's error code — a software
 // INT n and the external interrupt pin push a bare flags/CS/IP frame.
-enum { kIntException = 0, kIntExternal = 1, kIntSoft = 2 };
+// kIntSoftN is the CD imm8 form specifically: V86 checks IOPL < 3 for INT n,
+// while INT3/INTO are exempt (SDM vol.2 INT n; kIntSoft covers those two).
+enum { kIntException = 0, kIntExternal = 1, kIntSoft = 2, kIntSoftN = 3 };
 
 // Debug registers (SDM vol.3 ch.17). DR6's reserved bits read 1 (reset
 // 0xffff0ff0) and its B bits clear on any write; DR7 bit 10 reads 1 (reset
@@ -47,6 +49,11 @@ enum {
 enum {
   kDr7LBase = 0, kDr7RwBase = 16, kDr7LenBase = 18,
   kDr7AnyEnable = 0xffu,  // both enable bits (Li/Gi) of all four slots
+  // A task switch clears LE and the four local enables L0-L3; the global
+  // enables G0-G3 and GE survive (SDM vol.3 7.2.1; QEMU switch_tss_ra's
+  // `dr[7] & ~DR7_LOCAL_BP_MASK`, Bochs tasking.cc `dr7 &= ~0x155`).
+  kDr7LocalEnables = 0x55u,
+  kDr7LocalBpMask = kDr7Le | kDr7LocalEnables,
   // The R/W encodings (SDM vol.3 17.2.4, table 17-2). There is no read-only
   // data breakpoint: 11 means read *or* write.
   kDr7RwExec = 0, kDr7RwWrite = 1, kDr7RwIo = 2, kDr7RwAccess = 3
