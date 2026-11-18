@@ -30,6 +30,7 @@ void BusAddRegion(Bus* bus, uint64_t base, uint64_t size, const DeviceOps* ops, 
   r->ops = ops;
   r->dev = dev;
   r->host = NULL;
+  r->writable = 1;
   r->overlaps = 0;
   bus->version++;
   RefreshBus(bus);
@@ -96,6 +97,13 @@ int BusProbe(Bus* bus, uint64_t addr, int len, BusRegion** out) {
   return r ? 0 : -1;
 }
 
+void BusSetWritable(Bus* bus, uint64_t base, uint64_t size, int writable) {
+  for (int i = 0; i < bus->count; i++) {
+    BusRegion* r = &bus->regions[i];
+    if (r->base >= base && r->base + r->size <= base + size) r->writable = writable;
+  }
+}
+
 uint64_t BusRead(Bus* bus, uint64_t addr, int size) {
   BusRegion* r = FindRegion(bus, addr, size);
   if (!r) Fatal("read of unmapped address %llx", (unsigned long long)addr);
@@ -112,7 +120,7 @@ int BusRamPage(Bus* bus, uint64_t addr, uint8_t** host) {
   if (addr & 0xfff) return -1;
   for (int i = 0; i < bus->count; i++) {
     BusRegion* r = &bus->regions[i];
-    if (!r->host || addr < r->base || addr + 0x1000 > r->base + r->size) continue;
+    if (!r->host || !r->writable || addr < r->base || addr + 0x1000 > r->base + r->size) continue;
     // `overlaps` is region-granular: the PC's 32MB RAM contains the VGA/ROM
     // windows, so it is set for the whole RAM region even though almost every
     // page is plain RAM. Direct access is safe only when no other region

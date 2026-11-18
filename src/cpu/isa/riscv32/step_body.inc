@@ -37,7 +37,11 @@ void STEP_FN(CpuState* c) {
   // wfi sleep: no fetch until an enabled interrupt is pending; rv32_cpu->wait is
   // the one sleep flag and the board run loop keeps the timers running.
   if (rv32_cpu->wait) {
-    if (((rs->mip | rs->ext_irq) & rs->mie) == 0) return;
+    if (((rs->mip | rs->ext_irq) & rs->mie) == 0) {
+      // Time keeps running while the hart sleeps: mcycle is not frozen by WFI.
+      if (!(rs->mcountinhibit & kMcountinhibitCy)) rs->mcycle++;
+      return;
+    }
     rv32_cpu->wait = 0;
   }
   // Interrupts are taken at *any* instruction boundary (priv spec 3.1.9), so
@@ -56,6 +60,7 @@ void STEP_FN(CpuState* c) {
   // committed bank is copied back only when the instruction retires.
   Riscv32LoadRegs(rv32_cpu);
 
+  int retired = 0;
   if (setjmp(fr->raise)) {
     // The trap consumer: take it and land on the vector. Register writes made
     // before the fault are dropped with the local bank (instruction
@@ -67,6 +72,8 @@ void STEP_FN(CpuState* c) {
     rs->trap_signal = (uint8_t)GdbTrapSignal(fr->trap.cause);
     DebugTrap(fr);
   } else {
+    // Execute triggers fire before the fetch (Sail step.sail TriggerFetchAddr).
+    Riscv32TriggerCheck(fr, rs, kTrigOpExecute, rv32_cpu->pc, 0);
     if (rv32_cpu->pc & 1) raise_(fr, kExFetchMisaligned, rv32_cpu->pc);
     int c_on = (int)((rs->misa >> 2) & 1);
     // With misa.C clear IALIGN is 32: a 32-bit fetch at a 2-aligned address
@@ -116,10 +123,6 @@ void STEP_FN(CpuState* c) {
 #endif
 
     // Execute triggers fire on the fetched pc before the instruction runs
-    // (Sdtrig 5.3.12; xiangshanNEMU checks at decode — after the fetch, so a
-    // fetch fault keeps precedence).
-    Riscv32TriggerCheck(fr, rs, kTrigOpExecute, rv32_cpu->pc);
-
     // The one commit: the interpreter returns the new pc; x0 stays zero and
     // the 32-bit bank becomes the architectural register file again.
     x[0] = 0;
@@ -130,11 +133,15 @@ void STEP_FN(CpuState* c) {
 #if STEP_DBG
     if (g_dbg_insn) DebugInsn(fr);
 #endif
+    retired = 1;
   }
 
   // Counter increments gated by mcountinhibit; a write to a counter
   // suppresses its own increment for the writing instruction (Zicntr).
-  if (!(rs->mcountinhibit & kMcountinhibitIr) && rs->counter_written != kCounterMinstret)
+  // minstret counts retired instructions only: a step that took a trap did
+  // not retire (Sail step.sail sets retired from Retire_Success).
+  if (retired && !(rs->mcountinhibit & kMcountinhibitIr) &&
+      rs->counter_written != kCounterMinstret)
     rs->minstret++;
   if (!(rs->mcountinhibit & kMcountinhibitCy) && rs->counter_written != kCounterMcycle)
     rs->mcycle++;

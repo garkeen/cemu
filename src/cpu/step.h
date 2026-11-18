@@ -65,7 +65,10 @@ typedef struct frame {
 } frame;
 
 // Memory access classes (the riscv pipeline faults distinctly per class).
-enum { acc_ifetch = 0, acc_read, acc_write, acc_amo };
+// acc_cbo is a Zicbom cache-block management access: PMP accepts R or W
+// (Sail pmp_control.sail: CacheAccess(CB_manage) => ent[R] | ent[W]) and the
+// page is not dirtied.
+enum { acc_ifetch = 0, acc_read, acc_write, acc_amo, acc_cbo };
 
 // Raises out of the current instruction; the ISA's raise consumer installs
 // the resume point in rec.dnpc. The whole step unwinds — the manual's

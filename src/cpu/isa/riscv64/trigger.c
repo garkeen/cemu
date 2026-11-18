@@ -17,7 +17,14 @@
 // mcontrol6_match). select is WARL-0, so the compared value is always the
 // operation's address.
 static int Mc6Match(RiscvState* s, uint64_t t1, uint64_t t2, uint64_t t3, int op,
-                    uint64_t addr) {
+                    uint64_t addr, int size) {
+  if (((t1 >> 60) & 0xf) != 6) return 0;  // only mcontrol6 is implemented
+  // size field (18:16): 0 = any, 1/2/3/4 = 8/16/32/64-bit access.
+  uint64_t sz = (t1 >> 16) & 7;
+  if (sz != 0) {
+    int want = sz == 1 ? 1 : sz == 2 ? 2 : sz == 3 ? 4 : sz == 4 ? 8 : 0;
+    if (want == 0 || size != want) return 0;
+  }
   if ((!(op & kTrigOpExecute) || !(t1 & kMc6Execute)) &&
       (!(op & kTrigOpLoad) || !(t1 & kMc6Load)) &&
       (!(op & kTrigOpStore) || !(t1 & kMc6Store)))
@@ -65,24 +72,41 @@ static int TrigReentryOk(RiscvState* s) {
   return 1;
 }
 
-// action 0 = breakpoint exception (mtval carries the matched address);
-// action 1 = enter debug mode, which this machine does not implement (no
-// dcsr/dpc state) — stop loudly.
-_Noreturn static void Fire(frame* fr, uint64_t t1, uint64_t addr) {
-  if (((t1 >> 12) & 0xf) == 1) Fatal("riscv: trigger action 1 (debug mode) fired");
+// action 0 = breakpoint exception (mtval carries the matched address).
+_Noreturn static void Fire(frame* fr, uint64_t addr) {
   raise_(fr, kExBreakpoint, addr);
 }
 
-void RiscvTriggerCheck(frame* fr, RiscvState* s, int op, uint64_t addr) {
+// The first byte of [addr, addr+span) that the trigger matches, or ~0 when it
+// does not match. Sail compares every byte of the access (address_select_
+// matches_all_addresses); the matched address becomes mtval.
+static uint64_t MatchSpan(RiscvState* s, uint64_t t1, uint64_t t2, uint64_t t3, int op,
+                          uint64_t addr, int span, int size) {
+  for (int i = 0; i < span; i++) {
+    uint64_t a = addr + (uint64_t)i;
+    if (Mc6Match(s, t1, t2, t3, op, a, size)) return a;
+  }
+  return ~0ULL;
+}
+
+void RiscvTriggerCheck(frame* fr, RiscvState* s, int op, uint64_t addr, int size) {
   if (!TrigReentryOk(s)) return;
+  int span = (op & kTrigOpExecute) ? 1 : (size > 0 ? size : 1);
   // All hits are evaluated first: a chained trigger fires only when the
   // previous trigger in the chain matched the same operation (debug spec
-  // 5.3.12 chain; xiangshanNEMU check_triggers_mcontrol6).
-  int hit0 = Mc6Match(s, s->tdata1[0], s->tdata2[0], s->tdata3[0], op, addr);
-  int hit1 = Mc6Match(s, s->tdata1[1], s->tdata2[1], s->tdata3[1], op, addr);
+  // 5.3.12 chain).
+  uint64_t m0 = MatchSpan(s, s->tdata1[0], s->tdata2[0], s->tdata3[0], op, addr, span, size);
+  uint64_t m1 = MatchSpan(s, s->tdata1[1], s->tdata2[1], s->tdata3[1], op, addr, span, size);
+  int hit0 = m0 != ~0ULL, hit1 = m1 != ~0ULL;
   int chain0 = (int)((s->tdata1[0] >> 11) & 1);
-  if (hit0 && !chain0) Fire(fr, s->tdata1[0], addr);
-  if ((hit0 || !chain0) && hit1 && !((s->tdata1[1] >> 11) & 1)) Fire(fr, s->tdata1[1], addr);
+  if (hit0 && !chain0) {
+    s->tdata1[0] |= kMc6Hit0;  // hit0, before-timing (Sail Hit_before = 0b01)
+    Fire(fr, m0);
+  }
+  if ((hit0 || !chain0) && hit1 && !((s->tdata1[1] >> 11) & 1)) {
+    s->tdata1[1] |= kMc6Hit0;
+    Fire(fr, m1);
+  }
 }
 
 // tdata1 write (debug spec 5.3.12; xiangshanNEMU mcontrol6_checked_write):
@@ -94,16 +118,27 @@ void RiscvTriggerCheck(frame* fr, RiscvState* s, int op, uint64_t addr) {
 void RiscvTriggerWriteTdata1(RiscvState* s, uint64_t val) {
   int idx = (int)s->tselect;
   uint64_t cur = s->tdata1[idx];
+  uint64_t type = (val >> 60) & 0xf;
+  uint64_t action = (val >> 12) & 0xf;
+  // Type 0 or 15 disables the trigger; only mcontrol6 is implemented. Actions
+  // other than the breakpoint exception need Sdext/debug mode, so an
+  // unsupported action disables the trigger too (Sail make_disabled_trigger).
+  if (type != 6 || action != 0) {
+    s->tdata1[idx] = kTrigTypeDisabled;
+    return;
+  }
   uint64_t v = kTrigTypeMcontrol6;
   v |= cur & val & kMc6Dmode;
   uint64_t match = (val >> 7) & 0xf;
   if (match == kMc6MatchEq || match == kMc6MatchGe || match == kMc6MatchLt) v |= match << 7;
-  uint64_t action = (val >> 12) & 0xf;
-  if (action <= 1) v |= action << 12;
-  // A chained trigger with no successor can never fire: the last trigger's
-  // chain bit WARLs to 0 (xiangshanNEMU mcontrol6_check_chain_legal).
-  if (idx < kTrigCount - 1 || !(val & kMc6Chain)) v |= val & kMc6Chain;
+  // Chain is stored as written: a last trigger with chain=1 waits for a
+  // successor that does not exist and therefore never fires; the matcher
+  // treats chain=1 as "not a terminator".
+  v |= val & kMc6Chain;
   v |= val & (kMc6Load | kMc6Store | kMc6Execute | kMc6U | kMc6S | kMc6M);
+  uint64_t sz = (val >> 16) & 7;
+  if (sz <= 4) v |= sz << 16;  // 8/16/32/64-bit access size
+  v |= val & (kMc6Hit0 | kMc6Hit1);
   s->tdata1[idx] = v;
 }
 
@@ -111,7 +146,13 @@ void RiscvTriggerWriteTdata1(RiscvState* s, uint64_t val) {
 // H extension; the Sscontext fields store as written (the match above limits
 // which sselect encodings can ever fire). tselect selects the trigger.
 void RiscvTriggerWriteTdata3(RiscvState* s, uint64_t val) {
-  s->tdata3[s->tselect] = val & ~kTd3MhMask;
+  // Trigger_Extra_RV64: sselect 1:0, svalue 33:2, sbytemask 39:36; the mh
+  // fields read zero without mcontext matching, and bits 47:40/35:34 are
+  // reserved (Sail TExtra_to_bits starts from zeros).
+  uint64_t mask = 3ULL | (0xffffffffULL << 2) | (0xfULL << 36);
+  uint64_t v = val & mask;
+  if ((v & 3) == 3) v &= ~3ULL;  // sselect=3 is reserved, legalized to 0
+  s->tdata3[s->tselect] = v;
 }
 
 // ---- gdb stub watchpoints ---------------------------------------------------

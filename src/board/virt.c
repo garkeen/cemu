@@ -391,6 +391,8 @@ Board* VirtBoardCreate(const BoardOpts* opts) {
   }
   BusAddRamRegion(&m->bus, kDramBase, ram_size, &kRamOps, m->ram, m->ram->mem);
   BusAddRamRegion(&m->bus, kMromBase, kMromSize, &kRamOps, vm->mrom, vm->mrom->mem);
+  // Mask ROM is not writable (PMA): a store there is a store access fault.
+  BusSetWritable(&m->bus, kMromBase, kMromSize, 0);
   m->bin_base = kDramBase;  // firmware loads at the DRAM base
   m->bios_image = 1;        // -bios FILE is that firmware (QEMU -bios)
 

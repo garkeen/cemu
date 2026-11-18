@@ -43,6 +43,8 @@ static int PmpRegion(const Riscv32State* s, int i, uint64_t* base, uint64_t* siz
   uint8_t cfg = PmpCfg(s, i);
   uint64_t a = cfg & kPmpAMask;
   uint64_t addr = s->pmpaddr[i];
+  // G=2 pmpaddr projection: NAPOT's low bit reads as one.
+  if (a == kPmpANapot) addr |= 1;
   if (a == kPmpATor) {
     uint64_t lo = i > 0 ? (s->pmpaddr[i - 1] & ~3u) : 0;
     uint64_t hi = addr & ~3u;
@@ -93,6 +95,15 @@ int Riscv32PmpAllowed(const Riscv32State* s, uint64_t addr, uint64_t len, int ac
     }
     uint8_t cfg = PmpCfg(s, i);
     if (mode == kPrivMachine && !(cfg & kPmpL)) return 1;  // M passes unlocked
+    // Cache-block management is accepted by a region that is readable OR
+    // writable (Sail pmp_control.sail CacheAccess(CB_manage)).
+    if (acc == acc_cbo) {
+      if (!(cfg & (kPmpR | kPmpW))) {
+        DebugPmpDeny(addr, (int)len, acc, mode, i, cfg, base, size);
+        return 0;
+      }
+      return 1;
+    }
     if ((need_r && !(cfg & kPmpR)) || (need_w && !(cfg & kPmpW)) || (need_x && !(cfg & kPmpX))) {
       DebugPmpDeny(addr, (int)len, acc, mode, i, cfg, base, size);
       return 0;
@@ -126,16 +137,18 @@ static int PageFaultCause(int acc) {
 
 // PTE fetch: a physical 4-byte read checked as S-mode (the reference walks
 // page tables under MODE_S regardless of the trapped privilege).
-static uint32_t PteRead(frame* f, Riscv32State* s, uint64_t pte_addr, int acc) {
+static uint32_t PteRead(frame* f, Riscv32State* s, uint64_t vaddr, uint64_t pte_addr, int acc) {
   if (!Riscv32PmpAllowed(s, pte_addr, kSv32PteSize, acc_read, kPrivSupervisor) ||
       BusProbe(f->cpu->bus, pte_addr, kSv32PteSize, NULL) != 0) {
-    raise_paddr_(f, AccessFaultCause(acc), pte_addr, pte_addr);
+    // tval is the faulting virtual address; paddr is the PTE that could not
+    // be read (Sail vmem.sail build_exception_context: excinfo = gva).
+    raise_paddr_(f, AccessFaultCause(acc), vaddr, pte_addr);
   }
   return (uint32_t)BusRead(f->cpu->bus, pte_addr, kSv32PteSize);
 }
 
 int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int size, int acc,
-                     uint64_t* paddr, uint8_t** host) {
+                     uint64_t* paddr, uint8_t** host, uint64_t tval) {
   if (host) *host = NULL;
   vaddr &= kXlenMask;  // RV32: the virtual address is 32 bits wide
   // Effective privilege for data accesses under MPRV uses MPP (priv spec
@@ -146,8 +159,10 @@ int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int size, int ac
   uint64_t satp_mode = (s->satp >> 31) & 1;
   if (eff == kPrivMachine || satp_mode == kSatpModeBare) {
     *paddr = vaddr;
-    if (!Riscv32PmpAllowed(s, vaddr, (uint64_t)size, acc, s->priv))
-      raise_paddr_(f, AccessFaultCause(acc), vaddr, vaddr);
+    // MPRV data accesses are checked at the effective privilege (priv spec
+    // 3.1.6.6; Sail sys_control.sail effectivePrivilege).
+    if (!Riscv32PmpAllowed(s, vaddr, (uint64_t)size, acc, eff))
+      raise_paddr_(f, AccessFaultCause(acc), tval, vaddr);
     if (host) BusRamPage(f->cpu->bus, vaddr & ~kSv32OffsetMask, host);
     return 0;
   }
@@ -180,7 +195,7 @@ int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int size, int ac
   for (level = kSv32Levels - 1; level >= 0; level--) {
     uint64_t vpn = (vaddr >> (kSv32PageShift + kSv32VpnBits * level)) & kSv32VpnMask;
     pte_addr = (ppn_base << kSv32PageShift) + vpn * kSv32PteSize;
-    pte = PteRead(f, s, pte_addr, acc);
+    pte = PteRead(f, s, vaddr, pte_addr, acc);
     if (!(pte & kPteV) || (!(pte & kPteR) && (pte & kPteW))) {
       raise_(f, PageFaultCause(acc), vaddr);
     }
@@ -203,8 +218,23 @@ int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int size, int ac
     if (!ok || !(pte & kPteX)) goto page_fault;
   } else if (acc == acc_read) {
     if (!ok || (!((pte & kPteR) || ((s->mstatus & kMstatusMxr) && (pte & kPteX))))) goto page_fault;
+  } else if (acc == acc_cbo) {
+    // Zicbom management only needs the page to be readable or writable; MXR
+    // makes an execute-only page readable.
+    if (!ok || !((pte & (kPteR | kPteW)) || ((s->mstatus & kMstatusMxr) && (pte & kPteX))))
+      goto page_fault;
   } else {  // write and AMO need W (the AMO read side faults as a store)
     if (!ok || !(pte & kPteW)) goto page_fault;
+  }
+  // Superpage PPN alignment is checked before any A/D write-back (Sail
+  // vmem.sail: PTW_Misaligned is returned before update_and_write_pte).
+  uint64_t ppn = (pte >> 10) & kSatpPpnMask;
+  uint64_t low = 0;
+  if (level > 0) {
+    // Superpage: PPN[0] must be zero for a 4 MiB page (priv spec 4.3.2),
+    // which is also the encode rule the reference enforces.
+    low = kSv32VpnMask;
+    if (ppn & low) goto page_fault;
   }
   // A/D handling (priv spec 4.3.1 + Svadu): the A bit is updated by
   // hardware unconditionally on any successful access; the D bit matters
@@ -218,23 +248,27 @@ int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int size, int ac
     if (!(s->menvcfg & kMenvcfgAdue)) goto page_fault;
     new_pte |= kPteD;
   }
-  if (!(pte & kPteA)) new_pte |= kPteA;
+  if (!(pte & kPteA)) {
+    // Svade semantics: with ADUE=0 the hardware must not update A.
+    if (!(s->menvcfg & kMenvcfgAdue)) goto page_fault;
+    new_pte |= kPteA;
+  }
   if (new_pte != pte) {
     // The PTE lives in RAM on every machine that pages; a missing region
     // means it no longer does, which is an access fault.
     if (BusProbe(f->cpu->bus, pte_addr, kSv32PteSize, NULL) != 0) {
-      raise_paddr_(f, AccessFaultCause(acc), vaddr, pte_addr);
+      raise_paddr_(f, AccessFaultCause(acc), tval, pte_addr);
+    }
+    // The A/D write-back is a Supervisor-mode PTE store: PMP must allow W
+    // (Sail vmem.sail write_pte -> Store(PageTableEntry)).
+    if (!Riscv32PmpAllowed(s, pte_addr, kSv32PteSize, acc_write, kPrivSupervisor)) {
+      raise_paddr_(f, AccessFaultCause(acc), tval, pte_addr);
     }
     BusWrite(f->cpu->bus, pte_addr, kSv32PteSize, new_pte);
     pte = new_pte;
   }
 
-  uint64_t ppn = (pte >> 10) & kSatpPpnMask;
   if (level > 0) {
-    // Superpage: PPN[0] must be zero for a 4 MiB page (priv spec 4.3.2),
-    // which is also the encode rule the reference enforces.
-    uint64_t low = kSv32VpnMask;
-    if (ppn & low) goto page_fault;
     uint64_t off_mask = kSv32SuperpageMask;
     *paddr = ((ppn & ~low) << kSv32PageShift) | (vaddr & off_mask);
   } else {
@@ -242,11 +276,19 @@ int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int size, int ac
   }
   // PMP for the final physical access is decided once, at fill time: a cache
   // hit may then skip the 16-entry scan. The entry records pmp_gen, so a PMP
-  // CSR write makes every old decision miss.
-  if (!Riscv32PmpAllowed(s, *paddr, (uint64_t)size, acc, s->priv))
-    raise_paddr_(f, AccessFaultCause(acc), vaddr, *paddr);
+  // CSR write makes every old decision miss. MPRV uses the effective
+  // privilege for both this check and the page-wide one below.
+  if (!Riscv32PmpAllowed(s, *paddr, (uint64_t)size, acc, eff))
+    raise_paddr_(f, AccessFaultCause(acc), tval, *paddr);
   uint8_t* h = NULL;
   BusRamPage(f->cpu->bus, *paddr & ~kSv32OffsetMask, &h);
+  // The cache is keyed by VPN, so a hit can land at any offset in the page.
+  // Only cache when one PMP decision covers the whole 4 KiB page; a window
+  // that is allowed for this access alone still proceeds, uncached.
+  if (!Riscv32PmpAllowed(s, *paddr & ~kSv32OffsetMask, 0x1000, acc, eff)) {
+    if (host) *host = h;
+    return 0;
+  }
   // Prefer a slot invalidated by sfence; otherwise alternate ways so one hot
   // page cannot pin a set forever.
   int w = ways[0].gen != s->tlb_gen ? 0 : ways[1].gen != s->tlb_gen ? 1 : (int)(s->tlb_clock++ & 1);
@@ -266,6 +308,6 @@ int Riscv32Translate(frame* f, Riscv32State* s, uint64_t vaddr, int size, int ac
   return 0;
 
 page_fault:
-  raise_(f, PageFaultCause(acc), vaddr);
+  raise_(f, PageFaultCause(acc), tval);
   return -1;  // not reached
 }

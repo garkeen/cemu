@@ -62,6 +62,12 @@ void riscv32_sync_timer(CpuState* cpu, Riscv32State* s) {
   // no host clock reads. step.c calls this at batch boundaries and on every
   // step while STIP is asserted (the comparator is a level, so a stimecmp
   // write must retire the request at once).
+  // Sstc: stimecmp drives STIP only while menvcfg.STCE enables Sstc. With
+  // STCE=0, STIP is the platform/software bit (Sail gates the comparator).
+  if (!(s->menvcfg & kMenvcfgStce)) {
+    riscv32_set_ext_irq(cpu, kIrqStip, 0);
+    return;
+  }
   if (cpu->timer_read && s->stimecmp != ~0ULL)
     riscv32_set_ext_irq(cpu, kIrqStip, cpu->timer_read(cpu->timer_dev) >= s->stimecmp);
 }
@@ -139,6 +145,9 @@ static uint64_t CounterGate(uint64_t addr) {
     case 0xC82:
       return kCounterenInstret;
     default:
+      // hpmcounter3..31 aliases (0xC03..) and their RV32 high halves.
+      if (addr >= 0xC03 && addr <= 0xC1F) return 1ULL << (addr - 0xC00);
+      if (addr >= 0xC83 && addr <= 0xC9F) return 1ULL << (addr - 0xC80);
       return 0;
   }
 }
@@ -192,6 +201,14 @@ static int ReadCounter(const CpuState* cpu, Riscv32State* s, uint64_t addr, uint
         *out = (uint32_t)(s->mhpmcounter[addr - 0xB83] >> 32);
         return 0;
       }
+      if (addr >= 0xC03 && addr <= 0xC1F) {
+        *out = (uint32_t)s->mhpmcounter[addr - 0xC03];
+        return 0;  // S/U hpmcounter alias
+      }
+      if (addr >= 0xC83 && addr <= 0xC9F) {
+        *out = (uint32_t)(s->mhpmcounter[addr - 0xC83] >> 32);
+        return 0;  // S/U hpmcounterh alias
+      }
       return -1;
   }
 }
@@ -202,6 +219,8 @@ static int CsrPriv(uint64_t addr) { return (int)((addr >> 8) & 3); }
 
 int riscv32_csr_read(const CpuState* cpu, Riscv32State* s, uint64_t addr, uint64_t* out) {
   if (CsrPriv(addr) > s->priv) return -1;
+  // fflags/frm/fcsr exist only while mstatus.FS != 0 (unpriv spec 11.3).
+  if (addr >= 0x001 && addr <= 0x003 && !(s->mstatus & kMstatusFs)) return -1;
   if (ReadCounter(cpu, s, addr, out) == 0) return 0;
   switch (addr) {
     case 0x001:
@@ -220,7 +239,8 @@ int riscv32_csr_read(const CpuState* cpu, Riscv32State* s, uint64_t addr, uint64
       return 0;
     }
     case 0x104:
-      *out = s->mie & kIrqSLevelMask;
+      // sie is the delegated half of mie (Sail read_CSR: lower_mie).
+      *out = s->mie & (s->mideleg & kIrqSLevelMask);
       return 0;  // sie view
     case 0x105:
       *out = s->stvec;
@@ -231,13 +251,16 @@ int riscv32_csr_read(const CpuState* cpu, Riscv32State* s, uint64_t addr, uint64
     case 0x10A:
       *out = s->senvcfg;
       return 0;
-    case 0x11A:
-      *out = (uint32_t)(s->senvcfg >> 32);
-      return 0;  // senvcfgh (no implemented high field)
     case 0x14D:
+      if (s->priv == kPrivSupervisor &&
+          (!(s->menvcfg & kMenvcfgStce) || !(s->mcounteren & (1u << 1))))
+        return -1;
       *out = (uint32_t)s->stimecmp;
       return 0;  // Sstc low half (RV32)
     case 0x15D:
+      if (s->priv == kPrivSupervisor &&
+          (!(s->menvcfg & kMenvcfgStce) || !(s->mcounteren & (1u << 1))))
+        return -1;
       *out = (uint32_t)(s->stimecmp >> 32);
       return 0;  // Sstc high half (RV32)
     case 0x140:
@@ -253,16 +276,20 @@ int riscv32_csr_read(const CpuState* cpu, Riscv32State* s, uint64_t addr, uint64
       *out = s->stval;
       return 0;
     case 0x144:
-      *out = MipAll(s) & kIrqSLevelMask;
+      *out = MipAll(s) & (s->mideleg & kIrqSLevelMask);
       return 0;  // sip view
     case 0x180:
       // TVM gates S-mode satp reads too (priv spec 3.1.6.8).
       if (s->priv == kPrivSupervisor && (s->mstatus & kMstatusTvm)) return -1;
       *out = s->satp;
       return 0;
-    case 0x300:
-      *out = s->mstatus;
+    case 0x300: {
+      // SD reflects FS/VS/XS being Dirty (RV32 mstatus bit31).
+      uint32_t v = (uint32_t)s->mstatus;
+      if ((s->mstatus & kMstatusFs) == kMstatusFs) v |= 1u << 31;
+      *out = v;
       return 0;
+    }
     case 0x301:
       *out = s->misa;
       return 0;
@@ -273,7 +300,7 @@ int riscv32_csr_read(const CpuState* cpu, Riscv32State* s, uint64_t addr, uint64
       *out = s->mideleg;
       return 0;
     case 0x304:
-      *out = s->mie;
+      *out = s->mie & kIrqImplementedMask;
       return 0;
     case 0x305:
       *out = s->mtvec;
@@ -294,7 +321,7 @@ int riscv32_csr_read(const CpuState* cpu, Riscv32State* s, uint64_t addr, uint64
       *out = (uint32_t)(s->menvcfg >> 32);
       return 0;  // menvcfgh (ADUE/STCE in the high half)
     case 0x320:
-      *out = s->mcountinhibit;
+      *out = s->mcountinhibit & (kMcountinhibitCy | kMcountinhibitIr | kMcountinhibitHpm);
       return 0;
     case 0x340:
       *out = s->mscratch;
@@ -312,8 +339,11 @@ int riscv32_csr_read(const CpuState* cpu, Riscv32State* s, uint64_t addr, uint64
       *out = MipAll(s);
       return 0;
     case 0x5A8:
-      *out = s->scontext;
-      return 0;  // scontext (Sdtrig Sscontext; M/S via the CSR priv bits)
+      *out = (uint32_t)s->scontext & 0xffffu;
+      return 0;  // scontext (Sdtrig; 16 bits wide on RV32)
+    case 0x7A8:
+      *out = (uint32_t)s->mcontext & 0x3fffu;
+      return 0;  // mcontext (Sdtrig; 14 bits)
     case 0x7A0:
       *out = s->tselect;
       return 0;  // tselect
@@ -327,14 +357,12 @@ int riscv32_csr_read(const CpuState* cpu, Riscv32State* s, uint64_t addr, uint64
       *out = s->tdata3[s->tselect];
       return 0;  // tdata3
     case 0x7A4:
-      *out = 1ULL << 6;
-      return 0;  // tinfo: mcontrol6 only
+      // tinfo: version 1.0, mcontrol6 present, disabled type supported.
+      *out = (1ULL << 24) | (1ULL << 6) | (1ULL << 15);
+      return 0;
     case 0x7A5:
       *out = s->tcontrol;
       return 0;  // tcontrol
-    case 0x744:
-      *out = s->mnstatus;
-      return 0;  // mnstatus (Smrnig)
     case 0xF11:
       *out = 0;
       return 0;  // mvendorid
@@ -347,10 +375,13 @@ int riscv32_csr_read(const CpuState* cpu, Riscv32State* s, uint64_t addr, uint64
     case 0xF14:
       *out = 0;
       return 0;  // mhartid
+    case 0xF15:
+      *out = 0;
+      return 0;  // mconfigptr (priv spec 1.12+)
     default:
       // MHPM events 3..18 (Zihpm; XLEN-wide on RV32)
       if (addr >= 0x323 && addr <= 0x323 + kMhpmCount - 1) {
-        *out = (uint32_t)s->mhpmevent[addr - 0x323];
+        *out = (uint32_t)(s->mhpmevent[addr - 0x323] & 0xffffffffULL);
         return 0;
       }
       // RV32 packs four cfg entries into pmpcfg0..3 (priv spec 3.7.1)
@@ -359,7 +390,11 @@ int riscv32_csr_read(const CpuState* cpu, Riscv32State* s, uint64_t addr, uint64
         return 0;
       }
       if (addr >= 0x3B0 && addr <= 0x3BF) {
-        *out = s->pmpaddr[addr - 0x3B0];
+        int i = (int)(addr - 0x3B0);
+        uint8_t cfg = (uint8_t)(s->pmpcfg[i / 4] >> (8 * (i % 4)));
+        uint32_t a = s->pmpaddr[i];
+        // G=2 projection of pmpaddr for NAPOT vs TOR/OFF.
+        *out = (cfg & 0x10) ? (a | 1u) : (a & ~3u);
         return 0;
       }
       return -1;
@@ -376,7 +411,7 @@ static void WritePmpCfg(Riscv32State* s, int which, uint64_t val) {
       out |= (uint32_t)old << (8 * b);
       continue;
     }
-    uint8_t cfg = (uint8_t)(val >> (8 * b));
+    uint8_t cfg = (uint8_t)(val >> (8 * b)) & 0x9f;  // bits 6:5 read-only zero
     if (!(cfg & kPmpR)) cfg &= (uint8_t)~kPmpW;  // W requires R
     if ((cfg & kPmpAMask) == kPmpANa4)
       cfg = (uint8_t)((cfg & ~kPmpAMask) | kPmpANapot);  // G=2: NA4 -> NAPOT
@@ -400,6 +435,8 @@ static void WritePmpAddr(Riscv32State* s, int i, uint64_t val) {
 
 int riscv32_csr_write(Riscv32State* s, uint64_t addr, uint64_t val, uint64_t next_pc) {
   if (CsrPriv(addr) > s->priv) return -1;
+  // fflags/frm/fcsr exist only while mstatus.FS != 0 (unpriv spec 11.3).
+  if (addr >= 0x001 && addr <= 0x003 && !(s->mstatus & kMstatusFs)) return -1;
   if (addr == 0xB00 || addr == 0xB02 || addr == 0xB80 || addr == 0xB82) {
     // A counter write replaces the named half; the other half stays
     // (mcycle/mminstret are 64-bit counters on RV32 too).
@@ -434,26 +471,35 @@ int riscv32_csr_write(Riscv32State* s, uint64_t addr, uint64_t val, uint64_t nex
     case 0x100:  // sstatus view: only the S-level fields of mstatus
       s->mstatus = (s->mstatus & ~kSstatusWmask) | (val & kSstatusWmask);
       return 0;
-    case 0x104:  // sie view
-      s->mie = (s->mie & ~kIrqSLevelMask) | (val & kIrqSLevelMask);
+    case 0x104: {  // sie view: only delegated interrupt bits
+      uint32_t mask = s->mideleg & kIrqSLevelMask;
+      s->mie = (s->mie & ~mask) | ((uint32_t)val & mask);
       return 0;
-    case 0x105:
-      // stvec low bits: bit 0 = vectored mode, bit 1 reads zero (priv spec
-      // 3.1.7)
-      s->stvec = (uint32_t)val & ~2u;
+    }
+    case 0x105: {
+      uint32_t mode = (uint32_t)val & 3u;
+      s->stvec = ((uint32_t)val & ~3u) | (mode <= 1 ? mode : (s->stvec & 3u));
       return 0;
+    }
     case 0x106:
       s->scounteren = (uint32_t)val;
       return 0;
-    case 0x10A:
-      s->senvcfg = val & kSenvcfgWmask;
+    case 0x10A: {
+      uint32_t v = (uint32_t)val & kSenvcfgWmask;
+      if ((v & kMenvcfgCbie) == 0x20) v &= ~kMenvcfgCbie;
+      s->senvcfg = v;
       return 0;
-    case 0x11A:
-      return 0;  // senvcfgh: no implemented high field
+    }
     case 0x14D:
+      if (s->priv == kPrivSupervisor &&
+          (!(s->menvcfg & kMenvcfgStce) || !(s->mcounteren & (1u << 1))))
+        return -1;
       s->stimecmp = (s->stimecmp & ~kXlenMask) | (uint32_t)val;
       return 0;  // Sstc low half: retires a pending STIP
     case 0x15D:
+      if (s->priv == kPrivSupervisor &&
+          (!(s->menvcfg & kMenvcfgStce) || !(s->mcounteren & (1u << 1))))
+        return -1;
       s->stimecmp = (s->stimecmp & kXlenMask) | ((uint64_t)(uint32_t)val << 32);
       return 0;  // Sstc high half
     case 0x140:
@@ -468,9 +514,11 @@ int riscv32_csr_write(Riscv32State* s, uint64_t addr, uint64_t val, uint64_t nex
     case 0x143:
       s->stval = (uint32_t)val;
       return 0;
-    case 0x144:  // sip view: only SSIP is writable (priv spec 3.1.9)
-      s->mip = (s->mip & ~kIrqSsip) | (val & kIrqSsip);
+    case 0x144: {  // sip view: only delegated SSIP is writable
+      uint32_t mask = kIrqSsip & s->mideleg;
+      s->mip = (s->mip & ~mask) | ((uint32_t)val & mask);
       return 0;
+    }
     case 0x180: {  // satp
       // S-mode writes with TVM set trap (priv spec 3.1.6.8, 4.1.11).
       if (s->priv == kPrivSupervisor && (s->mstatus & kMstatusTvm)) return -1;
@@ -479,6 +527,10 @@ int riscv32_csr_write(Riscv32State* s, uint64_t addr, uint64_t val, uint64_t nex
       // unchanged (xiangshanNEMU priv.c CSR_SATP write path).
       if (mode != kSatpModeBare && mode != kSatpModeSv32) return 0;
       s->satp = val & kSatpWmask;
+      // The reservation is keyed by virtual address; a new address space makes
+      // the old pair meaningless. SC may fail spuriously, so dropping it here
+      // is legal (Sail keys reservations by physical address instead).
+      s->res_valid = 0;
       return 0;
     }
     case 0x300: {  // mstatus
@@ -507,17 +559,24 @@ int riscv32_csr_write(Riscv32State* s, uint64_t addr, uint64_t val, uint64_t nex
       s->mideleg = (uint32_t)val & kMidelegWmask;
       return 0;
     case 0x304:
-      s->mie = (uint32_t)val;
+      s->mie = (uint32_t)val & kIrqImplementedMask;
       return 0;
-    case 0x305:
-      s->mtvec = (uint32_t)val & ~2u;
+    case 0x305: {
+      uint32_t mode = (uint32_t)val & 3u;
+      s->mtvec = ((uint32_t)val & ~3u) | (mode <= 1 ? mode : (s->mtvec & 3u));
       return 0;
+    }
     case 0x306:
       s->mcounteren = (uint32_t)val;
       return 0;
-    case 0x30A:
-      s->menvcfg = val & kMenvcfgWmask;
+    case 0x30A: {
+      // menvcfg is a 32-bit CSR on RV32: writing it must keep the high half
+      // written through menvcfgh (ADUE/STCE) intact (Sail sys_regs.sail).
+      uint32_t v = (uint32_t)val & 0xf1u;
+      if ((v & kMenvcfgCbie) == 0x20) v &= ~kMenvcfgCbie;
+      s->menvcfg = (s->menvcfg & ~0xf1ULL) | v;
       return 0;
+    }
     case 0x310:
       return 0;  // mstatush: no big-endian memory (WARL 0)
     case 0x312:
@@ -526,7 +585,7 @@ int riscv32_csr_write(Riscv32State* s, uint64_t addr, uint64_t val, uint64_t nex
       s->menvcfg = (s->menvcfg & kXlenMask) | (((uint64_t)(uint32_t)val << 32) & kMenvcfgWmask);
       return 0;  // menvcfgh
     case 0x320:
-      s->mcountinhibit = (uint32_t)val;
+      s->mcountinhibit = (uint32_t)val & (kMcountinhibitCy | kMcountinhibitIr | kMcountinhibitHpm);
       return 0;
     case 0x340:
       s->mscratch = (uint32_t)val;
@@ -540,19 +599,26 @@ int riscv32_csr_write(Riscv32State* s, uint64_t addr, uint64_t val, uint64_t nex
     case 0x343:
       s->mtval = (uint32_t)val;
       return 0;
-    case 0x344:  // mip: M-mode software forwarding of S/U interrupts
+    case 0x344: {  // mip: M-mode software forwarding of S/U interrupts
       // OpenSBI's timer and IPI forwarding is built on M-mode writing
       // mip.STIP/SSIP/SEIP (lib/sbi/sbi_timer.c csr_set(CSR_MIP, MIP_STIP)).
       // The spec leaves these bits to the platform (3.1.9); QEMU made them
       // M-mode-writable for exactly this firmware (target/riscv csr.c mip
       // mask), so the machine follows the de-facto contract. S-mode keeps
       // the sip view below, where only SSIP is software-writable.
-      s->mip = (s->mip & ~(kIrqSsip | kIrqStip | kIrqSeip)) |
-               (val & (kIrqSsip | kIrqStip | kIrqSeip));
+      uint32_t wmask =
+          kIrqSsip | kIrqSeip | ((s->menvcfg & kMenvcfgStce) ? 0u : (uint32_t)kIrqStip);
+      s->mip = (s->mip & ~wmask) | ((uint32_t)val & wmask);
       return 0;
+    }
     case 0x5A8:
-      s->scontext = (uint32_t)val;
-      return 0;  // scontext (Sdtrig Sscontext)
+      s->scontext = (uint32_t)val & 0xffffu;
+      return 0;  // scontext (Sdtrig; 16 bits wide on RV32)
+    case 0x7A8:
+      s->mcontext = (uint32_t)val & 0x3fffu;
+      return 0;  // mcontext (Sdtrig; 14 bits)
+    case 0x7A4:
+      return 0;  // tinfo: write ignored (Sail sdtrig_regs.sail)
     case 0x7A0:
       // tselect WARL-clamps to the implemented trigger count (Sdtrig).
       s->tselect = val < kTrigCount ? val : kTrigCount - 1;
@@ -560,9 +626,6 @@ int riscv32_csr_write(Riscv32State* s, uint64_t addr, uint64_t val, uint64_t nex
     case 0x7A1:
       Riscv32TriggerWriteTdata1(s, val);  // mcontrol6 WARL policy (trigger.c)
       return 0;
-    case 0x744:
-      s->mnstatus = (uint32_t)val;
-      return 0;  // mnstatus (Smrnig, WARL)
     case 0x7A2:
       s->tdata2[s->tselect] = (uint32_t)val;
       return 0;  // tdata2 of the tselect-selected trigger
@@ -585,7 +648,8 @@ int riscv32_csr_write(Riscv32State* s, uint64_t addr, uint64_t val, uint64_t nex
         return 0;
       }
       if (addr >= 0x323 && addr <= 0x323 + kMhpmCount - 1) {
-        s->mhpmevent[addr - 0x323] = (uint32_t)val;
+        int i = (int)(addr - 0x323);
+        s->mhpmevent[i] = (s->mhpmevent[i] & ~0xffffffffULL) | (uint32_t)val;
         return 0;
       }
       if (addr >= 0x3A0 && addr <= 0x3A3) {

@@ -26,6 +26,9 @@ typedef struct BusRegion {
   // copy images in without device callbacks (same shape as dearchap-tinyemu
   // iomem.h PhysMemoryRange.is_ram/phys_mem); MMIO devices leave it NULL.
   uint8_t* host;
+  // PMA write permission (priv spec 3.6.2): mask ROM and read-only device
+  // windows clear it, and a store to them is a store access fault.
+  int writable;
 } BusRegion;
 
 // A PC's port space carries the chipset's fixed blocks plus every ISA device
@@ -61,6 +64,8 @@ int BusRemoveRegion(Bus* bus, const DeviceOps* ops, void* dev);
 void BusAddRamRegion(Bus* bus, uint64_t base, uint64_t size, const DeviceOps* ops, void* dev,
                      uint8_t* host);
 int BusProbe(Bus* bus, uint64_t addr, int len, BusRegion** out);
+// Clears/sets the write permission of every region fully inside [base, base+size).
+void BusSetWritable(Bus* bus, uint64_t base, uint64_t size, int writable);
 uint64_t BusRead(Bus* bus, uint64_t addr, int size);
 void BusWrite(Bus* bus, uint64_t addr, int size, uint64_t val);
 // Returns the host pointer backing [addr, addr+len) inside a RAM region.

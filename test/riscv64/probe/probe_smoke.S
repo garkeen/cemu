@@ -18,7 +18,7 @@ over:
   sd    t1, 0(t0)            # HTIF: tohost = 1 -> pass, exit 0
   j     .                    # never reached on pass
 
-  .section .tohost
+  .section .tohost, "aw", @progbits
   .globl tohost
 tohost:
   .dword 0

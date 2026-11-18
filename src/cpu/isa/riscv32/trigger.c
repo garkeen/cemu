@@ -17,7 +17,13 @@
 // mcontrol6_match). select is WARL-0, so the compared value is always the
 // operation's address.
 static int Mc6Match(Riscv32State* s, uint64_t t1, uint64_t t2, uint64_t t3, int op,
-                    uint64_t addr) {
+                    uint64_t addr, int size) {
+  if (((t1 >> 28) & 0xf) != 6) return 0;  // only mcontrol6 is implemented
+  uint64_t sz = (t1 >> 16) & 7;
+  if (sz != 0) {
+    int want = sz == 1 ? 1 : sz == 2 ? 2 : sz == 3 ? 4 : sz == 4 ? 8 : 0;
+    if (want == 0 || size != want) return 0;
+  }
   if ((!(op & kTrigOpExecute) || !(t1 & kMc6Execute)) &&
       (!(op & kTrigOpLoad) || !(t1 & kMc6Load)) &&
       (!(op & kTrigOpStore) || !(t1 & kMc6Store)))
@@ -34,10 +40,11 @@ static int Mc6Match(Riscv32State* s, uint64_t t1, uint64_t t2, uint64_t t3, int 
   // every other encoding never matches.
   uint64_t ssel = t3 & kTd3SselectMask;
   if (ssel == 1) {
-    uint32_t sval = (uint32_t)(t3 >> kTd3SvalueShift);
-    uint32_t smask = (uint32_t)((t3 >> kTd3SbytemaskShift) & 0xf);
-    uint32_t ctx = (uint32_t)s->scontext;
-    for (int b = 0; b < 4; b++)
+    // RV32 tdata3 layout: svalue 17:2, sbytemask 19:18, two context bytes.
+    uint32_t sval = (uint32_t)(t3 >> kTd3SvalueShift) & 0xffffu;
+    uint32_t smask = (uint32_t)((t3 >> kTd3SbytemaskShift) & 0x3u);
+    uint32_t ctx = (uint32_t)s->scontext & 0xffffu;
+    for (int b = 0; b < 2; b++)
       if (!((smask >> b) & 1) && ((ctx >> (8 * b)) & 0xff) != ((sval >> (8 * b)) & 0xff))
         return 0;
   } else if (ssel == 2) {
@@ -68,24 +75,36 @@ static int TrigReentryOk(Riscv32State* s) {
   return 1;
 }
 
-// action 0 = breakpoint exception (mtval carries the matched address);
-// action 1 = enter debug mode, which this machine does not implement (no
-// dcsr/dpc state) — stop loudly.
-_Noreturn static void Fire(frame* fr, uint64_t t1, uint64_t addr) {
-  if (((t1 >> 12) & 0xf) == 1) Fatal("riscv: trigger action 1 (debug mode) fired");
+// action 0 = breakpoint exception (mtval carries the matched address).
+_Noreturn static void Fire(frame* fr, uint64_t addr) {
   raise_(fr, kExBreakpoint, addr);
 }
 
-void Riscv32TriggerCheck(frame* fr, Riscv32State* s, int op, uint64_t addr) {
+// The first byte of [addr, addr+span) that matches, or ~0.
+static uint64_t MatchSpan(Riscv32State* s, uint64_t t1, uint64_t t2, uint64_t t3, int op,
+                          uint64_t addr, int span, int size) {
+  for (int i = 0; i < span; i++) {
+    uint64_t a = addr + (uint64_t)i;
+    if (Mc6Match(s, t1, t2, t3, op, a, size)) return a;
+  }
+  return ~0ULL;
+}
+
+void Riscv32TriggerCheck(frame* fr, Riscv32State* s, int op, uint64_t addr, int size) {
   if (!TrigReentryOk(s)) return;
-  // All hits are evaluated first: a chained trigger fires only when the
-  // previous trigger in the chain matched the same operation (debug spec
-  // 5.3.12 chain; xiangshanNEMU check_triggers_mcontrol6).
-  int hit0 = Mc6Match(s, s->tdata1[0], s->tdata2[0], s->tdata3[0], op, addr);
-  int hit1 = Mc6Match(s, s->tdata1[1], s->tdata2[1], s->tdata3[1], op, addr);
+  int span = (op & kTrigOpExecute) ? 1 : (size > 0 ? size : 1);
+  uint64_t m0 = MatchSpan(s, s->tdata1[0], s->tdata2[0], s->tdata3[0], op, addr, span, size);
+  uint64_t m1 = MatchSpan(s, s->tdata1[1], s->tdata2[1], s->tdata3[1], op, addr, span, size);
+  int hit0 = m0 != ~0ULL, hit1 = m1 != ~0ULL;
   int chain0 = (int)((s->tdata1[0] >> 11) & 1);
-  if (hit0 && !chain0) Fire(fr, s->tdata1[0], addr);
-  if ((hit0 || !chain0) && hit1 && !((s->tdata1[1] >> 11) & 1)) Fire(fr, s->tdata1[1], addr);
+  if (hit0 && !chain0) {
+    s->tdata1[0] |= kMc6Hit0;
+    Fire(fr, m0);
+  }
+  if ((hit0 || !chain0) && hit1 && !((s->tdata1[1] >> 11) & 1)) {
+    s->tdata1[1] |= kMc6Hit0;
+    Fire(fr, m1);
+  }
 }
 
 // tdata1 write (debug spec 5.3.12; xiangshanNEMU mcontrol6_checked_write):
@@ -97,16 +116,22 @@ void Riscv32TriggerCheck(frame* fr, Riscv32State* s, int op, uint64_t addr) {
 void Riscv32TriggerWriteTdata1(Riscv32State* s, uint64_t val) {
   int idx = (int)s->tselect;
   uint64_t cur = s->tdata1[idx];
+  uint64_t type = (val >> 28) & 0xf;
+  uint64_t action = (val >> 12) & 0xf;
+  if (type != 6 || action != 0) {
+    s->tdata1[idx] = kTrigTypeDisabled;
+    return;
+  }
   uint64_t v = kTrigTypeMcontrol6;
   v |= cur & val & kMc6Dmode;
   uint64_t match = (val >> 7) & 0xf;
   if (match == kMc6MatchEq || match == kMc6MatchGe || match == kMc6MatchLt) v |= match << 7;
-  uint64_t action = (val >> 12) & 0xf;
-  if (action <= 1) v |= action << 12;
-  // A chained trigger with no successor can never fire: the last trigger's
-  // chain bit WARLs to 0 (xiangshanNEMU mcontrol6_check_chain_legal).
-  if (idx < kTrigCount - 1 || !(val & kMc6Chain)) v |= val & kMc6Chain;
+  // Chain is stored as written: chain=1 means "wait for the successor".
+  v |= val & kMc6Chain;
   v |= val & (kMc6Load | kMc6Store | kMc6Execute | kMc6U | kMc6S | kMc6M);
+  uint64_t sz = (val >> 16) & 7;
+  if (sz <= 4) v |= sz << 16;
+  v |= val & (kMc6Hit0 | kMc6Hit1);
   s->tdata1[idx] = v;
 }
 
@@ -116,7 +141,11 @@ void Riscv32TriggerWriteTdata1(Riscv32State* s, uint64_t val) {
 // Sscontext fields store as written (the match above limits which sselect
 // encodings can ever fire). tselect selects the trigger.
 void Riscv32TriggerWriteTdata3(Riscv32State* s, uint64_t val) {
-  s->tdata3[s->tselect] = val & kXlenMask;
+  // RV32 Trigger_Extra: sselect 1:0, svalue 17:2, sbytemask 19:18; the mh
+  // fields (31:23) read zero without mcontext matching.
+  uint64_t v = val & 0xfffffULL;
+  if ((v & 3) == 3) v &= ~3ULL;  // sselect=3 reserved
+  s->tdata3[s->tselect] = v;
 }
 
 // ---- gdb stub watchpoints ---------------------------------------------------

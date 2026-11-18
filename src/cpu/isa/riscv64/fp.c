@@ -177,7 +177,7 @@ static uint64_t MinMaxS(RiscvState* s, uint64_t ra, uint64_t rb, int is_max) {
   if (anan && bnan) return Box32(kQnan32);
   if (anan) return Box32(b.v);
   if (bnan) return Box32(a.v);
-  if ((a.v & 0x7fffffffu) == 0 && (b.v & 0x7fffffffu) == 0)
+  if (((a.v ^ b.v) & 0x80000000u) && !(a.v & 0x7fffffffu) && !(b.v & 0x7fffffffu))
     return Box32(is_max ? 0u : 0x80000000u);
   BeginOp(kRmRne);  // quiet compare of non-NaN values sets no flag
   int lt = f32_lt_quiet(a, b);
@@ -192,7 +192,8 @@ static uint64_t MinMaxD(RiscvState* s, uint64_t ra, uint64_t rb, int is_max) {
   if (anan && bnan) return kQnan64;
   if (anan) return b.v;
   if (bnan) return a.v;
-  if ((a.v & 0x7fffffffffffffffULL) == 0 && (b.v & 0x7fffffffffffffffULL) == 0)
+  if (((a.v ^ b.v) & 0x8000000000000000ULL) && !(a.v & 0x7fffffffffffffffULL) &&
+      !(b.v & 0x7fffffffffffffffULL))
     return is_max ? 0ULL : 0x8000000000000000ULL;
   BeginOp(kRmRne);
   int lt = f64_lt_quiet(a, b);

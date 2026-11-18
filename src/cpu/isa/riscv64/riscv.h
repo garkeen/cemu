@@ -60,6 +60,10 @@ static const uint64_t kSstatusWmask =
 
 static const uint64_t kMcountinhibitCy = 1ULL << 0;
 static const uint64_t kMcountinhibitIr = 1ULL << 2;
+// mhpmcounter3..31.
+static const uint64_t kMcountinhibitHpm = 0xfffffff8ULL;
+// Interrupts this machine implements: SSIP|MSIP|STIP|MTIP|SEIP|MEIP.
+static const uint64_t kIrqImplementedMask = 0xaaaULL;
 static const uint64_t kMisaMxl64 = 2ULL << 62;  // MXL = 2: RV64
 static const uint64_t kMisaA = 1ULL << 0;
 static const uint64_t kMisaC = 1ULL << 2;
@@ -90,13 +94,17 @@ static const uint64_t kTcontrolMpte = 1ULL << 6;
 // menvcfg/senvcfg (priv spec 3.7.2): the byte of CBIE/CBCFE/CBZE control
 // fields, plus ADUE (Svadu hardware A/D update) and STCE (Sstc timecmp).
 // PBMTE stays hardwired 0 — the DTB does not advertise Svpbmt.
-static const uint64_t kMenvcfgWmask = 0xffULL | (1ULL << 61) | (1ULL << 63);
+// FIOM(0) + CBIE(5:4) + CBCFE(6) + CBZE(7); SSE/LPE are not implemented, so
+// bit1 and the reserved holes read zero. ADUE/STCE keep their positions.
+static const uint64_t kMenvcfgWmask = 0xf1ULL | (1ULL << 61) | (1ULL << 63);
 static const uint64_t kMenvcfgAdue = 1ULL << 61;
-static const uint64_t kSenvcfgWmask = 0xffULL;
+static const uint64_t kMenvcfgStce = 1ULL << 63;
+static const uint64_t kMenvcfgCbie = 0x30ULL;
+static const uint64_t kSenvcfgWmask = 0xf1ULL;
 
-// MHPM counters 3..18, the set QEMU virt implements (OpenSBI banner
-// "MHPM Info : 16 (0x0007fff8)").
-enum { kMhpmFirst = 3, kMhpmCount = 16, kMhpmLast = 18 };
+// mhpmcounter3..31 (Zihpm: the DTB advertises the extension; counters are
+// storage-only, see D36).
+enum { kMhpmFirst = 3, kMhpmCount = 29, kMhpmLast = 31 };
 
 // Sdtrig (debug triggers): QEMU virt has 2 mcontrol6 triggers (banner
 // "Debug Triggers : 2 triggers"). tdata1 bit layout per the debug spec 5.3.12
@@ -105,6 +113,9 @@ enum { kMhpmFirst = 3, kMhpmCount = 16, kMhpmLast = 18 };
 // hit1[25] dmode[59] type[63:60].
 enum { kTrigCount = 2 };
 static const uint64_t kTrigTypeMcontrol6 = 6ULL << 60;
+static const uint64_t kTrigTypeDisabled = 15ULL << 60;
+static const uint64_t kMc6Hit0 = 1ULL << 22;
+static const uint64_t kMc6Hit1 = 1ULL << 25;
 static const uint64_t kMc6Load = 1ULL << 0;
 static const uint64_t kMc6Store = 1ULL << 1;
 static const uint64_t kMc6Execute = 1ULL << 2;
@@ -149,7 +160,7 @@ static const uint64_t kIrqSLevelMask = kMidelegWmask;
 // medeleg WARL: every standard exception except M-mode ecall (11) is
 // delegable among codes 0..15 (priv spec 3.1.8; xiangshanNEMU
 // MEDELEG_NONRVH agrees).
-static const uint64_t kMedelegWmask = 0xf7ffULL;
+static const uint64_t kMedelegWmask = 0xb7ffULL;
 
 // satp (priv spec 4.1.11): Bare, Sv39 and Sv48 are the implemented modes
 // (Sv48 is priv spec 4.4.1, same walk as Sv39 with one more level); the
@@ -252,11 +263,11 @@ typedef struct RiscvState {
   uint64_t tdata2[kTrigCount];
   uint64_t tdata3[kTrigCount];
   uint64_t scontext;  // Sdtrig Sscontext: the trigger qualification context
+  uint64_t mcontext;  // Sdtrig mcontext (14 bits on this machine)
   uint64_t menvcfg;
   uint64_t senvcfg;
   uint64_t stimecmp;                 // Sstc: S-level timer compare, drives STIP
-  uint64_t mnstatus;                 // Smrnig: WARL-stored RNMI status (suite writes NMIE)
-  uint64_t mhpmcounter[kMhpmCount];  // counters 3..18
+  uint64_t mhpmcounter[kMhpmCount];  // counters 3..31
   uint64_t mhpmevent[kMhpmCount];
   uint64_t pmpcfg[2];  // pmpcfg0/pmpcfg2, 8 entries each (RV64 layout)
   uint64_t pmpaddr[kPmpCount];
@@ -320,7 +331,7 @@ void riscv_mem_store(frame* f, uint64_t vaddr, int size, uint64_t val);
 // Sdtrig trigger module (trigger.c): the check fires a breakpoint exception
 // through the raise channel when an armed mcontrol6 matches; the two write
 // helpers apply the tdata1/tdata3 WARL policies.
-void RiscvTriggerCheck(frame* f, RiscvState* s, int op, uint64_t addr);
+void RiscvTriggerCheck(frame* f, RiscvState* s, int op, uint64_t addr, int size);
 void RiscvTriggerWriteTdata1(RiscvState* s, uint64_t val);
 void RiscvTriggerWriteTdata3(RiscvState* s, uint64_t val);
 // gdb stub watchpoints (trigger.c): RSP kind 2 = write, 3 = read, 4 = access;
@@ -364,7 +375,7 @@ uint64_t riscv_sret(RiscvState* s);
 // is the direct host backing of the page when the whole page is plain RAM, so
 // the caller may read/write without a bus decode.
 int RiscvTranslate(frame* f, RiscvState* s, uint64_t vaddr, int size, int acc, uint64_t* paddr,
-                   uint8_t** host);
+                   uint8_t** host, uint64_t tval);
 // PMP check for a physical range under a privilege mode; 0 = allowed.
 int RiscvPmpAllowed(const RiscvState* s, uint64_t addr, uint64_t len, int acc, int mode);
 

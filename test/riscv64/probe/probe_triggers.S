@@ -31,9 +31,12 @@ _start:
   seqz t0, t0
   slli s0, t0, 4              # bit 4
 
-  # d6: tdata1 WARL policy on trigger 0
+  # d6: tdata1 WARL policy on trigger 0 (type=6 must be present or the
+  # write disables the trigger, as Sail does)
   csrw tselect, x0
-  li t0, 0x80                 # match=1 (NAPOT) — not accepted
+  li t0, 6
+  slli t0, t0, 60
+  ori t0, t0, 0x80            # mcontrol6, match=1 (NAPOT) — not accepted
   csrw tdata1, t0
   csrr t0, tdata1
   srli t0, t0, 7
@@ -41,7 +44,11 @@ _start:
   seqz t0, t0
   slli t0, t0, 5
   or s0, s0, t0
-  li t0, 2 << 12              # action=2 — WARLs to 0
+  li t0, 6
+  slli t0, t0, 60
+  li t1, 2
+  slli t1, t1, 12
+  or t0, t0, t1               # action=2 — unsupported, trigger disabled
   csrw tdata1, t0
   csrr t0, tdata1
   srli t0, t0, 12
@@ -49,7 +56,11 @@ _start:
   seqz t0, t0
   slli t0, t0, 6
   or s0, s0, t0
-  li t0, 1 << 59              # dmode is not writable outside debug mode
+  li t0, 6
+  slli t0, t0, 60
+  li t1, 1
+  slli t1, t1, 59
+  or t0, t0, t1               # dmode is not writable outside debug mode
   csrw tdata1, t0
   csrr t0, tdata1
   srli t0, t0, 59
@@ -61,7 +72,9 @@ _start:
   # d1: execute trigger (m | execute) at `target`
   la s1, target
   csrw tdata2, s1
-  li t0, 0x44
+  li t0, 6
+  slli t0, t0, 60
+  ori t0, t0, 0x44
   csrw tdata1, t0
   sd x0, h_tval, t2           # sentinel: no trap seen yet
 target:
@@ -74,7 +87,9 @@ target:
   # d2: load trigger (m | load) at dat
   la s1, dat
   csrw tdata2, s1
-  li t0, 0x41
+  li t0, 6
+  slli t0, t0, 60
+  ori t0, t0, 0x41
   csrw tdata1, t0
   sd x0, h_tval, t2
   lb t3, dat                  # fires before the load
@@ -85,7 +100,9 @@ target:
   or s0, s0, t0
 
   # d3: store trigger (m | store) at dat
-  li t0, 0x42
+  li t0, 6
+  slli t0, t0, 60
+  ori t0, t0, 0x42
   csrw tdata1, t0
   sd x0, h_tval, t2
   sb t3, dat, t4              # fires before the store
@@ -99,7 +116,9 @@ target:
   addi s1, s1, 2
   addi t0, s1, -1
   csrw tdata2, t0
-  li t0, 0x141                # m | load | match=2 (GE)
+  li t0, 6
+  slli t0, t0, 60
+  ori t0, t0, 0x141           # m | load | match=2 (GE)
   csrw tdata1, t0
   sd x0, h_tval, t2
   lb t3, dat+2                # fires, handler disarms
@@ -150,6 +169,7 @@ handler:
   mret
 
   .section .text.init
+  .align 3
   .globl tohost
 tohost: .dword 0
   .align 6

@@ -50,6 +50,17 @@ void Riscv32StoreRegs(CpuState* c) {
   c->gpr[0] = 0;
 }
 
+// jump_to (Sail base_insts.sail): with IALIGN=32 (misa.C clear) a target whose
+// bit1 is set is instruction-address-misaligned. The privileged spec reports
+// the exception *on the branch/jump instruction*, not on the target fetch, so
+// the raise happens here: mepc stays at this pc, mtval is the target, and the
+// caller has not written its link register yet. Callers clear bit 0 first
+// (JALR); the JAL/branch immediates are already even.
+static uint32_t JumpTo(frame* fr, uint32_t target) {
+  if (!(rs->misa & kMisaC) && (target & 2)) raise_(fr, kExFetchMisaligned, target);
+  return target;
+}
+
 // ---- instruction fields (volume I, figure 2.2) ------------------------------
 
 // Field accessors are macros: they keep every call site identical to the
@@ -86,26 +97,19 @@ _Noreturn static void illegal(frame* fr, uint64_t tval) { raise_(fr, kExIllegal,
 
 static int fault_cause(int acc) {
   if (acc == acc_ifetch) return kExFetchFault;
-  return acc == acc_write ? kExStoreFault : kExLoadFault;
+  // AMO is a store-class access even on its read half.
+  return (acc == acc_write || acc == acc_amo) ? kExStoreFault : kExLoadFault;
 }
 
-uint64_t riscv32_mem_load(frame* fr, uint64_t vaddr, int size, int acc) {
-  // Load triggers fire on the effective address before the access happens,
-  // so even an access that would fault triggers first (xiangshanNEMU checks
-  // in the ldst templates before the rtl memory op). Fetches don't qualify.
-  // gdb's own watchpoints are a separate internal list (trigger.c) and are
-  // checked after the guest trigger: a guest breakpoint that aborts the
-  // access means no gdb hit.
-  if (acc != acc_ifetch) {
-    Riscv32TriggerCheck(fr, rs, kTrigOpLoad, vaddr);
-    if (rs->gdb_watch_mask) Riscv32GdbWatchCheck(rs, kTrigOpLoad, vaddr, size);
-  }
+// One translated chunk. An access that crosses a page boundary is split
+// (Sail sys/vmem_utils.sail: split_on_page_boundary): each chunk gets its own
+// translation and PMP check, so the second page cannot borrow the first
+// page's mapping.
+static uint64_t MemLoadChunk(frame* fr, uint32_t vaddr, int size, int acc) {
   uint64_t paddr;
   uint8_t* host = NULL;
-  // Translation enforces PMP for this access; its cache stores the host
-  // backing of plain RAM pages, which is the fast path below.
-  Riscv32Translate(fr, rs, vaddr, size, acc, &paddr, &host);
-  if (host && (vaddr & 0xfff) + (uint64_t)size <= 0x1000 && !DebugOn(kDbgMem)) {
+  Riscv32Translate(fr, rs, vaddr, size, acc, &paddr, &host, vaddr);
+  if (host && !DebugOn(kDbgMem)) {
     uint64_t v = 0;
     memcpy(&v, host + (vaddr & 0xfff), (size_t)size);
     return v;
@@ -122,28 +126,64 @@ uint64_t riscv32_mem_load(frame* fr, uint64_t vaddr, int size, int acc) {
   return v;
 }
 
-void riscv32_mem_store(frame* fr, uint64_t vaddr, int size, uint64_t val) {
-  // Before the store commits, like the guest trigger: a guest breakpoint that
-  // aborts the access means no gdb hit; otherwise the stub reports the hit
-  // after the step and the access itself still happens (or faults).
-  Riscv32TriggerCheck(fr, rs, kTrigOpStore, vaddr);
-  if (rs->gdb_watch_mask) Riscv32GdbWatchCheck(rs, kTrigOpStore, vaddr, size);
+static uint64_t WidthMask(int size) {
+  return size >= 8 ? ~0ULL : (1ULL << (8 * size)) - 1;
+}
+
+uint64_t riscv32_mem_load(frame* fr, uint64_t vaddr, int size, int acc) {
+  // Load triggers fire on the effective address before the access happens,
+  // so even an access that would fault triggers first (xiangshanNEMU checks
+  // in the ldst templates before the rtl memory op). Fetches don't qualify.
+  // gdb's own watchpoints are a separate internal list (trigger.c) and are
+  // checked after the guest trigger: a guest breakpoint that aborts the
+  // access means no gdb hit. One access fires one trigger, even when split.
+  if (acc != acc_ifetch) {
+    Riscv32TriggerCheck(fr, rs, kTrigOpLoad, vaddr, size);
+    if (rs->gdb_watch_mask) Riscv32GdbWatchCheck(rs, kTrigOpLoad, vaddr, size);
+  }
+  if ((vaddr & 0xfff) + (uint64_t)size <= 0x1000)
+    return MemLoadChunk(fr, (uint32_t)vaddr, size, acc) & WidthMask(size);
+  int first = (int)(0x1000 - (vaddr & 0xfff));
+  uint64_t lo = MemLoadChunk(fr, (uint32_t)vaddr, first, acc) & WidthMask(first);
+  uint64_t hi = MemLoadChunk(fr, (uint32_t)(vaddr + (uint64_t)first), size - first, acc) &
+                WidthMask(size - first);
+  return lo | (hi << (8 * first));
+}
+
+static void MemStoreChunk(frame* fr, uint32_t vaddr, int size, uint64_t val) {
   uint64_t paddr;
   uint8_t* host = NULL;
-  Riscv32Translate(fr, rs, vaddr, size, acc_write, &paddr, &host);
-  if (host && (vaddr & 0xfff) + (uint64_t)size <= 0x1000 && !DebugOn(kDbgMem)) {
+  Riscv32Translate(fr, rs, vaddr, size, acc_write, &paddr, &host, vaddr);
+  if (host && !DebugOn(kDbgMem)) {
     memcpy(host + (vaddr & 0xfff), &val, (size_t)size);
     return;
   }
   BusRegion* r;
   if (BusProbe(rv32_cpu->bus, paddr, size, &r) != 0)
     raise_paddr_(fr, kExStoreFault, vaddr, paddr);
+  if (!r->writable) raise_paddr_(fr, kExStoreFault, vaddr, paddr);
   if (DebugOn(kDbgBus) && !r->host) {
     DebugBus(fr, r->ops->name, paddr, size, 0, val);
   } else if (DebugOn(kDbgMem)) {
     DebugMem(fr, vaddr, paddr, size, acc_write, val, 0);
   }
   BusWrite(rv32_cpu->bus, paddr, size, val);
+}
+
+void riscv32_mem_store(frame* fr, uint64_t vaddr, int size, uint64_t val) {
+  // Before the store commits, like the guest trigger: a guest breakpoint that
+  // aborts the access means no gdb hit; otherwise the stub reports the hit
+  // after the step and the access itself still happens (or faults).
+  Riscv32TriggerCheck(fr, rs, kTrigOpStore, vaddr, size);
+  if (rs->gdb_watch_mask) Riscv32GdbWatchCheck(rs, kTrigOpStore, vaddr, size);
+  if ((vaddr & 0xfff) + (uint64_t)size <= 0x1000) {
+    MemStoreChunk(fr, (uint32_t)vaddr, size, val);
+    return;
+  }
+  // Low half first (Sail sys_misaligned_order_decreasing = false).
+  int first = (int)(0x1000 - (vaddr & 0xfff));
+  MemStoreChunk(fr, (uint32_t)vaddr, first, val);
+  MemStoreChunk(fr, (uint32_t)(vaddr + (uint64_t)first), size - first, val >> (8 * first));
 }
 
 // Loads at the manual's widths: lb/lh/lw sign-extend into the 32-bit
@@ -178,17 +218,25 @@ static void csr_op(frame* fr, uint32_t i) {
   // source is nonzero — register forms test rs1 = x0, immediate forms test
   // uimm = 0. That is what makes the read-only idiom (csrr t0, csr) work.
   int do_write = 1;
-  uint64_t wval = old;
+  // mip/sip read-modify-write uses the software bits only: platform interrupt
+  // lines are visible in rd but are not part of the RMW base (Sail
+  // zicsr_insts.sail: read_val excludes platform interrupts).
+  uint64_t rmw_old = old;
+  if (csr == 0x344)
+    rmw_old = rs->mip;
+  else if (csr == 0x144)
+    rmw_old = rs->mip & (rs->mideleg & kIrqSLevelMask);
+  uint64_t wval = rmw_old;
   switch (f3v & 3) {
     case 1:
       wval = src;
       break;
     case 2:
-      wval = old | src;
+      wval = rmw_old | src;
       do_write = src != 0;
       break;
     case 3:
-      wval = old & ~src;
+      wval = rmw_old & ~src;
       do_write = src != 0;
       break;
     default:
@@ -205,6 +253,7 @@ static uint64_t system_op(frame* fr, uint32_t i) {
   uint32_t imm12 = (i >> 20) & 0xfff;
   switch (imm12) {
     case 0x000:  // ecall: the cause follows the active privilege (spec 1.4)
+      if (rd(i) || rs1(i)) illegal(fr, i);
       fr->rec.mnemonic = "ecall";
       raise_(fr,
              rs->priv == kPrivMachine      ? kExMachineEcall
@@ -212,6 +261,7 @@ static uint64_t system_op(frame* fr, uint32_t i) {
                                            : kExUserEcall,
              0);
     case 0x001:  // ebreak: mtval is the breakpoint address
+      if (rd(i) || rs1(i)) illegal(fr, i);
       fr->rec.mnemonic = "ebreak";
       raise_(fr, kExBreakpoint, rv32_cpu->pc);
     case 0x302:  // mret
@@ -243,6 +293,7 @@ static uint64_t system_op(frame* fr, uint32_t i) {
         illegal(fr, i);
       // One hart and no ASID filtering: every cached translation dies.
       rs->tlb_gen++;
+      rs->res_valid = 0;
       return (uint32_t)(rv32_cpu->pc + 4);
     default:
       illegal(fr, i);
@@ -255,27 +306,41 @@ static uint64_t system_op(frame* fr, uint32_t i) {
 static void amo_op(frame* fr, uint32_t i) {
   int op5 = f7(i) >> 2;  // funct5 = inst[31:27] (volume I table A-2)
   uint32_t addr = x[rs1(i)];
-  if (addr % 4) raise_(fr, kExStoreMisaligned, addr);
+  // AMO is both a load and a store for trigger purposes; matched before the
+  // alignment check and before either memory half.
+  Riscv32TriggerCheck(fr, rs, kTrigOpLoad | kTrigOpStore, addr, 4);
+  // LR faults like a normal load (Sail vmem_utils.sail: E_Load_Addr_Align);
+  // SC and AMOs fault as stores.
+  if (addr % 4)
+    raise_(fr, op5 == 0x02 ? kExLoadMisaligned : kExStoreMisaligned, addr);
   uint32_t old, val, stored;
   switch (op5) {
-    case 0x02:  // lr.w
+    case 0x02:  // lr.w (rs2 is a literal zero field; other values are reserved)
+      if (rs2(i)) illegal(fr, i);
       fr->rec.mnemonic = "lr.w";
       old = (uint32_t)riscv32_mem_load(fr, addr, 4, acc_read);
       rs->res_valid = 1;
       rs->res_addr = addr;
       x[rd(i)] = old;
       return;
-    case 0x03:  // sc.w
+    case 0x03: {  // sc.w
       fr->rec.mnemonic = "sc.w";
       val = x[rs2(i)];
-      if (rs->res_valid && rs->res_addr == addr) {
+      int success = rs->res_valid && rs->res_addr == addr;
+      // A store-conditional is a store: translation and PMP are checked even
+      // when the reservation does not match (Sail vmem_utils.sail).
+      if (!success) {
+        uint64_t paddr;
+        uint8_t* host = NULL;
+        Riscv32Translate(fr, rs, addr, 4, acc_write, &paddr, &host, addr);
+        x[rd(i)] = 1;
+      } else {
         riscv32_mem_store(fr, addr, 4, val);
         x[rd(i)] = 0;
-      } else {
-        x[rd(i)] = 1;
       }
       rs->res_valid = 0;
       return;
+    }
     case 0x01:
     case 0x00:
     case 0x04:
@@ -285,7 +350,9 @@ static void amo_op(frame* fr, uint32_t i) {
     case 0x14:
     case 0x18:
     case 0x1C: {
-      old = (uint32_t)riscv32_mem_load(fr, addr, 4, acc_read);
+      // The read half is part of an atomic: page/access faults are the
+      // store/AMO class (acc_amo), never load faults.
+      old = (uint32_t)riscv32_mem_load(fr, addr, 4, acc_amo);
       val = x[rs2(i)];
       switch (op5) {
         case 0x01:
@@ -338,7 +405,14 @@ static void amo_op(frame* fr, uint32_t i) {
 // mstatus.FS gates every FP instruction and flips to Dirty on use (priv spec
 // 3.1.6.7). rm = 7 (dyn) resolves through frm.
 
-static int fp_rm(int rm_field) { return rm_field == kRmDyn ? rs->frm : rm_field; }
+// Rounding mode: 111 selects frm; 5/6 are reserved static encodings and frm
+// values 5/6/7 are reserved too — all illegal (Sail
+// select_instr_or_fcsr_rm with Fcsr_RM_Illegal).
+static int fp_rm(frame* fr, uint32_t i, int rm_field) {
+  int rm = rm_field == kRmDyn ? (int)rs->frm : rm_field;
+  if (rm > kRmRmm) illegal(fr, i);
+  return rm;
+}
 
 _Noreturn static void fp_disabled(frame* fr, uint32_t i) { raise_(fr, kExIllegal, i); }
 
@@ -351,7 +425,7 @@ static void fp_op(frame* fr, uint32_t i) {
   fp_enter(fr, i);
   int f3v = f3(i), f7v = f7(i);
   int dbl = f7v & 1;
-  int rm = fp_rm(f3v);
+  int rm = fp_rm(fr, i, f3v);
   uint64_t a = f[rs1(i)], b = f[rs2(i)], r = 0;
   switch (f7v) {
     case 0x00:
@@ -466,8 +540,10 @@ static void fp_op(frame* fr, uint32_t i) {
 // both, fnmadd negates the product; rs3 is the third source.
 static void fma_op(frame* fr, uint32_t i, uint32_t opcode) {
   fp_enter(fr, i);
-  int dbl = (i >> 25) & 1;
-  int rm = fp_rm(f3(i));
+  int fmt = (i >> 25) & 3;  // fmt: 00=S, 01=D; 10/11 belong to Zfh/Q
+  if (fmt > 1) illegal(fr, i);
+  int dbl = fmt;
+  int rm = fp_rm(fr, i, f3(i));
   // FMAdd/FMSub/FNMSub/FNMAdd by opcode (volume I encode map), .s/.d by f7[0].
   static const char* const kFmaNames[8] = {"fmadd.s", "fmadd.d", "fmsub.s", "fmsub.d",
                                            "fnmsub.s", "fnmsub.d", "fnmadd.s", "fnmadd.d"};
@@ -496,22 +572,40 @@ static void fp_ldst(frame* fr, uint32_t i, int is_store, int is_double) {
   }
 }
 
-// cbo.clean/inval/flush (Zicbom): no cache exists, so only the permission
-// (U-mode needs the senvcfg R bit) and alignment checks remain (gem5 cbo).
-static void cbo_op(frame* fr, uint32_t i) {
-  fr->rec.mnemonic = f7(i) == 1 ? "cbo.clean" : f7(i) == 2 ? "cbo.flush" : "cbo.inval";
-  if (rs->priv == kPrivUser && !(rs->senvcfg & (1ULL << 4))) illegal(fr, i);
-  if (x[rs1(i)] % kCacheBlockSize) illegal(fr, i);
+// Zicbom/Zicboz enable gate (priv spec 3.7.2): M mode always; S mode needs
+// the menvcfg bit; U mode also needs the senvcfg bit. Zicbom's invalidate
+// field CBIE is two bits wide — any legal non-zero value enables it.
+static int CboEnabled(uint64_t mask) {
+  if (rs->priv == kPrivMachine) return 1;
+  if (!(rs->menvcfg & mask)) return 0;
+  if (rs->priv == kPrivUser && !(rs->senvcfg & mask)) return 0;
+  return 1;
 }
 
-// cbo.zero (Zicboz): stores zeros over the whole cache block.
+// cbo.inval/clean/flush (Zicbom, funct3=010): no cache to maintain, but the
+// block's translation and PMP permissions are still checked (Sail
+// zicbom_insts.sail process_clean_inval). RS1 is rounded down to the block.
+static void cbo_maint(frame* fr, uint32_t i, int op) {
+  fr->rec.mnemonic = op == 0 ? "cbo.inval" : op == 1 ? "cbo.clean" : "cbo.flush";
+  if (!CboEnabled(op == 0 ? (3ULL << 4) : (1ULL << 6))) illegal(fr, i);
+  uint32_t addr = x[rs1(i)] & ~(uint32_t)(kCacheBlockSize - 1);
+  // The whole block is one store-class trigger range (Sail zicbom_insts.sail).
+  Riscv32TriggerCheck(fr, rs, kTrigOpStore, addr, kCacheBlockSize);
+  uint64_t paddr;
+  uint8_t* host = NULL;
+  Riscv32Translate(fr, rs, addr, kCacheBlockSize, acc_cbo, &paddr, &host, x[rs1(i)]);
+}
+
+// cbo.zero (Zicboz, funct3=010, funct12=0x004): stores zeros over the whole
+// cache block. Any granularity is allowed (unpriv spec); the address is
+// rounded down rather than required to be aligned.
 static void cbo_zero(frame* fr, uint32_t i) {
   fr->rec.mnemonic = "cbo.zero";
-  if (rs->priv == kPrivUser && !(rs->senvcfg & (1ULL << 7))) illegal(fr, i);
-  uint32_t addr = x[rs1(i)];
-  if (addr % kCacheBlockSize) raise_(fr, kExStoreMisaligned, addr);
+  if (!CboEnabled(1ULL << 7)) illegal(fr, i);
+  uint32_t addr = x[rs1(i)] & ~(uint32_t)(kCacheBlockSize - 1);
+  Riscv32TriggerCheck(fr, rs, kTrigOpStore, addr, kCacheBlockSize);
   for (int off = 0; off < kCacheBlockSize; off += 8)
-    riscv32_mem_store(fr, (uint32_t)(addr + (uint32_t)off), 8, 0);
+    riscv32_mem_store(fr, addr + (uint32_t)off, 8, 0);
 }
 
 uint64_t riscv32_exec_inst(frame* fr, uint32_t i) {
@@ -529,16 +623,16 @@ uint64_t riscv32_exec_inst(frame* fr, uint32_t i) {
 
     case 0x6f: {  // jal: x[rd] = pc+4; pc += imm_j
       fr->rec.mnemonic = "jal";
-      uint32_t ret = pc + 4;
-      x[rd(i)] = ret;
-      return (uint32_t)(pc + (uint32_t)imm_j(i));
+      uint32_t target = JumpTo(fr, (uint32_t)(pc + (uint32_t)imm_j(i)));
+      x[rd(i)] = pc + 4;
+      return target;
     }
 
     case 0x67: {  // jalr: t = (x[rs1] + imm) & ~1; x[rd] = pc+4; pc = t
       fr->rec.mnemonic = "jalr";
-      uint32_t target = (x[rs1(i)] + (uint32_t)imm_i(i)) & ~1u;
+      uint32_t target = JumpTo(fr, (x[rs1(i)] + (uint32_t)imm_i(i)) & ~1u);
       x[rd(i)] = pc + 4;
-      return (rs->misa & kMisaC) ? target : (target & ~2u);
+      return target;
     }
 
     case 0x63: {  // branches: if (cond) pc += imm_b
@@ -573,7 +667,7 @@ uint64_t riscv32_exec_inst(frame* fr, uint32_t i) {
           illegal(fr, i);
           taken = 0;
       }
-      if (taken) return (uint32_t)(pc + (uint32_t)imm_b(i));
+      if (taken) return JumpTo(fr, (uint32_t)(pc + (uint32_t)imm_b(i)));
       break;
     }
 
@@ -775,19 +869,28 @@ uint64_t riscv32_exec_inst(frame* fr, uint32_t i) {
         fr->rec.mnemonic = "fence";
         break;
       }
-      if (f3(i) == 1) {       // fence.i or the Zicbom cbo forms
-        int funct5 = f7(i);
-        if (funct5 == 0 && !rs1(i) && !rd(i)) {  // fence.i: no icache
-          fr->rec.mnemonic = "fence.i";
-          break;
-        }
-        if (funct5 > 2) illegal(fr, i);
-        cbo_op(fr, i);
+      if (f3(i) == 1) {       // fence.i: funct12/rs1/rd are reserved and ignored
+        fr->rec.mnemonic = "fence.i";
         break;
       }
-      if (f3(i) == 2) {  // cbo.zero (Zicboz)
-        if (f7(i) != 0) illegal(fr, i);
-        cbo_zero(fr, i);
+      if (f3(i) == 2) {       // Zicbom/Zicboz: funct12 selects the operation
+        if (rd(i)) illegal(fr, i);
+        switch (i >> 20) {
+          case 0x000:
+            cbo_maint(fr, i, 0);  // cbo.inval
+            break;
+          case 0x001:
+            cbo_maint(fr, i, 1);  // cbo.clean
+            break;
+          case 0x002:
+            cbo_maint(fr, i, 2);  // cbo.flush
+            break;
+          case 0x004:
+            cbo_zero(fr, i);
+            break;
+          default:
+            illegal(fr, i);
+        }
         break;
       }
       illegal(fr, i);
@@ -949,15 +1052,17 @@ uint64_t riscv32_exec_c(frame* fr, uint16_t i16) {
         break;
       case 3:
         fr->rec.mnemonic = rdd == 2 ? "c.addi16sp" : "c.lui";
-        if (rdd == 2) {  // c.addi16sp
+        if (rdd == 2) {  // c.addi16sp (nzimm=0 is reserved)
           uint32_t imm = (uint32_t)sext32(
               (((i16 >> 12) & 1) << 9) | (((i16 >> 6) & 1) << 4) | (((i16 >> 5) & 1) << 6) |
                   (((i16 >> 3) & 3) << 7) | (((i16 >> 2) & 1) << 5),
               10);
+          if (imm == 0) illegal(fr, i16);
           x[2] += imm;
-        } else if (rdd != 0) {  // c.lui (nzimm=0 is a hint, matches QEMU)
+        } else {  // c.lui (nzimm=0 is reserved; rd=x0 is a HINT)
           uint32_t imm = (uint32_t)sext32((((i16 >> 12) & 1) << 17) | (((i16 >> 2) & 31) << 12), 18);
-          if (imm) x[rdd] = imm;
+          if (imm == 0) illegal(fr, i16);
+          if (rdd) x[rdd] = imm;
         }
         break;
       case 4: {
@@ -1043,12 +1148,12 @@ uint64_t riscv32_exec_c(frame* fr, uint16_t i16) {
       x[rdd] <<= shamt;
       break;
     }
-    case 1: {  // c.fldsp
+    case 1: {  // c.fldsp (rd=0 still loads f0: QEMU insn16.decode c_fld @c_ldsp)
       fr->rec.mnemonic = "c.fldsp";
       fp_enter(fr, i16);
       uint32_t imm =
           (uint32_t)((((i16 >> 12) & 1) << 5) | (((i16 >> 5) & 3) << 3) | (((i16 >> 2) & 7) << 6));
-      if (rdd) f[rdd] = riscv32_mem_load(fr, x[2] + imm, 8, acc_read);
+      f[rdd] = riscv32_mem_load(fr, x[2] + imm, 8, acc_read);
       break;
     }
     case 2: {  // c.lwsp (rd = 0 reserved)
@@ -1094,11 +1199,11 @@ uint64_t riscv32_exec_c(frame* fr, uint16_t i16) {
         x[rdd] += x[rs2v];
       }
       break;
-    case 5: {  // c.fsdsp (rs2 = 0 is the reserved/hint encoding, as RV64)
+    case 5: {  // c.fsdsp (rs2=0 still stores f0: QEMU insn16.decode c_fsd @c_sdsp)
       fr->rec.mnemonic = "c.fsdsp";
       fp_enter(fr, i16);
       uint32_t imm = (uint32_t)((((i16 >> 10) & 7) << 3) | (((i16 >> 7) & 7) << 6));
-      if (rs2v) riscv32_mem_store(fr, x[2] + imm, 8, f[rs2v]);
+      riscv32_mem_store(fr, x[2] + imm, 8, f[rs2v]);
       break;
     }
     case 6: {  // c.swsp
