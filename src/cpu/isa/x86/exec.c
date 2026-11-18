@@ -103,6 +103,7 @@ static x86_tlb_entry* TlbFill(uint64_t lin, int write, int fetch, int user);
 static void TlbCheck(x86_tlb_entry* e, uint64_t lin, int write, int fetch, int user);
 static void AcCheckSlow(uint64_t lin, int size, int user, int fetch, int write);
 static void X87UpdateFerr(void);
+static void X87WaitCheck(void);
 static void PerfUpdateActive(void);
 _Noreturn static void ud(void);
 
@@ -297,22 +298,27 @@ _Noreturn static void pf_fault(uint64_t lin, uint32_t code) {
   raise_vaddr_(fr, vec_pf, code, lin);
 }
 
-// The per-access segment checks, protected mode only (SDM vol.3 5.3): the
-// segment must be usable (a null selector loads into DS/ES/FS/GS fine and
-// faults on use), the access type must fit (writes go through writable data
-// segments only; execute-only code is unreadable), and the offset must lie
-// inside the limit — expand-up below the limit, expand-down data above it.
-// A stack-segment violation is #SS(0), every other segment #GP(0) (SDM vol.3
-// table 6-1). B bounds no ordinary data segment: it selects the 16/32-bit
-// stack pointer (handled by stack_push/stack_pop) and an expand-down
-// segment's upper bound only (SDM vol.3 3.4.5).
+// The per-access segment checks (SDM vol.3 5.3): the segment must be usable
+// (a null selector loads into DS/ES/FS/GS fine and faults on use), the access
+// type must fit (writes go through writable data segments only; execute-only
+// code is unreadable), and the offset must lie inside the limit — expand-up
+// below the limit, expand-down data above it. Real-address mode keeps the
+// cached 64-KByte limit and access rights (unreal mode's 4-GByte cache
+// survives a return to PE=0), while 16-bit effective addresses have already
+// wrapped in modrm. A stack-segment violation is #SS(0), every other segment
+// #GP(0) (SDM vol.3 table 6-1). B bounds no ordinary data segment: it selects
+// the 16/32-bit stack pointer (handled by stack_push/stack_pop) and an
+// expand-down segment's upper bound only (SDM vol.3 3.4.5).
 _Noreturn static void seg_fault(int seg, uint32_t code) {
   if (seg == ss_i) ss_fault(code);
   gp_fault(code);
 }
 
 static void seg_use(int seg, uint32_t off, int size, int write) {
-  if (!(s->cr0 & 1)) return;
+  // Real-address mode has a 64-KByte limit on every segment (SDM vol.3 2.2.1);
+  // the cached descriptor is the source so unreal mode's 4-GByte limits keep
+  // working after CR0.PE is cleared. 16-bit effective addresses already wrap
+  // in modrm; a 32-bit address override past the limit takes #GP (286+).
   uint8_t ar = s->ar[seg];
   if (ar == 0) gp_fault(0);
   if (write ? (ar & 0x1a) != 0x12 : (ar & 0x1a) == 0x18) seg_fault(seg, 0);
@@ -867,11 +873,23 @@ typedef struct walk_res {
   uint32_t page_shift; // 12 = 4KB, 21 = 2MB, 22 = 4MB
 } walk_res;
 
-// PAE entry masks (SDM vol.3 figs 4-5/4-6/4-7): physical base 51:12, 2MB leaf
-// base 51:21, bits 62:52 reserved, bit 63 the NX bit.
-static const uint64_t kPaeAddrMask = 0x000ffffffffff000ull;
-static const uint64_t kPae2mMask = 0x000fffffffe00000ull;
-static const uint64_t kPaeRsvdHi = 0x7ffull << 52;
+// This processor reports PSE-36 (CPUID.01H:EDX bit 17) and has no
+// CPUID.80000008H leaf, so MAXPHYADDR is 36 (SDM vol.3 4.1.4: with no
+// 80000008H the PSE-36 mechanism itself defines the width). Table 4-4 then
+// makes M = min(40, MAXPHYADDR) = 36: a 4MB PDE's bits 16:13 are physical
+// bits 35:32 and bits 21:17 are reserved. Every paging-structure address above
+// bit 35 is reserved as well.
+static const uint64_t kPhysAddrMask = (1ull << 36) - 1;
+// PAE entry masks (SDM vol.3 figs 4-5/4-6/4-7): physical base 35:12, 2MB leaf
+// base 35:21, bits 51:36 (above MAXPHYADDR) and 62:52 reserved, bit 63 the NX
+// bit. The two reserved ranges are separate fields, hence the OR.
+static const uint64_t kPaeAddrMask = 0x0000000ffffff000ull;
+static const uint64_t kPae2mMask = 0x0000000fffe00000ull;
+static const uint64_t kPaeRsvdHi = (0x7ffull << 52) | (0xffffull << 36);
+// A legacy PAE PDPTE has no R/W, U/S or A bits: bits 2:1 and 8:5 are reserved
+// and bit 7 (PS) is illegal in 32-bit PAE (SDM vol.3 table 4-8). QEMU ignores
+// them; Bochs rejects a present entry that sets one when CR3 loads.
+static const uint64_t kPaePdpRsvd = 0x1e6;
 static const uint64_t kNxBit = 1ull << 63;
 
 static void PfRsvd(uint64_t lin, uint32_t code) {
@@ -879,6 +897,26 @@ static void PfRsvd(uint64_t lin, uint32_t code) {
 }
 static void PfNx(uint64_t lin, uint32_t code) {
   pf_fault(lin, code | kPfPresent | kPfInstr);
+}
+
+// SDM vol.3 4.4.1: with PAE, loading CR3 (and a task switch that carries a
+// CR3 image) loads the four page-directory-pointer entries. A present entry
+// with any reserved bit set raises #GP(0) at that load point; Bochs
+// paging.cc CheckPDPTR does exactly this and crregs.cc turns it into #GP(0).
+// The access-time walk repeats the check as #PF(RSVD), which is what a later
+// modification of the table produces.
+static int PdpReserved(uint32_t cr3) {
+  uint64_t pdp = (uint64_t)(cr3 & 0xffffffe0u);
+  for (int i = 0; i < 4; i++) {
+    uint64_t e = phys_load(pdp + (uint64_t)i * 8, 8);
+    if (!(e & kPdeP)) continue;
+    if (e & (kPaeRsvdHi | kPaePdpRsvd)) return 1;
+    if ((e & kNxBit) && !(s->efer & kEferNxe)) return 1;
+  }
+  return 0;
+}
+static void PdpCheck(uint32_t cr3) {
+  if (PdpReserved(cr3)) gp_fault(0);
 }
 
 // The shared permission rule (SDM vol.3 4.6 table 4-2): a user access needs
@@ -903,15 +941,18 @@ static void WalkNonPae(uint64_t lin, int write, int user, walk_res* w) {
   uint32_t pde = (uint32_t)phys_load(pde_addr, 4);
   if (!(pde & kPdeP)) pf_fault(lin, code);
   if ((pde & kPdePs) && (s->cr4 & kCr4Pse)) {
-    // SDM vol.3 4.7: on a processor that supports PSE-36 (this i686 target
-    // advertises it), a reserved 4MB PDE bit sets RSVD in the #PF error code.
+    // SDM vol.3 table 4-4: with PSE-36 and MAXPHYADDR=36, PDE bits 16:13
+    // supply physical address bits 35:32 and bits 21:17 are reserved. The
+    // table's note makes M implementation-defined; this machine's M is 36, so
+    // a set reserved bit is a page fault. (32-bit #PF has no I/D bit; RSVD is
+    // reported for the reserved-entry case.)
     if (pde & kPde4mReserved) pf_fault(lin, code | kPfPresent | kPfRsvd);
     CheckPerm(lin, write, user, (pde & kPdeRw) != 0, (pde & kPdeUs) != 0, code);
     uint32_t new_pde = pde | kPdeA | (write ? kPdeD : 0u);
     if (new_pde != pde) phys_store(pde_addr, 4, new_pde);
     uint64_t frame = (pde & 0xffe00000u) |
-                     ((uint64_t)(pde & 0x001fe000u) << (32 - 13));
-    w->paddr = a20_gate(frame | (lin & 0x3fffff));
+                     ((uint64_t)(pde & 0x0001e000u) << 19);
+    w->paddr = a20_gate((frame | (lin & 0x3fffff)) & kPhysAddrMask);
     w->flags = ((pde & kPdeRw) ? kTlbWritable : 0) |
                ((pde & kPdeUs) ? kTlbUser : 0) | ((pde & kPdeG) ? kTlbGlobal : 0);
     w->lin_base = (uint32_t)lin & ~0x3fffffu;
@@ -938,8 +979,9 @@ static void WalkNonPae(uint64_t lin, int write, int user, walk_res* w) {
 // table) -> PTE. Every entry is 64-bit; D lives in the leaf (PDE for 2MB, PTE
 // for 4KB). NX in any level forbids instruction fetch. The legacy PAE PDPTE
 // has no R/W, U/S or A bits: SDM vol.3 table 4-8 makes 2:1 and 8:5 reserved
-// (must be 0), so only the PDE/PTE supply access rights and only they carry
-// A/D. QEMU ignores those PDPTE bits; Bochs rejects them when CR3 is loaded.
+// (must be 0) and bit 7 illegal, so only the PDE/PTE supply access rights and
+// only they carry A/D. QEMU ignores those PDPTE bits; Bochs rejects them when
+// CR3 is loaded and this walk rejects a later modification as #PF(RSVD).
 static void WalkPae(uint64_t lin, int write, int user, int fetch, walk_res* w) {
   uint32_t code = (write ? kPfWrite : 0) | (user ? kPfUser : 0);
   // SDM vol.3 4.7 / QEMU page_fault: with PAE+NXE, every instruction-fetch
@@ -949,8 +991,7 @@ static void WalkPae(uint64_t lin, int write, int user, int fetch, walk_res* w) {
   uint64_t pdpte = phys_load(pdpte_addr, 8);
   if (!(pdpte & kPdeP)) pf_fault(lin, code);
   uint64_t nx = pdpte & kNxBit;
-  if (pdpte & kPdePs) PfRsvd(lin, code);  // 1GB pages do not exist in 32-bit PAE
-  if (pdpte & kPaeRsvdHi) PfRsvd(lin, code);
+  if (pdpte & (kPaeRsvdHi | kPaePdpRsvd)) PfRsvd(lin, code);
   if (nx && !(s->efer & kEferNxe)) PfRsvd(lin, code);
 
   uint64_t pde_addr = (pdpte & kPaeAddrMask) | (((lin >> 21) & 0x1ff) * 8);
@@ -1785,7 +1826,15 @@ static void do_task_switch(uint16_t sel, int source, uint32_t next_eip, int has_
   // alone (QEMU applies CR3 only when type & 8). Loading CR3 flushes
   // non-global translations, exactly like MOV CR3.
   if (!tss16) {
-    s->cr3 = krd32(v.base + 0x1c);  // carried along (SDM 7.2.1)
+    uint32_t new_cr3 = krd32(v.base + 0x1c);  // carried along (SDM 7.2.1)
+    int cr3_changed = new_cr3 != s->cr3;
+    s->cr3 = new_cr3;
+    // A task switch that actually changes CR3 loads the PDPTEs; a reserved
+    // bit in a present entry is #TS(0) after the commit point (SDM vol.3 7.3;
+    // Bochs tasking.cc checks after SetCR3 and raises #TS).
+    if (cr3_changed && (s->cr0 & kCr0Pg) && (s->cr4 & kCr4Pae) &&
+        PdpReserved(s->cr3))
+      ts_fault(0);
     TlbFlushNonGlobal(s);
   }
   // The incoming LDT (TSS +0x60, or +0x2a in the 16-bit shape) loads BEFORE
@@ -3570,8 +3619,21 @@ static void SimdComi(int ucomi) {
   int esz = sd ? 8 : 4;
   uint8_t b[16];
   SimdSrc(b, esz, 1);
-  uint64_t a = SimdElem(s->fpu.xmm[d.reg], esz, 0);
-  uint64_t bv = SimdElem(b, esz, 0);
+  uint64_t raw_a = SimdElem(s->fpu.xmm[d.reg], esz, 0);
+  uint64_t raw_b = SimdElem(b, esz, 0);
+  // MXCSR.DE on a denormal operand, unless DAZ turns it into a signed zero
+  // first (SDM vol.1 11.6.3). COMISS/COMISD are SSE instructions: they have
+  // no x87 #D, and the check has to happen before the comparison because the
+  // flushed input is exactly +0/-0.
+  int raised = 0;
+  if (!fpu_sse_daz(&s->fpu) &&
+      (esz == 8 ? (SimdDenorm64(raw_a) || SimdDenorm64(raw_b))
+                : (SimdDenorm32((uint32_t)raw_a) || SimdDenorm32((uint32_t)raw_b)))) {
+    s->fpu.mxcsr |= 1u << 1;
+    raised = 1;
+  }
+  uint64_t a = SseInput(raw_a, esz);
+  uint64_t bv = SseInput(raw_b, esz);
   int nan = esz == 8 ? SimdNan64(a) || SimdNan64(bv) : SimdNan32((uint32_t)a) || SimdNan32((uint32_t)bv);
   int snan = 0;
   if (nan) {
@@ -3587,11 +3649,14 @@ static void SimdComi(int ucomi) {
   }
   if (nan && (!ucomi || snan)) {
     s->fpu.mxcsr |= 1u;  // MXCSR.IE
-    if (((s->fpu.mxcsr & 0x3f) & ~((s->fpu.mxcsr >> 7) & 0x3f)) != 0) {
-      if (s->cr4 & kCr4Osxmmexcpt)
-        raise_(fr, vec_xm, 0);
-      ud();
-    }
+    raised = 1;
+  }
+  // An exception this instruction raised reports #XM when unmasked, or #UD
+  // when CR4.OSXMMEXCPT is clear (SDM vol.3 13.5.2). DE takes part like IE.
+  if (raised && ((s->fpu.mxcsr & 0x3f) & ~((s->fpu.mxcsr >> 7) & 0x3f)) != 0) {
+    if (s->cr4 & kCr4Osxmmexcpt)
+      raise_(fr, vec_xm, 0);
+    ud();
   }
   enum { kCf = 1u << 0, kPf = 1u << 2, kZf = 1u << 6 };
   uint32_t cc;
@@ -4568,6 +4633,10 @@ static void SimdOp(uint8_t op2) {
   // CR4.OSFXSR=0 makes every XMM-using SSE/SSE2 instruction #UD; the MMX
   // subset stays legal (SDM vol.3 13.5.2, instruction pages' #UD entry).
   if (!(s->cr4 & kCr4Osfxsr) && SimdUsesXmm(op2)) ud();
+  // A pending unmasked x87 exception is also reported before the next MMX
+  // instruction (SDM vol.1 8.7.1). MOVNTI (0xC3) is a GPR instruction and
+  // does not go through the x87/MMX state.
+  if (op2 != 0xc3 && !SimdUsesXmm(op2)) X87WaitCheck();
   switch (op2) {
     case 0x10: case 0x11: case 0x28: case 0x29:
       fr->rec.mnemonic = op2 == 0x10 ? "movups" : op2 == 0x11 ? "movups" : "movaps";
@@ -4996,6 +5065,12 @@ static void run_op2(uint8_t op2) {
         // PG can rise only out of protected mode (SDM vol.2 MOV to CR0:
         // PG=1 with PE=0 is #GP(0); vol.3 9.9 sets PE first).
         if ((v & kCr0Pg) && !(v & kCr0Pe)) gp_fault(0);
+        // A CR0 write that changes PG/CD/NW/WP reloads the PAE PDPTEs; a
+        // present entry with a reserved bit set is #GP(0) (SDM vol.3 4.4.1;
+        // Bochs crregs.cc SetCR0). Check before committing the register.
+        if ((v & kCr0Pg) && (s->cr4 & kCr4Pae) &&
+            ((s->cr0 ^ v) & kCr0PdpReload))
+          PdpCheck(s->cr3);
         // ET is hardwired to 1 on 486+ (SDM vol.3 2.5); QEMU's
         // cpu_x86_update_cr0 ORs CR0_ET_MASK into every write
         // (target/i386/helper.c,
@@ -5009,14 +5084,24 @@ static void run_op2(uint8_t op2) {
       } else if (d.reg == 2) {
         s->cr2 = s->r[d.rm].e;
       } else if (d.reg == 3) {
-        s->cr3 = s->r[d.rm].e;
+        uint32_t v = s->r[d.rm].e;
+        // CR3 load with PAE paging loads the four PDPTEs; a reserved bit in a
+        // present one is #GP(0) (SDM vol.3 4.4.1; Bochs crregs.cc).
+        if ((s->cr0 & kCr0Pg) && (s->cr4 & kCr4Pae)) PdpCheck(v);
+        s->cr3 = v;
         // MOV CR3 flushes non-global translations; PGE keeps global ones
         // (SDM vol.3 4.10.4.1).
         TlbFlushNonGlobal(s);
       } else if (d.reg == 4) {
         // CR4 is WARL: bits this machine does not implement read back zero
         // (SDM vol.3 2.5). PAE/PSE/PGE all change what the walk means.
-        s->cr4 = s->r[d.rm].e & kCr4Supported;
+        uint32_t v = s->r[d.rm].e & kCr4Supported;
+        // A CR4 write that flips PSE/PAE/PGE reloads the PDPTEs when PAE
+        // paging is active (Bochs crregs.cc SetCR4). Check before committing.
+        if ((s->cr0 & kCr0Pg) && (v & kCr4Pae) &&
+            ((s->cr4 ^ v) & kCr4PdpReload))
+          PdpCheck(s->cr3);
+        s->cr4 = v;
         TlbFlushAll(s);
       } else {
         ud();
@@ -5760,7 +5845,7 @@ static const char* const kX87Arith[8] = {"fadd", "fmul", "fcom", "fcomp",
 // memory form updates the data pointer (SDM FSTENV: "the data pointer is not
 // affected").
 static void X87MemPtr(void) {
-  s->fpu.fdp = (uint32_t)d.mlin;
+  s->fpu.fdp = d.moff;  // offset within FDS, not the linear address
   s->fpu.fds = s->sreg[d.mseg];
 }
 
@@ -5815,8 +5900,13 @@ static void X87AfterEnvLoad(void) {
 // error while it is asserted.
 static void X87UpdateFerr(void) { X87DriveFerr(cpu, s); }
 
-static void X87FaultCheck(void) {
-  X87UpdateFerr();
+// A waiting x87 instruction checks for a pending unmasked exception before it
+// executes (SDM vol.1 8.7.1: the #MF comes immediately before the next
+// floating-point instruction, WAIT/FWAIT, or MMX instruction, not at the end
+// of the instruction that raised the flag). The saved CS:EIP is therefore the
+// waiting instruction's, while the x87 FIP/FCS still name the instruction
+// that produced the error.
+static void X87WaitCheck(void) {
   if (s->fpu.pending_mf && (s->cr0 & kCr0Ne)) raise_(fr, vec_mf, 0);
 }
 
@@ -5825,33 +5915,43 @@ static void X87ClearExceptions(void) {
   s->fpu.pending_mf = 0;
 }
 
+// Real-address and virtual-8086 mode use the real-mode environment layout
+// (SDM vol.1 8.1.10: "In virtual-8086 mode or SMM, the real-address mode
+// formats ... are used"); Bochs fpu.cc chooses its real/V86 branch the same
+// way (protected_mode() is false in V86).
+static int X87RealMode(void) { return !(s->cr0 & kCr0Pe) || fl->vm; }
+
 static void X87LoadEnv(int wide) {
   X87Access(wide ? 28 : 14, 0);
   uint8_t buf[28];
   rd_bytes(d.mlin, buf, wide ? 28 : 14);
-  fpu_load_env(&s->fpu, buf, wide);
+  fpu_load_env(&s->fpu, buf, wide, X87RealMode());
   X87AfterEnvLoad();
 }
 
 static void X87StoreEnv(int wide) {
   X87Access(wide ? 28 : 14, 1);
   uint8_t buf[28];
-  fpu_store_env(&s->fpu, buf, wide);
+  fpu_store_env(&s->fpu, buf, wide, X87RealMode());
   wr_bytes(d.mlin, buf, wide ? 28 : 14);
+  // FNSTENV masks every exception after the image is in memory (SDM vol.2
+  // FSTENV/FNSTENV; Bochs fpu.cc FNSTENV). FSTENV reaches here through the
+  // preceding WAIT, which is where its pending-#MF check happens.
+  fpu_mask_exceptions(&s->fpu);
 }
 
 static void X87LoadState(int wide) {
   X87Access(wide ? 108 : 94, 0);
   uint8_t buf[108];
   rd_bytes(d.mlin, buf, wide ? 108 : 94);
-  fpu_load_state(&s->fpu, buf, wide);
+  fpu_load_state(&s->fpu, buf, wide, X87RealMode());
   X87AfterEnvLoad();
 }
 
 static void X87StoreState(int wide) {
   X87Access(wide ? 108 : 94, 1);
   uint8_t buf[108];
-  fpu_store_state(&s->fpu, buf, wide);
+  fpu_store_state(&s->fpu, buf, wide, X87RealMode());
   wr_bytes(d.mlin, buf, wide ? 108 : 94);
   fpu_finit(&s->fpu);  // FNSAVE resets the FPU (SDM FNSAVE)
 }
@@ -5924,8 +6024,7 @@ static void X87MemForm(uint8_t op) {
         case 5:
           fr->rec.mnemonic = "fldcw";
           X87Access(2, 0);
-          s->fpu.cw = rd16(d.mlin);
-          fpu_refresh(&s->fpu);
+          fpu_load_cw(&s->fpu, rd16(d.mlin));
           break;
         case 6:
           fr->rec.mnemonic = "fnstenv";
@@ -6124,14 +6223,55 @@ static void X87RegisterArith(uint8_t op, int i) {
   if (op == 0xde) fpu_pop(&s->fpu);
 }
 
+// The non-waiting x87 control instructions (SDM vol.1 8.3.12): FNINIT,
+// FNCLEX, FNSTSW, FNSTCW, FNSTENV and FNSAVE execute even with an unmasked
+// exception pending. Their "F" forms are a WAIT prefix followed by one of
+// these, so the WAIT performs the check. FXSAVE/FXRSTOR ignore pending too,
+// but live in the 0F AE map, not here.
+static int X87NonWaiting(uint8_t op) {
+  if (!d.is_mem) {
+    if (op == 0xdb && d.reg == 4 && (d.rm == 2 || d.rm == 3)) return 1;  // fnclex/fninit
+    if (op == 0xdf && d.reg == 4 && d.rm == 0) return 1;                 // fnstsw ax
+    return 0;
+  }
+  if (op == 0xd9 && (d.reg == 6 || d.reg == 7)) return 1;  // fnstenv/fnstcw
+  if (op == 0xdd && (d.reg == 6 || d.reg == 7)) return 1;  // fnsave/fnstsw m
+  return 0;
+}
+
+// Control instructions leave the x87 instruction/data pointer and opcode
+// registers unchanged (SDM vol.1 8.1.7: FINIT/FNINIT, FCLEX/FNCLEX, FLDCW,
+// FSTCW/FNSTCW, FSTSW/FNSTSW, FSTENV/FNSTENV, FLDENV, FSAVE/FNSAVE, FRSTOR,
+// WAIT/FWAIT). QEMU's translate.c clears update_fip/update_fdp for exactly
+// these forms; FNOP is treated the same way there.
+static int X87ControlOp(uint8_t op) {
+  if (!d.is_mem) {
+    if (op == 0xdb && d.reg == 4 && (d.rm == 2 || d.rm == 3)) return 1;  // fnclex/fninit
+    if (op == 0xdf && d.reg == 4 && d.rm == 0) return 1;                 // fnstsw ax
+    if (op == 0xd9 && d.reg == 2 && d.rm == 0) return 1;                 // fnop
+    return 0;
+  }
+  if (op == 0xd9 && d.reg >= 4) return 1;                  // fldenv..fnstcw
+  if (op == 0xdd && (d.reg == 4 || d.reg == 6 || d.reg == 7)) return 1;  // frstor/fnsave/fnstsw
+  return 0;
+}
+
 static void x87_exec(uint8_t op) {
   // CR0.EM turns every escape into #NM, and CR0.TS does too (SDM vol.3 2.5:
   // the TS check is the lazy-context-switch mechanism for the FPU).
   if (s->cr0 & (kCr0Em | kCr0Ts)) nm();
-  s->fpu.fip = (uint32_t)(s->base[cs_i] + fr->rec.pc);
-  s->fpu.fcs = s->sreg[cs_i];
   modrm();
-  s->fpu.fop = (uint16_t)((op << 8) | d.enc);
+  // The pending-exception check precedes the instruction (SDM vol.1 8.7.1),
+  // so it must not overwrite the saved x87 instruction pointer with this
+  // instruction's address.
+  if (!X87NonWaiting(op)) X87WaitCheck();
+  if (!X87ControlOp(op)) {
+    // FIP is the offset within FCS (SDM vol.1 8.1.7); the real-mode save
+    // combines it with FCS later.
+    s->fpu.fip = (uint32_t)fr->rec.pc;
+    s->fpu.fcs = s->sreg[cs_i];
+    s->fpu.fop = (uint16_t)((op << 8) | d.enc);
+  }
   if (!d.is_mem) {
     int i = d.rm;
     switch (op) {
@@ -6321,7 +6461,9 @@ static void x87_exec(uint8_t op) {
   } else {
     X87MemForm(op);
   }
-  X87FaultCheck();
+  // An unmasked exception raised by this instruction stays pending until the
+  // next waiting x87 instruction or WAIT; with NE=0 it asserts FERR# now.
+  X87UpdateFerr();
 }
 
 // The one-byte opcodes, manual order. The comment names the encoding; body
@@ -8130,6 +8272,20 @@ static void x86_set_ignne_line(CpuState* c, int on) {
   X87DriveFerr(c, st);
 }
 
+// Reset state of the segment cache outside protected mode (SDM vol.3 9.1.4):
+// every segment is a 64-KByte real-mode window; CS is 0xF000:FFFF0 on the
+// firmware path, 0:0 for a boot-sector handoff. Callers set CS afterwards.
+static void ResetRealSegs(x86_state* st) {
+  for (int i = 0; i < 6; i++) {
+    st->sreg[i] = 0;
+    st->base[i] = 0;
+    st->limit[i] = 0xffff;
+    st->ar[i] = 0x93;  // present, DPL0, data, read/write, accessed
+    st->dbit[i] = 0;
+  }
+  st->ar[cs_i] = 0x9b;  // present, DPL0, code, readable, accessed
+}
+
 void x86_init(CpuState* c) {
   x86_state* st;
   if (!c->priv) {
@@ -8210,6 +8366,7 @@ void x86_init(CpuState* c) {
     // board maps its BIOS ROM over the top of the first megabyte and hands the
     // CPU the linear address. SeaBIOS enters at exactly the same place QEMU
     // puts it.
+    ResetRealSegs(st);
     st->sreg[cs_i] = 0xf000;
     st->base[cs_i] = 0xf0000;
     st->limit[cs_i] = 0xffff;
@@ -8219,6 +8376,7 @@ void x86_init(CpuState* c) {
     st->idtr_limit = 0xffff;  // SDM reset state: no IDT until POST builds one
   } else {
     // BIOS boot-sector handoff: DL = 0x80 (boot drive), IVT at linear 0.
+    ResetRealSegs(st);
     st->r[edx_i].e = 0x80;
     st->idtr = 0;
     st->idtr_limit = 0x3ff;

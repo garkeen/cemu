@@ -10,6 +10,13 @@
 ;       to non-contiguous physical pages (reads and writes)
 ;   t6  NX: a fetch from a PAE PTE with bit 63 set faults with #PF.I=1 after
 ;       IA32_EFER.NXE is enabled (the #PF handler recognizes the expected fault)
+;   t7  a present PDPTE with a reserved bit set raises #GP(0) when CR3 is
+;       loaded, and the register keeps its old value
+;
+; QEMU 11.1.50 ignores the legacy PAE PDPTE reserved bits (its walk treats
+; them as address/ignored fields), so it reaches the t7 fall-through and exits
+; status 3; SDM vol.3 4.4.1/table 4-8 and Bochs paging.cc CheckPDPTR raise
+; #GP(0) at the CR3 load, which is what this cell pins.
 ;
 ; Exit: pass payload 5 (status 11); failure payload 1 (status 3). The fault
 ; record (vector, error, EIP, CR2) lands at FAULT for CEMU_DEBUG=dump=.
@@ -29,6 +36,8 @@ bits 32
 %define IDTPTR    0x2f00
 %define EXPECT_NX 0x9000
 %define FAULT     0x9010
+%define EXPECT_GP 0x9020
+%define RESUME    0x9024
 
 %macro SET_GATE 2
   mov eax, %2
@@ -89,6 +98,7 @@ _start:
   lidt [IDTPTR]
 
   mov dword [EXPECT_NX], 0
+  mov dword [EXPECT_GP], 0
 
   ; Zero the PDPT and PD, then build the three-level tables.
   xor eax, eax
@@ -245,6 +255,24 @@ _start:
   call 0x202000
   jmp fail
 
+nx_done:
+  ; t7: a present PDPTE with a reserved bit set is #GP(0) at CR3 load. The
+  ; handler returns to .after_bad_cr3; CR3 must not have been committed.
+  mov dword [EXPECT_NX], 0
+  mov dword [EXPECT_GP], 1
+  mov dword [RESUME], .after_bad_cr3
+  mov dword [PDPT + 8], PD | 1 | 2   ; P=1 plus reserved bit 1
+  mov eax, PDPT
+  mov cr3, eax
+  jmp fail                          ; the load should have faulted
+
+.after_bad_cr3:
+  mov eax, cr3
+  cmp eax, PDPT
+  jne fail
+  mov dword [PDPT + 8], 0
+  mov dword [EXPECT_GP], 0
+
 pass:
   mov al, 5
   mov dx, 0xf4
@@ -261,9 +289,6 @@ fail:
   hlt
   jmp .hang_fail
 
-gp_handler:
-  mov dword [FAULT], 13
-  jmp gp_common
 pf_handler:
   mov dword [FAULT], 14
   mov eax, [esp]
@@ -277,7 +302,17 @@ pf_handler:
   mov eax, [FAULT + 4]
   test eax, 0x10
   jz fail
-  jmp pass
+  jmp nx_done
+
+gp_handler:
+  cmp dword [EXPECT_GP], 0
+  je gp_common
+  ; Expected #GP(0) from the bad CR3 load: resume after the instruction.
+  ; The error code sits at [esp], the saved EIP at [esp+4].
+  mov eax, [RESUME]
+  mov [esp + 4], eax
+  add esp, 4
+  iret
 
 gp_common:
   mov eax, [esp]

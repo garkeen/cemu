@@ -84,10 +84,33 @@ void fpu_set_tags(x86_fpu* f, uint16_t tw) { f->tw = tw; }
 
 void fpu_refresh(x86_fpu* f) { UpdateEs(f); }
 
+// FLDCW/FLDENV/FXRSTOR load the control word with bit 6 forced to 1 and the
+// reserved bits 15:13 cleared. SDM vol.1 8.1.5 gives bit 6 as reserved (1 on
+// 287 and later); Bochs control_w.h FPU_CW_Reserved_Bits = 0xe0c0 and
+// fpu.cc applies exactly this mask on FLDCW and environment loads.
+void fpu_load_cw(x86_fpu* f, uint16_t cw) {
+  f->cw = (uint16_t)((cw & ~0xe0c0u) | 0x0040u);
+  UpdateEs(f);
+}
+
+// FNSTENV/FSTENV mask all exceptions after the image has been stored
+// (SDM vol.2 FSTENV/FNSTENV: "Then mask all floating-point exceptions";
+// Bochs fpu.cc FNSTENV does `FPU_CONTROL_WORD |= FPU_CW_Exceptions_Mask`).
+// The exception flags stay in SW; only their unmasked state (and therefore
+// ES/#MF) goes away.
+void fpu_mask_exceptions(x86_fpu* f) {
+  f->cw |= 0x003fu;
+  UpdateEs(f);
+}
+
 static void UpdateEs(x86_fpu* f) {
   uint16_t raised = f->sw & (kFpuIe | kFpuDe | kFpuZe | kFpuOe | kFpuUe | kFpuPe);
   uint16_t unmasked = raised & (uint16_t)~f->cw & (kFpuIe | kFpuDe | kFpuZe | kFpuOe | kFpuUe | kFpuPe);
-  f->sw = (uint16_t)((f->sw & ~kFpuEs) | (unmasked ? kFpuEs : 0));
+  // B (bit 15) is the 8087-compatibility busy bit and always mirrors ES
+  // (SDM vol.1 8.1.3, Figure 8-4; Intel387 datasheet 3.2.1). ES itself is
+  // not a storage bit: it follows the flags and masks, including after
+  // FLDENV/FRSTOR replace the status word.
+  f->sw = (uint16_t)((f->sw & ~(kFpuEs | kFpuB)) | (unmasked ? kFpuEs | kFpuB : 0));
   f->pending_mf = unmasked != 0;
 }
 
@@ -299,8 +322,13 @@ void fpu_examine(x86_fpu* f) {
     // reported 1,1,1 (an encoding no class uses) and made an empty ST(0)
     // indistinguishable from nothing in particular.
     f->sw |= kFpuC3 | kFpuC0;
-  } else if (F80IsNan(v)) {
+  } else if (F80IsNan(v) && (v.signif & 0x8000000000000000ULL)) {
     f->sw |= kFpuC0;
+  } else if (F80IsNan(v)) {
+    // A mantissa with the integer bit clear is the "unsupported" class
+    // (SDM vol.2 FXAM table 3-42: C3,C2,C0 = 0,0,0), not a NaN. QEMU's
+    // helper_fxam_ST0 leaves all four C bits clear for exactly this case;
+    // treating it as a NaN reported 0,0,1.
   } else if (F80IsZero(v)) {
     f->sw |= kFpuC3;
   } else if (F80IsInf(v)) {
@@ -528,7 +556,10 @@ void fpu_fprem(x86_fpu* f, int ieee) {
     // 64-bit mantissa holds the integer quotient exactly, so the low three
     // bits are the architecture's Q0-Q2.
     long double ratio = la / lb;
-    long double q = ieee ? roundl(ratio) : truncl(ratio);
+    // FPREM1 rounds the quotient to nearest, ties to even (IEEE remainder,
+    // SDM FPREM1); FPREM truncates toward zero (SDM FPREM). roundl() would
+    // round a .5 quotient away from zero and report the wrong Q0-Q2.
+    long double q = ieee ? rintl(ratio) : truncl(ratio);
     fpu_begin(f);
     extFloat80_t r;
     extF80M_rem(&a, &b, &r);
@@ -898,56 +929,109 @@ static uint32_t Get32(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-void fpu_store_env(const x86_fpu* f, uint8_t* out, int wide) {
+void fpu_store_env(const x86_fpu* f, uint8_t* out, int wide, int real) {
   memset(out, 0, wide ? 28 : 14);
   if (wide) {
     // The 32-bit environment stores each control/status/tag word in a 32-bit
-    // slot with the upper half reserved; QEMU fills it with ones.
+    // slot with the upper half reserved; QEMU/Bochs fill it with ones.
     Put32(out + 0, 0xffff0000u | f->cw);
     Put32(out + 4, 0xffff0000u | f->sw);
     Put32(out + 8, 0xffff0000u | f->tw);
-    Put32(out + 12, f->fip);
-    Put16(out + 16, f->fcs);
-    Put16(out + 18, f->fop);
-    Put32(out + 20, f->fdp);
-    Put16(out + 24, f->fds);
+    if (real) {
+      // Real-address mode/V86 (SDM vol.1 figure 8-10): FIP and FDP are 20-bit
+      // linear addresses packed as low 16 bits at +0C/+14 and bits 31:16 in
+      // the high half of the dword at +10/+18 (bits 27:12); the opcode shares
+      // that dword's low 11 bits. No FCS/FDS fields exist. Bochs fpu.cc
+      // fpu_save_environment computes (FCS << 4) + FIP the same way.
+      uint32_t fip = ((uint32_t)f->fcs << 4) + f->fip;
+      uint32_t fdp = ((uint32_t)f->fds << 4) + f->fdp;
+      Put32(out + 12, 0xffff0000u | (fip & 0xffffu));
+      Put32(out + 16, ((fip >> 16) << 12) | (f->fop & 0x07ffu));
+      Put32(out + 20, 0xffff0000u | (fdp & 0xffffu));
+      Put32(out + 24, (fdp >> 16) << 12);
+    } else {
+      Put32(out + 12, f->fip);
+      Put16(out + 16, f->fcs);
+      Put16(out + 18, f->fop & 0x07ffu);
+      Put32(out + 20, f->fdp);
+      Put16(out + 24, f->fds);
+    }
   } else {
     Put16(out + 0, f->cw);
     Put16(out + 2, f->sw);
     Put16(out + 4, f->tw);
-    Put16(out + 6, (uint16_t)f->fip);
-    Put16(out + 8, f->fcs);
-    Put16(out + 10, (uint16_t)f->fdp);
-    Put16(out + 12, f->fds);
+    if (real) {
+      // Real-address mode/V86, 16-bit operand size (SDM figure 8-12): the
+      // 20-bit linear address is low 16 bits at +6/+10 and bits 19:16 in
+      // bits 15:12 of +8/+12; the opcode sits in bits 10:0 of +8.
+      uint32_t fip = ((uint32_t)f->fcs << 4) + f->fip;
+      uint32_t fdp = ((uint32_t)f->fds << 4) + f->fdp;
+      Put16(out + 6, (uint16_t)fip);
+      Put16(out + 8, (uint16_t)(((fip >> 16) & 0xfu) << 12) | (f->fop & 0x07ffu));
+      Put16(out + 10, (uint16_t)fdp);
+      Put16(out + 12, (uint16_t)(((fdp >> 16) & 0xfu) << 12));
+    } else {
+      Put16(out + 6, (uint16_t)f->fip);
+      Put16(out + 8, f->fcs);
+      Put16(out + 10, (uint16_t)f->fdp);
+      Put16(out + 12, f->fds);
+    }
   }
 }
 
-void fpu_load_env(x86_fpu* f, const uint8_t* in, int wide) {
+void fpu_load_env(x86_fpu* f, const uint8_t* in, int wide, int real) {
   if (wide) {
     f->cw = Get16(in + 0);
     f->sw = Get16(in + 4);
     f->tw = Get16(in + 8);
-    f->fip = Get32(in + 12);
-    f->fcs = Get16(in + 16);
-    f->fop = Get16(in + 18);
-    f->fdp = Get32(in + 20);
-    f->fds = Get16(in + 24);
+    if (real) {
+      // FCS/FDS are cleared outside protected mode (SDM vol.1 8.1.7); FIP and
+      // FDP are the 20-bit linear addresses from the real-mode image.
+      f->fip = Get16(in + 12) | ((Get32(in + 16) & 0x0ffff000u) << 4);
+      f->fop = Get32(in + 16) & 0x07ffu;
+      f->fdp = Get16(in + 20) | ((Get32(in + 24) & 0x0ffff000u) << 4);
+      f->fcs = 0;
+      f->fds = 0;
+    } else {
+      f->fip = Get32(in + 12);
+      f->fcs = Get16(in + 16);
+      f->fop = Get16(in + 18) & 0x07ffu;
+      f->fdp = Get32(in + 20);
+      f->fds = Get16(in + 24);
+    }
   } else {
     f->cw = Get16(in + 0);
     f->sw = Get16(in + 2);
     f->tw = Get16(in + 4);
-    f->fip = Get16(in + 6);
-    f->fcs = Get16(in + 8);
-    f->fdp = Get16(in + 10);
-    f->fds = Get16(in + 12);
+    if (real) {
+      f->fip = Get16(in + 6) | ((Get16(in + 8) & 0xf000u) << 4);
+      f->fop = Get16(in + 8) & 0x07ffu;
+      f->fdp = Get16(in + 10) | ((Get16(in + 12) & 0xf000u) << 4);
+      f->fcs = 0;
+      f->fds = 0;
+    } else {
+      f->fip = Get16(in + 6);
+      f->fcs = Get16(in + 8);
+      f->fdp = Get16(in + 10);
+      f->fds = Get16(in + 12);
+    }
   }
-  fpu_set_top(f, fpu_top(f));
+  // FLDENV loads the tag word, then the non-empty entries take their class
+  // from the register they describe. Bochs fpu.cc FLDENV loops over the
+  // loaded tags and calls FPU_settagi(FPU_tagof(reg)) for every non-empty
+  // one; QEMU's do_fldenv keeps only the empty bit and classifies at save
+  // time. Preserving the loaded empty bits and recomputing the class is the
+  // common behaviour. The control word gets the same reserved-bit
+  // normalization as FLDCW.
+  fpu_load_cw(f, f->cw);
+  for (int i = 0; i < 8; i++)
+    if (fpu_tag(f, i) != kFpuTagEmpty) fpu_mark(f, i);
   UpdateEs(f);
 }
 
-void fpu_store_state(const x86_fpu* f, uint8_t* out, int wide) {
+void fpu_store_state(const x86_fpu* f, uint8_t* out, int wide, int real) {
   int n = wide ? 28 : 14;
-  fpu_store_env(f, out, wide);
+  fpu_store_env(f, out, wide, real);
   for (int i = 0; i < 8; i++) {
     extFloat80_t v = f->st[(fpu_top(f) + i) & 7];
     Put32(out + n + i * 10, (uint32_t)v.signif);
@@ -956,12 +1040,14 @@ void fpu_store_state(const x86_fpu* f, uint8_t* out, int wide) {
   }
 }
 
-void fpu_load_state(x86_fpu* f, const uint8_t* in, int wide) {
+void fpu_load_state(x86_fpu* f, const uint8_t* in, int wide, int real) {
   int n = wide ? 28 : 14;
   // FRSTOR loads the tags before the register images; the images are in
-  // stack order (ST0 first), unlike the tag word's physical order.
+  // stack order (ST0 first), unlike the tag word's physical order. Once the
+  // registers are in place, a non-empty tag takes its class from the value
+  // it names (Bochs fpu.cc FRSTOR: "update tag only if it is not empty").
   uint16_t tw = wide ? Get16(in + 8) : Get16(in + 4);
-  fpu_load_env(f, in, wide);
+  fpu_load_env(f, in, wide, real);
   for (int i = 0; i < 8; i++) {
     extFloat80_t v;
     v.signif = Get32(in + n + i * 10) | ((uint64_t)Get32(in + n + i * 10 + 4) << 32);
@@ -969,6 +1055,8 @@ void fpu_load_state(x86_fpu* f, const uint8_t* in, int wide) {
     f->st[(fpu_top(f) + i) & 7] = v;
   }
   f->tw = tw;
+  for (int i = 0; i < 8; i++)
+    if (fpu_tag(f, i) != kFpuTagEmpty) fpu_mark(f, i);
   UpdateEs(f);
 }
 
@@ -1043,7 +1131,7 @@ void fpu_sse_flush(uint8_t* elem, int bytes) {
 }
 
 void fpu_fxrstor(x86_fpu* f, const uint8_t* in) {
-  f->cw = Get16(in + 0);
+  fpu_load_cw(f, Get16(in + 0));
   f->sw = Get16(in + 2);
   f->fop = Get16(in + 6);
   f->fip = Get32(in + 8);

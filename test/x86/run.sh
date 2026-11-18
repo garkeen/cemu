@@ -890,8 +890,9 @@ fi
 # PAE/PGE/NX/cross-page probe: three-level PAE paging with 4KB and 2MB
 # leaves, A/D in PAE entries, PGE global survival across CR3, INVLPG of one
 # 4KB subpage dropping a whole 2MB leaf, an unaligned access crossing two
-# non-contiguous pages, and NX (#PF.I=1). Self-contained; pass status 11,
-# failure status 3 (the fault record at 0x9000 is dump=-able).
+# non-contiguous pages, NX (#PF.I=1), and a reserved-bit PDPTE (#GP(0) at the
+# CR3 load; QEMU ignores those bits and stops at this case). Self-contained;
+# pass status 11, failure status 3 (the fault record at 0x9000 is dump=-able).
 paging32="$dir/probe/paging32.elf"
 if [ ! -f "$paging32" ] && command -v nasm > /dev/null 2>&1 &&
    command -v ld.lld > /dev/null 2>&1; then
@@ -912,12 +913,13 @@ else
 fi
 
 # The D13/D39 feature probes: x87 (stack, arithmetic, control words, FXSAVE,
-# #NM, FERR#/IRQ13), MMX/SSE/SSE2 (moves, float/packed arithmetic, conversions, MXCSR),
+# #NM, FERR#/IRQ13), x87mf (deferred #MF at the next waiting instruction,
+# FNSTENV masking), MMX/SSE/SSE2 (moves, float/packed arithmetic, conversions, MXCSR),
 # the i686 system MSRs (TSC/RDTSCP, SYSENTER, MTRR/PAT, MCE, performance
 # counters), PSE-36's 4MB PDE decode and the CPL-3 alignment check (#AC).
 # All are self-contained multiboot images exiting through 0xF4 with payload 5
 # (status 11); a failure carries its own status > 1.
-for t in x87 sse sys686 pse36 ac; do
+for t in x87 x87mf sse sys686 pse36 ac; do
   elf="$dir/probe/$t.elf"
   if [ ! -f "$elf" ] && command -v nasm > /dev/null 2>&1 &&
      command -v ld.lld > /dev/null 2>&1; then

@@ -22,6 +22,7 @@ enum {
   kFpuC1 = 1u << 9,
   kFpuC2 = 1u << 10,
   kFpuC3 = 1u << 14,
+  kFpuB = 1u << 15,   // 8087-compat busy bit: mirrors ES (SDM vol.1 8.1.3)
   kFpuTopShift = 11,
   kFpuTopMask = 7u << kFpuTopShift,
 };
@@ -62,6 +63,8 @@ int fpu_tag(const x86_fpu* f, int physical);
 void fpu_mark(x86_fpu* f, int physical);
 void fpu_set_tags(x86_fpu* f, uint16_t tw);
 void fpu_refresh(x86_fpu* f);  // recompute ES/#MF after CW or SW changes
+void fpu_load_cw(x86_fpu* f, uint16_t cw);  // FLDCW/FLDENV/FXRSTOR normalization
+void fpu_mask_exceptions(x86_fpu* f);       // FNSTENV's "mask all exceptions"
 
 // Stack access. get/require returns the indefinite QNaN and records a stack
 // fault when the register is empty; set marks the physical register's tag.
@@ -122,11 +125,13 @@ int64_t fpu_store_i64_trunc(x86_fpu* f, extFloat80_t v);
 
 // Environment and state images (SDM FSTENV/FNSAVE/FRSTOR, FXSAVE/FXRSTOR).
 // `wide` selects the 32-bit operand-size layout (28/108 bytes) over the 16-bit
-// one (14/94 bytes).
-void fpu_store_env(const x86_fpu* f, uint8_t* out, int wide);
-void fpu_load_env(x86_fpu* f, const uint8_t* in, int wide);
-void fpu_store_state(const x86_fpu* f, uint8_t* out, int wide);
-void fpu_load_state(x86_fpu* f, const uint8_t* in, int wide);
+// one (14/94 bytes); `real` selects the real-mode/V86 pointer layout, where
+// FIP/FDP are 20-bit linear addresses and FCS/FDS are not stored (SDM vol.1
+// figures 8-10/8-12).
+void fpu_store_env(const x86_fpu* f, uint8_t* out, int wide, int real);
+void fpu_load_env(x86_fpu* f, const uint8_t* in, int wide, int real);
+void fpu_store_state(const x86_fpu* f, uint8_t* out, int wide, int real);
+void fpu_load_state(x86_fpu* f, const uint8_t* in, int wide, int real);
 void fpu_fxsave(const x86_fpu* f, uint8_t* out);
 void fpu_fxrstor(x86_fpu* f, const uint8_t* in);
 

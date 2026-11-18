@@ -74,7 +74,14 @@ enum { kCr0Pe = 1u, kCr0Mp = 2u, kCr0Em = 4u, kCr0Ts = 8u,
        // and a guest that reads it back to choose an FPU path must see the
        // same bit this machine's CPUID advertises.
        kCr0Et = 1u << 4, kCr0Ne = 1u << 5,
-       kCr0Wp = 1u << 16, kCr0Am = 1u << 18, kCr0Pg = 1u << 31 };
+       kCr0Wp = 1u << 16, kCr0Am = 1u << 18,
+       // CD/NW are cache-control bits this interpreter stores but does not
+       // model; a CR0 write that changes them still reloads the PAE PDPTEs on
+       // hardware (Bochs crregs.h BX_CR0_PDPTE_RELOAD_MASK).
+       kCr0Nw = 1u << 29, kCr0Cd = 1u << 30, kCr0Pg = 1u << 31 };
+// The CR0 bits whose change reloads the PAE page-directory-pointer entries
+// (Bochs crregs.h BX_CR0_PDPTE_RELOAD_MASK, minus the bits this machine lacks).
+enum { kCr0PdpReload = kCr0Pg | kCr0Cd | kCr0Nw | kCr0Wp };
 // CR4: PSE gates 4MB pages; PAE selects the three-level 64-bit-entry walk;
 // PGE makes global translations survive a CR3 reload (SDM vol.3 2.5, 4.3,
 // 4.10.4.1). DE/TSD/VME/PVI are defined so the register reads back honestly;
@@ -95,6 +102,9 @@ enum {
 // read back zero (SDM vol.3 2.5 "CR4 ... may be ... reserved").
 enum { kCr4Supported = kCr4Vme | kCr4Pvi | kCr4Tsd | kCr4De | kCr4Pse | kCr4Pae |
                          kCr4Pge | kCr4Pce | kCr4Osfxsr | kCr4Osxmmexcpt };
+// A CR4 write that changes one of these reloads the PAE PDPTEs (Bochs
+// crregs.h BX_CR4_PDPTE_RELOAD_MASK, restricted to bits this machine has).
+enum { kCr4PdpReload = kCr4Pse | kCr4Pae | kCr4Pge };
 // IA32_APIC_BASE (MSR 0x1B): base[31:12], BSP bit 8, global enable bit 11
 // (SDM vol.3 11.4.3). QEMU's xAPIC keeps the MMIO window at 0xFEE00000 and
 // uses the enable bit to gate the register file (hw/intc/apic.c
@@ -114,14 +124,15 @@ enum { kPdeP = 1u, kPdeRw = 2u, kPdeUs = 4u, kPdeA = 0x20u, kPdeD = 0x40u,
        kPdePs = 0x80u, kPdeG = 0x100u };
 enum { kPteP = 1u, kPteRw = 2u, kPteUs = 4u, kPteA = 0x20u, kPteD = 0x40u,
        kPteG = 0x100u };
-// #PF error-code bits beyond the 386 set (SDM vol.3 table 6-1): RSVD and I
-// appear with PAE/NX. The non-PAE 386-class code keeps exactly P|W|U.
+// #PF error-code bits beyond the 386 set (SDM vol.3 table 6-1): RSVD marks a
+// reserved paging-structure bit, I/D an instruction fetch under PAE+NX. A
+// plain 386 page fault without reserved bits keeps exactly P|W|U.
 enum { kPfPresent = 1u, kPfWrite = 2u, kPfUser = 4u, kPfRsvd = 8u, kPfInstr = 0x10u };
-// A 4-MByte page with PSE-36 keeps bits 31:22 in the PDE, takes physical
-// address bits 39:32 from PDE[20:13], and leaves PDE[21] reserved (SDM vol.3
-// fig 4-4). A set reserved bit is a page fault; the 386-class #PF error code
-// carries no RSVD flag, so the fault reads as an ordinary present fault.
-enum { kPde4mReserved = 0x00200000u };
+// A 4-MByte page with PSE-36 keeps bits 31:22 in the PDE; with this machine's
+// MAXPHYADDR of 36, PDE bits 16:13 supply physical address bits 35:32 and bits
+// 21:17 are reserved (SDM vol.3 table 4-4, M = min(40, MAXPHYADDR)). A set
+// reserved bit is a page fault.
+enum { kPde4mReserved = 0x003e0000u };
 // SGDT/SIDT/LGDT/LIDT with a 16-bit operand size keep only 24 base bits.
 enum { kDescBase16Mask = 0x00ffffffu };
 

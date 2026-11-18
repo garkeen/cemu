@@ -174,7 +174,7 @@ ISA 头，`virt.c` 仅引 `platform.h`。
   `floppy` 与 `vga` 两格（`-bios ../seabios/out/bios.bin -vgabios ... -fda`）
   已从 `test/x86/run.sh` 删除，覆盖改由两个自足探针承担（`vga_core` 直接写
   0x3C4/0x3CE/0x3C0 与孔径；`fdc_dma` 自己下 8272A/8237 命令与 DMA 编程，都不借
-  SeaBIOS 的手），x86 套件 63 格（51 个自足探针 + kvm-unit-tests 11 镜像 + realmode 1）。
+  SeaBIOS 的手），x86 套件 64 格（52 个自足探针 + kvm-unit-tests 11 镜像 + realmode 1）。
 
 ### 落盘体积
 
@@ -616,6 +616,7 @@ CEMU_DEBUG="screen" timeout 110 ./cemu.exe ... img 2> c.txt
 | D36 | riscv64/csr.c、riscv32/csr.c 的 MHPM 计数器 | **MHPM 计数器只存储不自增**：`mhpmcounter3..18` 在 cemu 里没有事件源，写进去的值能读回，但从不增长；`mhpmevent3..18` 同样只存储。mcycle/minstret 不受影响（step.c 每步自增）。OpenSBI 按 CSR 存在探测计数器数量，拿到的是"能读但不动"的计数器 | QEMU target/riscv/csr.c 的 pmu 计数（Zihpm 允许实现定义事件）；特权规范 3.1.11 | 出现依赖性能计数器/剖析的客户机或工具时 | 登记中 |
 | D39 | x86 后端（exec.c / fpu.c / x86.h） | 已实现 AC 对齐检查（#AC 在页走查之后、只查 2/4/8 字节 CPL-3 访问）、PSE-36、SYSENTER/SYSEXIT、MMX/SSE/SSE2、FXSAVE/FXRSTOR、MTRR/PAT、MCE 寄存器组、架构性能计数器（0x3C/0xC0、RDPMC）、RDTSC/RDTSCP、CR4 WARL 与 CPUID 广告（EDX 含 FPU/MMX/FXSR/SSE/SSE2/APIC/PSE36/PAT/MTRR/MCE/SEP/TSC，leaf 0x0B 报单线程/单核拓扑）。剩下：**VME 的软件中断重定向位图未实现**（V86 下的 INT n 一律反射到监视器；参考实现 QEMU 11.1.50 同样只广告不实现：`target/i386/tcg` 无 `HF_VME`、`seg_helper.c` 无位图代码，`I486_FEATURES` 却带 `CPUID_VME`，实测 `-cpu pentium` + CR4.VME=1 + 位图位置 0x20/0x0B 也一律反射，`GP ec=5a` 即 0x0B 的门索引；本机与之一致，CPUID.VME 不广告）；**性能计数器只计数 0x3C/0xC0，其余 event select、PEBS/PMI 未实现**；长模式不在本行（归入阶段 6，见 arch.md） | SDM vol.2/vol.3（20.3 VME、21 PVI、19 PMU）；QEMU target/i386；v86 cpu.rs/instructions_0f.rs；`test/x86/probe/sys686.asm`、`sse.asm`、`ac.asm`、`pse36.asm` | VME/PVI 位图在出现依赖它的 V86 客户机时；PMU 其余事件在出现剖析工具时 | 登记中 |
 | D43 | device/audio/sb16.c、device/dma/i8237.c | **SB16 只覆盖 QEMU sb16.c 的 DSP 播放路径**：ADPCM（0x74-0x77/0x7D/0x7F）、0xE2 的 DSP 识别应答不实现；OPL3 FM（0x388/0x389）与 MPU-401 MIDI（0x330/0x331）不实现（QEMU 的 sb16 也不含，FM 是独立的 adlib 设备）；16 位 DMA 的高页寄存器 0x480-0x48F 未建模（本机 8237 只有 0x81-0x8F 的低页锁存，DMA 缓冲须落在 16MB 内；QEMU 的 i8257 有 pageh）；混音器音量寄存器只存不缩放（QEMU sb16 同）；游戏端口 0x200-0x207 无 | QEMU hw/audio/sb16.c（DSP 命令表、mixer、IRQ status、DMA 速率）、hw/dma/i8257.c（pageh 与 16 位通道）；v86 src/sb16.js（0x41/0x48 的字节序与 16 位命令）；Creative SB16 Hardware Programming Guide（pdos.csail.mit.edu/6.828/2011/readings/hardware/SoundBlaster.pdf）；Intel 8237A datasheet（16 位通道的字计数/地址与 128KB 回绕） | 出现依赖 FM/ADPCM/高页 DMA/混音器音量/游戏端口的客户机时 | 登记中 |
+| D44 | cpu/isa/x86/fpu.c 的 x87 目标写入与弹出 | **未屏蔽前操作异常不回滚目标**：invalid、zero-divide、denormal 在操作开始前检测；未屏蔽时 SDM vol.1 4.9.2 说 "destination operand has not yet been updated, and appears as if the offending instruction has not been executed"。Bochs 只在 `FPU_exception()` 返回 0 时写目标/弹栈；QEMU 的 fpu_helper.c 直接写（同样不建模）。cemu 现在先算并写目标、`fpu_end` 后才置 `pending_mf`，目标与栈顶已经变了。恢复时在 fpu_arith/compare/store 之前做前操作异常判定，统一 gate 目的写入与 pop（含 FSTP/FIST 的未屏蔽 overflow/underflow 不写内存） | SDM vol.1 4.9.1.1、4.9.2；Bochs fpu_arith.cc `FADD_STi_ST0` 等 `if (!FPU_exception(...))`、ferr.cc `FPU_exception`；QEMU target/i386/tcg/fpu_helper.c（反例） | 出现检查 x87 异常现场/依赖操作数回滚的客户机时 | 登记中 |
 
 ## 七、显示窗口指针契约（所有主板）
 
@@ -750,3 +751,11 @@ CEMU_DEBUG="screen" timeout 110 ./cemu.exe ... img 2> c.txt
   模式后的 `ljmp $0x20` 随即 #GP（DOS7 的 IO.SYS 一启动就走这条服务）。
   v86 的 `instr16_0F01_*` 用 0xffffff 掩码。验收：`test/x86/probe/lgdt16.asm`
   （双向各测 16/32 位，QEMU 同 transcript 同 status）。
+
+- **x87 实模式/V86 环境格式**：FSTENV/FNSAVE/FLDENV/FRSTOR 在真实模式与 V86 用实模式布局（SDM vol.1 图 8-10/8-12），FIP/FDP 是 20 位线性地址、FCS/FDS 不存；保护模式才存选择子。Bochs `fpu.cc` 的 real/V86 分支与此一致；QEMU 的 `do_fstenv/do_fldenv` 不分模式，按保护模式布局存，属参考偏差。
+
+- **x87 #MF 的检查点**：`#MF` 在“下一条 waiting x87 指令 / WAIT / MMX 指令之前”检查（SDM vol.1 8.7.1），不是发出异常的指令末尾；FNINIT/FNCLEX/FNSTSW/FNSTCW/FNSTENV/FNSAVE 不检查。QEMU TCG 只在 WAIT/FWAIT 检查，属参考偏差；按 SDM。验收：`test/x86/probe/x87mf.asm`（QEMU 该格停在 fail3）。
+
+- **实模式段限**：真实模式下每个段仍是 64KB 限（SDM vol.3 2.2.1），16 位有效地址在 modrm 里回绕，32 位地址覆盖越限报 #GP；缓存描述子保留，所以 unreal mode 的 4GB 限在 CR0.PE 清零后继续有效。QEMU TCG 不做该检查，属参考偏差。验收：`test/x86/smoke/x86_smoke.bin` 与 `test/x86/realmode/realmode.elf` 的 127 PASS。
+
+- **IRET/RETF 外层返回的 not-present SS**：当前 SDM 的 IRET 异常表把它列为 `#SS(0)`，QEMU `helper_ret_protected` 用 `EXCP0B_NOSEG`（#NP）。按 SDM 报 #SS(selector)，不改。
