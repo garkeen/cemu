@@ -8,6 +8,62 @@
 > 旧 §九 → §四，旧 §十/§X（调试设施）→ §五，旧 §十一 → §七；`§X Dnn`
 > 指现在的 §六 台账。
 
+## x86 Multiboot 1 info 交接补全（2026-11-19）
+
+- 背景：cemu 的 x86 multiboot 入口只实现了一半——EAX/EBX/ESP 和 32 位平坦
+  保护模式给了，但 EBX 指向清零 scratch，没有 info 结构；MB1 规范要求 EBX
+  指向有效结构。本轮补成最小可用。
+- 实现：
+  - `CpuState` 增加 `boot_info_addr`/`boot_info`/`boot_info_ctx`；`x86_init`
+    在 multiboot 分支记录地址并调用板级回调；BIOS 引导扇区路径不调用。
+  - `board/x86_min.c` 把 e820 表提成 `X86E820Entry`，fw_cfg 的 `etc/e820`
+    与 MB1 mmap 共用一份；新增 `X86BuildBootInfo`：flags=0x241（内存/mmap/
+    loader name）、mem_lower=639、mem_upper=RAM−1MiB、mmap 在 info 基址
+    +0x100（每项 `size=20`、stride 24）、loader name `"cemu"` 在 +0x200；
+    cmdline/modules/VBE/framebuffer 不广告。
+  - info 基址定为 **0x9F000**：高常规内存、低于 EBDA 0x9FC00，避开
+    realmode 镜像的 `.text`（0x4000-0x90E0）、0x6F00 引导栈和 0x7C00 引导
+    扇区；窗口 0x300 字节。板级在 `WireDevices` 安装回调，机器复位时
+    `X86Reset → isa->init` 会重新发布。
+  - 最初放在 0x7000（旧注释的 scratch），x86 套件里 realmode 只报
+    109/127 PASS——`realmode.elf` 的 `.text` 正好覆盖 0x4000-0x90E0，
+    0x7000 是它的代码；改到 0x9F000 后恢复 127/127。
+- 探针：新增 `test/x86/probe/mb_info.asm`，检查 EAX/EBX=0x9F000、flags、
+  mem_lower/mem_upper、mmap 的 3–4 项（0x9fc00/0xa0000/0xf0000/0x100000
+  边界）、第四项与 mem_upper 一致、loader name；pass=11。`test/x86/run.sh`
+  加一格，套件计数 64 → 65（53 个自足探针 + 11 个 kvm-unit-tests + realmode）。
+- 测试侧修复（既有 HEAD 红格，不是本次 info 引入）：v86 的 `header.inc` 以
+  `pxor xmm0,xmm0` 开头；CR4.OSFXSR=0 时该指令按 SDM 报 #UD，三个 idiv 格
+  在到达 IDIV 前就停了，mov_sreg 两格也把 `pxor` 的 #UD 当成了目标。
+  `test/x86/nasm/build.sh` 现在从去掉该行的 header 副本构建（v86 树不动），
+  重建五个 ELF；idiv 现在在 `idiv` 指令上报 `de=0`，mov_sreg 在 `mov` 上
+  报 `ud=6`。
+- 验证：
+  - 构建零告警；`mb_info` 在 `--mem 1`（3 段）、`--mem 4` 与 `--mem 32`
+    （4 段）均 exit=11。
+  - `CEMU_DEBUG=dump=0x9F000:0x300` 实取（4MB）：flags=0x241、
+    mem_lower=0x27f、mem_upper=0xc00、mmap_length=96、mmap_addr=0x9F100、
+    name=`cemu`，四段边界与 e820 一致。
+  - 既有 multiboot 探针 pm_smoke（26 ok + done）、paging32、sys686 与 BIOS
+    引导扇区 x86_smoke 均 exit=11。
+  - **x86 65/0**、riscv64 136/0、riscv32 104/0、depcheck ok。
+  - realmode 以 127 PASS/0 FAIL 通过，但跑完 perf 段后不自行退出，由 60s
+    timeout 收住；baseline HEAD（无本次改动）同样如此，属既有现象，判据仍是
+    PASS/FAIL 计数。
+- 本轮已提交（见 git 历史）。
+
+## riscv 两套件回归（2026-11-19）
+
+- 按用户当轮授权只跑 riscv 两套，x86 未跑；HEAD `164a1e7`（11-18 的 Sail
+  语义修正），`cmake --build build` 显示无工作可做（增量构建已最新）。
+- `cmake --build build --target check-riscv64`：**136 passed, 0 failed**。
+- `cmake --build build --target check-riscv32`：**104 passed, 0 failed**。
+- 原始输出留档：`build/riscv64-suite.log`、`build/riscv32-suite.log`。
+- 过程记录：直接 `bash test/riscv64/run.sh` 时 PATH 先命中 Windows
+  `timeout.exe`（报“默认选项不允许超过 '1' 次”），改用 CMake 的 check 目标
+  （登录 shell，`/usr/bin/timeout` 优先）后正常；与 AGENTS §二 的直跑约定一致。
+- 本轮不动代码、不提交。
+
 ## riscv32/64 gdb 硬件观察点（D6 销账，2026-11-04）
 
 - `cpu/isa/riscv{64,32}/trigger.c` 增加四个 stub 私有的 mcontrol 等价槽位：

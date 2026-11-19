@@ -21,6 +21,13 @@ typedef struct CpuState {
   uint64_t pc;          // the one committed PC (address space is ISA-defined:
                         // riscv = linear vaddr; x86 = offset within CS)
   uint64_t image_base;  // where the loaded image starts (multiboot scans here)
+  // Boot-protocol machine description (x86 Multiboot 1): the ISA sets
+  // boot_info_addr to the physical address it hands the guest (EBX) and calls
+  // boot_info so the board can fill the structure without the CPU model
+  // knowing the machine. 0/NULL = the boot path has no such structure.
+  uint64_t boot_info_addr;
+  void (*boot_info)(struct CpuState* cpu, void* ctx);
+  void* boot_info_ctx;
   Bus* bus;             // where the ISA reads and writes memory
   Bus* fetch_bus;       // instruction-stream bus (debug runs install a fetch
                         // wrapper here; normal runs point at `bus`)

@@ -138,6 +138,16 @@ typedef struct IrqBus {
   IoapicDevice* ioapic;
 } IrqBus;
 
+// The machine's physical memory map, in the order it is published to firmware
+// (fw_cfg "etc/e820") and to Multiboot 1 guests (the info structure's mmap).
+// One table, two serializations: the map is a property of the board, not of
+// the protocol that asks for it.
+typedef struct X86E820Entry {
+  uint64_t addr;
+  uint64_t len;
+  uint32_t type;  // kE820Ram / kE820Reserved
+} X86E820Entry;
+
 typedef struct X86Board {
   Board base;
   Uart16550 uart;
@@ -178,6 +188,11 @@ typedef struct X86Board {
   int lapic_irq;
   int intr_level;  // the combined pin level last driven (kDbgMark edge detect)
   IrqBus irqbus;  // the ISA IRQ fan-out: the 8259s on one side, the I/O APIC on the other
+  // The board's RAM size and memory map: both boot protocols (fw_cfg's
+  // "etc/e820" and Multiboot 1's info structure) publish these bytes.
+  uint64_t ram_size;
+  X86E820Entry e820[8];
+  int e820_count;
   uint8_t* rom;  // the -bios image, mapped in the ROM window (NULL = none)
   uint64_t rom_size;
   // The display card's option ROM (-vgabios), handed to the firmware through
@@ -557,35 +572,35 @@ static const uint64_t kEbdaEnd = 0xa0000;
 static const uint64_t kBiosStart = 0xf0000;
 static const uint64_t kBiosEnd = 0x100000;
 
-static int PublishMemoryMap(FwCfgDevice* fwcfg, uint64_t ram_size) {
-  struct E820Entry {
-    uint64_t addr, len;
-    uint32_t type;
-  } entries[8];
+static void BuildE820(X86Board* xm) {
+  X86E820Entry* e = xm->e820;
   int n = 0;
-  entries[n].addr = 0;
-  entries[n].len = kConventionalRamEnd;
-  entries[n++].type = kE820Ram;
-  entries[n].addr = kConventionalRamEnd;
-  entries[n].len = kEbdaEnd - kConventionalRamEnd;
-  entries[n++].type = kE820Reserved;              // the EBDA
-  entries[n].addr = kBiosStart;
-  entries[n].len = kBiosEnd - kBiosStart;
-  entries[n++].type = kE820Reserved;              // the firmware itself
-  if (ram_size > kBiosEnd) {
-    entries[n].addr = kBiosEnd;
-    entries[n].len = ram_size - kBiosEnd;
-    entries[n++].type = kE820Ram;
+  e[n].addr = 0;
+  e[n].len = kConventionalRamEnd;
+  e[n++].type = kE820Ram;
+  e[n].addr = kConventionalRamEnd;
+  e[n].len = kEbdaEnd - kConventionalRamEnd;
+  e[n++].type = kE820Reserved;  // the EBDA
+  e[n].addr = kBiosStart;
+  e[n].len = kBiosEnd - kBiosStart;
+  e[n++].type = kE820Reserved;  // the firmware itself
+  if (xm->ram_size > kBiosEnd) {
+    e[n].addr = kBiosEnd;
+    e[n].len = xm->ram_size - kBiosEnd;
+    e[n++].type = kE820Ram;
   }
+  xm->e820_count = n;
+}
 
-  uint32_t bytes = (uint32_t)n * 20;
+static int PublishMemoryMap(FwCfgDevice* fwcfg, X86Board* xm) {
+  uint32_t bytes = (uint32_t)xm->e820_count * 20;
   uint8_t* buf = (uint8_t*)malloc(bytes);
   if (!buf) return -1;
   uint8_t* p = buf;
-  for (int i = 0; i < n; i++) {
-    for (int b = 0; b < 8; b++) p[b] = (uint8_t)(entries[i].addr >> (8 * b));
-    for (int b = 0; b < 8; b++) p[8 + b] = (uint8_t)(entries[i].len >> (8 * b));
-    for (int b = 0; b < 4; b++) p[16 + b] = (uint8_t)(entries[i].type >> (8 * b));
+  for (int i = 0; i < xm->e820_count; i++) {
+    for (int b = 0; b < 8; b++) p[b] = (uint8_t)(xm->e820[i].addr >> (8 * b));
+    for (int b = 0; b < 8; b++) p[8 + b] = (uint8_t)(xm->e820[i].len >> (8 * b));
+    for (int b = 0; b < 4; b++) p[16 + b] = (uint8_t)(xm->e820[i].type >> (8 * b));
     p += 20;
   }
   // The device keeps the pointer, not a copy, so the payload has to outlive the
@@ -594,9 +609,77 @@ static int PublishMemoryMap(FwCfgDevice* fwcfg, uint64_t ram_size) {
     free(buf);
     return -1;
   }
-  LogInfo("memory map: %d entries as the fw_cfg romfile %s (%llu MB)", n,
-          kE820RomFileName, (unsigned long long)(ram_size >> 20));
+  LogInfo("memory map: %d entries as the fw_cfg romfile %s (%llu MB)", xm->e820_count,
+          kE820RomFileName, (unsigned long long)(xm->ram_size >> 20));
   return 0;
+}
+
+// Multiboot 1's info structure (Multiboot 0.6.96 §3.3) lives at the address
+// the CPU handed the guest in EBX. The board publishes only what it can answer
+// for: mem_lower/mem_upper, the e820 map and the loader name. cmdline, modules,
+// drives, VBE and framebuffer stay absent (their flag bits are clear); cemu's
+// x86 image entry has no inputs for them.
+enum {
+  kMbFlagMemory = 1u << 0,
+  kMbFlagMmap = 1u << 6,
+  kMbFlagLoaderName = 1u << 9,
+  kMbInfoFlags = 0x00,
+  kMbInfoMemLower = 0x04,
+  kMbInfoMemUpper = 0x08,
+  kMbInfoMmapLength = 0x2c,
+  kMbInfoMmapAddr = 0x30,
+  kMbInfoLoaderName = 0x40,
+  kMbMmapEntrySize = 20,  // the `size` field; the entry itself is 24 bytes
+  kMbMmapStride = 24,
+  kMbInfoMmapOffset = 0x100,
+  kMbInfoNameOffset = 0x200,
+  kMbInfoWindow = 0x300,
+};
+
+static void Put32(uint8_t* p, uint32_t v) {
+  for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static void Put64(uint8_t* p, uint64_t v) {
+  for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static void X86BuildBootInfo(CpuState* cpu, void* ctx) {
+  X86Board* xm = (X86Board*)ctx;
+  uint64_t base = cpu->boot_info_addr;
+  if (!base || base + kMbInfoWindow > xm->ram_size) return;
+  uint8_t* p = xm->base.ram->mem + base;
+  memset(p, 0, kMbInfoWindow);
+
+  // mem_lower is the RAM below 1 MiB; mem_upper is everything usable above
+  // it (Multiboot 0.6.96 §3.3). Both are in KiB.
+  uint64_t lower = 0;
+  uint64_t upper = 0;
+  for (int i = 0; i < xm->e820_count; i++) {
+    if (xm->e820[i].type != kE820Ram) continue;
+    uint64_t start = xm->e820[i].addr;
+    uint64_t end = start + xm->e820[i].len;
+    if (start == 0) lower = xm->e820[i].len;
+    if (end <= kBiosEnd) continue;
+    if (start < kBiosEnd) start = kBiosEnd;
+    upper += end - start;
+  }
+
+  Put32(p + kMbInfoFlags, kMbFlagMemory | kMbFlagMmap | kMbFlagLoaderName);
+  Put32(p + kMbInfoMemLower, (uint32_t)(lower / 1024));
+  Put32(p + kMbInfoMemUpper, (uint32_t)(upper / 1024));
+  Put32(p + kMbInfoMmapLength, (uint32_t)(xm->e820_count * kMbMmapStride));
+  Put32(p + kMbInfoMmapAddr, (uint32_t)(base + kMbInfoMmapOffset));
+  Put32(p + kMbInfoLoaderName, (uint32_t)(base + kMbInfoNameOffset));
+  uint8_t* m = p + kMbInfoMmapOffset;
+  for (int i = 0; i < xm->e820_count; i++) {
+    Put32(m + 0, kMbMmapEntrySize);
+    Put64(m + 4, xm->e820[i].addr);
+    Put64(m + 12, xm->e820[i].len);
+    Put32(m + 20, xm->e820[i].type == kE820Ram ? 1 : 2);
+    m += kMbMmapStride;
+  }
+  memcpy(p + kMbInfoNameOffset, "cemu", 5);
 }
 
 static int LoadVgaRom(X86Board* xm, FwCfgDevice* fwcfg, const char* path) {
@@ -766,6 +849,12 @@ static void WireDevices(X86Board* xm) {
   // CPU model owns the line level and calls this sink.
   m->cpu.ferr = OnFerr;
   m->cpu.ferr_dev = &xm->irqbus;
+  // Multiboot 1: the CPU sets EBX to the info address (k_mb_info_addr in the
+  // x86 backend) and calls this hook, so the board publishes the memory
+  // description there without the CPU model knowing the machine. A BIOS
+  // boot-sector handoff never calls it.
+  m->cpu.boot_info = X86BuildBootInfo;
+  m->cpu.boot_info_ctx = xm;
 }
 
 // The machine's reset. Devices first, so the firmware that starts at the reset
@@ -879,12 +968,14 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   Port92Device* p92 = &xm->port92;
   CmosDevice* cmos = &xm->cmos;
   IdeDevice* ide = &xm->ide;
+  xm->ram_size = ram_size;
+  BuildE820(xm);
   Uart16550Init(uart);
   DebugExitBind(dexit, &m->cpu);
   PicInit(pic);
   PitInit(pit);
   FwCfgInit(fwcfg);
-  if (PublishMemoryMap(fwcfg, ram_size) != 0) {
+  if (PublishMemoryMap(fwcfg, xm) != 0) {
     BoardDestroy(m);
     return NULL;
   }
@@ -960,7 +1051,7 @@ Board* X86BoardCreate(const BoardOpts* opts) {
   PortF0Register(&m->io, &xm->portf0);
   CmosRegister(&m->io, cmos);
   TestDevRegister(&m->io, &xm->testdev);
-  CmosSetMemory(cmos, ram_size);
+  CmosSetMemory(cmos, xm->ram_size);
   // What firmware sees of the floppy: the equipment byte, and nothing else.
   // With no -fda both nibbles stay zero and SeaBIOS never registers a drive
   // at all (seabios src/hw/floppy.c floppy_setup).

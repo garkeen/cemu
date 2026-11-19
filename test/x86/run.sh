@@ -912,6 +912,28 @@ else
   echo "SKIP (paging32: needs nasm/ld.lld)"
 fi
 
+# Multiboot 1 info handoff: cemu's x86 loader publishes flags, mem_lower/
+# mem_upper, the e820 map and the loader name at EBX. The probe checks the
+# fields and the map's consistency; pass status 11, failure status > 1.
+mb_info="$dir/probe/mb_info.elf"
+if [ ! -f "$mb_info" ] && command -v nasm > /dev/null 2>&1 &&
+   command -v ld.lld > /dev/null 2>&1; then
+  nasm -f elf32 -o "$dir/probe/mb_info.o" "$dir/probe/mb_info.asm" &&
+    ld.lld -m elf_i386 -T "$dir/pm/pm_smoke.ld" -o "$mb_info" "$dir/probe/mb_info.o"
+fi
+if [ -f "$mb_info" ]; then
+  out=$(timeout 30 "$CEMU" --machine x86 --isa x86 "$mb_info" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 11 ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    report_fail "mb_info: rc=$rc"
+  fi
+else
+  echo "SKIP (mb_info: needs nasm/ld.lld)"
+fi
+
 # The D13/D39 feature probes: x87 (stack, arithmetic, control words, FXSAVE,
 # #NM, FERR#/IRQ13), x87mf (deferred #MF at the next waiting instruction,
 # FNSTENV masking), MMX/SSE/SSE2 (moves, float/packed arithmetic, conversions, MXCSR),

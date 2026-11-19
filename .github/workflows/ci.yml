@@ -50,7 +50,7 @@ concurrency:
 jobs:
   build-test:
     runs-on: windows-latest
-    # 回归本身很快（riscv64 136 格 + riscv32 104 格 + x86 63 格），但 guest 全靠
+    # 回归本身很快（riscv64 136 格 + riscv32 104 格 + x86 65 格），但 guest 全靠
     # timeout 收场，真挂住时得有人兜底：整轮硬顶 60 分钟。
     timeout-minutes: 60
     # Windows runner 的 run 默认是 pwsh；本仓库一切脚本都是 bash，显式钉死，

@@ -16,9 +16,16 @@ trap 'rm -rf "$TMP"' EXIT
 
 # header.inc is the suite's own (it zeroes the GP registers, sets ESP to
 # stack_top and clears EFLAGS); footer.inc is the hlt loop. Both are picked up
-# through -I$N, so the v86 tree is never modified.
+# through -I, so the v86 tree is never modified.
+#
+# The v86 header also starts with `pxor xmm0,xmm0`. With CR4.OSFXSR=0 that is
+# #UD (SDM vol.3 2.5), and it would mask the IDIV/MOV-Sreg instruction these
+# images are about. Build from a copy without the SSE prologue; the tests do
+# not use XMM state.
+sed '/^[[:space:]]*pxor[[:space:]]*xmm0/d' "$N/header.inc" > "$TMP/header.inc"
+
 build() { # build <stem>
-  nasm -w+error -f elf32 -I"$N" -o "$TMP/$1.o" "$N/$1.asm"
+  nasm -w+error -f elf32 -I"$TMP" -I"$N" -o "$TMP/$1.o" "$N/$1.asm"
   ld.lld -m elf_i386 -T "$OUT/mb.ld" -o "$OUT/$1.elf" "$TMP/$1.o"
   echo "built: $1"
 }

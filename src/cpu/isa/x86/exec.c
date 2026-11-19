@@ -8241,7 +8241,15 @@ void x86_set_nmi(CpuState* c) {
 // the loader magic the kernel expects in EAX (§3.2). The same enum carries the
 // reset vector a board hands the CPU when it boots firmware instead of an
 // image: on a 16-bit PC board that is the linear address of F000:FFF0.
-enum { k_mb_hdr_magic = 0x1badb002, k_mb_load_magic = 0x2badb002, k_bios_reset_vector = 0xffff0 };
+enum {
+  k_mb_hdr_magic = 0x1badb002,
+  k_mb_load_magic = 0x2badb002,
+  // Where the Multiboot 1 info structure is published: high conventional RAM
+  // below the EBDA (0x9fc00), clear of the boot stack (0x6f00), the boot
+  // sector (0x7c00) and the low-memory scratch areas probes use.
+  k_mb_info_addr = 0x9f000,
+  k_bios_reset_vector = 0xffff0
+};
 
 // How boards drive our interrupt lines: x86 has one shared INTR line, so the
 // line id is ignored (the PIC supplies the vector on the INTA acknowledge).
@@ -8297,6 +8305,9 @@ void x86_init(CpuState* c) {
   }
   if (!c->real_bus) c->real_bus = c->bus;
   if (!c->fetch_bus) c->fetch_bus = c->bus;  // normal run: same bus for fetch
+  // A boot sector has no machine-description structure; the multiboot arm
+  // below publishes the address it hands the guest.
+  c->boot_info_addr = 0;
   fpu_init(&st->fpu);
   st->r = (cell*)c->gpr;
   st->fl.word = 0x202;  // IF set, reserved bit 1 on (SDM reset state)
@@ -8339,9 +8350,10 @@ void x86_init(CpuState* c) {
   if (multiboot) {
     st->cr0 = kCr0Pe | kCr0Et;  // flat protected mode, ET hardwired
     // Boot stack (multiboot leaves ESP undefined; QEMU's loader hands the
-    // image a stack just below the multiboot info struct — measured
-    // 0x6f07 post-push on qemu-system-i386 -kernel). Our info scratch sits
-    // at 0x7000, so the same region works.
+    // image a stack just below its info buffer — measured 0x6f07 post-push
+    // on qemu-system-i386 -kernel). Keep that stack; the info itself is
+    // published high (k_mb_info_addr), clear of the stack and the boot
+    // sector.
     st->r[esp_i].e = 0x6f00;
     // Flat CS=0x08 / data=0x10 descriptors (QEMU multiboot GDT: 00cf9b00...,
     // 00cf93...): 4 GiB limit, DPL0, D/B set.
@@ -8359,7 +8371,12 @@ void x86_init(CpuState* c) {
       st->dbit[i] = 1;
     }
     st->r[eax_i].e = k_mb_load_magic;
-    st->r[ebx_i].e = 0x7000;  // multiboot info scratch
+    st->r[ebx_i].e = k_mb_info_addr;
+    // The board owns the machine description: it fills the Multiboot 1 info
+    // structure (flags, memory map, loader name) at the address in EBX. The
+    // CPU model only knows the boot protocol, not the machine.
+    c->boot_info_addr = k_mb_info_addr;
+    if (c->boot_info) c->boot_info(c, c->boot_info_ctx);
   } else if (c->pc == k_bios_reset_vector) {
     // Firmware reset: the first instruction is fetched at the reset vector,
     // which on a 16-bit PC board is CS:IP = F000:FFF0 (SDM vol.3 9.1.4) — the
